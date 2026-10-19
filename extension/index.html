@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vector Panel</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <header class="panel-header">
+        <div class="mark">V</div>
+        <div>
+          <h1>Vector Panel</h1>
+          <p>ภาพใน Illustrator เป็น path ที่แก้ได้</p>
+        </div>
+      </header>
+
+      <section class="section" aria-labelledby="selection-title">
+        <div class="section-heading">
+          <h2 id="selection-title">1 · ภาพที่เลือก</h2>
+          <button id="refresh" class="text-button" type="button">ตรวจภาพ</button>
+        </div>
+        <div id="selection" class="selection-box">เลือกภาพ raster หนึ่งภาพบน artboard</div>
+      </section>
+
+      <section class="section" aria-labelledby="settings-title">
+        <h2 id="settings-title">2 · ตั้งค่าการแปลง</h2>
+        <label for="preset">ลักษณะภาพ</label>
+        <select id="preset">
+          <option value="logo">โลโก้ / สีแบน</option>
+          <option value="icon">ไอคอน / ขอบคม</option>
+          <option value="photo">ภาพหลายสี</option>
+        </select>
+        <div class="field-row">
+          <label for="colors">จำนวนสีสูงสุด</label>
+          <output id="colors-value" for="colors">8</output>
+        </div>
+        <input id="colors" type="range" min="2" max="32" value="8" />
+        <div class="field-row">
+          <label for="smooth">ความเรียบของเส้น</label>
+          <output id="smooth-value" for="smooth">1.5</output>
+        </div>
+        <input id="smooth" type="range" min="0" max="30" value="15" />
+      </section>
+
+      <section class="section" aria-labelledby="preview-title">
+        <div class="section-heading">
+          <h2 id="preview-title">3 · ตัวอย่าง</h2>
+          <span id="phase" class="phase">พร้อม</span>
+        </div>
+        <div class="preview-frame">
+          <img id="preview" alt="ตัวอย่างผลลัพธ์เวกเตอร์" hidden />
+          <p id="preview-empty">ผลลัพธ์จะปรากฏตรงนี้</p>
+        </div>
+        <p id="status" class="status" role="status" aria-live="polite">พร้อมแปลงภาพที่เลือก</p>
+      </section>
+
+      <footer class="actions">
+        <button id="trace" class="primary" type="button">สร้างตัวอย่าง</button>
+        <button id="cancel" class="secondary" type="button" hidden>ยกเลิก</button>
+        <button id="apply" class="secondary" type="button" disabled>ใส่ใน Illustrator</button>
+      </footer>
+    </main>
+    <script src="vendor/CSInterface.js"></script>
+    <script src="js/panel.js"></script>
+  </body>
+</html>
