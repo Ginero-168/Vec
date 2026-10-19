@@ -101,25 +101,26 @@
     return value;
   }
   function parseSelection(parts) {
-    if (parts.length !== 10) throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
-    const itemType = parts[2];
+    if (parts.length !== 11) throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
+    const itemType = parts[3];
     if (itemType !== "PlacedItem" && itemType !== "RasterItem") throw new Error("\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A\u0E20\u0E32\u0E1E raster \u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E2B\u0E19\u0E36\u0E48\u0E07\u0E20\u0E32\u0E1E");
-    const uuid = parts[3];
+    const uuid = parts[4];
     if (!uuid) throw new Error("\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E21\u0E35 Illustrator UUID");
-    const left = parseFiniteNumber(parts[4], "left");
-    const top = parseFiniteNumber(parts[5], "top");
-    const right = parseFiniteNumber(parts[6], "right");
-    const bottom = parseFiniteNumber(parts[7], "bottom");
+    const left = parseFiniteNumber(parts[5], "left");
+    const top = parseFiniteNumber(parts[6], "top");
+    const right = parseFiniteNumber(parts[7], "right");
+    const bottom = parseFiniteNumber(parts[8], "bottom");
     return {
       documentName: parts[0] ?? "",
-      itemName: parts[1] ?? "",
+      documentIdentity: parts[1] ?? "",
+      itemName: parts[2] ?? "",
       itemType,
       uuid,
       bounds: [left, top, right, bottom],
       widthPt: parsePositiveNumber(String(right - left), "width"),
       heightPt: parsePositiveNumber(String(top - bottom), "height"),
-      embedded: parts[8] === "1",
-      fromResult: parts[9] === "1"
+      embedded: parts[9] === "1",
+      fromResult: parts[10] === "1"
     };
   }
   function callHost(host, method, args = []) {
@@ -309,7 +310,7 @@
         state = { kind: "capturing", selection, job };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator\u2026");
         render();
-        await callHost(host, "VP_capture", [selection.uuid, job.pngPath]);
+        await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
         if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
         const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
         if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
@@ -338,7 +339,7 @@
       render();
       try {
         const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
-        const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(",")]);
+        const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48");
         cleanJob(job);
         state = { kind: "selected", selection };

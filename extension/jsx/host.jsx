@@ -49,6 +49,11 @@ function VP_boundsMatch(actual, expectedText) {
   return true;
 }
 
+function VP_documentIdentity(documentRef) {
+  try { return "file:" + documentRef.fullName.fsName; } catch (ignored) {}
+  return "unsaved:" + documentRef.name;
+}
+
 function VP_snapshot() {
   try {
     if (app.documents.length === 0) throw new Error("เปิดเอกสาร Illustrator ก่อน");
@@ -57,20 +62,22 @@ function VP_snapshot() {
     var item = resolved.source;
     var b = item.geometricBounds;
     if (Number(b[2]) <= Number(b[0]) || Number(b[1]) <= Number(b[3])) throw new Error("ขนาดภาพที่เลือกไม่ถูกต้อง");
-    return VP_ok([doc.name, item.name || "ภาพที่เลือก", item.typename, item.uuid, b[0], b[1], b[2], b[3], item.typename === "RasterItem" && item.embedded ? "1" : "0", resolved.fromResult ? "1" : "0"]);
+    return VP_ok([doc.name, VP_documentIdentity(doc), item.name || "ภาพที่เลือก", item.typename, item.uuid, b[0], b[1], b[2], b[3], item.typename === "RasterItem" && item.embedded ? "1" : "0", resolved.fromResult ? "1" : "0"]);
   } catch (error) {
     return VP_error(error);
   }
 }
 
-function VP_capture(encodedUuid, encodedPath) {
+function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity) {
   var temporary = null;
   var sourceDocument = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
     var outputPath = decodeURIComponent(encodedPath);
+    var documentIdentity = decodeURIComponent(encodedDocumentIdentity);
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
     sourceDocument = app.activeDocument;
+    if (VP_documentIdentity(sourceDocument) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
     var resolved = VP_selectionSource(sourceDocument);
     if (resolved.source.uuid !== uuid) throw new Error("ภาพที่เลือกเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
     var source = resolved.source;
@@ -115,7 +122,7 @@ function VP_capture(encodedUuid, encodedPath) {
   }
 }
 
-function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, encodedBounds) {
+function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, encodedBounds, encodedDocumentIdentity) {
   var createdLayer = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
@@ -123,9 +130,11 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     var jobId = decodeURIComponent(encodedJobId);
     var settings = decodeURIComponent(encodedSettings);
     var boundsText = decodeURIComponent(encodedBounds);
+    var documentIdentity = decodeURIComponent(encodedDocumentIdentity);
     if (!/^[0-9a-f]{16}$/.test(jobId)) throw new Error("รหัสงานไม่ถูกต้อง");
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
     var doc = app.activeDocument;
+    if (VP_documentIdentity(doc) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณาแปลงใหม่");
     var source = VP_image(doc, uuid);
     var bounds = source.geometricBounds;
     if (!VP_boundsMatch(bounds, boundsText)) throw new Error("ภาพต้นฉบับถูกย้ายหรือปรับขนาด กรุณาแปลงใหม่");

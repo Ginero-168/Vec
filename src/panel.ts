@@ -20,6 +20,7 @@ class HostTimeoutError extends Error {
 
 type Selection = {
   readonly documentName: string;
+  readonly documentIdentity: string;
   readonly itemName: string;
   readonly itemType: "PlacedItem" | "RasterItem";
   readonly uuid: string;
@@ -140,25 +141,26 @@ function parseFiniteNumber(raw: string | undefined, label: string): number {
 }
 
 function parseSelection(parts: string[]): Selection {
-  if (parts.length !== 10) throw new Error("ข้อมูลภาพที่เลือกไม่ครบ");
-  const itemType = parts[2];
+  if (parts.length !== 11) throw new Error("ข้อมูลภาพที่เลือกไม่ครบ");
+  const itemType = parts[3];
   if (itemType !== "PlacedItem" && itemType !== "RasterItem") throw new Error("รองรับภาพ raster ที่เลือกหนึ่งภาพ");
-  const uuid = parts[3];
+  const uuid = parts[4];
   if (!uuid) throw new Error("ภาพที่เลือกไม่มี Illustrator UUID");
-  const left = parseFiniteNumber(parts[4], "left");
-  const top = parseFiniteNumber(parts[5], "top");
-  const right = parseFiniteNumber(parts[6], "right");
-  const bottom = parseFiniteNumber(parts[7], "bottom");
+  const left = parseFiniteNumber(parts[5], "left");
+  const top = parseFiniteNumber(parts[6], "top");
+  const right = parseFiniteNumber(parts[7], "right");
+  const bottom = parseFiniteNumber(parts[8], "bottom");
   return {
     documentName: parts[0] ?? "",
-    itemName: parts[1] ?? "",
+    documentIdentity: parts[1] ?? "",
+    itemName: parts[2] ?? "",
     itemType,
     uuid,
     bounds: [left, top, right, bottom],
     widthPt: parsePositiveNumber(String(right - left), "width"),
     heightPt: parsePositiveNumber(String(top - bottom), "height"),
-    embedded: parts[8] === "1",
-    fromResult: parts[9] === "1"
+    embedded: parts[9] === "1",
+    fromResult: parts[10] === "1"
   };
 }
 
@@ -362,7 +364,7 @@ function start(): void {
       state = { kind: "capturing", selection, job };
       message("กำลังอ่านภาพจาก Illustrator…");
       render();
-      await callHost(host, "VP_capture", [selection.uuid, job.pngPath]);
+      await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
       const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
       if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
@@ -392,7 +394,7 @@ function start(): void {
     render();
     try {
       const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
-      const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(",")]);
+      const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่");
       cleanJob(job);
       state = { kind: "selected", selection };
