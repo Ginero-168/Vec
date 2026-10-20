@@ -116,6 +116,18 @@
     tail.writeInt32BE(crc ^ -1, 0);
     return Buffer.concat([head, body, tail]);
   }
+  async function joinStrips(strips) {
+    if (strips.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
+    const width = strips[0].width;
+    const height = strips.reduce((sum, strip) => sum + strip.height, 0);
+    const data = Buffer.alloc(width * height * 4);
+    let y = 0;
+    for (const strip of strips) {
+      const copyWidth = Math.min(width, strip.width) * 4;
+      for (let row = 0; row < strip.height; row++, y++) strip.data.copy(data, y * width * 4, row * strip.width * 4, row * strip.width * 4 + copyWidth);
+    }
+    return { width, height, data };
+  }
   async function stitchPng(strips) {
     if (strips.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
     const width = strips[0].width;
@@ -136,6 +148,64 @@
     header[9] = 6;
     const compressed = await deflate2(raw, { level: 1 });
     return { png: Buffer.concat([SIGNATURE, chunk("IHDR", header), chunk("IDAT", compressed), chunk("IEND", Buffer.alloc(0))]), width, height };
+  }
+  async function median3(image, rowsPerSlice = 96) {
+    const { width, height, data } = image;
+    const out = Buffer.alloc(data.length);
+    const v = new Int32Array(9);
+    const stride = width * 4;
+    for (let start2 = 0; start2 < height; start2 += rowsPerSlice) {
+      const end = Math.min(height, start2 + rowsPerSlice);
+      for (let y = start2; y < end; y++) {
+        const y0 = (y > 0 ? y - 1 : y) * stride, y1 = y * stride, y2 = (y < height - 1 ? y + 1 : y) * stride;
+        for (let x = 0; x < width; x++) {
+          const x0 = (x > 0 ? x - 1 : x) * 4, x1 = x * 4, x2 = (x < width - 1 ? x + 1 : x) * 4;
+          for (let c = 0; c < 4; c++) {
+            v[0] = data[y0 + x0 + c];
+            v[1] = data[y0 + x1 + c];
+            v[2] = data[y0 + x2 + c];
+            v[3] = data[y1 + x0 + c];
+            v[4] = data[y1 + x1 + c];
+            v[5] = data[y1 + x2 + c];
+            v[6] = data[y2 + x0 + c];
+            v[7] = data[y2 + x1 + c];
+            v[8] = data[y2 + x2 + c];
+            out[y1 + x1 + c] = median9(v);
+          }
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    return { width, height, data: out };
+  }
+  function median9(p) {
+    const s = (a, b) => {
+      const x = p[a], y = p[b];
+      if (x > y) {
+        p[a] = y;
+        p[b] = x;
+      }
+    };
+    s(1, 2);
+    s(4, 5);
+    s(7, 8);
+    s(0, 1);
+    s(3, 4);
+    s(6, 7);
+    s(1, 2);
+    s(4, 5);
+    s(7, 8);
+    s(0, 3);
+    s(5, 8);
+    s(4, 7);
+    s(3, 6);
+    s(1, 4);
+    s(2, 5);
+    s(4, 7);
+    s(4, 2);
+    s(6, 4);
+    s(4, 2);
+    return p[4];
   }
 
   // src/panel.ts
@@ -228,9 +298,41 @@
       linkedPath: parts[11] ?? ""
     };
   }
+  var ledger = { calls: [], phases: {}, panelStallMs: 0, lastTick: 0 };
+  function resetLedger() {
+    ledger.calls = [];
+    ledger.phases = {};
+    ledger.panelStallMs = 0;
+    ledger.lastTick = performance.now();
+  }
+  function ledgerSummary() {
+    const host = ledger.calls.map((call) => call.ms);
+    const byMethod = {};
+    for (const call of ledger.calls) {
+      const entry = byMethod[call.method] ?? (byMethod[call.method] = { n: 0, total: 0, max: 0 });
+      entry.n++;
+      entry.total += Math.round(call.ms);
+      entry.max = Math.max(entry.max, Math.round(call.ms));
+    }
+    return {
+      hostCalls: host.length,
+      hostTotalMs: Math.round(host.reduce((a, b) => a + b, 0)),
+      hostMaxMs: Math.round(Math.max(0, ...host)),
+      byMethod,
+      phases: ledger.phases,
+      panelStallMs: Math.round(ledger.panelStallMs),
+      rssMb: Math.round(process.memoryUsage().rss / 1048576)
+    };
+  }
+  window.setInterval(() => {
+    const now = performance.now();
+    if (ledger.lastTick > 0) ledger.panelStallMs = Math.max(ledger.panelStallMs, now - ledger.lastTick - 50);
+    ledger.lastTick = now;
+  }, 50);
   function callHost(host, method, args = []) {
     const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
     const script = method + "(" + encoded + ")";
+    const started = performance.now();
     return new Promise((resolve, reject) => {
       let finished = false;
       const timer = window.setTimeout(() => {
@@ -242,6 +344,7 @@
         if (finished) return;
         finished = true;
         window.clearTimeout(timer);
+        ledger.calls.push({ method, ms: performance.now() - started });
         try {
           resolve(parseHostResult(raw));
         } catch (error) {
@@ -304,7 +407,6 @@
     return args;
   }
   function colorPrecision(maxColors) {
-    if (maxColors <= 4) return 3;
     if (maxColors <= 10) return 4;
     if (maxColors <= 20) return 5;
     return 6;
@@ -521,28 +623,40 @@
       try {
         job = newJob(readSettings(ui));
         const current = job;
+        resetLedger();
+        let mark = performance.now();
+        const phaseDone = (name) => {
+          const now = performance.now();
+          ledger.phases[name] = Math.round(now - mark);
+          mark = now;
+        };
         state = { kind: "capturing", selection, job: current };
         progress(selection.linkedPath ? "1/3 \u0E2D\u0E48\u0E32\u0E19\u0E15\u0E33\u0E41\u0E2B\u0E19\u0E48\u0E07\u0E44\u0E1F\u0E25\u0E4C\u0E25\u0E34\u0E07\u0E01\u0E4C\u2026" : "1/3 Illustrator \u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E23\u0E19\u0E40\u0E14\u0E2D\u0E23\u0E4C\u0E20\u0E32\u0E1E (embedded)\u2026");
         render();
         const sourcePath = await captureSource(host, selection, current);
         if (current.cancelled) throw new CancelledError();
         if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
+        phaseDone("capture");
         state = { kind: "preparing", selection, job: current };
         progress("2/3 \u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E (\u0E19\u0E2D\u0E01 Illustrator)\u2026");
         render();
         const prepared = await prepareInput(current, sourcePath);
+        phaseDone("prepare");
         const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
         if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
         state = { kind: "tracing", selection, job: current };
         progress("3/3 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C " + prepared.note + "\u2026");
         render();
         await runProcess(current, binary, vtracerArguments(current, prepared.input), "VTracer \u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
+        phaseDone("trace");
         await addCanvasFrame(current.svgPath);
         const stats = await svgStats(current.svgPath);
+        phaseDone("finish");
         const seconds = ((Date.now() - current.startedAt) / 1e3).toFixed(1);
         state = { kind: "preview", selection, job: current, dataUrl: "file://" + encodeURI(current.svgPath) + "?v=" + current.id };
         message(stats.paths + " paths \xB7 " + stats.nodes + " nodes \xB7 " + seconds + " s \u2014 \u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator");
         render();
+        console.log("[VectorPanel] metrics " + JSON.stringify({ step: "preview", totalMs: Date.now() - current.startedAt, paths: stats.paths, nodes: stats.nodes, source: selection.linkedPath ? "link" : "strips", ...ledgerSummary() }));
       } catch (error) {
         if (job !== null) cleanJob(job);
         state = { kind: "selected", selection };
@@ -565,7 +679,7 @@
           strips.push(await decodePng(await fs.promises.readFile(stripPath)));
           void fs.promises.unlink(stripPath).catch(() => void 0);
         }
-        const stitched = await stitchPng(strips);
+        const stitched = await stitchPng([await median3(await joinStrips(strips))]);
         await fs.promises.writeFile(job.pngPath, stitched.png);
         return job.pngPath;
       } finally {
@@ -578,10 +692,13 @@
       state = { kind: "applying", selection, job, dataUrl };
       progress("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
       render();
+      resetLedger();
+      const applyStarted = performance.now();
       try {
         const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
         const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48 \xB7 Undo \u0E2B\u0E19\u0E36\u0E48\u0E07\u0E04\u0E23\u0E31\u0E49\u0E07\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E22\u0E49\u0E2D\u0E19");
+        console.log("[VectorPanel] metrics " + JSON.stringify({ step: "apply", totalMs: Math.round(performance.now() - applyStarted), paths: Number(result[1] ?? 0), ...ledgerSummary() }));
         cleanJob(job);
         state = { kind: "selected", selection };
       } catch (error) {

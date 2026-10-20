@@ -3,7 +3,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { decodePng, stitchPng, Rgba } from "./png";
+import { decodePng, joinStrips, median3, stitchPng, Rgba } from "./png";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -173,9 +173,39 @@ function parseSelection(parts: string[]): Selection {
   };
 }
 
+/** Timing ledger for the console "[VectorPanel] metrics" line: every evalScript round trip (an upper
+ * bound on how long that call held Illustrator's main thread) and the panel's own worst event-loop stall. */
+const ledger = { calls: [] as { method: string; ms: number }[], phases: {} as Record<string, number>, panelStallMs: 0, lastTick: 0 };
+function resetLedger(): void {
+  ledger.calls = []; ledger.phases = {}; ledger.panelStallMs = 0; ledger.lastTick = performance.now();
+}
+function ledgerSummary(): Record<string, unknown> {
+  const host = ledger.calls.map((call) => call.ms);
+  const byMethod: Record<string, { n: number; total: number; max: number }> = {};
+  for (const call of ledger.calls) {
+    const entry = byMethod[call.method] ?? (byMethod[call.method] = { n: 0, total: 0, max: 0 });
+    entry.n++; entry.total += Math.round(call.ms); entry.max = Math.max(entry.max, Math.round(call.ms));
+  }
+  return {
+    hostCalls: host.length,
+    hostTotalMs: Math.round(host.reduce((a, b) => a + b, 0)),
+    hostMaxMs: Math.round(Math.max(0, ...host)),
+    byMethod,
+    phases: ledger.phases,
+    panelStallMs: Math.round(ledger.panelStallMs),
+    rssMb: Math.round(process.memoryUsage().rss / 1048576)
+  };
+}
+window.setInterval(() => {
+  const now = performance.now();
+  if (ledger.lastTick > 0) ledger.panelStallMs = Math.max(ledger.panelStallMs, now - ledger.lastTick - 50);
+  ledger.lastTick = now;
+}, 50);
+
 function callHost(host: CepBridge, method: "VP_snapshot" | "VP_captureBegin" | "VP_captureStrip" | "VP_captureEnd" | "VP_commit", args: readonly string[] = []): Promise<string[]> {
   const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
   const script = method + "(" + encoded + ")";
+  const started = performance.now();
   return new Promise((resolve, reject) => {
     let finished = false;
     const timer = window.setTimeout(() => {
@@ -187,6 +217,7 @@ function callHost(host: CepBridge, method: "VP_snapshot" | "VP_captureBegin" | "
       if (finished) return;
       finished = true;
       window.clearTimeout(timer);
+      ledger.calls.push({ method, ms: performance.now() - started });
       try {
         resolve(parseHostResult(raw));
       } catch (error) {
@@ -263,7 +294,6 @@ function vtracerArguments(job: Job, input: string): string[] {
  * Measured on the balloon test (docs/perf-rounds.md): 4 bits gives the cleanest flat shapes with the
  * best edge F1 and ~1/10 the anchors of 6 bits; more bits mostly adds blotchy texture regions. */
 function colorPrecision(maxColors: number): number {
-  if (maxColors <= 4) return 3;
   if (maxColors <= 10) return 4;
   if (maxColors <= 20) return 5;
   return 6;
@@ -504,17 +534,22 @@ function start(): void {
     try {
       job = newJob(readSettings(ui));
       const current = job;
+      resetLedger();
+      let mark = performance.now();
+      const phaseDone = (name: string): void => { const now = performance.now(); ledger.phases[name] = Math.round(now - mark); mark = now; };
       state = { kind: "capturing", selection, job: current };
       progress(selection.linkedPath ? "1/3 อ่านตำแหน่งไฟล์ลิงก์…" : "1/3 Illustrator กำลังเรนเดอร์ภาพ (embedded)…");
       render();
       const sourcePath = await captureSource(host, selection, current);
       if (current.cancelled) throw new CancelledError();
       if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error("Illustrator ไม่ได้ส่งภาพกลับมา");
+      phaseDone("capture");
 
       state = { kind: "preparing", selection, job: current };
       progress("2/3 เตรียมภาพ (นอก Illustrator)…");
       render();
       const prepared = await prepareInput(current, sourcePath);
+      phaseDone("prepare");
 
       const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
       if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
@@ -522,12 +557,15 @@ function start(): void {
       progress("3/3 กำลังสร้างเส้นเวกเตอร์ " + prepared.note + "…");
       render();
       await runProcess(current, binary, vtracerArguments(current, prepared.input), "VTracer แปลงภาพไม่สำเร็จ");
+      phaseDone("trace");
       await addCanvasFrame(current.svgPath);
       const stats = await svgStats(current.svgPath);
+      phaseDone("finish");
       const seconds = ((Date.now() - current.startedAt) / 1000).toFixed(1);
       state = { kind: "preview", selection, job: current, dataUrl: "file://" + encodeURI(current.svgPath) + "?v=" + current.id };
       message(stats.paths + " paths · " + stats.nodes + " nodes · " + seconds + " s — ดูตัวอย่างแล้วกดใส่ใน Illustrator");
       render();
+      console.log("[VectorPanel] metrics " + JSON.stringify({ step: "preview", totalMs: Date.now() - current.startedAt, paths: stats.paths, nodes: stats.nodes, source: selection.linkedPath ? "link" : "strips", ...ledgerSummary() }));
     } catch (error) {
       if (job !== null) cleanJob(job);
       state = { kind: "selected", selection };
@@ -554,7 +592,7 @@ function start(): void {
         strips.push(await decodePng(await fs.promises.readFile(stripPath)));
         void fs.promises.unlink(stripPath).catch(() => undefined);
       }
-      const stitched = await stitchPng(strips);
+      const stitched = await stitchPng([await median3(await joinStrips(strips))]);
       await fs.promises.writeFile(job.pngPath, stitched.png);
       return job.pngPath;
     } finally {
@@ -568,10 +606,13 @@ function start(): void {
     state = { kind: "applying", selection, job, dataUrl };
     progress("กำลังนำ path เข้า Illustrator…");
     render();
+    resetLedger();
+    const applyStarted = performance.now();
     try {
       const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่ · Undo หนึ่งครั้งเพื่อย้อน");
+      console.log("[VectorPanel] metrics " + JSON.stringify({ step: "apply", totalMs: Math.round(performance.now() - applyStarted), paths: Number(result[1] ?? 0), ...ledgerSummary() }));
       cleanJob(job);
       state = { kind: "selected", selection };
     } catch (error) {
