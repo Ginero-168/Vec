@@ -28,20 +28,21 @@
         <h2 id="settings-title">2 · ตั้งค่าการแปลง</h2>
         <label for="preset">ลักษณะภาพ</label>
         <select id="preset">
-          <option value="logo">โลโก้ / สีแบน</option>
-          <option value="icon">ไอคอน / ขอบคม</option>
-          <option value="photo">ภาพหลายสี</option>
+          <option value="fast">Fast · เร็ว</option>
+          <option value="balanced" selected>Balanced · สมดุล</option>
+          <option value="detail">Detail · ละเอียด</option>
         </select>
         <div class="field-row">
           <label for="colors">จำนวนสีสูงสุด</label>
-          <output id="colors-value" for="colors">8</output>
+          <output id="colors-value" for="colors">16</output>
         </div>
-        <input id="colors" type="range" min="2" max="32" value="8" />
+        <input id="colors" type="range" min="2" max="32" value="16" />
+        <label class="check"><input id="auto-palette" type="checkbox" checked /> ตรวจจำนวนสีอัตโนมัติ (ตัวเลขด้านบนคือเพดาน)</label>
         <div class="field-row">
           <label for="smooth">ความเรียบของเส้น</label>
-          <output id="smooth-value" for="smooth">1.5</output>
+          <output id="smooth-value" for="smooth">1.6</output>
         </div>
-        <input id="smooth" type="range" min="0" max="30" value="15" />
+        <input id="smooth" type="range" min="0" max="30" value="16" />
       </section>
 
       <section class="section" aria-labelledby="preview-title">

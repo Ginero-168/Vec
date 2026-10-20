@@ -4,6 +4,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import { PRESET_UI, speedSpec, traceFile, type SpeedPreset } from "./engine";
+
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
   getSystemPath(kind: string): string;
@@ -32,9 +34,10 @@ type Selection = {
 };
 
 type Settings = {
-  readonly preset: "logo" | "icon" | "photo";
+  readonly preset: SpeedPreset;
   readonly maxColors: number;
   readonly simplify: number;
+  readonly autoPalette: boolean;
 };
 
 type Job = {
@@ -43,6 +46,7 @@ type Job = {
   readonly pngPath: string;
   readonly svgPath: string;
   readonly settings: Settings;
+  resolvedColors: number;
   cancelled: boolean;
 };
 
@@ -70,6 +74,7 @@ type Ui = {
   readonly colorsValue: HTMLOutputElement;
   readonly smooth: HTMLInputElement;
   readonly smoothValue: HTMLOutputElement;
+  readonly autoPalette: HTMLInputElement;
 };
 
 function getElement(id: string): HTMLElement {
@@ -115,7 +120,8 @@ function getUi(): Ui {
     colors: getInput("colors"),
     colorsValue: getOutput("colors-value"),
     smooth: getInput("smooth"),
-    smoothValue: getOutput("smooth-value")
+    smoothValue: getOutput("smooth-value"),
+    autoPalette: getInput("auto-palette")
   };
 }
 
@@ -199,6 +205,7 @@ function newJob(settings: Settings): Job {
     pngPath: path.join(directory, "source.png"),
     svgPath: path.join(directory, "result.svg"),
     settings,
+    resolvedColors: settings.maxColors,
     cancelled: false
   };
 }
@@ -227,49 +234,14 @@ function cleanStaleJobs(): void {
   }
 }
 
-function vtracerArguments(job: Job): string[] {
-  const args = [job.pngPath, job.svgPath];
-  const preset = job.settings.preset;
-  if (preset === "photo") {
-    args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
-  } else {
-    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
-    if (preset === "icon") args.push("--mode", "polygon");
-  }
-  if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
-  args.push("--optimize", "1");
-  return args;
-}
-
-function runVtracer(binary: string, job: Job, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(binary, vtracerArguments(job), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-    onStart(child);
-    let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < 4000) stderr += chunk.toString("utf8").slice(0, 4000 - stderr.length);
-    });
-    child.once("error", (error) => reject(error));
-    child.once("close", (code) => {
-      if (job.cancelled) {
-        reject(new Error("ยกเลิกแล้ว"));
-      } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
-        resolve();
-      } else {
-        reject(new Error("VTracer แปลงภาพไม่สำเร็จ" + (stderr ? ": " + stderr.trim() : "")));
-      }
-    });
-  });
-}
-
 function readSettings(ui: Ui): Settings {
   const preset = ui.preset.value;
-  if (preset !== "logo" && preset !== "icon" && preset !== "photo") throw new Error("Preset ไม่ถูกต้อง");
+  if (preset !== "fast" && preset !== "balanced" && preset !== "detail") throw new Error("Preset ไม่ถูกต้อง");
   const maxColors = Number(ui.colors.value);
   const simplify = Number(ui.smooth.value) / 10;
   if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("จำนวนสีไม่ถูกต้อง");
   if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
-  return { preset, maxColors, simplify };
+  return { preset, maxColors, simplify, autoPalette: ui.autoPalette.checked };
 }
 
 function showSelection(ui: Ui, selection: Selection | null): void {
@@ -368,12 +340,21 @@ function start(): void {
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
       const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
       if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
-      message("กำลังสร้างเส้นเวกเตอร์…");
-      await runVtracer(binary, job, (child) => {
-        if (job === null) return;
-        state = { kind: "tracing", selection, job, child };
-        render();
+      message("กำลังเตรียมภาพและสร้างเส้นเวกเตอร์…");
+      const report = await traceFile({
+        binary,
+        inputPath: job.pngPath,
+        outputPath: job.svgPath,
+        preparedPath: path.join(job.directory, "prepared.png"),
+        spec: speedSpec(job.settings.preset, job.settings.maxColors, job.settings.simplify, !job.settings.autoPalette),
+        isCancelled: () => job?.cancelled === true,
+        onChild: (child) => {
+          if (job === null) return;
+          state = { kind: "tracing", selection, job, child };
+          render();
+        }
       });
+      job.resolvedColors = report.paletteSize;
       const svg = fs.readFileSync(job.svgPath);
       state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64") };
       message("ดูตัวอย่างแล้วกดใส่ใน Illustrator");
@@ -393,7 +374,7 @@ function start(): void {
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
-      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
+      const settings = "preset=" + job.settings.preset + ";colors=" + job.resolvedColors + ";cap=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";auto=" + (job.settings.autoPalette ? "1" : "0");
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่");
       cleanJob(job);
@@ -421,10 +402,18 @@ function start(): void {
   });
   ui.colors.addEventListener("input", () => { ui.colorsValue.value = ui.colors.value; });
   ui.smooth.addEventListener("input", () => { ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1); });
-  ui.preset.addEventListener("change", () => {
-    ui.colors.value = ui.preset.value === "photo" ? "24" : ui.preset.value === "icon" ? "4" : "8";
+  function applyPresetDefaults(): void {
+    const preset = ui.preset.value;
+    if (preset !== "fast" && preset !== "balanced" && preset !== "detail") return;
+    const defaults = PRESET_UI[preset];
+    ui.colors.value = String(defaults.colors);
     ui.colorsValue.value = ui.colors.value;
-  });
+    ui.smooth.value = String(Math.round(defaults.simplify * 10));
+    ui.smoothValue.value = defaults.simplify.toFixed(1);
+    ui.autoPalette.checked = defaults.autoPalette;
+  }
+
+  ui.preset.addEventListener("change", applyPresetDefaults);
 
   window.addEventListener("beforeunload", () => {
     if (state.kind === "preview") cleanJob(state.job);

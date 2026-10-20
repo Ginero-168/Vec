@@ -4,12 +4,15 @@
   "version": "0.1.0",
   "description": "CEP vector tracing panel for Adobe Illustrator",
   "scripts": {
-    "build": "tsc -p tsconfig.json && esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js",
+    "build": "tsc -p tsconfig.json && esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js && esbuild src/trace-cli.ts --bundle --platform=node --format=cjs --target=node18 --outfile=bench/trace-cli.js",
     "watch": "esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js --watch"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0"
   }
 }
