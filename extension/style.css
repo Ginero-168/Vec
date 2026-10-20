@@ -52,6 +52,10 @@ select { width: 100%; border: 1px solid #55545a; border-radius: 6px; background:
 
 input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 
+.check { display: flex; gap: 8px; align-items: center; color: #c6c6ca; font-size: 12px; }
+
+.check input { accent-color: #c6a6fb; }
+
 .phase { font-size: 11px; color: #a8dcbb; }
 
 .preview-frame { min-height: 175px; max-height: 280px; display: grid; place-items: center; overflow: hidden; background-image: linear-gradient(45deg, #37373c 25%, transparent 25%), linear-gradient(-45deg, #37373c 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #37373c 75%), linear-gradient(-45deg, transparent 75%, #37373c 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0; }

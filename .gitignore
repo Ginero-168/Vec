@@ -2,3 +2,7 @@ node_modules/
 .vendor-build/
 .DS_Store
 *.log
+bench/out/
+bench/bin/
+__pycache__/
+*.pyc
