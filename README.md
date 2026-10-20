@@ -8,7 +8,8 @@
 - เครื่องนี้มี Illustrator 30.8.2 ที่กำลังใช้ CEP 12.1.1; development link ถูกติดตั้งในบัญชีผู้ใช้แล้ว
 - Panel ใช้ `PageItem.uuid` และตัวระบุเอกสารตรวจภาพที่เลือกก่อนใส่ผล และลบ layer ที่สร้างหาก Illustrator ไม่สร้าง path
 - เลือกกลุ่มผลเดิมแล้วสร้างเวอร์ชันใหม่ได้จาก UUID ของภาพต้นฉบับ โดยไม่ลบผลที่แก้มือไว้
-- ยังไม่ผ่านการตรวจใช้งานจริงภายใน Illustrator เวอร์ชัน 30.8.2 บนเครื่องนี้ แอปกำลังเปิดอยู่ จึงยังไม่ได้ปิดหรือเปิดใหม่เพื่อโหลด extension
+- ภาพที่ลิงก์และเมทริกซ์เป็นสเกลไม่หมุน (`A > 0`, `D < 0`) อ่านจาก `file.fsName` นอก main thread ของ Illustrator ภาพ embedded, ภาพในคลิป, ภาพหมุน หรือไฟล์ที่สัดส่วนไม่ตรงกับกรอบ ถูกจับเป็นแถบบางในเอกสารเดิม ไม่คัดลอกคลิปบอร์ดและไม่เปิดเอกสารใหม่ การค้น uuid เดินเข้ากลุ่มห่อของ Illustrator 30 ผลถูกนำเข้าด้วย `createFromFile` เป็น path ไม่ได้ Place SVG
+- การทดสอบใน Illustrator 30.8.2 ของ `af401bc` ไม่ผ่าน Apply รอบนี้แก้จากผลนั้น และยังไม่ได้รันซ้ำใน Illustrator
 - งานที่ยังต้องพิสูจน์: ความถูกต้องของ embedded/CMYK/clipping, Undo หนึ่งครั้ง, Re-trace หลังเปิด `.ai` ใหม่, ความเร็ว 10,000 paths, Windows และการแจกจ่ายแบบลงลายเซ็น
 
 ## ติดตั้งสำหรับพัฒนา
@@ -31,7 +32,7 @@ npm run build
 4. ตรวจภาพตัวอย่างแล้วกด **ใส่ใน Illustrator** ผลจะอยู่ใน layer ใหม่ ต้นฉบับยังอยู่
 5. เมื่อต้องการแปลงใหม่ ให้เลือกกลุ่ม `Trace ...` ที่ Panel สร้าง กด **ตรวจภาพ** แล้วกด **สร้างเวอร์ชันใหม่**
 
-ขั้นตอนอ่านภาพจะคัดลอกภาพที่เลือกไปยังเอกสารชั่วคราวแล้วใช้ `Document.imageCapture()` ทำ PNG วิธีนี้เปลี่ยนเนื้อหา clipboard ของระบบและสร้างไฟล์ชั่วคราวในโฟลเดอร์ระบบ ซึ่ง Panel ลบเมื่อจบงาน
+ภาพที่ลิงก์และไม่ได้ครอป หมุน พลิก หรือใส่คลิป อ่านจาก `file.fsName` แล้วให้ worker ถอดรหัส ย่อ และเรียก VTracer ภาพ embedded หรือภาพที่ต้องแรสเตอร์จากเอกสารถูกจับเป็นแถบบาง ๆ ด้วย `imageCapture` นอก artboard แถบละหนึ่งสคริปต์ แล้ว worker ต่อแถบเป็น PNG ไม่ได้เปิดเอกสารชั่วคราวและไม่ได้เขียนคลิปบอร์ด การใส่ผลใช้ `GroupItems.createFromFile()` เป็น path ในสคริปต์เดียว ไม่ได้ Place ไฟล์ SVG เพราะ Illustrator 30 เปิดหน้าต่าง “cannot be placed” ค้างจนกว่าจะกด OK
 
 ## โครงสร้าง
 
@@ -40,6 +41,7 @@ npm run build
 | `extension/CSXS/manifest.xml` | ประกาศ CEP Panel สำหรับ Illustrator |
 | `extension/index.html`, `extension/style.css` | UI ใน Panel |
 | `src/panel.ts` | สถานะ UI, เรียก JSX, เรียก worker และ preview |
+| `src/trace-worker.ts`, `extension/js/trace-worker.js` | ถอดรหัส ย่อภาพ เรียก VTracer และตรวจ SVG นอกเธรดของพาเนล |
 | `extension/jsx/host.jsx` | อ่าน selection/capture ภาพ/นำ SVG เข้าเอกสาร |
 | `extension/bin/vtracer` | VTracer CLI สำหรับ macOS arm64 |
 | `scripts/` | Build worker และติดตั้ง/ถอด link สำหรับพัฒนา |
