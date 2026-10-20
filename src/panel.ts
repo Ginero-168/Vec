@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { decodePng, stitchPng, Rgba } from "./png";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -172,7 +173,7 @@ function parseSelection(parts: string[]): Selection {
   };
 }
 
-function callHost(host: CepBridge, method: "VP_snapshot" | "VP_capture" | "VP_commit", args: readonly string[] = []): Promise<string[]> {
+function callHost(host: CepBridge, method: "VP_snapshot" | "VP_captureBegin" | "VP_captureStrip" | "VP_captureEnd" | "VP_commit", args: readonly string[] = []): Promise<string[]> {
   const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
   const script = method + "(" + encoded + ")";
   return new Promise((resolve, reject) => {
@@ -449,7 +450,7 @@ function start(): void {
     ui.trace.disabled = busy || state.kind === "empty";
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
     ui.apply.disabled = state.kind !== "preview";
-    ui.cancel.hidden = !(state.kind === "preparing" || state.kind === "tracing");
+    ui.cancel.hidden = !(state.kind === "capturing" || state.kind === "preparing" || state.kind === "tracing");
     ui.phase.textContent = PHASES[state.kind];
     ui.phase.classList.toggle("busy", busy);
     if (busy && ticker === null) ticker = window.setInterval(tick, 200);
@@ -506,9 +507,8 @@ function start(): void {
       state = { kind: "capturing", selection, job: current };
       progress(selection.linkedPath ? "1/3 อ่านตำแหน่งไฟล์ลิงก์…" : "1/3 Illustrator กำลังเรนเดอร์ภาพ (embedded)…");
       render();
-      const captured = await callHost(host, "VP_capture", [selection.uuid, current.pngPath, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+      const sourcePath = await captureSource(host, selection, current);
       if (current.cancelled) throw new CancelledError();
-      const sourcePath = captured[1] ?? "";
       if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error("Illustrator ไม่ได้ส่งภาพกลับมา");
 
       state = { kind: "preparing", selection, job: current };
@@ -533,6 +533,32 @@ function start(): void {
       state = { kind: "selected", selection };
       message(errorMessage(error), !(error instanceof CancelledError));
       render();
+    }
+  }
+
+  /** Linked image: its file path (no rendering). Embedded image: Illustrator renders thin strips, one
+   * evalScript call each, so its main thread is never blocked for more than ~150 ms; strips are decoded
+   * here as they arrive and stitched into job.pngPath. */
+  async function captureSource(bridge: CepBridge, selection: Selection, job: Job): Promise<string> {
+    const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+    if (begun[0] === "link") return begun[1] ?? "";
+    try {
+      const count = Number(begun[1]);
+      if (!(count > 0)) throw new Error("Illustrator ไม่ได้ส่งขนาดภาพกลับมา");
+      const strips: Rgba[] = [];
+      for (let index = 0; index < count; index++) {
+        if (job.cancelled) throw new CancelledError();
+        progressText = "1/3 Illustrator กำลังเรนเดอร์ภาพ (embedded) " + (index + 1) + "/" + count;
+        const stripPath = path.join(job.directory, "strip-" + index + ".png");
+        await callHost(bridge, "VP_captureStrip", [String(index), stripPath]);
+        strips.push(await decodePng(await fs.promises.readFile(stripPath)));
+        void fs.promises.unlink(stripPath).catch(() => undefined);
+      }
+      const stitched = await stitchPng(strips);
+      await fs.promises.writeFile(job.pngPath, stitched.png);
+      return job.pngPath;
+    } finally {
+      await callHost(bridge, "VP_captureEnd").catch(() => undefined);
     }
   }
 

@@ -133,19 +133,32 @@ function VP_snapshot() {
 
 // Returns OK|link|<path> (no pixel work on the main thread) or OK|png|<path>|<bytes>.
 // maxPixels caps the capture size so imageCapture never renders more than the tracer needs.
-function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity, encodedMaxPixels) {
-  var temporary = null;
+// Strip capture for embedded images. One full-size imageCapture of a 4 MP embedded image blocks
+// Illustrator's main thread for ~4 s (and scratch-document creation adds ~1 s). Instead the panel
+// parks a duplicate on a temporary layer (VP_captureBegin, one undo step), asks for one thin strip
+// per evalScript call (VP_captureStrip, ~70-150 ms each; Illustrator processes UI events between
+// calls), then removes the layer (VP_captureEnd). Strip time grows faster than linearly with
+// height, so thin strips are also cheaper in total.
+var VP_CAPTURE_LAYER = "Vector Panel capture (temporary)";
+var VP_STRIP_ROWS = 48;
+
+function VP_captureLayer(doc) {
+  for (var i = 0; i < doc.layers.length; i++) {
+    if (doc.layers[i].name === VP_CAPTURE_LAYER) return doc.layers[i];
+  }
+  return null;
+}
+
+function VP_captureBegin(encodedUuid, encodedDocumentIdentity, encodedMaxPixels) {
   var previousLevel = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
-    var outputPath = decodeURIComponent(encodedPath);
     var documentIdentity = decodeURIComponent(encodedDocumentIdentity);
     var maxPixels = Number(decodeURIComponent(encodedMaxPixels || "")) || 4000000;
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
-    var sourceDocument = app.activeDocument;
-    if (VP_documentIdentity(sourceDocument) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
-    var source = VP_image(sourceDocument, uuid);
-
+    var doc = app.activeDocument;
+    if (VP_documentIdentity(doc) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
+    var source = VP_image(doc, uuid);
     var linked = VP_linkedPath(source);
     if (linked !== "") return VP_ok(["link", linked]);
 
@@ -153,34 +166,79 @@ function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity, encodedMa
     var width = Number(bounds[2]) - Number(bounds[0]);
     var height = Number(bounds[1]) - Number(bounds[3]);
     if (width <= 0 || height <= 0) throw new Error("ขนาดภาพไม่ถูกต้อง");
-    // pixels = (w/72*ppi)*(h/72*ppi) <= maxPixels  →  ppi <= 72*sqrt(maxPixels/(w*h))
-    var resolution = Math.min(300, Math.max(36, Math.floor(72 * Math.sqrt(maxPixels / (width * height)))));
+    var ppi = Math.min(300, Math.max(36, Math.floor(72 * Math.sqrt(maxPixels / (width * height)))));
 
     previousLevel = app.userInteractionLevel;
     app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
-    // duplicate() into a scratch document: no clipboard round trip, selection untouched.
-    temporary = app.documents.add(sourceDocument.documentColorSpace, Math.max(10, width), Math.max(10, height));
-    var copy = source.duplicate(temporary.layers[0], ElementPlacement.PLACEATBEGINNING);
-    var captureBounds = copy.visibleBounds;
+    var stale = VP_captureLayer(doc);
+    if (stale !== null) { stale.locked = false; stale.remove(); }
+    var previousLayer = null;
+    try { previousLayer = doc.activeLayer; } catch (ignoredActive) {}
+    var layer = doc.layers.add();
+    layer.name = VP_CAPTURE_LAYER;
+    var copy = source.duplicate(layer, ElementPlacement.PLACEATBEGINNING);
+    // Park right of every artboard, top-aligned, so no other art falls inside the capture area.
+    var right = -1e9, top = -1e9;
+    for (var a = 0; a < doc.artboards.length; a++) {
+      var rect = doc.artboards[a].artboardRect;
+      if (Number(rect[2]) > right) right = Number(rect[2]);
+      if (Number(rect[1]) > top) top = Number(rect[1]);
+    }
+    var copyBounds = copy.geometricBounds;
+    copy.translate(right + 72 - Number(copyBounds[0]), top - Number(copyBounds[1]));
+    layer.locked = true;
+    try { if (previousLayer) doc.activeLayer = previousLayer; } catch (ignoredRestore) {}
+    var area = copy.visibleBounds;
+    var stripPoints = VP_STRIP_ROWS * 72 / ppi;
+    var count = Math.ceil((Number(area[1]) - Number(area[3])) / stripPoints - 1e-6);
+    $.global.VP_captureState = { identity: documentIdentity, area: [Number(area[0]), Number(area[1]), Number(area[2]), Number(area[3])], ppi: ppi, stripPoints: stripPoints, count: count };
+    return VP_ok(["strips", count, ppi]);
+  } catch (error) {
+    try { VP_captureEnd(); } catch (ignoredEnd) {}
+    return VP_error(error);
+  } finally {
+    if (previousLevel !== null) {
+      try { app.userInteractionLevel = previousLevel; } catch (ignoredLevel) {}
+    }
+  }
+}
+
+function VP_captureStrip(encodedIndex, encodedPath) {
+  try {
+    var state = $.global.VP_captureState;
+    if (!state) throw new Error("การอ่านภาพถูกยกเลิก กรุณาแปลงใหม่");
+    if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
+    var doc = app.activeDocument;
+    if (VP_documentIdentity(doc) !== state.identity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณาแปลงใหม่");
+    if (VP_captureLayer(doc) === null) throw new Error("ภาพชั่วคราวถูกลบระหว่างอ่าน กรุณาแปลงใหม่");
+    var index = Number(decodeURIComponent(encodedIndex));
+    var outputPath = decodeURIComponent(encodedPath);
+    var stripTop = state.area[1] - index * state.stripPoints;
+    var stripBottom = Math.max(state.area[3], stripTop - state.stripPoints);
     var options = new ImageCaptureOptions();
     options.antiAliasing = true;
     options.transparency = true;
     options.matte = false;
-    options.resolution = resolution;
-    temporary.imageCapture(new File(outputPath), captureBounds, options);
-    var imageFile = new File(outputPath);
-    if (!imageFile.exists || imageFile.length === 0) throw new Error("Illustrator ไม่ได้สร้างไฟล์ภาพชั่วคราว");
-    return VP_ok(["png", imageFile.fsName, imageFile.length, resolution]);
+    options.resolution = state.ppi;
+    doc.imageCapture(new File(outputPath), [state.area[0], stripTop, state.area[2], stripBottom], options);
+    var file = new File(outputPath);
+    if (!file.exists || file.length === 0) throw new Error("Illustrator ไม่ได้สร้างไฟล์ภาพชั่วคราว");
+    return VP_ok([file.length]);
   } catch (error) {
     return VP_error(error);
-  } finally {
-    if (temporary !== null) {
-      try { temporary.close(SaveOptions.DONOTSAVECHANGES); } catch (ignored) {}
-      try { sourceDocument.activate(); } catch (ignoredAgain) {}
+  }
+}
+
+function VP_captureEnd() {
+  try {
+    $.global.VP_captureState = null;
+    for (var d = 0; d < app.documents.length; d++) {
+      var layer = VP_captureLayer(app.documents[d]);
+      if (layer !== null) { layer.locked = false; layer.remove(); }
     }
-    if (previousLevel !== null) {
-      try { app.userInteractionLevel = previousLevel; } catch (ignoredLevel) {}
-    }
+    return VP_ok(["done"]);
+  } catch (error) {
+    return VP_error(error);
   }
 }
 

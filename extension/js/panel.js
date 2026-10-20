@@ -35,6 +35,110 @@
   var fs = __toESM(__require("fs"));
   var os = __toESM(__require("os"));
   var path = __toESM(__require("path"));
+
+  // src/png.ts
+  var zlib = __toESM(__require("zlib"));
+  var import_util = __require("util");
+  var inflate2 = (0, import_util.promisify)(zlib.inflate);
+  var deflate2 = (0, import_util.promisify)(zlib.deflate);
+  var SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  function paeth(a, b, c) {
+    const p = a + b - c;
+    const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+  }
+  async function decodePng(file) {
+    if (file.length < 8 || !file.subarray(0, 8).equals(SIGNATURE)) throw new Error("\u0E44\u0E1F\u0E25\u0E4C\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48 PNG");
+    let offset = 8, width = 0, height = 0, depth = 0, colorType = 0, interlace = 0;
+    const idat = [];
+    while (offset + 8 <= file.length) {
+      const length = file.readUInt32BE(offset);
+      const type = file.toString("latin1", offset + 4, offset + 8);
+      const body = file.subarray(offset + 8, offset + 8 + length);
+      if (type === "IHDR") {
+        width = body.readUInt32BE(0);
+        height = body.readUInt32BE(4);
+        depth = body.readUInt8(8);
+        colorType = body.readUInt8(9);
+        interlace = body.readUInt8(12);
+      } else if (type === "IDAT") idat.push(body);
+      else if (type === "IEND") break;
+      offset += 12 + length;
+    }
+    const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : 0;
+    if (depth !== 8 || channels === 0 || interlace !== 0) throw new Error("\u0E23\u0E39\u0E1B\u0E41\u0E1A\u0E1A PNG \u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A (" + depth + "/" + colorType + ")");
+    const raw = await inflate2(Buffer.concat(idat));
+    const stride = width * channels;
+    const out = Buffer.alloc(width * height * 4);
+    let previous = new Uint8Array(stride);
+    let line = new Uint8Array(stride);
+    for (let y = 0; y < height; y++) {
+      const base = y * (stride + 1);
+      const filter = raw[base];
+      for (let x = 0; x < stride; x++) {
+        const value = raw[base + 1 + x];
+        const left = x >= channels ? line[x - channels] : 0;
+        const up = previous[x];
+        const upLeft = x >= channels ? previous[x - channels] : 0;
+        line[x] = (filter === 0 ? value : filter === 1 ? value + left : filter === 2 ? value + up : filter === 3 ? value + (left + up >> 1) : value + paeth(left, up, upLeft)) & 255;
+      }
+      const row = y * width * 4;
+      if (channels === 4) out.set(line, row);
+      else for (let x = 0; x < width; x++) {
+        out[row + x * 4] = line[x * 3];
+        out[row + x * 4 + 1] = line[x * 3 + 1];
+        out[row + x * 4 + 2] = line[x * 3 + 2];
+        out[row + x * 4 + 3] = 255;
+      }
+      const swap = previous;
+      previous = line;
+      line = swap;
+    }
+    return { width, height, data: out };
+  }
+  var CRC_TABLE = (() => {
+    const table = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+      table[n] = c;
+    }
+    return table;
+  })();
+  function chunk(type, body) {
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(body.length, 0);
+    head.write(type, 4, "latin1");
+    let crc = -1;
+    for (let i = 4; i < 8; i++) crc = CRC_TABLE[(crc ^ head[i]) & 255] ^ crc >>> 8;
+    for (let i = 0; i < body.length; i++) crc = CRC_TABLE[(crc ^ body[i]) & 255] ^ crc >>> 8;
+    const tail = Buffer.alloc(4);
+    tail.writeInt32BE(crc ^ -1, 0);
+    return Buffer.concat([head, body, tail]);
+  }
+  async function stitchPng(strips) {
+    if (strips.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
+    const width = strips[0].width;
+    const height = strips.reduce((sum, strip) => sum + strip.height, 0);
+    const rowBytes = width * 4 + 1;
+    const raw = Buffer.alloc(rowBytes * height);
+    let y = 0;
+    for (const strip of strips) {
+      const copyWidth = Math.min(width, strip.width) * 4;
+      for (let row = 0; row < strip.height; row++, y++) {
+        strip.data.copy(raw, y * rowBytes + 1, row * strip.width * 4, row * strip.width * 4 + copyWidth);
+      }
+    }
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(width, 0);
+    header.writeUInt32BE(height, 4);
+    header[8] = 8;
+    header[9] = 6;
+    const compressed = await deflate2(raw, { level: 1 });
+    return { png: Buffer.concat([SIGNATURE, chunk("IHDR", header), chunk("IDAT", compressed), chunk("IEND", Buffer.alloc(0))]), width, height };
+  }
+
+  // src/panel.ts
   var HostTimeoutError = class extends Error {
     constructor() {
       super("Illustrator \u0E44\u0E21\u0E48\u0E15\u0E2D\u0E1A\u0E01\u0E25\u0E31\u0E1A\u0E20\u0E32\u0E22\u0E43\u0E19\u0E40\u0E27\u0E25\u0E32\u0E17\u0E35\u0E48\u0E01\u0E33\u0E2B\u0E19\u0E14");
@@ -215,11 +319,11 @@
       job.child = child;
       let stdout = "";
       let stderr = "";
-      child.stdout?.on("data", (chunk) => {
-        if (stdout.length < 8e3) stdout += chunk.toString("utf8");
+      child.stdout?.on("data", (chunk2) => {
+        if (stdout.length < 8e3) stdout += chunk2.toString("utf8");
       });
-      child.stderr?.on("data", (chunk) => {
-        if (stderr.length < 4e3) stderr += chunk.toString("utf8").slice(0, 4e3 - stderr.length);
+      child.stderr?.on("data", (chunk2) => {
+        if (stderr.length < 4e3) stderr += chunk2.toString("utf8").slice(0, 4e3 - stderr.length);
       });
       child.once("error", (error) => {
         job.child = null;
@@ -365,7 +469,7 @@
       ui.trace.disabled = busy || state.kind === "empty";
       ui.trace.textContent = currentSelection(state)?.fromResult ? "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48" : "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07";
       ui.apply.disabled = state.kind !== "preview";
-      ui.cancel.hidden = !(state.kind === "preparing" || state.kind === "tracing");
+      ui.cancel.hidden = !(state.kind === "capturing" || state.kind === "preparing" || state.kind === "tracing");
       ui.phase.textContent = PHASES[state.kind];
       ui.phase.classList.toggle("busy", busy);
       if (busy && ticker === null) ticker = window.setInterval(tick, 200);
@@ -420,9 +524,8 @@
         state = { kind: "capturing", selection, job: current };
         progress(selection.linkedPath ? "1/3 \u0E2D\u0E48\u0E32\u0E19\u0E15\u0E33\u0E41\u0E2B\u0E19\u0E48\u0E07\u0E44\u0E1F\u0E25\u0E4C\u0E25\u0E34\u0E07\u0E01\u0E4C\u2026" : "1/3 Illustrator \u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E23\u0E19\u0E40\u0E14\u0E2D\u0E23\u0E4C\u0E20\u0E32\u0E1E (embedded)\u2026");
         render();
-        const captured = await callHost(host, "VP_capture", [selection.uuid, current.pngPath, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+        const sourcePath = await captureSource(host, selection, current);
         if (current.cancelled) throw new CancelledError();
-        const sourcePath = captured[1] ?? "";
         if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
         state = { kind: "preparing", selection, job: current };
         progress("2/3 \u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E (\u0E19\u0E2D\u0E01 Illustrator)\u2026");
@@ -445,6 +548,28 @@
         state = { kind: "selected", selection };
         message(errorMessage(error), !(error instanceof CancelledError));
         render();
+      }
+    }
+    async function captureSource(bridge, selection, job) {
+      const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+      if (begun[0] === "link") return begun[1] ?? "";
+      try {
+        const count = Number(begun[1]);
+        if (!(count > 0)) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E02\u0E19\u0E32\u0E14\u0E20\u0E32\u0E1E\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
+        const strips = [];
+        for (let index = 0; index < count; index++) {
+          if (job.cancelled) throw new CancelledError();
+          progressText = "1/3 Illustrator \u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E23\u0E19\u0E40\u0E14\u0E2D\u0E23\u0E4C\u0E20\u0E32\u0E1E (embedded) " + (index + 1) + "/" + count;
+          const stripPath = path.join(job.directory, "strip-" + index + ".png");
+          await callHost(bridge, "VP_captureStrip", [String(index), stripPath]);
+          strips.push(await decodePng(await fs.promises.readFile(stripPath)));
+          void fs.promises.unlink(stripPath).catch(() => void 0);
+        }
+        const stitched = await stitchPng(strips);
+        await fs.promises.writeFile(job.pngPath, stitched.png);
+        return job.pngPath;
+      } finally {
+        await callHost(bridge, "VP_captureEnd").catch(() => void 0);
       }
     }
     async function apply() {
