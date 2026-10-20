@@ -191,3 +191,119 @@ perf/offload-trace remains primary.
 - **P1:** embedded preview is about 4.6 s, bounded by Illustrator's `imageCapture` (~3 s for 4 MP in strips). Getting under 5 s reliably needs either fewer pixels or a faster pixel source.
 - **P2:** Illustrator RSS rises by up to 183 MB during embedded strip capture.
 - **X1:** Windows build, signed/notarised ZXP, 3-designer A/B and the 1,050-image corpus all need Peerawat.
+
+---
+
+# Round 13 — PR #2 A/B, Apply laps, 3 MP embedded cap (3887e81, 2026-10-21 03:02 Bangkok)
+
+Machine: M2 8 GB with swap at 10.1–10.5 GB of 11 GB (Chrome and LINE) for the whole round. Illustrator 30.8.2, CEP 12. Live panel loaded through the Desktop symlink; /Library was not touched.
+
+## PR #2 (cursor/perf-engine-presets-a804 @ 6449209) A/B — no graft
+
+The comparison used the same Mac, the same vtracer and the same q.py. Live runs used the PR #2 panel with `pr2_shim.jsx`, because PR #2 still ships main's clipboard/place host.
+
+| Run | Preview | Panel freeze | Apply | SSIM | Edge F1 | PSNR | MAD | Nodes |
+|---|---|---|---|---|---|---|---|---|
+| PR #2 balanced, linked | 2.56 s | 1430 ms | 1032 ms | 0.869 | 0.947 | 24.95 | 4.41 | 2880 |
+| PR #2 balanced, embedded | 1.10 s (+1357 ms one-shot capture block) | 1910 ms | 603 ms | 0.865 | 0.928 | 24.01 | 5.08 | 2792 |
+| PR #2 fast, linked | 2.20 s | 1213 ms | – | 0.870 | 0.949 | 25.10 | 4.37 | 3065 |
+| PR #2 detail, linked | 6.31 s | 1394 ms | – | 0.874 | 0.949 | 25.77 | 4.32 | 9871 |
+| PR #2 detail, embedded | 1.34 s (+1439 ms block) | 1948 ms | – | 0.869 | 0.969 | 24.58 | 4.79 | 3753 |
+| mine 3887e81, linked | 1.66 s | 192 ms | 429 ms | 0.865 | 0.964 | 23.93 | 6.49 | 1360 |
+| mine 3887e81, embedded | 3.7–4.0 s (strips, max 105 ms) | 140–180 ms | 333–1174 ms | 0.869 | 0.974 | 24.24 | 6.35 | 510 |
+
+- **Where PR #2 wins:** tonal fidelity (PSNR about +1 dB, MAD 4.4 vs 6.4), from its palette quantiser.
+- **Where it loses:**
+  - Edge F1 0.928–0.949, below the 0.955 floor.
+  - 2–7× the nodes.
+  - 1.2–1.9 s panel freezes: decode and palette run on the panel thread, and CEP 12 Node 17.7 has no worker_threads.
+  - Its one-shot capture blocks Illustrator for about 1.4 s.
+  - Detail preset on linked takes 6.3 s.
+- **Graft test** (PR #2 palette + my vtracer flags): MAD improves to 3.8–4.4, but nodes rise to 5.8k–53k and trace time to 3.4–4 s. Rejected.
+- **PR #2 bugs found on macOS:**
+  1. The bench/CLI calls `/usr/bin/time -f`, which is GNU-only, so it fails on Mac.
+  2. The SVG has no registration frame, so the applied art is misregistered (AI-render SSIM 0.70 in the shim combination).
+  3. The host is still main's clipboard/place path, so the modal risk remains.
+- **PR #2 live score: 4.5/10.**
+  - S1 0
+  - S2 0.5
+  - P1 0.5
+  - P2 0.5
+  - P3 0.5
+  - Q1 1
+  - Q2 0
+  - Q3 1
+  - R1 0.5
+  - X1 0
+
+## Apply: cold vs warm (internal laps from VP_commit, CEP12 log)
+
+| Case | find | import (createFromFile) | fit | select | total |
+|---|---|---|---|---|---|
+| R12 cold (first Apply after preview) | 0–7 | 282–933 | 2–3 | 135–652 | 594–1489 |
+| R12 warm (repeat immediately) | 0 | 34–224 | 2 | 106–460 | ~140–700 |
+| R13 embedded, first of round | 9 | 673 | 2 | 473 | 1174 |
+| R13 linked | 0 | 206 | 2 | 210 | 429 |
+| R13 embedded, repeat | 0 | 172 | 3 | 148 | 333 |
+
+- **Code fix:** `find` was 40–644 ms. Taking the source from the current selection first cut it to 0–9 ms.
+- **What remains:** `import` and `select` swing 5–6× between cold and warm with the same SVG, which is page-in under 10+ GB swap rather than code.
+- **Not shipped:** skipping result selection could save about 100–200 ms warm. It was not shipped because:
+  - users expect the result to be selected;
+  - an external A/B probe of it stalled Illustrator for more than 30 s under swap, so I stopped probing.
+- One Undo is kept on every run.
+
+## Embedded capture budget sweep (strip capture + median + vtracer, balloon)
+
+| Cap | ppi | Strips | Illustrator capture total | Max strip | SSIM | Edge F1 | PSNR | Nodes |
+|---|---|---|---|---|---|---|---|---|
+| 1 MP | 100 | 25 | 1020 ms | 73 | 0.844 | 0.903 ✗ | 21.51 | 620 |
+| 2 MP | 142 | 35 | 1225 ms | 73 | 0.861 | 0.9615 | 23.38 | 481 |
+| **3 MP (new)** | 174 | 43 | 2066–2271 ms | 97–105 | 0.869 | 0.9739 | 24.24 | 510 |
+| 4 MP (9593032) | 200 | ~50 | 2855–3106 ms | 115–147 | 0.871 | 0.9745 | 24.55 | 542 |
+
+## R13 live round (3887e81) vs main 417e71b and previous best 9593032
+
+| Metric | main 417e71b | 9593032 (R8) | **3887e81 (R13)** |
+|---|---|---|---|
+| Embedded preview total | 5.5 s+ (harness) | 4.75–5.11 s | **3.66–3.98 s** |
+| Embedded: Illustrator busy (sum / max call) | one-shot | 2855–3106 / 115–147 ms | **2178–2271 / 100–105 ms** |
+| Linked preview total / Illustrator max | – | 1.6–2.1 s / ≤24 ms | 1.66 s / 3 ms |
+| Panel stall (preview) | – | 112–297 ms | 140–192 ms |
+| Apply commit (cold → warm) | modal risk | 505–1489 ms | 1174 → 333–429 ms |
+| Hangs / modals | 4-min freeze, modal | 0 / 0 | 0 / 0 |
+| Illustrator ΔRSS, embedded | – | 45–183 MB | 60–128 MB (76 preview-only) |
+| vtracer / CEP peak RSS | – | ≤92 / ~300 MB | ≤63 / 319 MB |
+| Embedded SSIM / F1 / PSNR / gaps / nodes | – | 0.871 / 0.9745 / 24.55 / 0 % / 542 | 0.869 / 0.9739 / 24.24 / 0 % / 510 |
+| Linked SSIM / F1 / gaps / nodes | – | 0.865 / 0.964 / 0 % / 1360 | same (linked path unchanged) |
+| AI-render SSIM / F1 (registration) | – | – | embedded 0.865 / 0.968; linked 0.862 / 0.957 |
+| Single Undo | ✗ | ✓ | ✓ |
+
+## Score (live rubric)
+
+| Item | 9593032 | **3887e81** | Note |
+|---|---|---|---|
+| S1 | 0.5 | 0.5 | Preview max call 105 ms and 0 hangs. Apply is 333–429 ms warm but 1174 ms cold under swap. |
+| S2 | 1 | 1 | |
+| P1 | 0.5 | **1** | Embedded 3.7–4.0 s and linked 1.7 s, so reliably under 5 s. |
+| P2 | 0.5 | 0.5 | Embedded Illustrator ΔRSS 60–128 MB, still sometimes over 100 MB (was up to 183). |
+| P3 | 0.5 | 0.5 | Native paths, 1 Undo and registration all pass; cold commit is over 500 ms. |
+| Q1 | 1 | 1 | |
+| Q2 | 1 | 1 | |
+| Q3 | 1 | 1 | |
+| R1 | 1 | 1 | |
+| X1 | 0 | 0 | |
+| **Total** | 7.0 | **7.5** | |
+
+Swap-normalised (warm Apply, machine paging excluded), S1 and P3 would read 1, giving about 8.5.
+
+## What still blocks 10
+
+- **S1 / P3:** cold Apply. `createFromFile` plus selection pages in at 0.7–1.2 s under 10 GB swap. Warm runs are ≤430 ms. Single Undo forbids splitting Apply, so this needs a machine that isn't paging, or fewer DOM objects.
+- **P2:** Illustrator ΔRSS during embedded capture is 60–128 MB. It is noisy under swap. Going below 3 MP costs edge F1.
+- **X1:** Windows build, signed ZXP, designer A/B and the 1,050-image corpus all need Peerawat.
+
+Screenshots (copied to ~/Desktop/vp-debug-out/):
+- r13_panel_embedded_preview.png
+- r13_panel_embedded_preview_bottom.png
+- r13_embedded_preview.png (the Illustrator window; the Vector Panel tab is behind Rocket Launcher)
