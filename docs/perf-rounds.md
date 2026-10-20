@@ -307,3 +307,81 @@ Screenshots (copied to ~/Desktop/vp-debug-out/):
 - r13_panel_embedded_preview.png
 - r13_panel_embedded_preview_bottom.png
 - r13_embedded_preview.png (the Illustrator window; the Vector Panel tab is behind Rocket Launcher)
+
+---
+
+# Round 14: Apply import/selection, capture memory, live.py warm Apply (6d7b3ac, 2026-10-21 03:30 Bangkok)
+
+Machine: swap was 10.3–11.45 GB used for the whole round, and macOS grew the swap file from 11 GB to 12 GB mid-round. A fresh test doc was built: placing a second linked PNG took ~110 s under swap, so `setup.py` now places once and duplicates.
+
+## What was tried
+
+| Idea | Result | Kept? |
+|---|---|---|
+| Merge same-colour paths into compound paths before import | vtracer `stacked` output never has two adjacent paths with the same fill (checked on 8 live SVGs: 10–25 paths each, 0 merges). Merging non-adjacent ones would change stacking order and therefore rendering. There are no invisible or tiny paths either (filter-speckle 16). | No: no effect |
+| `doc.selection = [holder]` instead of deselect source + select result | A/B on 4+4 runs, interleaved. Cold select: once 166–568 ms vs pair 124–836 ms. Warm: once 106–428 vs pair 109–322. No difference beyond paging noise. | No: reverted to the simple form |
+| Release the capture layer right after the last strip (before median/stitch), and free strip buffers after the join | Embedded Illustrator RSS peak growth 8–85 MB over 7 runs (R13: 60–128 MB) | **Yes** (6d7b3ac) |
+| Separate `note` lap in VP_commit | `note` takes 0–1 ms, so the `select` lap is the selection itself | Yes |
+| Skip selection | Not retried (it stalled Illustrator >30 s in R13) | – |
+
+## Apply: cold vs warm (internal VP_commit laps; warm = the exact same commit replayed immediately after Undo)
+
+| Run | Cold total (import / select) | Warm total (import / select) | Swap used |
+|---|---|---|---|
+| embedded ×6 | 301–1277 ms (164–520 / 124–568) | 147–984 ms (33–429 / 106–524) | 10.3–11.4 GB |
+| linked ×6 | 379–3443 ms (214–1750 / 145–836) | 158–265 ms (34–101 / 120–182) | 10.5–11.45 GB |
+
+- **Warm import** is 33–49 ms in most runs, so the SVG itself is cheap to parse.
+- **Cold import** is 5–40× slower for the same file, and the 3443 ms outlier happened while swap jumped from 10.5 to 11.3 GB.
+- **Warm runs can also exceed 500 ms.** The 535 ms and 984 ms warm runs came right after swap grew.
+- Selection costs 100–180 ms even warm.
+- **Conclusion:** what is left of Apply cost is Illustrator paging plus its own selection bookkeeping. Single Undo rules out splitting it, so there is no code lever left in the commit step.
+
+## R14 vs main 417e71b and 3887e81
+
+| Metric | main 417e71b | 3887e81 (R13) | **6d7b3ac (R14)** |
+|---|---|---|---|
+| Embedded preview | 5.5 s+ | 3.66–3.98 s | 3.45–3.97 s |
+| Illustrator busy, embedded (sum / max call) | one-shot capture | 2.18–2.27 s / 105 ms | ~2.3 s / 103 ms |
+| Linked preview | – | 1.66 s | 1.41–1.66 s |
+| Panel stall | – | 140–192 ms | 132–183 ms |
+| Apply cold → warm (median) | modal risk | 1174 → 333–429 ms | cold ~620 ms, warm ~200 ms (ranges above) |
+| Hangs / modals | 4-min freeze, modal | 0 / 0 | 0 / 0 (11 runs) |
+| Illustrator ΔRSS, embedded (peak) | – | 60–128 MB | **8–85 MB** |
+| Illustrator ΔRSS, linked (peak) | – | 14 MB | ≤36 MB |
+| vtracer peak | – | ≤63 MB | ≤63 MB |
+| Embedded SSIM / F1 / PSNR / gaps / nodes | – | 0.869 / 0.9739 / 24.24 / 0 % / 510 | same |
+| Linked SSIM / F1 / gaps / nodes | – | 0.865 / 0.964 / 0 % / 1360 | same |
+| AI-render SSIM / F1 (registration) | – | emb 0.865 / 0.968; linked 0.862 / 0.957 | same |
+| Single Undo | ✗ | ✓ | ✓ (every run) |
+
+The early R14 "linked" A/B runs actually traced the clipped duplicate, which had inherited the name VPBENCH; their AI-render F1 of 0 is a test-doc artefact. Renaming it to VPBENCH_CLIP_INNER fixed this, and the final runs read 0.862 / 0.957.
+
+## Tools
+
+`tools/live.py` has a working warm-Apply step. It records the panel's own VP_commit call, replays it against a kept SVG copy right after Undo (60 s bound), and then undoes again. Every AppleEvent is capped at 90 s, and the run aborts if a ping takes 5 s or more.
+
+## Score
+
+| Item | R13 | **R14** | Note |
+|---|---|---|---|
+| S1 | 0.5 | 0.5 | Preview max call 103 ms and 0 hangs. Apply holds Illustrator 0.3–3.4 s cold, from paging. |
+| S2 | 1 | 1 | |
+| P1 | 1 | 1 | |
+| P2 | 0.5 | **1** | Embedded ΔRSS ≤85 MB in all 7 runs; helper ≤63 MB. Caveat: RSS under heavy swap undercounts. |
+| P3 | 0.5 | 0.5 | Paths, 1 Undo and registration all pass. Warm commit is usually ≤265 ms (2 of 12 runs reached 535–984 ms, after swap grew); cold exceeds 500 ms under swap. |
+| Q1–Q3, R1 | 4 | 4 | |
+| X1 | 0 | 0 | |
+| **Total** | 7.5 | **8.0** | Swap-normalised (warm Apply): 9.0 |
+
+## Stopping the loop
+
+The remaining gaps are:
+- **S1 and P3:** Apply under paging, which needs a Mac that isn't 11+ GB into swap to verify, or a non-undoable split that the single-Undo requirement forbids.
+- **X1:** needs Peerawat.
+
+Per instructions, the loop stops here.
+
+Screenshots:
+- ~/Desktop/vp-debug-out/r14_panel_embedded_preview.png
+- ~/Desktop/vp-debug-out/r14_panel_embedded_preview_bottom.png
