@@ -390,6 +390,7 @@
     }
   }
   var MAX_TRACE_PIXELS = 4e6;
+  var EMBEDDED_TRACE_PIXELS = 3e6;
   var DIRECT_FORMATS = /* @__PURE__ */ new Set([".png", ".jpg", ".jpeg"]);
   function vtracerArguments(job, input) {
     const args = [input, job.svgPath];
@@ -665,7 +666,7 @@
       }
     }
     async function captureSource(bridge, selection, job) {
-      const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+      const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(EMBEDDED_TRACE_PIXELS)]);
       if (begun[0] === "link") return begun[1] ?? "";
       try {
         const count = Number(begun[1]);
@@ -698,7 +699,7 @@
         const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
         const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48 \xB7 Undo \u0E2B\u0E19\u0E36\u0E48\u0E07\u0E04\u0E23\u0E31\u0E49\u0E07\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E22\u0E49\u0E2D\u0E19");
-        console.log("[VectorPanel] metrics " + JSON.stringify({ step: "apply", totalMs: Math.round(performance.now() - applyStarted), paths: Number(result[1] ?? 0), ...ledgerSummary() }));
+        console.log("[VectorPanel] metrics " + JSON.stringify({ step: "apply", totalMs: Math.round(performance.now() - applyStarted), paths: Number(result[1] ?? 0), hostLaps: result[2] ?? "", ...ledgerSummary() }));
         cleanJob(job);
         state = { kind: "selected", selection };
       } catch (error) {

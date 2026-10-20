@@ -31,6 +31,17 @@ function VP_image(documentRef, uuid) {
   var item = null;
   try { item = documentRef.getPageItemFromUuid(uuid); } catch (ignored) {}
   if (VP_isRaster(item) && String(item.uuid) === String(uuid)) return item;
+  // Usually the source (or its group) is still selected: check that before scanning every placed item.
+  try {
+    var selected = documentRef.selection;
+    for (var s = 0; selected && s < selected.length && s < 8; s++) {
+      if (VP_isRaster(selected[s]) && String(selected[s].uuid) === String(uuid)) return selected[s];
+      if (selected[s].typename === "GroupItem") {
+        var hit = VP_findRaster(selected[s], 0);
+        if (hit && String(hit.uuid) === String(uuid)) return hit;
+      }
+    }
+  } catch (ignoredSelection) {}
   var lists = [documentRef.placedItems, documentRef.rasterItems];
   for (var l = 0; l < lists.length; l++) {
     for (var i = 0; i < lists[l].length; i++) {
@@ -259,8 +270,11 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
     var doc = app.activeDocument;
     if (VP_documentIdentity(doc) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณาแปลงใหม่");
+    var clock = new Date().getTime(), laps = [];
+    var lap = function (name) { var now = new Date().getTime(); laps.push(name + ":" + (now - clock)); clock = now; };
     var source = VP_image(doc, uuid);
     var bounds = source.geometricBounds;
+    lap("find");
     if (!VP_boundsMatch(bounds, boundsText)) throw new Error("ภาพต้นฉบับถูกย้ายหรือปรับขนาด กรุณาแปลงใหม่");
     var svgFile = new File(svgPath);
     if (!svgFile.exists || svgFile.length === 0) throw new Error("ไม่พบไฟล์เวกเตอร์จาก worker");
@@ -270,6 +284,7 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     createdLayer = doc.layers.add();
     createdLayer.name = "Vector Panel " + jobId;
     var holder = createdLayer.groupItems.createFromFile(svgFile);
+    lap("import");
     holder.name = "Trace " + jobId;
     var addedPaths = holder.pathItems.length + holder.compoundPathItems.length - (VP_canvasFrame(holder) ? 1 : 0);
     if (addedPaths <= 0) throw new Error("Illustrator ไม่ได้แปลง SVG เป็น path ที่แก้ได้");
@@ -284,10 +299,12 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     fb = (frame || holder).geometricBounds;
     holder.translate(Number(bounds[0]) - Number(fb[0]), Number(bounds[1]) - Number(fb[1]));
     if (frame) frame.remove();
+    lap("fit");
     holder.note = "VectorPanel/1|source=" + uuid + "|job=" + jobId + "|settings=" + encodeURIComponent(settings);
     source.selected = false;
     holder.selected = true;
-    return VP_ok([holder.uuid, addedPaths]);
+    lap("select");
+    return VP_ok([holder.uuid, addedPaths, laps.join(",")]);
   } catch (error) {
     if (createdLayer !== null) {
       try { createdLayer.remove(); } catch (ignored) {}
@@ -301,6 +318,7 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
 }
 
 function VP_canvasFrame(group) {
+  try { return group.pageItems.getByName("vp-canvas"); } catch (notFound) {}
   for (var i = group.pageItems.length - 1; i >= 0; i--) {
     var it = group.pageItems[i];
     if (it.name === "vp-canvas") return it;

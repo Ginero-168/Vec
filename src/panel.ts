@@ -272,6 +272,10 @@ function cleanStaleJobs(): void {
 /** Upper bound for pixels handed to the tracer. Above this, extra pixels cost time and memory
  * but do not improve a flat-colour trace measurably (see docs/perf-rounds.md). */
 const MAX_TRACE_PIXELS = 4_000_000;
+/** Embedded captures are rasterised by Illustrator itself, so every pixel costs main-thread time and
+ * Illustrator memory. Balloon sweep (rounds.md R13): 3 MP keeps edge F1 0.974 vs 0.9745 at 4 MP while
+ * cutting capture time ~0.9 s; 2 MP drops F1 to 0.96 and 1 MP opens gaps. */
+const EMBEDDED_TRACE_PIXELS = 3_000_000;
 const DIRECT_FORMATS = new Set([".png", ".jpg", ".jpeg"]);
 
 function vtracerArguments(job: Job, input: string): string[] {
@@ -578,7 +582,7 @@ function start(): void {
    * evalScript call each, so its main thread is never blocked for more than ~150 ms; strips are decoded
    * here as they arrive and stitched into job.pngPath. */
   async function captureSource(bridge: CepBridge, selection: Selection, job: Job): Promise<string> {
-    const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+    const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(EMBEDDED_TRACE_PIXELS)]);
     if (begun[0] === "link") return begun[1] ?? "";
     try {
       const count = Number(begun[1]);
@@ -612,7 +616,7 @@ function start(): void {
       const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่ · Undo หนึ่งครั้งเพื่อย้อน");
-      console.log("[VectorPanel] metrics " + JSON.stringify({ step: "apply", totalMs: Math.round(performance.now() - applyStarted), paths: Number(result[1] ?? 0), ...ledgerSummary() }));
+      console.log("[VectorPanel] metrics " + JSON.stringify({ step: "apply", totalMs: Math.round(performance.now() - applyStarted), paths: Number(result[1] ?? 0), hostLaps: result[2] ?? "", ...ledgerSummary() }));
       cleanJob(job);
       state = { kind: "selected", selection };
     } catch (error) {
