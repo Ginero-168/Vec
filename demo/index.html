@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vector Panel · แก้สี</title>
+    <link rel="stylesheet" href="../extension/style.css" />
+    <style>
+      body { min-height: 100vh; background: #161618; }
+      .desk { max-width: 400px; margin: 0 auto; padding: 24px 0 48px; }
+      .desk .panel { background: #252528; min-height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <div class="desk">
+      <main class="panel">
+        <header class="panel-header">
+          <div class="mark">V</div>
+          <div>
+            <h1>Vector Panel</h1>
+            <p>แก้สีบนแผนที่พิกเซล ก่อนทำเส้นให้เรียบ</p>
+          </div>
+        </header>
+        <section class="section" aria-labelledby="sample-title">
+          <div class="section-heading">
+            <h2 id="sample-title">ภาพตัวอย่าง</h2>
+            <span id="phase" class="phase">แก้สี</span>
+          </div>
+          <p class="editor-lead">ลายลูกโป่งจำลอง มีจุดส้มอ่อนและเส้นขอบบางให้ลอง Zap หน้านี้ใช้ตัวแก้สีชุดเดียวกับ Panel ใน Illustrator</p>
+        </section>
+        <div id="editor-root"></div>
+        <section class="section" aria-labelledby="preview-title">
+          <h2 id="preview-title">เส้นจากสีที่แก้</h2>
+          <div class="preview-frame">
+            <img id="preview" alt="ตัวอย่างเวกเตอร์จากแผนที่สีที่แก้" hidden />
+            <p id="preview-empty">กดดูเส้นเพื่อเห็นสีที่จะส่งเข้าตัวทำเส้น</p>
+          </div>
+          <p id="status" class="status" role="status" aria-live="polite"></p>
+        </section>
+      </main>
+    </div>
+    <script src="editor.js"></script>
+  </body>
+</html>

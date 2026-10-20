@@ -3,6 +3,10 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { createColorEditor, type ColorEditor } from "./editor-ui";
+import type { Rgb } from "./color/model";
+import { decodePng, encodePng } from "./color/png";
+import { countSvgFills, renderRgba, segmentImage, segmentationToSvg } from "./color/segment";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -41,8 +45,9 @@ type Job = {
   readonly id: string;
   readonly directory: string;
   readonly pngPath: string;
+  readonly flatPath: string;
   readonly svgPath: string;
-  readonly settings: Settings;
+  settings: Settings;
   cancelled: boolean;
 };
 
@@ -51,7 +56,8 @@ type State =
   | { readonly kind: "loading" }
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
-  | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: childProcess.ChildProcess }
+  | { readonly kind: "editing"; readonly selection: Selection; readonly job: Job }
+  | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: childProcess.ChildProcess | null }
   | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string }
   | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string };
 
@@ -70,6 +76,7 @@ type Ui = {
   readonly colorsValue: HTMLOutputElement;
   readonly smooth: HTMLInputElement;
   readonly smoothValue: HTMLOutputElement;
+  readonly editorRoot: HTMLElement;
 };
 
 function getElement(id: string): HTMLElement {
@@ -115,7 +122,8 @@ function getUi(): Ui {
     colors: getInput("colors"),
     colorsValue: getOutput("colors-value"),
     smooth: getInput("smooth"),
-    smoothValue: getOutput("smooth-value")
+    smoothValue: getOutput("smooth-value"),
+    editorRoot: getElement("editor-root")
   };
 }
 
@@ -164,7 +172,7 @@ function parseSelection(parts: string[]): Selection {
   };
 }
 
-function callHost(host: CepBridge, method: "VP_snapshot" | "VP_capture" | "VP_commit", args: readonly string[] = []): Promise<string[]> {
+function callHost(host: CepBridge, method: "VP_snapshot" | "VP_capture" | "VP_commit" | "VP_swatches", args: readonly string[] = []): Promise<string[]> {
   const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
   const script = method + "(" + encoded + ")";
   return new Promise((resolve, reject) => {
@@ -197,6 +205,7 @@ function newJob(settings: Settings): Job {
     id: crypto.randomBytes(8).toString("hex"),
     directory,
     pngPath: path.join(directory, "source.png"),
+    flatPath: path.join(directory, "flat.png"),
     svgPath: path.join(directory, "result.svg"),
     settings,
     cancelled: false
@@ -227,13 +236,14 @@ function cleanStaleJobs(): void {
   }
 }
 
-function vtracerArguments(job: Job): string[] {
-  const args = [job.pngPath, job.svgPath];
+function vtracerArguments(job: Job, maxColors: number): string[] {
+  const args = [job.flatPath, job.svgPath];
   const preset = job.settings.preset;
+  const colors = String(Math.max(2, maxColors));
   if (preset === "photo") {
-    args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
+    args.push("--preset", "photo", "--max-colors", colors);
   } else {
-    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
+    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", colors);
     if (preset === "icon") args.push("--mode", "polygon");
   }
   if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
@@ -241,9 +251,9 @@ function vtracerArguments(job: Job): string[] {
   return args;
 }
 
-function runVtracer(binary: string, job: Job, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
+function runVtracer(binary: string, job: Job, maxColors: number, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(binary, vtracerArguments(job), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+    const child = childProcess.spawn(binary, vtracerArguments(job, maxColors), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
     onStart(child);
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -292,6 +302,7 @@ function currentSelection(state: State): Selection | null {
     case "loading": return null;
     case "selected":
     case "capturing":
+    case "editing":
     case "tracing":
     case "preview":
     case "applying": return state.selection;
@@ -302,11 +313,27 @@ function currentSelection(state: State): Selection | null {
   }
 }
 
+const RESET_CAPTURE = "การอ่านภาพแล้วแยกสีใหม่จะล้าง Zap, ดินสอ, เทสี และการรวมสีที่ทำไว้ ถ้าต้องการเส้นจากสีที่แก้อยู่ ให้กดดูเส้นแทน";
+const RESET_SEGMENT = "การแยกสีใหม่จากภาพที่จับไว้จะล้างการแก้สีที่ทำด้วยมือ แล้วเริ่มนับสีจากภาพต้นฉบับอีกครั้ง";
+
+function swatchPayload(palette: readonly Rgb[]): string {
+  return palette.map((color) => color.r + "," + color.g + "," + color.b).join(";");
+}
+
 function start(): void {
   const ui = getUi();
   let state: State = { kind: "empty" };
   const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
   const host = typeof CSInterface === "undefined" ? null : new CSInterface();
+  const editor: ColorEditor = createColorEditor(ui.editorRoot, {
+    onVectorPreview: () => { void vectorize(); },
+    onResegment: () => { void resegment(); },
+    onExportSwatches: (palette) => { void exportSwatches(palette); },
+    onChange: (colorCount) => {
+      if (state.kind === "editing") ui.phase.textContent = "แก้สี · " + colorCount + " สี";
+      else if (state.kind === "preview") ui.phase.textContent = "พร้อมใส่ผล · " + colorCount + " สี";
+    }
+  });
 
   function message(value: string, isError = false): void {
     ui.status.textContent = value;
@@ -321,7 +348,10 @@ function start(): void {
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
     ui.apply.disabled = state.kind !== "preview";
     ui.cancel.hidden = state.kind !== "tracing";
-    ui.phase.textContent = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
+    ui.editorRoot.hidden = !editor.hasDocument();
+    const count = editor.hasDocument() ? " · " + editor.colorCount() + " สี" : "";
+    const phase = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "editing" ? "แก้สี" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
+    ui.phase.textContent = phase + (state.kind === "editing" || state.kind === "preview" || state.kind === "applying" ? count : "");
     if (state.kind === "preview" || state.kind === "applying") {
       ui.preview.src = state.dataUrl;
       ui.preview.hidden = false;
@@ -333,13 +363,20 @@ function start(): void {
     }
   }
 
+  function openSegmentation(job: Job): void {
+    const decoded = decodePng(fs.readFileSync(job.pngPath));
+    editor.load(segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors));
+  }
+
   async function refresh(): Promise<void> {
     if (host === null) {
       message("เปิด Panel นี้จาก Adobe Illustrator เท่านั้น", true);
       return;
     }
     if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
-    if (state.kind === "preview") cleanJob(state.job);
+    if (!(await editor.confirmDiscard(RESET_CAPTURE))) return;
+    if (state.kind === "preview" || state.kind === "editing") cleanJob(state.job);
+    editor.clear();
     state = { kind: "loading" };
     render();
     try {
@@ -355,9 +392,10 @@ function start(): void {
 
   async function trace(): Promise<void> {
     if (host === null) return;
-    if (state.kind !== "selected" && state.kind !== "preview") return;
+    if (state.kind !== "selected" && state.kind !== "preview" && state.kind !== "editing") return;
+    if (!(await editor.confirmDiscard(RESET_CAPTURE))) return;
     const selection = state.selection;
-    if (state.kind === "preview") cleanJob(state.job);
+    if (state.kind === "preview" || state.kind === "editing") cleanJob(state.job);
     let job: Job | null = null;
     try {
       job = newJob(readSettings(ui));
@@ -366,23 +404,81 @@ function start(): void {
       render();
       await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
-      const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
-      if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
-      message("กำลังสร้างเส้นเวกเตอร์…");
-      await runVtracer(binary, job, (child) => {
-        if (job === null) return;
-        state = { kind: "tracing", selection, job, child };
-        render();
-      });
-      const svg = fs.readFileSync(job.svgPath);
-      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64") };
-      message("ดูตัวอย่างแล้วกดใส่ใน Illustrator");
+      openSegmentation(job);
+      state = { kind: "editing", selection, job };
+      message("แยกได้ " + editor.colorCount() + " สี แก้บนแผนที่สี แล้วกดดูเส้นเมื่อพร้อม");
       render();
     } catch (error) {
       if (job !== null) cleanJob(job);
+      editor.clear();
       state = { kind: "selected", selection };
       message(errorMessage(error), true);
       render();
+    }
+  }
+
+  async function resegment(): Promise<void> {
+    if (state.kind !== "editing" && state.kind !== "preview") return;
+    if (!(await editor.confirmDiscard(RESET_SEGMENT))) return;
+    const { selection, job } = state;
+    try {
+      job.settings = readSettings(ui);
+      openSegmentation(job);
+      state = { kind: "editing", selection, job };
+      message("แยกสีใหม่ · " + editor.colorCount() + " สี");
+    } catch (error) {
+      message(errorMessage(error), true);
+    }
+    render();
+  }
+
+  async function vectorize(): Promise<void> {
+    if ((state.kind !== "editing" && state.kind !== "preview") || !editor.hasDocument()) return;
+    const { selection, job } = state;
+    try {
+      const segmentation = editor.segmentation();
+      if (segmentation.palette.length === 0) throw new Error("ไม่มีสีให้แปลง");
+      fs.writeFileSync(job.flatPath, encodePng(segmentation.width, segmentation.height, renderRgba(segmentation)));
+      const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
+      let note = "";
+      if (!fs.existsSync(binary)) {
+        fs.writeFileSync(job.svgPath, segmentationToSvg(segmentation), "utf8");
+        note = "ไม่พบ VTracer จึงแสดงสีที่แก้แบบพิกเซล";
+      } else {
+        message("กำลังสร้างเส้นจากสีที่แก้…");
+        state = { kind: "tracing", selection, job, child: null };
+        render();
+        await runVtracer(binary, job, segmentation.palette.length, (child) => {
+          state = { kind: "tracing", selection, job, child };
+          render();
+        });
+      }
+      const svg = fs.readFileSync(job.svgPath, "utf8");
+      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svg, "utf8").toString("base64") };
+      message((note ? note + " · " : "ดูตัวอย่างแล้วกดใส่ใน Illustrator · ") + "แผนที่สี " + editor.colorCount() + " · เวกเตอร์ " + countSvgFills(svg) + " สี");
+      render();
+    } catch (error) {
+      state = { kind: "editing", selection, job };
+      message(errorMessage(error), true);
+      render();
+    }
+  }
+
+  async function exportSwatches(palette: readonly Rgb[]): Promise<void> {
+    if (host === null) {
+      message("ใส่ Swatches ได้เมื่อเปิด Panel ใน Illustrator", true);
+      return;
+    }
+    if (palette.length === 0) {
+      message("ยังไม่มีสีให้ใส่", true);
+      return;
+    }
+    const jobId = state.kind === "editing" || state.kind === "preview" || state.kind === "tracing" || state.kind === "applying" || state.kind === "capturing" ? state.job.id : "palette";
+    try {
+      const result = await callHost(host, "VP_swatches", ["Vector Panel " + jobId, swatchPayload(palette)]);
+      message("ใส่ Swatches แล้ว " + (result[1] ?? String(palette.length)) + " สี ในกลุ่ม " + (result[0] ?? ""));
+    } catch (error) {
+      message(errorMessage(error), true);
     }
   }
 
@@ -393,15 +489,16 @@ function start(): void {
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
-      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
+      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";edited=" + editor.colorCount();
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
-      message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่");
+      message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่ · สี " + editor.colorCount());
       cleanJob(job);
+      editor.clear();
       state = { kind: "selected", selection };
     } catch (error) {
       if (error instanceof HostTimeoutError) {
-        message("Illustrator ยังไม่ตอบกลับ ตรวจ Layers ก่อนเริ่มงานใหม่ เพื่อไม่สร้างผลซ้ำ", true);
-        state = { kind: "selected", selection };
+        message("Illustrator ยังไม่ตอบกลับ ตรวจ Layers ก่อนกดใส่ผลอีกครั้ง การแก้สียังอยู่", true);
+        state = { kind: "editing", selection, job };
       } else {
         message(errorMessage(error), true);
         state = { kind: "preview", selection, job, dataUrl };
@@ -416,7 +513,7 @@ function start(): void {
   ui.cancel.addEventListener("click", () => {
     if (state.kind !== "tracing") return;
     state.job.cancelled = true;
-    state.child.kill();
+    state.child?.kill();
     message("กำลังยกเลิก…");
   });
   ui.colors.addEventListener("input", () => { ui.colorsValue.value = ui.colors.value; });
@@ -427,10 +524,10 @@ function start(): void {
   });
 
   window.addEventListener("beforeunload", () => {
-    if (state.kind === "preview") cleanJob(state.job);
+    if (state.kind === "preview" || state.kind === "editing") cleanJob(state.job);
     if (state.kind === "tracing") {
       state.job.cancelled = true;
-      state.child.kill();
+      state.child?.kill();
       cleanJob(state.job);
     }
   });

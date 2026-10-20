@@ -166,3 +166,78 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     return VP_error(error);
   }
 }
+
+function VP_nameExists(collection, name) {
+  try {
+    return !!collection.getByName(name);
+  } catch (ignored) {
+    return false;
+  }
+}
+
+function VP_uniqueName(collection, base) {
+  var name = base;
+  var suffix = 2;
+  while (VP_nameExists(collection, name)) {
+    name = base + " " + suffix;
+    suffix++;
+  }
+  return name;
+}
+
+function VP_documentColor(doc, r, g, b) {
+  if (doc.documentColorSpace === DocumentColorSpace.CMYK) {
+    var cyan = 1 - r / 255;
+    var magenta = 1 - g / 255;
+    var yellow = 1 - b / 255;
+    var black = Math.min(cyan, Math.min(magenta, yellow));
+    var cmyk = new CMYKColor();
+    if (black >= 0.999) {
+      cmyk.cyan = 0;
+      cmyk.magenta = 0;
+      cmyk.yellow = 0;
+      cmyk.black = 100;
+    } else {
+      cmyk.cyan = ((cyan - black) / (1 - black)) * 100;
+      cmyk.magenta = ((magenta - black) / (1 - black)) * 100;
+      cmyk.yellow = ((yellow - black) / (1 - black)) * 100;
+      cmyk.black = black * 100;
+    }
+    return cmyk;
+  }
+  var rgb = new RGBColor();
+  rgb.red = r;
+  rgb.green = g;
+  rgb.blue = b;
+  return rgb;
+}
+
+function VP_swatches(encodedName, encodedColors) {
+  try {
+    if (app.documents.length === 0) throw new Error("เปิดเอกสาร Illustrator ก่อน");
+    var doc = app.activeDocument;
+    var groupName = VP_uniqueName(doc.swatchGroups, decodeURIComponent(encodedName));
+    var payload = decodeURIComponent(encodedColors);
+    if (!payload) throw new Error("ไม่มีสีให้ใส่");
+    var parts = payload.split(";");
+    var group = doc.swatchGroups.add();
+    group.name = groupName;
+    var added = 0;
+    for (var i = 0; i < parts.length; i++) {
+      var channels = parts[i].split(",");
+      if (channels.length !== 3) throw new Error("รูปแบบสีไม่ถูกต้อง");
+      var red = Number(channels[0]);
+      var green = Number(channels[1]);
+      var blue = Number(channels[2]);
+      if (!isFinite(red) || !isFinite(green) || !isFinite(blue)) throw new Error("ค่าสีไม่ถูกต้อง");
+      var swatch = doc.swatches.add();
+      swatch.color = VP_documentColor(doc, red, green, blue);
+      swatch.name = VP_uniqueName(doc.swatches, groupName + " " + (i + 1));
+      group.addSwatch(swatch);
+      added++;
+    }
+    return VP_ok([group.name, added]);
+  } catch (error) {
+    return VP_error(error);
+  }
+}
