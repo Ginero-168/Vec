@@ -194,9 +194,16 @@
       if (preset === "icon") args.push("--mode", "polygon");
     }
     args.push("--filter-speckle", String(job.settings.speckle));
+    args.push("--color-precision", String(colorPrecision(job.settings.maxColors)));
     if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
     args.push("--optimize", "1");
     return args;
+  }
+  function colorPrecision(maxColors) {
+    if (maxColors <= 4) return 3;
+    if (maxColors <= 10) return 4;
+    if (maxColors <= 20) return 5;
+    return 6;
   }
   function runProcess(job, binary, args, failure) {
     return new Promise((resolve, reject) => {

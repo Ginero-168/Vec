@@ -252,9 +252,20 @@ function vtracerArguments(job: Job, input: string): string[] {
     if (preset === "icon") args.push("--mode", "polygon");
   }
   args.push("--filter-speckle", String(job.settings.speckle));
+  args.push("--color-precision", String(colorPrecision(job.settings.maxColors)));
   if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
   args.push("--optimize", "1");
   return args;
+}
+
+/** Clustering precision (significant bits per RGB channel) that matches the requested palette size.
+ * Measured on the balloon test (docs/perf-rounds.md): 4 bits gives the cleanest flat shapes with the
+ * best edge F1 and ~1/10 the anchors of 6 bits; more bits mostly adds blotchy texture regions. */
+function colorPrecision(maxColors: number): number {
+  if (maxColors <= 4) return 3;
+  if (maxColors <= 10) return 4;
+  if (maxColors <= 20) return 5;
+  return 6;
 }
 
 /** Run a helper process without blocking the panel. The job keeps a handle so Cancel can kill it. */
