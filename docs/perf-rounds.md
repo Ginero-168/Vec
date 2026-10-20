@@ -100,3 +100,94 @@ perf/offload-trace @ 272b256 works best. It combines:
 - stacked vtracer with speckle 16 and colour precision chosen from the palette size.
 
 PR #1's worker idea is complementary: the PNG stitch could move into a worker if the panel ever hitches.
+
+---
+
+# Live-panel rounds (2026-10-21 01:56–02:25, Bangkok time / UTC+7)
+
+## How these rounds were measured
+
+**Loading the panel.** The Vector Panel was loaded live from the existing CEP path `~/Library/Application Support/Adobe/CEP/extensions/com.peerawat.vectorpanel`, a symlink to `~/Desktop/Illustrator-Vector-Panel/extension`. CEP logs confirm it loads from there. The `/Library/.../Illustrator-Vector-Panel` folder is a whole-repo copy that CEP does not load as an extension; it was not touched.
+
+**Driving it.** An untracked `extension/.debug` file (excluded via `.git/info/exclude`) opens a CDP port on 8099. Through that port:
+- `tools/live.py` and `tools/live_generic.py` click the panel's own buttons (refresh, trace, apply, cancel).
+- `live_generic.py` also instruments `CSInterface.evalScript` from outside, so it can time any build.
+
+**What is recorded:**
+- the round trip of every evalScript call, i.e. how long that call held Illustrator's main thread;
+- the panel's worst event-loop stall;
+- per-phase times;
+- peak RSS of Illustrator, vtracer and CEPHtmlEngine;
+- HangMonitor lines;
+- SVG quality, plus an Illustrator render of the applied result;
+- one-Undo check.
+
+**Machine state.** Heavy swap throughout: 9.5–10.3 GB used of 10–11 GB. Apply times vary a lot because of it.
+
+## Results
+
+| Round | Build | Source | Preview (s) | Longest Illustrator call during preview (ms) | Apply call (ms) | Panel stall (ms) | AI ΔRSS (MB) | vtracer (MB) | Hang | SSIM svg / AI | Edge F1 svg / AI | PSNR | Gap % | Paths | Nodes | Undo |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---|
+| R6/R8 | **9593032** (perf/offload-trace) | linked | 1.13–2.06 (n=8) | 2–24 | 99–1447 (median ≈300) | 82–297 | 5–118 | 40–87 | 0 | 0.865 / 0.862 | 0.964 / 0.957 | 23.93 | 0 | 25 | 1,360 | 1 ✓ |
+| R6/R8/R9 | **9593032** | embedded | 4.26–5.11 (n=10, median ≈4.6) | 110–147 | 132–1677 (median ≈560) | 112–256 | 40–183 | 44–92 | 0 | 0.871 / 0.867 | **0.975 / 0.966** | 24.55 | 0 | 15 | **542** | 1 ✓ |
+| R6 | 9593032 | clip group | 1.18 | 3 | 114 | 116 | 8 | 55 | 0 | 0.865 | 0.964 | 23.93 | 0 | 25 | 1,360 | 1 ✓ |
+| R6 | 9593032 | embedded, 4 colours | 4.26 | 113 | 137 | 144 | 148 | 61 | 0 | 0.870 / 0.865 | 0.967 / 0.959 | 24.32 | 0 | 10 | 542 | 1 ✓ |
+| R6 | 9593032 | embedded, 16 colours, simplify 0.5 | 4.40 | 110 | 286 | 146 | 142 | 69 | 0 | 0.873 / 0.873 | 0.987 / 0.985 | 24.51 | 0 | 21 | 1,784 | 1 ✓ |
+| R7 | **PR #1 208945b** | linked | 2.74 | 5 | 338 | **955** | 127 | 110 | 0 | 0.869 / 0.867 | 0.958 / 0.958 | 24.96 | 0 | 178 | **18,588** | 1 ✓ |
+| R7 | PR #1 208945b | embedded | 5.46 | 111 | 629 | 268 | 40 | 88 | 0 | 0.868 / 0.866 | 0.947 / 0.946 | 24.92 | 0 | 81 | 8,067 | 1 ✓ |
+| R7 | PR #1 208945b | clip group | 6.56 (renders the clip in strips) | 137 | 960 | 383 | 105 | 87 | 0 | n/a (cropped) | n/a | n/a | n/a | 86 | 6,109 | 1 ✓ |
+
+**Cancel, live, on 9593032:**
+- During embedded capture (strip 19/50): status shows "ยกเลิกแล้ว" (cancelled) after 254 ms. The temporary layer is removed; the document is back to 1 layer / 5 items.
+- During the linked trace: cancelled after 152 ms, and vtracer is killed.
+
+**Apply profile** (ExtendScript-internal, warm): find ~40 ms, `createFromFile` ~30 ms, fit and translate ~1 ms, select ~65 ms, about 140 ms in total. The first/cold call took 1,360 ms (644 ms in find and 356 ms in import), consistent with paging under swap.
+
+**CEP 12 has no worker_threads** (`require("worker_threads")` → "SharedArrayBuffer is not a constructor"):
+- PR #1's worker always takes its inline fallback, which explains the 955 ms panel stall on linked images.
+- My median filter runs in yielded 96-row slices instead.
+
+## What changed in 9593032
+
+- **Embedded captures get a 3×3 median filter.** Illustrator renders embedded rasters with little smoothing, so the grain survives. On the balloon, edge F1 rose from 0.947 to 0.975 and nodes fell from 8,067 to 542, with 0 gaps.
+- **Not applied to linked images.** The sips resample is already smooth. On linked images the median filter only moves F1 from 0.954 to 0.959, which is not worth the decode cost, so it is not used. This also agrees with the sweep agent's hint that a median filter hurt the photo case.
+- **Colour precision 4 bits for ≤10 colours.** 3 bits is fragile: on the median-filtered capture it collapses stripes (F1 0.80).
+- **Timing ledger.** The panel prints a `[VectorPanel] metrics {...}` console line for every preview and apply.
+
+A tried-and-reverted experiment: pipelining strip decode with the next capture gave no measurable gain (host time dominates), so it was reverted.
+
+## Score (same derived rubric, now from live-panel evidence)
+
+| # | Criterion | R5 272b256 (harness) | R5 re-scored with live evidence | **9593032 live** | PR #1 208945b live |
+|---|---|---:|---:|---:|---:|
+| S1 | No Illustrator call > 500 ms; 0 hangs; no modal | 1 | 0.5 | 0.5 (preview ≤147 ms; Apply median ≈300–560, worst 1.7 s under swap) | 0.5 (Apply up to 960 ms) |
+| S2 | Continuous progress, cancel in every phase, persistent errors | 0.5 | 0.5 | **1** (live: "19/50 1.6 s" ticker; cancel 152–254 ms; red errors) | 0.5 (955 ms panel stall on linked) |
+| P1 | Preview ≤ 5 s | 0.5 | 0.5 | 0.5 (linked ≤2.1 s; embedded median 4.6 s, worst 5.1 s) | 0 (embedded 5.5 s, clip 6.6 s) |
+| P2 | helper ≤ 256 MB, Illustrator ΔRSS ≤ 100 MB | 1 | 0.5 | 0.5 (vtracer ≤92 MB; AI ΔRSS up to 183 MB on embedded) | 0.5 (CEP 549 MB peak) |
+| P3 | Native paths, 1 Undo, registration, commit ≤ 500 ms | 1 | 0.5 | 0.5 (all ✓ except commit time under swap) | 0.5 |
+| Q1 | SSIM ≥ IT − 0.01, PSNR ≥ IT − 1 dB | 1 | 1 | 1 | 1 |
+| Q2 | Edge F1 ≥ IT − 0.02, 0 % gaps | 0.5 | 0.5 | **1** (0.964 linked / 0.975 embedded) | 0.5 (embedded 0.947) |
+| Q3 | Anchors ≤ 80 % of IT | 1 | 1 | 1 (8.5 % / 3.4 %) | 0 (linked 116 %) |
+| R1 | All source kinds, retrace | 1 | 1 | 1 | 0.5 (retrace not evidenced) |
+| X1 | Windows / signed ZXP / designer A/B / corpus | 0 | 0 | 0 | 0 |
+| | **Total** | 7.5 | 6.0 | **7.0** | **4.0** |
+
+**Comparison.** Under the live rubric, the gain over the previous best is +1.0: from 6.0 (R5 re-scored live) to 7.0. The headline number moves from 7.5 to 7.0 only because live evidence is stricter than the harness. PR #1 @ 208945b now works in real Illustrator:
+- no "ต้นฉบับไม่ใช่ภาพ raster" (source is not a raster image) error;
+- no modal;
+- native paths and one Undo.
+
+It still loses to perf/offload-trace:
+- 13.7× the nodes on linked images;
+- edge F1 0.947 on embedded;
+- slower embedded and clip previews;
+- a 955 ms panel freeze on linked images.
+
+perf/offload-trace remains primary.
+
+## What still blocks 10
+
+- **S1 / P3:** Apply still holds Illustrator up to 1.7 s on this swap-bound 8 GB Mac (warm internal time ~140 ms). Splitting Apply would break single Undo. Needs a less memory-starved machine to verify, or a smaller selection/redraw cost.
+- **P1:** embedded preview is about 4.6 s, bounded by Illustrator's `imageCapture` (~3 s for 4 MP in strips). Getting under 5 s reliably needs either fewer pixels or a faster pixel source.
+- **P2:** Illustrator RSS rises by up to 183 MB during embedded strip capture.
+- **X1:** Windows build, signed/notarised ZXP, 3-designer A/B and the 1,050-image corpus all need Peerawat.
