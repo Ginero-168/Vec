@@ -101,7 +101,7 @@
     return value;
   }
   function parseSelection(parts) {
-    if (parts.length !== 11) throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
+    if (parts.length !== 12) throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A (host.jsx \u0E01\u0E31\u0E1A panel.js \u0E44\u0E21\u0E48\u0E15\u0E23\u0E07\u0E23\u0E38\u0E48\u0E19 \u2014 \u0E1B\u0E34\u0E14\u0E41\u0E25\u0E49\u0E27\u0E40\u0E1B\u0E34\u0E14 Panel \u0E43\u0E2B\u0E21\u0E48)");
     const itemType = parts[3];
     if (itemType !== "PlacedItem" && itemType !== "RasterItem") throw new Error("\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A\u0E20\u0E32\u0E1E raster \u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E2B\u0E19\u0E36\u0E48\u0E07\u0E20\u0E32\u0E1E");
     const uuid = parts[4];
@@ -120,7 +120,8 @@
       widthPt: parsePositiveNumber(String(right - left), "width"),
       heightPt: parsePositiveNumber(String(top - bottom), "height"),
       embedded: parts[9] === "1",
-      fromResult: parts[10] === "1"
+      fromResult: parts[10] === "1",
+      linkedPath: parts[11] ?? ""
     };
   }
   function callHost(host, method, args = []) {
@@ -156,7 +157,9 @@
       pngPath: path.join(directory, "source.png"),
       svgPath: path.join(directory, "result.svg"),
       settings,
-      cancelled: false
+      startedAt: Date.now(),
+      cancelled: false,
+      child: null
     };
   }
   function cleanJob(job) {
@@ -179,38 +182,91 @@
     } catch (_) {
     }
   }
-  function vtracerArguments(job) {
-    const args = [job.pngPath, job.svgPath];
+  var MAX_TRACE_PIXELS = 4e6;
+  var DIRECT_FORMATS = /* @__PURE__ */ new Set([".png", ".jpg", ".jpeg"]);
+  function vtracerArguments(job, input) {
+    const args = [input, job.svgPath];
     const preset = job.settings.preset;
     if (preset === "photo") {
       args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
     } else {
-      args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
+      args.push("--preset", "poster", "--hierarchical", "stacked", "--max-colors", String(job.settings.maxColors));
       if (preset === "icon") args.push("--mode", "polygon");
     }
+    args.push("--filter-speckle", String(job.settings.speckle));
     if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
     args.push("--optimize", "1");
     return args;
   }
-  function runVtracer(binary, job, onStart) {
+  function runProcess(job, binary, args, failure) {
     return new Promise((resolve, reject) => {
-      const child = childProcess.spawn(binary, vtracerArguments(job), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-      onStart(child);
+      if (job.cancelled) {
+        reject(new CancelledError());
+        return;
+      }
+      const child = childProcess.spawn(binary, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      job.child = child;
+      let stdout = "";
       let stderr = "";
+      child.stdout?.on("data", (chunk) => {
+        if (stdout.length < 8e3) stdout += chunk.toString("utf8");
+      });
       child.stderr?.on("data", (chunk) => {
         if (stderr.length < 4e3) stderr += chunk.toString("utf8").slice(0, 4e3 - stderr.length);
       });
-      child.once("error", (error) => reject(error));
+      child.once("error", (error) => {
+        job.child = null;
+        reject(new Error(failure + ": " + error.message));
+      });
       child.once("close", (code) => {
-        if (job.cancelled) {
-          reject(new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27"));
-        } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
-          resolve();
-        } else {
-          reject(new Error("VTracer \u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08" + (stderr ? ": " + stderr.trim() : "")));
-        }
+        job.child = null;
+        if (job.cancelled) reject(new CancelledError());
+        else if (code === 0) resolve(stdout);
+        else reject(new Error(failure + (stderr ? ": " + stderr.trim() : " (exit " + String(code) + ")")));
       });
     });
+  }
+  var CancelledError = class extends Error {
+    constructor() {
+      super("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
+    }
+  };
+  async function prepareInput(job, sourcePath) {
+    const ext = path.extname(sourcePath).toLowerCase();
+    if (process.platform !== "darwin") {
+      if (!DIRECT_FORMATS.has(ext)) throw new Error("\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A\u0E44\u0E1F\u0E25\u0E4C\u0E25\u0E34\u0E07\u0E01\u0E4C PNG/JPEG \u0E1A\u0E19\u0E23\u0E30\u0E1A\u0E1A\u0E19\u0E35\u0E49\u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19");
+      return { input: sourcePath, width: 0, height: 0, note: "\u0E2A\u0E48\u0E07\u0E44\u0E1F\u0E25\u0E4C\u0E15\u0E23\u0E07" };
+    }
+    const info = await runProcess(job, "/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", sourcePath], "\u0E2D\u0E48\u0E32\u0E19\u0E02\u0E19\u0E32\u0E14\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
+    const width = Number(/pixelWidth:\s*(\d+)/.exec(info)?.[1] ?? NaN);
+    const height = Number(/pixelHeight:\s*(\d+)/.exec(info)?.[1] ?? NaN);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) throw new Error("\u0E2D\u0E48\u0E32\u0E19\u0E02\u0E19\u0E32\u0E14\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49: " + path.basename(sourcePath));
+    const pixels = width * height;
+    if (pixels <= MAX_TRACE_PIXELS && DIRECT_FORMATS.has(ext)) return { input: sourcePath, width, height, note: width + "\xD7" + height };
+    const scale = Math.min(1, Math.sqrt(MAX_TRACE_PIXELS / pixels));
+    const side = Math.max(1, Math.floor(Math.max(width, height) * scale));
+    await runProcess(job, "/usr/bin/sips", ["-s", "format", "png", "-Z", String(side), sourcePath, "--out", job.pngPath], "\u0E22\u0E48\u0E2D\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
+    const w = Math.round(width * scale);
+    const h = Math.round(height * scale);
+    return { input: job.pngPath, width: w, height: h, note: width + "\xD7" + height + " \u2192 " + w + "\xD7" + h };
+  }
+  async function addCanvasFrame(svgPath) {
+    const text = await fs.promises.readFile(svgPath, "utf8");
+    const svgTag = /<svg\b[^>]*>/.exec(text);
+    if (!svgTag) throw new Error("\u0E1C\u0E25\u0E08\u0E32\u0E01 VTracer \u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48 SVG");
+    const width = /\swidth="([\d.]+)"/.exec(svgTag[0])?.[1];
+    const height = /\sheight="([\d.]+)"/.exec(svgTag[0])?.[1];
+    if (!width || !height) throw new Error("SVG \u0E44\u0E21\u0E48\u0E21\u0E35\u0E02\u0E19\u0E32\u0E14 canvas");
+    const frame = '<rect id="vp-canvas" x="0" y="0" width="' + width + '" height="' + height + '" fill="none" stroke="none"/>';
+    const at = svgTag.index + svgTag[0].length;
+    await fs.promises.writeFile(svgPath, text.slice(0, at) + "\n" + frame + text.slice(at), "utf8");
+  }
+  async function svgStats(svgPath) {
+    const text = await fs.promises.readFile(svgPath, "utf8");
+    const paths = (text.match(/<path\b/g) ?? []).length;
+    let nodes = 0;
+    for (const match of text.matchAll(/\bd="([^"]*)"/g)) nodes += (match[1]?.match(/[MLCQSTHVAmlcqsthva]/g) ?? []).length;
+    return { paths, nodes, kb: Math.round(text.length / 1024) };
   }
   function readSettings(ui) {
     const preset = ui.preset.value;
@@ -219,18 +275,19 @@
     const simplify = Number(ui.smooth.value) / 10;
     if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E27\u0E32\u0E21\u0E40\u0E23\u0E35\u0E22\u0E1A\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    return { preset, maxColors, simplify };
+    return { preset, maxColors, simplify, speckle: preset === "photo" ? 8 : 16 };
   }
-  function showSelection(ui, selection) {
+  function showSelection(ui, selection, hint) {
     ui.selection.replaceChildren();
     if (selection === null) {
-      ui.selection.textContent = "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E20\u0E32\u0E1E raster \u0E2B\u0E19\u0E36\u0E48\u0E07\u0E20\u0E32\u0E1E\u0E1A\u0E19 artboard";
+      ui.selection.textContent = hint;
       return;
     }
     const title = document.createElement("strong");
     title.textContent = selection.itemName || selection.itemType;
     const detail = document.createElement("small");
-    detail.textContent = selection.documentName + " \xB7 " + (selection.embedded ? "embedded" : "linked") + " \xB7 " + Math.round(selection.widthPt) + " \xD7 " + Math.round(selection.heightPt) + " pt";
+    const kind = selection.linkedPath ? "linked (\u0E2D\u0E48\u0E32\u0E19\u0E44\u0E1F\u0E25\u0E4C\u0E15\u0E23\u0E07)" : selection.embedded ? "embedded" : "linked";
+    detail.textContent = selection.documentName + " \xB7 " + kind + " \xB7 " + Math.round(selection.widthPt) + " \xD7 " + Math.round(selection.heightPt) + " pt";
     if (selection.fromResult) detail.textContent += " \xB7 \u0E41\u0E1B\u0E25\u0E07\u0E0B\u0E49\u0E33\u0E40\u0E1B\u0E47\u0E19\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48";
     ui.selection.append(title, detail);
   }
@@ -242,6 +299,7 @@
         return null;
       case "selected":
       case "capturing":
+      case "preparing":
       case "tracing":
       case "preview":
       case "applying":
@@ -252,30 +310,72 @@
       }
     }
   }
+  var PHASES = {
+    empty: "\u0E1E\u0E23\u0E49\u0E2D\u0E21",
+    loading: "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E",
+    selected: "\u0E1E\u0E23\u0E49\u0E2D\u0E21",
+    capturing: "1/3 \u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E",
+    preparing: "2/3 \u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E",
+    tracing: "3/3 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07",
+    preview: "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25",
+    applying: "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25"
+  };
+  function isBusy(state) {
+    return state.kind === "loading" || state.kind === "capturing" || state.kind === "preparing" || state.kind === "tracing" || state.kind === "applying";
+  }
   function start() {
     const ui = getUi();
     let state = { kind: "empty" };
+    let selectionHint = "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E20\u0E32\u0E1E raster \u0E2B\u0E19\u0E36\u0E48\u0E07\u0E20\u0E32\u0E1E\u0E1A\u0E19 artboard \u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E";
     const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
     const host = typeof CSInterface === "undefined" ? null : new CSInterface();
+    let phaseStartedAt = Date.now();
+    let progressText = "";
+    let ticker = null;
     function message(value, isError = false) {
+      progressText = "";
       ui.status.textContent = value;
       ui.status.classList.toggle("error", isError);
+      if (isError) console.error("[VectorPanel] " + value);
+      else console.log("[VectorPanel] " + value);
+    }
+    function progress(value) {
+      progressText = value;
+      phaseStartedAt = Date.now();
+      ui.status.classList.remove("error");
+      tick();
+    }
+    function tick() {
+      if (!progressText) return;
+      const job = "job" in state ? state.job : null;
+      const total = job ? " \xB7 \u0E23\u0E27\u0E21 " + ((Date.now() - job.startedAt) / 1e3).toFixed(1) + " s" : "";
+      ui.status.textContent = progressText + " " + ((Date.now() - phaseStartedAt) / 1e3).toFixed(1) + " s" + total;
     }
     function render() {
-      showSelection(ui, currentSelection(state));
-      const busy = state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying";
+      showSelection(ui, currentSelection(state), selectionHint);
+      const busy = isBusy(state);
       ui.refresh.disabled = busy;
       ui.trace.disabled = busy || state.kind === "empty";
       ui.trace.textContent = currentSelection(state)?.fromResult ? "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48" : "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07";
       ui.apply.disabled = state.kind !== "preview";
-      ui.cancel.hidden = state.kind !== "tracing";
-      ui.phase.textContent = state.kind === "loading" ? "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E" : state.kind === "capturing" ? "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E" : state.kind === "tracing" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07" : state.kind === "applying" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25" : state.kind === "preview" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : "\u0E1E\u0E23\u0E49\u0E2D\u0E21";
+      ui.cancel.hidden = !(state.kind === "preparing" || state.kind === "tracing");
+      ui.phase.textContent = PHASES[state.kind];
+      ui.phase.classList.toggle("busy", busy);
+      if (busy && ticker === null) ticker = window.setInterval(tick, 200);
+      if (!busy && ticker !== null) {
+        window.clearInterval(ticker);
+        ticker = null;
+      }
       if (state.kind === "preview" || state.kind === "applying") {
-        ui.preview.src = state.dataUrl;
+        if (ui.preview.dataset.src !== state.dataUrl) {
+          ui.preview.src = state.dataUrl;
+          ui.preview.dataset.src = state.dataUrl;
+        }
         ui.preview.hidden = false;
         ui.previewEmpty.hidden = true;
       } else {
         ui.preview.removeAttribute("src");
+        delete ui.preview.dataset.src;
         ui.preview.hidden = true;
         ui.previewEmpty.hidden = false;
       }
@@ -285,9 +385,10 @@
         message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
         return;
       }
-      if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
+      if (isBusy(state)) return;
       if (state.kind === "preview") cleanJob(state.job);
       state = { kind: "loading" };
+      progress("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u2026");
       render();
       try {
         const selection = parseSelection(await callHost(host, "VP_snapshot"));
@@ -295,6 +396,7 @@
         message("\u0E20\u0E32\u0E1E\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E41\u0E1B\u0E25\u0E07");
       } catch (error) {
         state = { kind: "empty" };
+        selectionHint = errorMessage(error);
         message(errorMessage(error), true);
       }
       render();
@@ -307,27 +409,34 @@
       let job = null;
       try {
         job = newJob(readSettings(ui));
-        state = { kind: "capturing", selection, job };
-        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator\u2026");
+        const current = job;
+        state = { kind: "capturing", selection, job: current };
+        progress(selection.linkedPath ? "1/3 \u0E2D\u0E48\u0E32\u0E19\u0E15\u0E33\u0E41\u0E2B\u0E19\u0E48\u0E07\u0E44\u0E1F\u0E25\u0E4C\u0E25\u0E34\u0E07\u0E01\u0E4C\u2026" : "1/3 Illustrator \u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E23\u0E19\u0E40\u0E14\u0E2D\u0E23\u0E4C\u0E20\u0E32\u0E1E (embedded)\u2026");
         render();
-        await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
-        if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
+        const captured = await callHost(host, "VP_capture", [selection.uuid, current.pngPath, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+        if (current.cancelled) throw new CancelledError();
+        const sourcePath = captured[1] ?? "";
+        if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
+        state = { kind: "preparing", selection, job: current };
+        progress("2/3 \u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E (\u0E19\u0E2D\u0E01 Illustrator)\u2026");
+        render();
+        const prepared = await prepareInput(current, sourcePath);
         const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
         if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
-        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");
-        await runVtracer(binary, job, (child) => {
-          if (job === null) return;
-          state = { kind: "tracing", selection, job, child };
-          render();
-        });
-        const svg = fs.readFileSync(job.svgPath);
-        state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64") };
-        message("\u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator");
+        state = { kind: "tracing", selection, job: current };
+        progress("3/3 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C " + prepared.note + "\u2026");
+        render();
+        await runProcess(current, binary, vtracerArguments(current, prepared.input), "VTracer \u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
+        await addCanvasFrame(current.svgPath);
+        const stats = await svgStats(current.svgPath);
+        const seconds = ((Date.now() - current.startedAt) / 1e3).toFixed(1);
+        state = { kind: "preview", selection, job: current, dataUrl: "file://" + encodeURI(current.svgPath) + "?v=" + current.id };
+        message(stats.paths + " paths \xB7 " + stats.nodes + " nodes \xB7 " + seconds + " s \u2014 \u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator");
         render();
       } catch (error) {
         if (job !== null) cleanJob(job);
         state = { kind: "selected", selection };
-        message(errorMessage(error), true);
+        message(errorMessage(error), !(error instanceof CancelledError));
         render();
       }
     }
@@ -335,12 +444,12 @@
       if (host === null || state.kind !== "preview") return;
       const { selection, job, dataUrl } = state;
       state = { kind: "applying", selection, job, dataUrl };
-      message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
+      progress("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
       render();
       try {
         const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
         const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
-        message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48");
+        message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48 \xB7 Undo \u0E2B\u0E19\u0E36\u0E48\u0E07\u0E04\u0E23\u0E31\u0E49\u0E07\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E22\u0E49\u0E2D\u0E19");
         cleanJob(job);
         state = { kind: "selected", selection };
       } catch (error) {
@@ -354,6 +463,12 @@
       }
       render();
     }
+    function cancel() {
+      if (state.kind !== "preparing" && state.kind !== "tracing" && state.kind !== "capturing") return;
+      state.job.cancelled = true;
+      state.job.child?.kill();
+      progress("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
+    }
     ui.refresh.addEventListener("click", () => {
       void refresh();
     });
@@ -363,12 +478,7 @@
     ui.apply.addEventListener("click", () => {
       void apply();
     });
-    ui.cancel.addEventListener("click", () => {
-      if (state.kind !== "tracing") return;
-      state.job.cancelled = true;
-      state.child.kill();
-      message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
-    });
+    ui.cancel.addEventListener("click", cancel);
     ui.colors.addEventListener("input", () => {
       ui.colorsValue.value = ui.colors.value;
     });
@@ -380,10 +490,9 @@
       ui.colorsValue.value = ui.colors.value;
     });
     window.addEventListener("beforeunload", () => {
-      if (state.kind === "preview") cleanJob(state.job);
-      if (state.kind === "tracing") {
+      if ("job" in state) {
         state.job.cancelled = true;
-        state.child.kill();
+        state.job.child?.kill();
         cleanJob(state.job);
       }
     });

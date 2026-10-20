@@ -29,12 +29,16 @@ type Selection = {
   readonly heightPt: number;
   readonly embedded: boolean;
   readonly fromResult: boolean;
+  /** Linked source file the panel can read itself (empty when Illustrator must render pixels). */
+  readonly linkedPath: string;
 };
 
 type Settings = {
   readonly preset: "logo" | "icon" | "photo";
   readonly maxColors: number;
   readonly simplify: number;
+  /** Discard patches smaller than this many px (removes paper grain / JPEG noise). */
+  readonly speckle: number;
 };
 
 type Job = {
@@ -43,7 +47,9 @@ type Job = {
   readonly pngPath: string;
   readonly svgPath: string;
   readonly settings: Settings;
+  readonly startedAt: number;
   cancelled: boolean;
+  child: childProcess.ChildProcess | null;
 };
 
 type State =
@@ -51,7 +57,8 @@ type State =
   | { readonly kind: "loading" }
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
-  | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: childProcess.ChildProcess }
+  | { readonly kind: "preparing"; readonly selection: Selection; readonly job: Job }
+  | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job }
   | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string }
   | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string };
 
@@ -141,7 +148,7 @@ function parseFiniteNumber(raw: string | undefined, label: string): number {
 }
 
 function parseSelection(parts: string[]): Selection {
-  if (parts.length !== 11) throw new Error("ข้อมูลภาพที่เลือกไม่ครบ");
+  if (parts.length !== 12) throw new Error("ข้อมูลภาพที่เลือกไม่ครบ (host.jsx กับ panel.js ไม่ตรงรุ่น — ปิดแล้วเปิด Panel ใหม่)");
   const itemType = parts[3];
   if (itemType !== "PlacedItem" && itemType !== "RasterItem") throw new Error("รองรับภาพ raster ที่เลือกหนึ่งภาพ");
   const uuid = parts[4];
@@ -160,7 +167,8 @@ function parseSelection(parts: string[]): Selection {
     widthPt: parsePositiveNumber(String(right - left), "width"),
     heightPt: parsePositiveNumber(String(top - bottom), "height"),
     embedded: parts[9] === "1",
-    fromResult: parts[10] === "1"
+    fromResult: parts[10] === "1",
+    linkedPath: parts[11] ?? ""
   };
 }
 
@@ -199,7 +207,9 @@ function newJob(settings: Settings): Job {
     pngPath: path.join(directory, "source.png"),
     svgPath: path.join(directory, "result.svg"),
     settings,
-    cancelled: false
+    startedAt: Date.now(),
+    cancelled: false,
+    child: null
   };
 }
 
@@ -227,39 +237,108 @@ function cleanStaleJobs(): void {
   }
 }
 
-function vtracerArguments(job: Job): string[] {
-  const args = [job.pngPath, job.svgPath];
+/** Upper bound for pixels handed to the tracer. Above this, extra pixels cost time and memory
+ * but do not improve a flat-colour trace measurably (see docs/perf-rounds.md). */
+const MAX_TRACE_PIXELS = 4_000_000;
+const DIRECT_FORMATS = new Set([".png", ".jpg", ".jpeg"]);
+
+function vtracerArguments(job: Job, input: string): string[] {
+  const args = [input, job.svgPath];
   const preset = job.settings.preset;
   if (preset === "photo") {
     args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
   } else {
-    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
+    args.push("--preset", "poster", "--hierarchical", "stacked", "--max-colors", String(job.settings.maxColors));
     if (preset === "icon") args.push("--mode", "polygon");
   }
+  args.push("--filter-speckle", String(job.settings.speckle));
   if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
   args.push("--optimize", "1");
   return args;
 }
 
-function runVtracer(binary: string, job: Job, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
+/** Run a helper process without blocking the panel. The job keeps a handle so Cancel can kill it. */
+function runProcess(job: Job, binary: string, args: readonly string[], failure: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(binary, vtracerArguments(job), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-    onStart(child);
+    if (job.cancelled) {
+      reject(new CancelledError());
+      return;
+    }
+    const child = childProcess.spawn(binary, args as string[], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    job.child = child;
+    let stdout = "";
     let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (stdout.length < 8000) stdout += chunk.toString("utf8");
+    });
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 4000) stderr += chunk.toString("utf8").slice(0, 4000 - stderr.length);
     });
-    child.once("error", (error) => reject(error));
+    child.once("error", (error) => {
+      job.child = null;
+      reject(new Error(failure + ": " + error.message));
+    });
     child.once("close", (code) => {
-      if (job.cancelled) {
-        reject(new Error("ยกเลิกแล้ว"));
-      } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
-        resolve();
-      } else {
-        reject(new Error("VTracer แปลงภาพไม่สำเร็จ" + (stderr ? ": " + stderr.trim() : "")));
-      }
+      job.child = null;
+      if (job.cancelled) reject(new CancelledError());
+      else if (code === 0) resolve(stdout);
+      else reject(new Error(failure + (stderr ? ": " + stderr.trim() : " (exit " + String(code) + ")")));
     });
   });
+}
+
+class CancelledError extends Error {
+  constructor() {
+    super("ยกเลิกแล้ว");
+  }
+}
+
+type Prepared = { readonly input: string; readonly width: number; readonly height: number; readonly note: string };
+
+/** Turn whatever Illustrator gave us (linked file or captured PNG) into a tracer input that is at
+ * most MAX_TRACE_PIXELS, using an external process so neither Illustrator nor the panel decodes it. */
+async function prepareInput(job: Job, sourcePath: string): Promise<Prepared> {
+  const ext = path.extname(sourcePath).toLowerCase();
+  if (process.platform !== "darwin") {
+    if (!DIRECT_FORMATS.has(ext)) throw new Error("รองรับไฟล์ลิงก์ PNG/JPEG บนระบบนี้เท่านั้น");
+    return { input: sourcePath, width: 0, height: 0, note: "ส่งไฟล์ตรง" };
+  }
+  const info = await runProcess(job, "/usr/bin/sips", ["-g", "pixelWidth", "-g", "pixelHeight", sourcePath], "อ่านขนาดภาพไม่สำเร็จ");
+  const width = Number(/pixelWidth:\s*(\d+)/.exec(info)?.[1] ?? NaN);
+  const height = Number(/pixelHeight:\s*(\d+)/.exec(info)?.[1] ?? NaN);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) throw new Error("อ่านขนาดภาพไม่ได้: " + path.basename(sourcePath));
+  const pixels = width * height;
+  if (pixels <= MAX_TRACE_PIXELS && DIRECT_FORMATS.has(ext)) return { input: sourcePath, width, height, note: width + "×" + height };
+  const scale = Math.min(1, Math.sqrt(MAX_TRACE_PIXELS / pixels));
+  const side = Math.max(1, Math.floor(Math.max(width, height) * scale));
+  await runProcess(job, "/usr/bin/sips", ["-s", "format", "png", "-Z", String(side), sourcePath, "--out", job.pngPath], "ย่อภาพไม่สำเร็จ");
+  const w = Math.round(width * scale);
+  const h = Math.round(height * scale);
+  return { input: job.pngPath, width: w, height: h, note: width + "×" + height + " → " + w + "×" + h };
+}
+
+/** Insert an invisible rectangle that spans the SVG canvas. host.jsx uses it to register the imported
+ * group with the source raster, then deletes it. Runs in Node (async I/O), not on Illustrator's thread. */
+async function addCanvasFrame(svgPath: string): Promise<void> {
+  const text = await fs.promises.readFile(svgPath, "utf8");
+  const svgTag = /<svg\b[^>]*>/.exec(text);
+  if (!svgTag) throw new Error("ผลจาก VTracer ไม่ใช่ SVG");
+  const width = /\swidth="([\d.]+)"/.exec(svgTag[0])?.[1];
+  const height = /\sheight="([\d.]+)"/.exec(svgTag[0])?.[1];
+  if (!width || !height) throw new Error("SVG ไม่มีขนาด canvas");
+  const frame = '<rect id="vp-canvas" x="0" y="0" width="' + width + '" height="' + height + '" fill="none" stroke="none"/>';
+  const at = svgTag.index + svgTag[0].length;
+  await fs.promises.writeFile(svgPath, text.slice(0, at) + "\n" + frame + text.slice(at), "utf8");
+}
+
+type SvgStats = { readonly paths: number; readonly nodes: number; readonly kb: number };
+
+async function svgStats(svgPath: string): Promise<SvgStats> {
+  const text = await fs.promises.readFile(svgPath, "utf8");
+  const paths = (text.match(/<path\b/g) ?? []).length;
+  let nodes = 0;
+  for (const match of text.matchAll(/\bd="([^"]*)"/g)) nodes += (match[1]?.match(/[MLCQSTHVAmlcqsthva]/g) ?? []).length;
+  return { paths, nodes, kb: Math.round(text.length / 1024) };
 }
 
 function readSettings(ui: Ui): Settings {
@@ -269,19 +348,20 @@ function readSettings(ui: Ui): Settings {
   const simplify = Number(ui.smooth.value) / 10;
   if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("จำนวนสีไม่ถูกต้อง");
   if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
-  return { preset, maxColors, simplify };
+  return { preset, maxColors, simplify, speckle: preset === "photo" ? 8 : 16 };
 }
 
-function showSelection(ui: Ui, selection: Selection | null): void {
+function showSelection(ui: Ui, selection: Selection | null, hint: string): void {
   ui.selection.replaceChildren();
   if (selection === null) {
-    ui.selection.textContent = "เลือกภาพ raster หนึ่งภาพบน artboard";
+    ui.selection.textContent = hint;
     return;
   }
   const title = document.createElement("strong");
   title.textContent = selection.itemName || selection.itemType;
   const detail = document.createElement("small");
-  detail.textContent = selection.documentName + " · " + (selection.embedded ? "embedded" : "linked") + " · " + Math.round(selection.widthPt) + " × " + Math.round(selection.heightPt) + " pt";
+  const kind = selection.linkedPath ? "linked (อ่านไฟล์ตรง)" : selection.embedded ? "embedded" : "linked";
+  detail.textContent = selection.documentName + " · " + kind + " · " + Math.round(selection.widthPt) + " × " + Math.round(selection.heightPt) + " pt";
   if (selection.fromResult) detail.textContent += " · แปลงซ้ำเป็นเวอร์ชันใหม่";
   ui.selection.append(title, detail);
 }
@@ -292,6 +372,7 @@ function currentSelection(state: State): Selection | null {
     case "loading": return null;
     case "selected":
     case "capturing":
+    case "preparing":
     case "tracing":
     case "preview":
     case "applying": return state.selection;
@@ -302,32 +383,79 @@ function currentSelection(state: State): Selection | null {
   }
 }
 
+const PHASES: Record<State["kind"], string> = {
+  empty: "พร้อม",
+  loading: "ตรวจภาพ",
+  selected: "พร้อม",
+  capturing: "1/3 อ่านภาพ",
+  preparing: "2/3 เตรียมภาพ",
+  tracing: "3/3 กำลังแปลง",
+  preview: "พร้อมใส่ผล",
+  applying: "กำลังใส่ผล"
+};
+
+function isBusy(state: State): boolean {
+  return state.kind === "loading" || state.kind === "capturing" || state.kind === "preparing" || state.kind === "tracing" || state.kind === "applying";
+}
+
 function start(): void {
   const ui = getUi();
   let state: State = { kind: "empty" };
+  let selectionHint = "เลือกภาพ raster หนึ่งภาพบน artboard แล้วกดตรวจภาพ";
   const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
   const host = typeof CSInterface === "undefined" ? null : new CSInterface();
+  let phaseStartedAt = Date.now();
+  let progressText = "";
+  let ticker: number | null = null;
 
+  /** Status line. Errors stay on screen (red) until the next user action replaces them. */
   function message(value: string, isError = false): void {
+    progressText = "";
     ui.status.textContent = value;
     ui.status.classList.toggle("error", isError);
+    if (isError) console.error("[VectorPanel] " + value);
+    else console.log("[VectorPanel] " + value);
+  }
+
+  function progress(value: string): void {
+    progressText = value;
+    phaseStartedAt = Date.now();
+    ui.status.classList.remove("error");
+    tick();
+  }
+
+  function tick(): void {
+    if (!progressText) return;
+    const job = "job" in state ? state.job : null;
+    const total = job ? " · รวม " + ((Date.now() - job.startedAt) / 1000).toFixed(1) + " s" : "";
+    ui.status.textContent = progressText + " " + ((Date.now() - phaseStartedAt) / 1000).toFixed(1) + " s" + total;
   }
 
   function render(): void {
-    showSelection(ui, currentSelection(state));
-    const busy = state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying";
+    showSelection(ui, currentSelection(state), selectionHint);
+    const busy = isBusy(state);
     ui.refresh.disabled = busy;
     ui.trace.disabled = busy || state.kind === "empty";
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
     ui.apply.disabled = state.kind !== "preview";
-    ui.cancel.hidden = state.kind !== "tracing";
-    ui.phase.textContent = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
+    ui.cancel.hidden = !(state.kind === "preparing" || state.kind === "tracing");
+    ui.phase.textContent = PHASES[state.kind];
+    ui.phase.classList.toggle("busy", busy);
+    if (busy && ticker === null) ticker = window.setInterval(tick, 200);
+    if (!busy && ticker !== null) {
+      window.clearInterval(ticker);
+      ticker = null;
+    }
     if (state.kind === "preview" || state.kind === "applying") {
-      ui.preview.src = state.dataUrl;
+      if (ui.preview.dataset.src !== state.dataUrl) {
+        ui.preview.src = state.dataUrl;
+        ui.preview.dataset.src = state.dataUrl;
+      }
       ui.preview.hidden = false;
       ui.previewEmpty.hidden = true;
     } else {
       ui.preview.removeAttribute("src");
+      delete ui.preview.dataset.src;
       ui.preview.hidden = true;
       ui.previewEmpty.hidden = false;
     }
@@ -338,9 +466,10 @@ function start(): void {
       message("เปิด Panel นี้จาก Adobe Illustrator เท่านั้น", true);
       return;
     }
-    if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
+    if (isBusy(state)) return;
     if (state.kind === "preview") cleanJob(state.job);
     state = { kind: "loading" };
+    progress("กำลังตรวจภาพที่เลือก…");
     render();
     try {
       const selection = parseSelection(await callHost(host, "VP_snapshot"));
@@ -348,6 +477,7 @@ function start(): void {
       message("ภาพพร้อมแปลง");
     } catch (error) {
       state = { kind: "empty" };
+      selectionHint = errorMessage(error);
       message(errorMessage(error), true);
     }
     render();
@@ -361,27 +491,36 @@ function start(): void {
     let job: Job | null = null;
     try {
       job = newJob(readSettings(ui));
-      state = { kind: "capturing", selection, job };
-      message("กำลังอ่านภาพจาก Illustrator…");
+      const current = job;
+      state = { kind: "capturing", selection, job: current };
+      progress(selection.linkedPath ? "1/3 อ่านตำแหน่งไฟล์ลิงก์…" : "1/3 Illustrator กำลังเรนเดอร์ภาพ (embedded)…");
       render();
-      await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
-      if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
+      const captured = await callHost(host, "VP_capture", [selection.uuid, current.pngPath, selection.documentIdentity, String(MAX_TRACE_PIXELS)]);
+      if (current.cancelled) throw new CancelledError();
+      const sourcePath = captured[1] ?? "";
+      if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error("Illustrator ไม่ได้ส่งภาพกลับมา");
+
+      state = { kind: "preparing", selection, job: current };
+      progress("2/3 เตรียมภาพ (นอก Illustrator)…");
+      render();
+      const prepared = await prepareInput(current, sourcePath);
+
       const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
       if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
-      message("กำลังสร้างเส้นเวกเตอร์…");
-      await runVtracer(binary, job, (child) => {
-        if (job === null) return;
-        state = { kind: "tracing", selection, job, child };
-        render();
-      });
-      const svg = fs.readFileSync(job.svgPath);
-      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64") };
-      message("ดูตัวอย่างแล้วกดใส่ใน Illustrator");
+      state = { kind: "tracing", selection, job: current };
+      progress("3/3 กำลังสร้างเส้นเวกเตอร์ " + prepared.note + "…");
+      render();
+      await runProcess(current, binary, vtracerArguments(current, prepared.input), "VTracer แปลงภาพไม่สำเร็จ");
+      await addCanvasFrame(current.svgPath);
+      const stats = await svgStats(current.svgPath);
+      const seconds = ((Date.now() - current.startedAt) / 1000).toFixed(1);
+      state = { kind: "preview", selection, job: current, dataUrl: "file://" + encodeURI(current.svgPath) + "?v=" + current.id };
+      message(stats.paths + " paths · " + stats.nodes + " nodes · " + seconds + " s — ดูตัวอย่างแล้วกดใส่ใน Illustrator");
       render();
     } catch (error) {
       if (job !== null) cleanJob(job);
       state = { kind: "selected", selection };
-      message(errorMessage(error), true);
+      message(errorMessage(error), !(error instanceof CancelledError));
       render();
     }
   }
@@ -390,12 +529,12 @@ function start(): void {
     if (host === null || state.kind !== "preview") return;
     const { selection, job, dataUrl } = state;
     state = { kind: "applying", selection, job, dataUrl };
-    message("กำลังนำ path เข้า Illustrator…");
+    progress("กำลังนำ path เข้า Illustrator…");
     render();
     try {
       const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
-      message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่");
+      message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่ · Undo หนึ่งครั้งเพื่อย้อน");
       cleanJob(job);
       state = { kind: "selected", selection };
     } catch (error) {
@@ -410,15 +549,17 @@ function start(): void {
     render();
   }
 
+  function cancel(): void {
+    if (state.kind !== "preparing" && state.kind !== "tracing" && state.kind !== "capturing") return;
+    state.job.cancelled = true;
+    state.job.child?.kill();
+    progress("กำลังยกเลิก…");
+  }
+
   ui.refresh.addEventListener("click", () => { void refresh(); });
   ui.trace.addEventListener("click", () => { void trace(); });
   ui.apply.addEventListener("click", () => { void apply(); });
-  ui.cancel.addEventListener("click", () => {
-    if (state.kind !== "tracing") return;
-    state.job.cancelled = true;
-    state.child.kill();
-    message("กำลังยกเลิก…");
-  });
+  ui.cancel.addEventListener("click", cancel);
   ui.colors.addEventListener("input", () => { ui.colorsValue.value = ui.colors.value; });
   ui.smooth.addEventListener("input", () => { ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1); });
   ui.preset.addEventListener("change", () => {
@@ -427,10 +568,9 @@ function start(): void {
   });
 
   window.addEventListener("beforeunload", () => {
-    if (state.kind === "preview") cleanJob(state.job);
-    if (state.kind === "tracing") {
+    if ("job" in state) {
       state.job.cancelled = true;
-      state.child.kill();
+      state.job.child?.kill();
       cleanJob(state.job);
     }
   });
