@@ -1,7 +1,7 @@
 import * as childProcess from "child_process";
 import * as fs from "fs";
-import { prepareTracePng } from "./image-prep";
-import { summarizeSvg } from "./svg-summary";
+import { prepareTracePng, stitchStripPngs } from "./image-prep";
+import { insertCanvasFrame, summarizeSvg } from "./svg-summary";
 
 export type TraceStage = "prepare" | "trace" | "svg";
 
@@ -13,6 +13,7 @@ export type TraceRequest = {
   readonly flags: readonly string[];
   readonly maxPixels: number;
   readonly maxDecodePixels: number;
+  readonly stripPaths: readonly string[];
 };
 
 export type TraceResult = {
@@ -33,7 +34,15 @@ export async function runTraceJob(request: TraceRequest, hooks: TraceHooks): Pro
   if (hooks.isCancelled()) throw new Error("ยกเลิกแล้ว");
   hooks.onProgress("prepare");
   writeThreadMarker(hooks.thread);
-  const prepared = await prepareTracePng(request.sourcePath, request.pngPath, request.maxPixels, request.maxDecodePixels);
+  if (request.stripPaths.length > 0) {
+    await stitchStripPngs(request.stripPaths, request.pngPath);
+  }
+  const prepared = await prepareTracePng(
+    request.stripPaths.length > 0 ? request.pngPath : request.sourcePath,
+    request.pngPath,
+    request.maxPixels,
+    request.maxDecodePixels
+  );
   if (hooks.isCancelled()) throw new Error("ยกเลิกแล้ว");
   const stat = await fs.promises.stat(request.pngPath);
   if (!stat.isFile() || stat.size <= 0) throw new Error("เตรียมไฟล์ PNG ไม่สำเร็จ");
@@ -41,7 +50,8 @@ export async function runTraceJob(request: TraceRequest, hooks: TraceHooks): Pro
   await spawnVtracer(request, hooks);
   if (hooks.isCancelled()) throw new Error("ยกเลิกแล้ว");
   hooks.onProgress("svg");
-  const svg = await fs.promises.readFile(request.svgPath, "utf8");
+  const svg = insertCanvasFrame(await fs.promises.readFile(request.svgPath, "utf8"));
+  await fs.promises.writeFile(request.svgPath, svg, "utf8");
   const summary = summarizeSvg(svg);
   return { width: prepared.width, height: prepared.height, resized: prepared.resized, pathCount: summary.pathCount };
 }

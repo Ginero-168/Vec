@@ -104,10 +104,11 @@ function makeItem(doc, spec) {
     _selected: false,
     geometricBounds: copyBounds(spec.bounds || [0, 0, 0, 0]),
     visibleBounds: copyBounds(spec.bounds || [0, 0, 0, 0]),
-    matrix: spec.matrix || { mValueA: 1, mValueB: 0, mValueC: 0, mValueD: 1, mValueTX: 0, mValueTY: 0 },
+    matrix: spec.matrix || { mValueA: 1, mValueB: 0, mValueC: 0, mValueD: -1, mValueTX: 0, mValueTY: 0 },
     opacity: spec.opacity === undefined ? 100 : spec.opacity,
     clipped: Boolean(spec.clipped),
     embedded: spec.kind === "RasterItem",
+    locked: false,
     _file: spec.file ? new HostFile(spec.file) : null
   };
   Object.defineProperty(item, "selected", {
@@ -155,6 +156,33 @@ function makeItem(doc, spec) {
   item.translate = function translate(dx, dy) {
     return recordCall(doc._log, doc._state, "PageItem.translate", () => {
       shiftTree(item, dx, dy);
+    });
+  };
+  item.resize = function resize(xPercent, yPercent) {
+    return recordCall(doc._log, doc._state, "GroupItem.resize", () => {
+      const originX = Number(item.geometricBounds[0]);
+      const originY = Number(item.geometricBounds[1]);
+      const sx = Number(xPercent) / 100;
+      const sy = Number(yPercent) / 100;
+      const scaleNode = (node) => {
+        const bounds = node.geometricBounds;
+        const left = originX + (Number(bounds[0]) - originX) * sx;
+        const top = originY + (Number(bounds[1]) - originY) * sy;
+        const right = originX + (Number(bounds[2]) - originX) * sx;
+        const bottom = originY + (Number(bounds[3]) - originY) * sy;
+        node.geometricBounds = [left, top, right, bottom];
+        node.visibleBounds = [left, top, right, bottom];
+        for (const child of node.children) scaleNode(child);
+      };
+      scaleNode(item);
+    });
+  };
+  item.remove = function remove() {
+    return recordCall(doc._log, doc._state, item.typename + ".remove", () => {
+      const parent = item.parent;
+      if (!parent) return;
+      parent.children = parent.children.filter((child) => child !== item);
+      parent._paths = (parent._paths || []).filter((child) => child !== item);
     });
   };
   item.embed = function embed() {
@@ -208,8 +236,48 @@ function makeItem(doc, spec) {
             item.children.push(group);
             return group;
           });
+        },
+        createFromFile(file) {
+          return recordCall(doc._log, doc._state, "GroupItem.createFromFile", () => {
+            const svg = fs.readFileSync(file.fsName, "utf8");
+            const box = /viewBox="\s*[-\d.]+\s+[-\d.]+\s+([-\d.]+)\s+([-\d.]+)\s*"/.exec(svg);
+            const width = box ? Number(box[1]) : 100;
+            const height = box ? Number(box[2]) : 100;
+            const group = makeItem(doc, {
+              kind: "GroupItem",
+              id: "import-" + Math.random().toString(16).slice(2),
+              name: "import",
+              bounds: [0, height, width, 0]
+            });
+            const pathCount = (svg.match(/<path\b/g) || []).length;
+            for (let index = 0; index < pathCount; index += 1) {
+              const pathItem = makeItem(doc, { kind: "PathItem", id: "path-" + index, name: "path-" + index, bounds: [0, 1, 1, 0] });
+              pathItem.parent = group;
+              group.children.push(pathItem);
+              group._paths.push(pathItem);
+            }
+            if (svg.indexOf('id="vp-canvas"') !== -1) {
+              const frame = makeItem(doc, { kind: "PathItem", id: "vp-canvas", name: "vp-canvas", bounds: [0, height, width, 0] });
+              frame.parent = group;
+              group.children.push(frame);
+              group._paths.push(frame);
+            }
+            group.parent = item;
+            item.children.push(group);
+            return group;
+          });
         }
       };
+    }
+  });
+  Object.defineProperty(item, "pageItems", {
+    get() {
+      return item.children;
+    }
+  });
+  Object.defineProperty(item, "compoundPathItems", {
+    get() {
+      return { length: 0 };
     }
   });
   return item;
@@ -309,6 +377,12 @@ function createDocument(log, state, tinyPng, filePath) {
       });
     }
     if (!found) throw new Error("missing uuid");
+    // Illustrator 30 returns the wrapper group for a placed or embedded image id.
+    if (doc._wrapRasterIds && (found.typename === "PlacedItem" || found.typename === "RasterItem")) {
+      const wrapper = makeItem(doc, { kind: "GroupItem", id: "wrapper-" + uuid, name: "wrapper", bounds: copyBounds(found.geometricBounds) });
+      wrapper.children = [found];
+      return wrapper;
+    }
     return found;
   };
   doc.activate = function activate() {
@@ -316,12 +390,28 @@ function createDocument(log, state, tinyPng, filePath) {
   };
   doc.close = function close() {
     recordCall(log, state, "Document.close", () => {
-      const docs = state.app.documents._docs;
+      const docs = state.app.documents;
       const index = docs.indexOf(doc);
       if (index >= 0) docs.splice(index, 1);
       if (state.app.activeDocument === doc) state.app.activeDocument = docs[docs.length - 1] || null;
     });
   };
+  Object.defineProperty(doc, "placedItems", {
+    get() {
+      if (doc._wrapperOnly) return [];
+      const found = [];
+      for (const layer of doc.layers) found.push(...collect(layer, "PlacedItem"));
+      return found;
+    }
+  });
+  Object.defineProperty(doc, "rasterItems", {
+    get() {
+      if (doc._wrapperOnly) return [];
+      const found = [];
+      for (const layer of doc.layers) found.push(...collect(layer, "RasterItem"));
+      return found;
+    }
+  });
   Object.defineProperty(doc, "pathItems", {
     get() {
       return recordCall(log, state, "Document.pathItems", () => {
@@ -425,26 +515,22 @@ function VP_commitPaths(encodedUuid, encodedList, encodedJobId, encodedSettings,
 }
 `;
 
-function createSession(jsxSource, tinyPng, kind) {
+function createSession(jsxSource, tinyPng, kind, wrapRasterIds) {
   const log = [];
   const state = { script: "", app: null };
   const app = {
     userInteractionLevel: 0,
     activeDocument: null,
-    documents: {
-      _docs: [],
-      get length() {
-        return this._docs.length;
-      },
+    documents: Object.assign([], {
       add(colorSpace, width, height) {
         return recordCall(log, state, "documents.add", () => {
           const created = createDocument(log, state, tinyPng, path.join(os.tmpdir(), "vector-panel-temporary.ai"));
-          this._docs.push(created);
+          app.documents.push(created);
           app.activeDocument = created;
           return created;
         });
       }
-    },
+    }),
     copy() {
       recordCall(log, state, "app.copy", () => {
         app._clipboard = app.activeDocument.selection.map((item) => item);
@@ -467,8 +553,9 @@ function createSession(jsxSource, tinyPng, kind) {
   app._clipboard = [];
   state.app = app;
   const doc = createDocument(log, state, tinyPng, path.join(runtime, kind + ".ai"));
-  app.documents._docs.push(doc);
+  app.documents.push(doc);
   app.activeDocument = doc;
+  doc._wrapRasterIds = Boolean(wrapRasterIds);
   populate(doc, kind);
   const sandbox = {
     app,
@@ -477,6 +564,8 @@ function createSession(jsxSource, tinyPng, kind) {
     ElementPlacement: { PLACEATBEGINNING: 1 },
     UserInteractionLevel: { DONTDISPLAYALERTS: 1 },
     SaveOptions: { DONOTSAVECHANGES: 1 },
+    $: { global: {} },
+    Transformation: { TOPLEFT: 1 },
     encodeURIComponent,
     decodeURIComponent,
     isFinite,
@@ -637,7 +726,7 @@ function boot(bundle, extensionPath, session) {
 async function runPanel(bundle, extensionPath, jsxSource, tinyPng, scenario) {
   fs.writeFileSync(spawnLog, "");
   fs.writeFileSync(threadLog, "");
-  const session = createSession(jsxSource, tinyPng, scenario.kind);
+  const session = createSession(jsxSource, tinyPng, scenario.kind, scenario.wrapRasterIds);
   const page = boot(bundle, extensionPath, session);
   try {
     await waitFor(() => {
@@ -733,6 +822,11 @@ function assertScenario(id, side, result, expect) {
   if (expect.inline) check(result.thread && result.thread.isMainThread === true, prefix + " inline thread " + JSON.stringify(result.thread));
   if (expect.previewStays) check(result.previewHidden === false, prefix + " preview was cleared");
   if (expect.layersStable) check(result.layersAfterApply === result.layersBeforeApply, prefix + " layer count changed on failed apply");
+  if (expect.nativeImport) {
+    check(count(result.log, "GroupItem.createFromFile") === 1, prefix + " createFromFile " + count(result.log, "GroupItem.createFromFile"));
+    check(count(result.log, "PlacedItem.embed") === 0, prefix + " embed " + count(result.log, "PlacedItem.embed"));
+    check(result.finalStatus.indexOf("ต้นฉบับไม่ใช่ภาพ raster") === -1, prefix + " wrapper error " + result.finalStatus);
+  }
 }
 
 function markdownTable(before, after, leftLabel = "Before", rightLabel = "After") {
@@ -795,18 +889,72 @@ await esbuild.build({ entryPoints: [path.join(root, "src", "panel.ts")], bundle:
 await esbuild.build({ entryPoints: [path.join(root, "src", "trace-worker.ts")], bundle: true, platform: "node", format: "cjs", target: "node14", outfile: path.join(extensionDir, "js", "trace-worker.js") });
 await esbuild.build({ entryPoints: [path.join(root, "test", "fixtures", "before", "panel.ts")], bundle: true, platform: "node", format: "iife", target: "chrome99", outfile: path.join(runtime, "before-panel.js") });
 await esbuild.build({ entryPoints: [path.join(root, "src", "image-prep.ts")], bundle: true, platform: "node", format: "cjs", outfile: path.join(runtime, "image-prep.cjs") });
+await esbuild.build({ entryPoints: [path.join(root, "src", "trace-flags.ts")], bundle: true, platform: "node", format: "cjs", outfile: path.join(runtime, "trace-flags.cjs") });
+
+let planTall = { count: 0, ppi: 0 };
+let planShort = { count: 0, ppi: 0 };
+
+function stripPlan(widthPt, heightPt, rows, minPpi, maxPpi, maxPixels) {
+  let fitted = 72 * Math.sqrt(maxPixels / (widthPt * heightPt));
+  if (fitted < minPpi) fitted = minPpi;
+  if (fitted > maxPpi) fitted = maxPpi;
+  const ppi = Math.floor(fitted);
+  const stripPoints = rows * 72 / ppi;
+  return { ppi, count: Math.max(1, Math.ceil(heightPt / stripPoints - 1e-6)) };
+}
 
 const limitsSource = fs.readFileSync(path.join(root, "src", "limits.ts"), "utf8");
 const hostSource = fs.readFileSync(path.join(extensionDir, "jsx", "host.jsx"), "utf8");
+planTall = stripPlan(80, 40, readAssigned(hostSource, /var VP_STRIP_ROWS = (\d+);/), readAssigned(hostSource, /var VP_MIN_PPI = (\d+);/), readAssigned(hostSource, /var VP_MAX_PPI = (\d+);/), readAssigned(hostSource, /var VP_MAX_PIXELS = (\d+);/));
+planShort = stripPlan(80, 10, readAssigned(hostSource, /var VP_STRIP_ROWS = (\d+);/), readAssigned(hostSource, /var VP_MIN_PPI = (\d+);/), readAssigned(hostSource, /var VP_MAX_PPI = (\d+);/), readAssigned(hostSource, /var VP_MAX_PIXELS = (\d+);/));
 const beforeHost = fs.readFileSync(path.join(root, "test", "fixtures", "before", "host.jsx"), "utf8");
 const afterBundle = fs.readFileSync(path.join(extensionDir, "js", "panel.js"), "utf8");
 const beforeBundle = fs.readFileSync(path.join(runtime, "before-panel.js"), "utf8");
 check(readAssigned(limitsSource, /export const MAX_TRACE_PIXELS = (\d+);/) === readAssigned(hostSource, /var VP_MAX_PIXELS = (\d+);/), "pixel cap drifted");
 check(readAssigned(limitsSource, /export const MAX_DECODE_PIXELS = (\d+);/) === readAssigned(hostSource, /var VP_MAX_DECODE_PIXELS = (\d+);/), "decode cap drifted");
 check(readAssigned(limitsSource, /export const TARGET_CAPTURE_PPI = (\d+);/) === readAssigned(hostSource, /var VP_TARGET_PPI = (\d+);/), "capture ppi drifted");
-for (const file of ["src/panel.ts", "src/trace-job.ts", "src/trace-client.ts", "src/trace-worker.ts", "src/image-prep.ts", "extension/jsx/host.jsx"]) {
+for (const file of ["src/panel.ts", "src/trace-job.ts", "src/trace-client.ts", "src/trace-worker.ts", "src/image-prep.ts", "src/trace-flags.ts", "extension/jsx/host.jsx"]) {
   check(!fs.readFileSync(path.join(root, file), "utf8").includes("execSync"), file + " contains execSync");
 }
+check(hostSource.includes("createFromFile"), "host commit does not import SVG with createFromFile");
+check(!hostSource.includes(".embed()"), "host still places and embeds the SVG");
+check(!hostSource.includes("ต้นฉบับไม่ใช่ภาพ raster"), "host still rejects Illustrator 30 wrapper groups");
+
+const flagApi = require(path.join(runtime, "trace-flags.cjs"));
+const logoFlags = flagApi.vtracerArguments({ pngPath: "in.png", svgPath: "out.svg", preset: "logo", maxColors: 8, simplify: 1.5 });
+check(logoFlags.indexOf("cutout") === -1, "logo flags still use cutout " + logoFlags.join(" "));
+check(logoFlags.indexOf("stacked") !== -1, "logo flags missing stacked");
+check(logoFlags[logoFlags.indexOf("--color-precision") + 1] === "4", "8 colours precision " + logoFlags.join(" "));
+check(logoFlags[logoFlags.indexOf("--filter-speckle") + 1] === "16", "logo speckle " + logoFlags.join(" "));
+check(logoFlags[logoFlags.length - 2] === "--optimize" && logoFlags[logoFlags.length - 1] === "1", "optimize flag moved");
+const photoFlags = flagApi.vtracerArguments({ pngPath: "in.png", svgPath: "out.svg", preset: "photo", maxColors: 24, simplify: 0 });
+check(photoFlags.indexOf("stacked") === -1, "photo flags use stacked");
+check(photoFlags[photoFlags.indexOf("--filter-speckle") + 1] === "8", "photo speckle");
+check(photoFlags[photoFlags.indexOf("--color-precision") + 1] === "6", "24 colours precision");
+check(flagApi.colorPrecision(4) === 3 && flagApi.colorPrecision(10) === 4 && flagApi.colorPrecision(20) === 5, "precision steps");
+
+function decodeOk(raw) {
+  const parts = String(raw).split("|");
+  if (parts[0] !== "OK") return null;
+  return parts.slice(1).map((part) => decodeURIComponent(part));
+}
+
+const wrapperSession = createSession(hostSource, tinyPng, "linked", true);
+wrapperSession.doc._wrapperOnly = true;
+const wrapped = decodeOk(wrapperSession.evalScript('(function () { var item = VP_image(app.activeDocument, "logo"); return VP_ok([item.typename, item.uuid]); })()'));
+check(wrapped && wrapped[0] === "PlacedItem" && wrapped[1] === "logo", "wrapper-group lookup " + JSON.stringify(wrapped) + " " + wrapperSession.lastResult);
+
+const rasterWrap = createSession(hostSource, tinyPng, "raster", true);
+rasterWrap.doc._wrapperOnly = true;
+const wrappedRaster = decodeOk(rasterWrap.evalScript('(function () { var item = VP_image(app.activeDocument, "raster"); return VP_ok([item.typename, item.uuid]); })()'));
+check(wrappedRaster && wrappedRaster[0] === "RasterItem" && wrappedRaster[1] === "raster", "embedded wrapper lookup " + JSON.stringify(wrappedRaster) + " " + rasterWrap.lastResult);
+
+const matrixSession = createSession(hostSource, tinyPng, "linked", true);
+const upright = decodeOk(matrixSession.evalScript("VP_snapshot()"));
+check(upright && upright[11] === "file", "unrotated linked acquire " + (upright ? upright[11] : matrixSession.lastResult));
+matrixSession.doc.selection[0].matrix = { mValueA: 1, mValueB: 0, mValueC: 0, mValueD: 1, mValueTX: 0, mValueTY: 0 };
+const positiveD = decodeOk(matrixSession.evalScript("VP_snapshot()"));
+check(positiveD && positiveD[11] === "capture", "positive D acquire " + (positiveD ? positiveD[11] : matrixSession.lastResult));
 
 const prep = require(path.join(runtime, "image-prep.cjs"));
 const resizeSource = path.join(runtime, "resize-source.png");
@@ -853,8 +1001,8 @@ for (const scenario of scenarios) {
   const row = { id: scenario.id, before: null, after: null, error: null };
   try {
     delete process.env.VECTOR_PANEL_NO_WORKER;
-    row.before = await runPanel(beforeBundle, beforeExtension, beforeHost, tinyPng, scenario);
-    row.after = await runPanel(afterBundle, extensionDir, hostSource, tinyPng, scenario);
+    row.before = await runPanel(beforeBundle, beforeExtension, beforeHost, tinyPng, { ...scenario, wrapRasterIds: false });
+    row.after = await runPanel(afterBundle, extensionDir, hostSource, tinyPng, { ...scenario, wrapRasterIds: true });
   } catch (error) {
     row.error = error instanceof Error ? error.stack || error.message : String(error);
     failures.push(scenario.id + " threw: " + row.error);
@@ -865,7 +1013,7 @@ for (const scenario of scenarios) {
 let inline = null;
 try {
   process.env.VECTOR_PANEL_NO_WORKER = "1";
-  inline = await runPanel(afterBundle, extensionDir, hostSource, tinyPng, { id: "linked-placed-inline", kind: "linked", trace: true, apply: true, expectSpawn: true });
+  inline = await runPanel(afterBundle, extensionDir, hostSource, tinyPng, { id: "linked-placed-inline", kind: "linked", trace: true, apply: true, expectSpawn: true, wrapRasterIds: true });
 } catch (error) {
   failures.push("inline threw: " + (error instanceof Error ? error.stack || error.message : String(error)));
 } finally {
@@ -874,8 +1022,8 @@ try {
 
 function expectFor(id, side) {
   const heavy = { copy: 1, paste: 1, addDoc: 1, capture: 1 };
-  const calmLinked = { copy: 0, paste: 0, addDoc: 0, capture: 0, spawn: true, noOverlap: true, worker: true };
-  const calmCapture = { copy: 0, paste: 0, addDoc: 0, capture: 1, parked: true, resolution: 144, spawn: true, noOverlap: true, worker: true };
+  const calmLinked = { copy: 0, paste: 0, addDoc: 0, capture: 0, spawn: true, noOverlap: true, worker: true, nativeImport: true };
+  const calmCapture = { copy: 0, paste: 0, addDoc: 0, parked: true, spawn: true, noOverlap: true, worker: true, nativeImport: true };
   if (side === "before") {
     if (id === "two-rasters") return { refreshIncludes: "เลือกภาพ raster", traceDisabled: true, copy: 0, capture: 0 };
     if (id === "plain-group" || id === "clip-group") return { refreshIncludes: "เลือกภาพ raster", traceDisabled: true, copy: 0, capture: 0 };
@@ -886,12 +1034,15 @@ function expectFor(id, side) {
   }
   if (id === "two-rasters") return { refreshIncludes: "มากกว่าหนึ่ง", traceDisabled: true, copy: 0, capture: 0 };
   if (id === "plain-group") return { ...calmLinked, refreshIncludes: "ภาพพร้อมแปลง", selectionIncludes: "logo.png", finalIncludes: "ใส่ผลแล้ว" };
-  if (id === "clip-group" || id === "linked-cropped" || id === "linked-rotated" || id === "embedded-raster") {
-    return { ...calmCapture, finalIncludes: "ใส่ผลแล้ว", selectionIncludes: id === "embedded-raster" ? "embedded" : "logo.png" };
+  if (id === "linked-cropped") {
+    return { ...calmCapture, capture: planShort.count, resolution: planShort.ppi, finalIncludes: "ใส่ผลแล้ว", selectionIncludes: "logo.png" };
+  }
+  if (id === "clip-group" || id === "linked-rotated" || id === "embedded-raster") {
+    return { ...calmCapture, capture: planTall.count, resolution: planTall.ppi, finalIncludes: "ใส่ผลแล้ว", selectionIncludes: id === "embedded-raster" ? "embedded" : "logo.png" };
   }
   if (id === "document-switch-trace") return { finalIncludes: "เอกสารปัจจุบันเปลี่ยนไป", selectionIncludes: "logo.png", copy: 0, paste: 0, addDoc: 0, capture: 0 };
-  if (id === "cancel-trace") return { ...calmLinked, worker: true, finalIncludes: "ยกเลิก", selectionIncludes: "logo.png" };
-  if (id === "document-switch-apply") return { ...calmLinked, finalIncludes: "เอกสารปัจจุบันเปลี่ยนไป", previewStays: true, layersStable: true };
+  if (id === "cancel-trace") return { ...calmLinked, nativeImport: false, worker: true, finalIncludes: "ยกเลิก", selectionIncludes: "logo.png" };
+  if (id === "document-switch-apply") return { ...calmLinked, nativeImport: false, finalIncludes: "เอกสารปัจจุบันเปลี่ยนไป", previewStays: true, layersStable: true };
   return { ...calmLinked, finalIncludes: "ใส่ผลแล้ว", selectionIncludes: "logo.png" };
 }
 
@@ -912,26 +1063,28 @@ if (inline) {
     spawn: true,
     noOverlap: true,
     inline: true,
+    nativeImport: true,
     finalIncludes: "ใส่ผลแล้ว"
   });
 }
 
-const importSessionA = createSession(hostSource, tinyPng, "linked");
+const importSessionA = createSession(hostSource, tinyPng, "linked", true);
 const importLogA = importSessionA.log;
 importLogA.splice(0, importLogA.length);
 const embedResult = importSessionA.evalScript('VP_commit("logo","' + encodeURIComponent(svgFixture) + '","0123456789abcdef","preset%3Dlogo","10,90,90,50","' + encodeURIComponent("file:" + importSessionA.doc.fullName.fsName) + '")');
-const importSessionB = createSession(hostSource, tinyPng, "linked");
+const importSessionB = createSession(hostSource, tinyPng, "linked", true);
 const importLogB = importSessionB.log;
 importLogB.splice(0, importLogB.length);
 const parseStarted = process.hrtime.bigint();
 const parsedPaths = (fs.readFileSync(svgFixture, "utf8").match(/<path\b/g) || []).length;
 const parseNs = Number(process.hrtime.bigint() - parseStarted);
 const pathsResult = importSessionB.evalScript('VP_commitPaths("logo","' + encodeURIComponent(pathList) + '","0123456789abcdef","batched","10,90,90,50","' + encodeURIComponent("file:" + importSessionB.doc.fullName.fsName) + '")');
-check(embedResult.startsWith("OK"), "place+embed returned " + embedResult);
+check(embedResult.startsWith("OK"), "createFromFile returned " + embedResult);
 check(pathsResult.startsWith("OK"), "batched paths returned " + pathsResult);
-check(count(importLogA, "PlacedItem.embed") === 1, "embed count " + count(importLogA, "PlacedItem.embed"));
-check(count(importLogA, "PathItem.add") === 0, "embed created paths through PathItem.add");
-check(count(importLogA, "evalScript:VP_commit") === 1, "embed was not one evalScript");
+check(count(importLogA, "GroupItem.createFromFile") === 1, "createFromFile count " + count(importLogA, "GroupItem.createFromFile"));
+check(count(importLogA, "PlacedItem.embed") === 0, "native import called embed");
+check(count(importLogA, "PathItem.add") === 0, "native import created paths through PathItem.add");
+check(count(importLogA, "evalScript:VP_commit") === 1, "native import was not one evalScript");
 check(count(importLogB, "PathItem.add") === FIXTURE_PATHS, "batched PathItem.add " + count(importLogB, "PathItem.add"));
 check(count(importLogB, "PlacedItem.embed") === 0, "batched path import called embed");
 check(count(importLogB, "evalScript:VP_commitPaths") === 1, "batched import was not one evalScript");
@@ -1011,7 +1164,7 @@ sections.push("## import comparison (" + FIXTURE_PATHS + " SVG paths)");
 sections.push("");
 sections.push("Node SVG parse (not a main-thread call): " + (parseNs / 1e6).toFixed(3) + " ms.");
 sections.push("");
-    sections.push(markdownTable(importComparison.placeEmbed, importComparison.batchedPaths, "Place+embed", "Batched paths"));
+    sections.push(markdownTable(importComparison.placeEmbed, importComparison.batchedPaths, "createFromFile", "Batched paths"));
 sections.push("");
 sections.push("## resize check");
 sections.push("");

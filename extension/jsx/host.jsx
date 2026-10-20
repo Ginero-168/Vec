@@ -29,12 +29,35 @@ function VP_error(error) {
   return "ERR|" + VP_field(VP_message(error));
 }
 
+function VP_isRaster(item) {
+  return item && (item.typename === "PlacedItem" || item.typename === "RasterItem");
+}
+
+// Illustrator 30 getPageItemFromUuid() returns the wrapper group of a placed or embedded
+// image, not the PlacedItem/RasterItem whose uuid was stored. Scan the document collections,
+// then the wrapper's children.
 function VP_image(documentRef, uuid) {
+  var wanted = String(uuid);
   var item = null;
-  try { item = documentRef.getPageItemFromUuid(uuid); } catch (ignored) {}
-  if (!item) throw new Error("ไม่พบภาพต้นฉบับในเอกสารปัจจุบัน");
-  if (item.typename !== "PlacedItem" && item.typename !== "RasterItem") throw new Error("ต้นฉบับไม่ใช่ภาพ raster");
-  return item;
+  try { item = documentRef.getPageItemFromUuid(wanted); } catch (ignored) {}
+  if (VP_isRaster(item) && String(item.uuid) === wanted) return item;
+  var lists = [];
+  try { lists.push(documentRef.placedItems); } catch (ignoredPlaced) {}
+  try { lists.push(documentRef.rasterItems); } catch (ignoredRaster) {}
+  var l;
+  for (l = 0; l < lists.length; l++) {
+    var list = lists[l];
+    if (!list) continue;
+    var i;
+    for (i = 0; i < list.length; i++) {
+      if (list[i] && String(list[i].uuid) === wanted) return list[i];
+    }
+  }
+  if (item && item.typename === "GroupItem") {
+    var inner = VP_rastersIn(item);
+    if (inner.length === 1 && String(inner[0].uuid) === wanted) return inner[0];
+  }
+  throw new Error("ไม่พบภาพต้นฉบับในเอกสารปัจจุบัน");
 }
 
 function VP_collect(collection, into) {
@@ -87,10 +110,11 @@ function VP_isSimpleScale(item) {
   var matrix = null;
   try { matrix = item.matrix; } catch (ignored) { return false; }
   if (!matrix) return false;
-  if (Math.abs(Number(matrix.mValueB)) > 0.001) return false;
-  if (Math.abs(Number(matrix.mValueC)) > 0.001) return false;
+  // An unrotated, unflipped placement is [A>0, 0, 0, D<0]. Illustrator's y axis points up.
+  if (Math.abs(Number(matrix.mValueB)) > 0.000001) return false;
+  if (Math.abs(Number(matrix.mValueC)) > 0.000001) return false;
   if (!(Number(matrix.mValueA) > 0)) return false;
-  if (!(Number(matrix.mValueD) > 0)) return false;
+  if (!(Number(matrix.mValueD) < 0)) return false;
   return true;
 }
 
@@ -165,30 +189,26 @@ function VP_documentIdentity(documentRef) {
   return "unsaved:" + documentRef.name;
 }
 
-function VP_resolution(widthPt, heightPt) {
-  var ppi = VP_TARGET_PPI;
-  var widthPx = widthPt * ppi / 72;
-  var heightPx = heightPt * ppi / 72;
-  if (widthPx < 1) widthPx = 1;
-  if (heightPx < 1) heightPx = 1;
-  var pixels = widthPx * heightPx;
-  if (pixels > VP_MAX_PIXELS) ppi = ppi * Math.sqrt(VP_MAX_PIXELS / pixels);
-  var rounded = Math.round(ppi);
-  if (rounded < 1) rounded = 1;
-  if (!VP_limitsActive()) return VP_TARGET_PPI;
-  return rounded;
+var VP_STRIP_ROWS = 48;
+var VP_MIN_PPI = 36;
+var VP_MAX_PPI = 300;
+var VP_CAPTURE_LAYER = "Vector Panel capture (temporary)";
+
+function VP_capturePpi(widthPt, heightPt) {
+  var area = widthPt * heightPt;
+  if (!(area > 0)) return VP_MIN_PPI;
+  var fitted = 72 * Math.sqrt(VP_MAX_PIXELS / area);
+  if (fitted < VP_MIN_PPI) fitted = VP_MIN_PPI;
+  if (fitted > VP_MAX_PPI) fitted = VP_MAX_PPI;
+  return Math.floor(fitted);
 }
 
-function VP_parkPoint(doc, width, height) {
-  var right = 0;
-  var top = 0;
-  var boards = doc.artboards;
-  for (var i = 0; i < boards.length; i++) {
-    var rect = boards[i].artboardRect;
-    if (Number(rect[2]) > right) right = Number(rect[2]);
-    if (Number(rect[1]) > top) top = Number(rect[1]);
+function VP_captureLayer(doc) {
+  var i;
+  for (i = 0; i < doc.layers.length; i++) {
+    if (doc.layers[i].name === VP_CAPTURE_LAYER) return doc.layers[i];
   }
-  return [right + width + 72, top + height + 72];
+  return null;
 }
 
 function VP_rasterizeTarget(item) {
@@ -231,21 +251,18 @@ function VP_snapshot() {
   }
 }
 
-function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity, encodedMode) {
-  var temporaryLayer = null;
-  var previousInteraction = null;
-  var interactionChanged = false;
+// Linked file: OK|file|path|bytes, with no pixel work. Anything else: park a duplicate and
+// return OK|strips|count|ppi. Each following VP_captureStrip is one short imageCapture.
+function VP_captureBegin(encodedUuid, encodedDocumentIdentity, encodedMode) {
+  var previousLevel = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
-    var outputPath = decodeURIComponent(encodedPath);
     var documentIdentity = decodeURIComponent(encodedDocumentIdentity);
     var requested = encodedMode ? decodeURIComponent(encodedMode) : "";
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
-    var sourceDocument = app.activeDocument;
-    if (VP_documentIdentity(sourceDocument) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
-    var resolved = VP_selectionSource(sourceDocument);
-    if (resolved.source.uuid !== uuid) throw new Error("ภาพที่เลือกเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
-    var source = resolved.source;
+    var doc = app.activeDocument;
+    if (VP_documentIdentity(doc) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
+    var source = VP_image(doc, uuid);
     if (requested !== "capture") {
       var linked = VP_linkedRasterPath(source);
       if (linked) {
@@ -257,50 +274,115 @@ function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity, encodedMo
     var width = Number(bounds[2]) - Number(bounds[0]);
     var height = Number(bounds[1]) - Number(bounds[3]);
     if (!(width > 0) || !(height > 0)) throw new Error("ขนาดภาพไม่ถูกต้อง");
+    var ppi = VP_capturePpi(width, height);
     try {
-      previousInteraction = app.userInteractionLevel;
+      previousLevel = app.userInteractionLevel;
       app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
-      interactionChanged = true;
     } catch (ignoredLevel) {}
+    var stale = VP_captureLayer(doc);
+    if (stale) {
+      try { stale.locked = false; } catch (ignoredUnlock) {}
+      stale.remove();
+    }
     var previousLayer = null;
-    try { previousLayer = sourceDocument.activeLayer; } catch (ignoredActive) {}
-    temporaryLayer = sourceDocument.layers.add();
-    temporaryLayer.name = "Vector Panel Export";
+    try { previousLayer = doc.activeLayer; } catch (ignoredActive) {}
+    var layer = doc.layers.add();
+    layer.name = VP_CAPTURE_LAYER;
     var target = VP_rasterizeTarget(source);
-    var duplicate = target.duplicate(temporaryLayer, ElementPlacement.PLACEATBEGINNING);
-    var duplicateBounds = duplicate.geometricBounds;
-    var duplicateWidth = Number(duplicateBounds[2]) - Number(duplicateBounds[0]);
-    var duplicateHeight = Number(duplicateBounds[1]) - Number(duplicateBounds[3]);
-    var park = VP_parkPoint(sourceDocument, duplicateWidth, duplicateHeight);
-    duplicate.translate(park[0] - Number(duplicateBounds[0]), park[1] - Number(duplicateBounds[1]));
-    var options = new ImageCaptureOptions();
-    options.antiAliasing = true;
-    options.transparency = true;
-    options.matte = false;
-    options.resolution = VP_resolution(duplicateWidth, duplicateHeight);
-    sourceDocument.imageCapture(new File(outputPath), duplicate.visibleBounds, options);
-    var imageFile = new File(outputPath);
-    if (!imageFile.exists || imageFile.length === 0) throw new Error("Illustrator ไม่ได้สร้างไฟล์ภาพชั่วคราว");
-    try { if (previousLayer) sourceDocument.activeLayer = previousLayer; } catch (ignoredRestore) {}
-    return VP_ok(["capture", imageFile.fsName, imageFile.length]);
+    var copy = target.duplicate(layer, ElementPlacement.PLACEATBEGINNING);
+    var copyBounds = copy.geometricBounds;
+    var right = 0;
+    var top = 0;
+    var boards = doc.artboards;
+    var a;
+    for (a = 0; a < boards.length; a++) {
+      var rect = boards[a].artboardRect;
+      if (Number(rect[2]) > right) right = Number(rect[2]);
+      if (Number(rect[1]) > top) top = Number(rect[1]);
+    }
+    copy.translate(right + 72 - Number(copyBounds[0]), top - Number(copyBounds[1]));
+    try { layer.locked = true; } catch (ignoredLock) {}
+    try { if (previousLayer) doc.activeLayer = previousLayer; } catch (ignoredRestore) {}
+    var area = copy.visibleBounds;
+    var stripPoints = VP_STRIP_ROWS * 72 / ppi;
+    var count = Math.ceil((Number(area[1]) - Number(area[3])) / stripPoints - 1e-6);
+    if (count < 1) count = 1;
+    $.global.VP_captureState = {
+      identity: documentIdentity,
+      area: [Number(area[0]), Number(area[1]), Number(area[2]), Number(area[3])],
+      ppi: ppi,
+      stripPoints: stripPoints,
+      count: count
+    };
+    return VP_ok(["strips", count, ppi]);
   } catch (error) {
+    try { VP_captureEnd(); } catch (ignoredEnd) {}
     return VP_error(error);
   } finally {
-    if (temporaryLayer !== null) {
-      try { temporaryLayer.remove(); } catch (ignoredRemove) {}
-    }
-    if (interactionChanged) {
-      try { app.userInteractionLevel = previousInteraction; } catch (ignoredLevelRestore) {}
+    if (previousLevel !== null) {
+      try { app.userInteractionLevel = previousLevel; } catch (ignoredLevelRestore) {}
     }
   }
 }
 
-function VP_countPaths(container) {
-  try { return container.pathItems.length; } catch (ignored) { return 0; }
+function VP_captureStrip(encodedIndex, encodedPath) {
+  try {
+    var state = $.global.VP_captureState;
+    if (!state) throw new Error("การอ่านภาพถูกยกเลิก กรุณาแปลงใหม่");
+    if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
+    var doc = app.activeDocument;
+    if (VP_documentIdentity(doc) !== state.identity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณาแปลงใหม่");
+    if (!VP_captureLayer(doc)) throw new Error("ภาพชั่วคราวถูกลบระหว่างอ่าน กรุณาแปลงใหม่");
+    var index = Number(decodeURIComponent(encodedIndex));
+    var outputPath = decodeURIComponent(encodedPath);
+    var stripTop = state.area[1] - index * state.stripPoints;
+    var stripBottom = stripTop - state.stripPoints;
+    if (stripBottom < state.area[3]) stripBottom = state.area[3];
+    var options = new ImageCaptureOptions();
+    options.antiAliasing = true;
+    options.transparency = true;
+    options.matte = false;
+    options.resolution = state.ppi;
+    doc.imageCapture(new File(outputPath), [state.area[0], stripTop, state.area[2], stripBottom], options);
+    var file = new File(outputPath);
+    if (!file.exists || file.length === 0) throw new Error("Illustrator ไม่ได้สร้างไฟล์ภาพชั่วคราว");
+    return VP_ok([file.length]);
+  } catch (error) {
+    return VP_error(error);
+  }
 }
 
+function VP_captureEnd() {
+  try {
+    $.global.VP_captureState = null;
+    var d;
+    for (d = 0; d < app.documents.length; d++) {
+      var layer = VP_captureLayer(app.documents[d]);
+      if (layer) {
+        try { layer.locked = false; } catch (ignoredUnlock) {}
+        layer.remove();
+      }
+    }
+    return VP_ok(["done"]);
+  } catch (error) {
+    return VP_error(error);
+  }
+}
+
+function VP_canvasFrame(group) {
+  var i;
+  for (i = group.pageItems.length - 1; i >= 0; i--) {
+    var it = group.pageItems[i];
+    if (it && it.name === "vp-canvas") return it;
+  }
+  return null;
+}
+
+// Native paths via GroupItems.createFromFile. Placing an SVG (PlacedItem.file) makes
+// Illustrator 30 show a modal "cannot be placed" alert that blocks until OK.
 function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, encodedBounds, encodedDocumentIdentity) {
   var createdLayer = null;
+  var previousLevel = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
     var svgPath = decodeURIComponent(encodedSvgPath);
@@ -317,20 +399,30 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     if (!VP_boundsMatch(bounds, boundsText)) throw new Error("ภาพต้นฉบับถูกย้ายหรือปรับขนาด กรุณาแปลงใหม่");
     var svgFile = new File(svgPath);
     if (!svgFile.exists || svgFile.length === 0) throw new Error("ไม่พบไฟล์เวกเตอร์จาก worker");
-    var width = Number(bounds[2]) - Number(bounds[0]);
-    var height = Number(bounds[1]) - Number(bounds[3]);
+    try {
+      previousLevel = app.userInteractionLevel;
+      app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+    } catch (ignoredLevel) {}
     createdLayer = doc.layers.add();
     createdLayer.name = "Vector Panel " + jobId;
-    var holder = createdLayer.groupItems.add();
+    var holder = createdLayer.groupItems.createFromFile(svgFile);
     holder.name = "Trace " + jobId;
-    var placed = holder.placedItems.add();
-    placed.file = svgFile;
-    placed.width = width;
-    placed.height = height;
-    placed.position = [Number(bounds[0]), Number(bounds[1])];
-    placed.embed();
-    var addedPaths = VP_countPaths(holder);
+    var frame = VP_canvasFrame(holder);
+    var compounds = 0;
+    try { compounds = holder.compoundPathItems.length; } catch (ignoredCompounds) {}
+    var addedPaths = holder.pathItems.length + compounds - (frame ? 1 : 0);
     if (!(addedPaths > 0)) throw new Error("Illustrator ไม่ได้แปลง SVG เป็น path ที่แก้ได้");
+    var fitted = frame || holder;
+    var fittedBounds = fitted.geometricBounds;
+    var fittedWidth = Number(fittedBounds[2]) - Number(fittedBounds[0]);
+    var fittedHeight = Number(fittedBounds[1]) - Number(fittedBounds[3]);
+    if (!(fittedWidth > 0) || !(fittedHeight > 0)) throw new Error("ขนาดผลเวกเตอร์ไม่ถูกต้อง");
+    var sx = (Number(bounds[2]) - Number(bounds[0])) / fittedWidth;
+    var sy = (Number(bounds[1]) - Number(bounds[3])) / fittedHeight;
+    holder.resize(sx * 100, sy * 100, true, true, true, true, sx * 100, Transformation.TOPLEFT);
+    fittedBounds = fitted.geometricBounds;
+    holder.translate(Number(bounds[0]) - Number(fittedBounds[0]), Number(bounds[1]) - Number(fittedBounds[1]));
+    if (frame) frame.remove();
     holder.note = "VectorPanel/1|source=" + uuid + "|job=" + jobId + "|settings=" + encodeURIComponent(settings);
     source.selected = false;
     holder.selected = true;
@@ -340,5 +432,9 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
       try { createdLayer.remove(); } catch (ignored) {}
     }
     return VP_error(error);
+  } finally {
+    if (previousLevel !== null) {
+      try { app.userInteractionLevel = previousLevel; } catch (ignoredLevelRestore) {}
+    }
   }
 }

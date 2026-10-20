@@ -7,6 +7,7 @@ import { aspectMismatch, ImagePrepError, readRasterSize } from "./image-prep";
 import { MAX_DECODE_PIXELS, MAX_TRACE_PIXELS } from "./limits";
 import { TraceRunner } from "./trace-client";
 import type { TraceRequest, TraceStage } from "./trace-job";
+import { vtracerArguments } from "./trace-flags";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -189,16 +190,23 @@ function parseSelection(parts: string[]): Selection {
   };
 }
 
-function parseCapture(parts: string[]): { mode: "file" | "capture"; filePath: string; bytes: number } {
-  const mode = parts[0];
-  const filePath = parts[1] ?? "";
-  if ((mode !== "file" && mode !== "capture") || filePath === "") throw new Error("ข้อมูลภาพจาก Illustrator ไม่ครบ");
-  const bytes = Number(parts[2] ?? "0");
-  if (!Number.isFinite(bytes) || bytes <= 0) throw new Error("ไฟล์ภาพว่าง");
-  return { mode, filePath, bytes };
+type BeginResult =
+  | { readonly mode: "file"; readonly filePath: string }
+  | { readonly mode: "strips"; readonly count: number; readonly ppi: number };
+
+function parseBegin(parts: string[]): BeginResult {
+  if (parts[0] === "file") {
+    const filePath = parts[1] ?? "";
+    if (filePath === "") throw new Error("ข้อมูลภาพจาก Illustrator ไม่ครบ");
+    return { mode: "file", filePath };
+  }
+  if (parts[0] === "strips") {
+    return { mode: "strips", count: parsePositiveNumber(parts[1], "strips"), ppi: parsePositiveNumber(parts[2], "ppi") };
+  }
+  throw new Error("ข้อมูลภาพจาก Illustrator ไม่ครบ");
 }
 
-function callHost(host: CepBridge, method: "VP_snapshot" | "VP_capture" | "VP_commit", args: readonly string[] = []): Promise<string[]> {
+function callHost(host: CepBridge, method: "VP_snapshot" | "VP_captureBegin" | "VP_captureStrip" | "VP_captureEnd" | "VP_commit", args: readonly string[] = []): Promise<string[]> {
   const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
   const script = method + "(" + encoded + ")";
   return new Promise((resolve, reject) => {
@@ -259,20 +267,6 @@ async function cleanStaleJobs(): Promise<void> {
   } catch (_) {
     // Temp cleanup is best effort and must not stop the panel from opening.
   }
-}
-
-function vtracerArguments(job: Job): string[] {
-  const args = [job.pngPath, job.svgPath];
-  const preset = job.settings.preset;
-  if (preset === "photo") {
-    args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
-  } else {
-    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
-    if (preset === "icon") args.push("--mode", "polygon");
-  }
-  if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
-  args.push("--optimize", "1");
-  return args;
 }
 
 function vtracerBinary(extensionPath: string): string {
@@ -451,11 +445,57 @@ function start(): void {
     render();
   }
 
-  async function capturePixels(selection: Selection, job: Job, mode: "" | "capture"): Promise<{ mode: "file" | "capture"; filePath: string }> {
+  async function endCapture(): Promise<void> {
+    if (host === null) return;
+    try {
+      await callHost(host, "VP_captureEnd");
+    } catch (_) {
+      // A failed begin already removes the temporary layer.
+    }
+  }
+
+  async function readStrips(job: Job, count: number): Promise<readonly string[]> {
     if (host === null) throw new Error("เปิด Panel นี้จาก Adobe Illustrator เท่านั้น");
-    const captured = parseCapture(await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity, mode]));
-    if (job.cancelled) throw new Error("ยกเลิกแล้ว");
-    return captured;
+    const strips: string[] = [];
+    try {
+      for (let index = 0; index < count; index += 1) {
+        if (job.cancelled) throw new Error("ยกเลิกแล้ว");
+        message("กำลังอ่านภาพ " + String(index + 1) + "/" + String(count) + "…");
+        render();
+        const stripPath = path.join(job.directory, "strip-" + String(index) + ".png");
+        const written = await callHost(host, "VP_captureStrip", [String(index), stripPath]);
+        const bytes = Number(written[0] ?? "0");
+        if (!Number.isFinite(bytes) || bytes <= 0) throw new Error("ไฟล์ภาพว่าง");
+        strips.push(stripPath);
+      }
+      return strips;
+    } finally {
+      await endCapture();
+    }
+  }
+
+  async function beginRead(selection: Selection, mode: "" | "capture"): Promise<BeginResult> {
+    if (host === null) throw new Error("เปิด Panel นี้จาก Adobe Illustrator เท่านั้น");
+    return parseBegin(await callHost(host, "VP_captureBegin", [selection.uuid, selection.documentIdentity, mode]));
+  }
+
+  function traceRequest(job: Job, sourcePath: string, stripPaths: readonly string[]): TraceRequest {
+    return {
+      binary: vtracerBinary(extensionPath),
+      sourcePath,
+      pngPath: job.pngPath,
+      svgPath: job.svgPath,
+      flags: vtracerArguments({
+        pngPath: job.pngPath,
+        svgPath: job.svgPath,
+        preset: job.settings.preset,
+        maxColors: job.settings.maxColors,
+        simplify: job.settings.simplify
+      }).slice(2),
+      maxPixels: MAX_TRACE_PIXELS,
+      maxDecodePixels: MAX_DECODE_PIXELS,
+      stripPaths
+    };
   }
 
   async function trace(): Promise<void> {
@@ -470,27 +510,27 @@ function start(): void {
       state = { kind: "capturing", selection, job };
       message("กำลังอ่านภาพจาก Illustrator…");
       render();
-      let captured = await capturePixels(selection, job, "");
-      if (captured.mode === "file") {
-        const reason = await linkedFileDecision(captured.filePath, selection);
+      let begun = await beginRead(selection, "");
+      let stripPaths: readonly string[] = [];
+      let sourcePath = "";
+      if (begun.mode === "file") {
+        const reason = await linkedFileDecision(begun.filePath, selection);
         if (reason !== null) {
           if (job.cancelled) throw new Error("ยกเลิกแล้ว");
           message(reason);
           render();
-          captured = await capturePixels(selection, job, "capture");
+          begun = await beginRead(selection, "capture");
+        } else {
+          sourcePath = begun.filePath;
         }
       }
-      const binary = vtracerBinary(extensionPath);
-      if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
-      const request: TraceRequest = {
-        binary,
-        sourcePath: captured.filePath,
-        pngPath: job.pngPath,
-        svgPath: job.svgPath,
-        flags: vtracerArguments(job).slice(2),
-        maxPixels: MAX_TRACE_PIXELS,
-        maxDecodePixels: MAX_DECODE_PIXELS
-      };
+      if (begun.mode === "strips") {
+        stripPaths = await readStrips(job, begun.count);
+        sourcePath = job.pngPath;
+      }
+      if (job.cancelled) throw new Error("ยกเลิกแล้ว");
+      if (!fs.existsSync(traceRequest(job, sourcePath, stripPaths).binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
+      const request = traceRequest(job, sourcePath, stripPaths);
       state = { kind: "tracing", selection, job, stage: "prepare" };
       message("กำลังเตรียมภาพ…");
       render();
@@ -503,15 +543,17 @@ function start(): void {
           render();
         });
       } catch (error) {
-        if (captured.mode === "file" && error instanceof ImagePrepError && job !== null && !job.cancelled) {
+        if (stripPaths.length === 0 && error instanceof ImagePrepError && job !== null && !job.cancelled) {
           message("ถอดรหัสไฟล์ลิงก์ไม่สำเร็จ กำลังส่งออกจากเอกสาร…");
           state = { kind: "capturing", selection, job };
           render();
-          captured = await capturePixels(selection, job, "capture");
+          const forced = await beginRead(selection, "capture");
+          if (forced.mode !== "strips") throw new Error("ข้อมูลภาพจาก Illustrator ไม่ครบ");
+          stripPaths = await readStrips(job, forced.count);
           state = { kind: "tracing", selection, job, stage: "prepare" };
           message("กำลังเตรียมภาพ…");
           render();
-          result = await runner.run({ ...request, sourcePath: captured.filePath }, (stage) => {
+          result = await runner.run({ ...request, sourcePath: job.pngPath, stripPaths }, (stage) => {
             if (state.kind !== "tracing" || state.job !== job) return;
             state = { kind: "tracing", selection, job, stage };
             message(stage === "trace" ? "กำลังสร้างเส้นเวกเตอร์…" : stage === "svg" ? "กำลังอ่านผลลัพธ์…" : "กำลังเตรียมภาพ…");

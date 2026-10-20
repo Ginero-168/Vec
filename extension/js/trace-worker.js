@@ -4420,6 +4420,31 @@ function jpegSize(buffer) {
   }
   return null;
 }
+async function stitchStripPngs(stripPaths, destPath) {
+  if (stripPaths.length === 0) throw new ImagePrepError("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
+  const strips = [];
+  for (const stripPath of stripPaths) {
+    strips.push(decodeRaster(await fs.promises.readFile(stripPath)));
+  }
+  const first = strips[0];
+  if (!first) throw new ImagePrepError("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
+  const width = first.width;
+  const height = strips.reduce((sum, strip) => sum + strip.height, 0);
+  const data = new Uint8Array(width * height * 4);
+  let row = 0;
+  for (const strip of strips) {
+    const copyWidth = Math.min(width, strip.width);
+    for (let y = 0; y < strip.height; y += 1) {
+      const sourceStart = y * strip.width * 4;
+      data.set(strip.data.subarray(sourceStart, sourceStart + copyWidth * 4), (row + y) * width * 4);
+    }
+    row += strip.height;
+  }
+  const png = new import_pngjs.PNG({ width, height });
+  Buffer.from(data).copy(png.data);
+  await fs.promises.writeFile(destPath, import_pngjs.PNG.sync.write(png));
+  return { width, height, resized: false };
+}
 function isStartOfFrame(marker) {
   if (marker >= 192 && marker <= 195) return true;
   if (marker >= 197 && marker <= 199) return true;
@@ -4439,13 +4464,43 @@ function summarizeSvg(svg) {
   if (pathCount <= 0) throw new Error("VTracer \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E43\u0E19 SVG");
   return { pathCount };
 }
+function insertCanvasFrame(svg) {
+  if (svg.indexOf('id="vp-canvas"') !== -1) return svg;
+  const svgTag = /<svg\b[^>]*>/i.exec(svg);
+  if (!svgTag) throw new Error("\u0E1C\u0E25\u0E08\u0E32\u0E01 VTracer \u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48 SVG");
+  const tag = svgTag[0];
+  const size = canvasSize(tag);
+  if (size === null) throw new Error("SVG \u0E44\u0E21\u0E48\u0E21\u0E35\u0E02\u0E19\u0E32\u0E14 canvas");
+  const frame = '<rect id="vp-canvas" x="0" y="0" width="' + size.width + '" height="' + size.height + '" fill="none" stroke="none"/>';
+  const at = svgTag.index + tag.length;
+  return svg.slice(0, at) + frame + svg.slice(at);
+}
+function canvasSize(tag) {
+  var _a, _b;
+  const width = (_a = /\swidth="([\d.]+)"/.exec(tag)) == null ? void 0 : _a[1];
+  const height = (_b = /\sheight="([\d.]+)"/.exec(tag)) == null ? void 0 : _b[1];
+  if (width && height) return { width, height };
+  const box = /\sviewBox="\s*[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)\s*"/.exec(tag);
+  const boxWidth = box == null ? void 0 : box[1];
+  const boxHeight = box == null ? void 0 : box[2];
+  if (!boxWidth || !boxHeight) return null;
+  return { width: boxWidth, height: boxHeight };
+}
 
 // src/trace-job.ts
 async function runTraceJob(request, hooks) {
   if (hooks.isCancelled()) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
   hooks.onProgress("prepare");
   writeThreadMarker(hooks.thread);
-  const prepared = await prepareTracePng(request.sourcePath, request.pngPath, request.maxPixels, request.maxDecodePixels);
+  if (request.stripPaths.length > 0) {
+    await stitchStripPngs(request.stripPaths, request.pngPath);
+  }
+  const prepared = await prepareTracePng(
+    request.stripPaths.length > 0 ? request.pngPath : request.sourcePath,
+    request.pngPath,
+    request.maxPixels,
+    request.maxDecodePixels
+  );
   if (hooks.isCancelled()) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
   const stat = await fs2.promises.stat(request.pngPath);
   if (!stat.isFile() || stat.size <= 0) throw new Error("\u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E44\u0E1F\u0E25\u0E4C PNG \u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
@@ -4453,7 +4508,8 @@ async function runTraceJob(request, hooks) {
   await spawnVtracer(request, hooks);
   if (hooks.isCancelled()) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
   hooks.onProgress("svg");
-  const svg = await fs2.promises.readFile(request.svgPath, "utf8");
+  const svg = insertCanvasFrame(await fs2.promises.readFile(request.svgPath, "utf8"));
+  await fs2.promises.writeFile(request.svgPath, svg, "utf8");
   const summary = summarizeSvg(svg);
   return { width: prepared.width, height: prepared.height, resized: prepared.resized, pathCount: summary.pathCount };
 }

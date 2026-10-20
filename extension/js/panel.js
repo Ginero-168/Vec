@@ -4438,6 +4438,31 @@
     }
     return null;
   }
+  async function stitchStripPngs(stripPaths, destPath) {
+    if (stripPaths.length === 0) throw new ImagePrepError("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
+    const strips = [];
+    for (const stripPath of stripPaths) {
+      strips.push(decodeRaster(await fs.promises.readFile(stripPath)));
+    }
+    const first = strips[0];
+    if (!first) throw new ImagePrepError("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator");
+    const width = first.width;
+    const height = strips.reduce((sum, strip) => sum + strip.height, 0);
+    const data = new Uint8Array(width * height * 4);
+    let row = 0;
+    for (const strip of strips) {
+      const copyWidth = Math.min(width, strip.width);
+      for (let y = 0; y < strip.height; y += 1) {
+        const sourceStart = y * strip.width * 4;
+        data.set(strip.data.subarray(sourceStart, sourceStart + copyWidth * 4), (row + y) * width * 4);
+      }
+      row += strip.height;
+    }
+    const png = new import_pngjs.PNG({ width, height });
+    Buffer.from(data).copy(png.data);
+    await fs.promises.writeFile(destPath, import_pngjs.PNG.sync.write(png));
+    return { width, height, resized: false };
+  }
   function isStartOfFrame(marker) {
     if (marker >= 192 && marker <= 195) return true;
     if (marker >= 197 && marker <= 199) return true;
@@ -4461,13 +4486,42 @@
     if (pathCount <= 0) throw new Error("VTracer \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E43\u0E19 SVG");
     return { pathCount };
   }
+  function insertCanvasFrame(svg) {
+    if (svg.indexOf('id="vp-canvas"') !== -1) return svg;
+    const svgTag = /<svg\b[^>]*>/i.exec(svg);
+    if (!svgTag) throw new Error("\u0E1C\u0E25\u0E08\u0E32\u0E01 VTracer \u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48 SVG");
+    const tag = svgTag[0];
+    const size = canvasSize(tag);
+    if (size === null) throw new Error("SVG \u0E44\u0E21\u0E48\u0E21\u0E35\u0E02\u0E19\u0E32\u0E14 canvas");
+    const frame = '<rect id="vp-canvas" x="0" y="0" width="' + size.width + '" height="' + size.height + '" fill="none" stroke="none"/>';
+    const at = svgTag.index + tag.length;
+    return svg.slice(0, at) + frame + svg.slice(at);
+  }
+  function canvasSize(tag) {
+    const width = /\swidth="([\d.]+)"/.exec(tag)?.[1];
+    const height = /\sheight="([\d.]+)"/.exec(tag)?.[1];
+    if (width && height) return { width, height };
+    const box = /\sviewBox="\s*[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)\s*"/.exec(tag);
+    const boxWidth = box?.[1];
+    const boxHeight = box?.[2];
+    if (!boxWidth || !boxHeight) return null;
+    return { width: boxWidth, height: boxHeight };
+  }
 
   // src/trace-job.ts
   async function runTraceJob(request, hooks) {
     if (hooks.isCancelled()) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
     hooks.onProgress("prepare");
     writeThreadMarker(hooks.thread);
-    const prepared = await prepareTracePng(request.sourcePath, request.pngPath, request.maxPixels, request.maxDecodePixels);
+    if (request.stripPaths.length > 0) {
+      await stitchStripPngs(request.stripPaths, request.pngPath);
+    }
+    const prepared = await prepareTracePng(
+      request.stripPaths.length > 0 ? request.pngPath : request.sourcePath,
+      request.pngPath,
+      request.maxPixels,
+      request.maxDecodePixels
+    );
     if (hooks.isCancelled()) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
     const stat = await fs2.promises.stat(request.pngPath);
     if (!stat.isFile() || stat.size <= 0) throw new Error("\u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E44\u0E1F\u0E25\u0E4C PNG \u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
@@ -4475,7 +4529,8 @@
     await spawnVtracer(request, hooks);
     if (hooks.isCancelled()) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
     hooks.onProgress("svg");
-    const svg = await fs2.promises.readFile(request.svgPath, "utf8");
+    const svg = insertCanvasFrame(await fs2.promises.readFile(request.svgPath, "utf8"));
+    await fs2.promises.writeFile(request.svgPath, svg, "utf8");
     const summary = summarizeSvg(svg);
     return { width: prepared.width, height: prepared.height, resized: prepared.resized, pathCount: summary.pathCount };
   }
@@ -4614,6 +4669,28 @@
     return error.message === "\u0E44\u0E21\u0E48\u0E1E\u0E1A trace worker" || error.message === "worker_threads \u0E44\u0E21\u0E48\u0E1E\u0E23\u0E49\u0E2D\u0E21" || error.message.indexOf("Cannot find module") !== -1;
   }
 
+  // src/trace-flags.ts
+  function colorPrecision(maxColors) {
+    if (maxColors <= 4) return 3;
+    if (maxColors <= 10) return 4;
+    if (maxColors <= 20) return 5;
+    return 6;
+  }
+  function vtracerArguments(input) {
+    const args = [input.pngPath, input.svgPath];
+    if (input.preset === "photo") {
+      args.push("--preset", "photo", "--max-colors", String(input.maxColors));
+    } else {
+      args.push("--preset", "poster", "--hierarchical", "stacked", "--max-colors", String(input.maxColors));
+      if (input.preset === "icon") args.push("--mode", "polygon");
+    }
+    args.push("--filter-speckle", input.preset === "photo" ? "8" : "16");
+    args.push("--color-precision", String(colorPrecision(input.maxColors)));
+    if (input.simplify > 0) args.push("--simplify", String(input.simplify));
+    args.push("--optimize", "1");
+    return args;
+  }
+
   // src/panel.ts
   var HostTimeoutError = class extends Error {
     constructor() {
@@ -4717,13 +4794,16 @@
       viaGroup: parts[14] === "1"
     };
   }
-  function parseCapture(parts) {
-    const mode = parts[0];
-    const filePath = parts[1] ?? "";
-    if (mode !== "file" && mode !== "capture" || filePath === "") throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
-    const bytes = Number(parts[2] ?? "0");
-    if (!Number.isFinite(bytes) || bytes <= 0) throw new Error("\u0E44\u0E1F\u0E25\u0E4C\u0E20\u0E32\u0E1E\u0E27\u0E48\u0E32\u0E07");
-    return { mode, filePath, bytes };
+  function parseBegin(parts) {
+    if (parts[0] === "file") {
+      const filePath = parts[1] ?? "";
+      if (filePath === "") throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
+      return { mode: "file", filePath };
+    }
+    if (parts[0] === "strips") {
+      return { mode: "strips", count: parsePositiveNumber(parts[1], "strips"), ppi: parsePositiveNumber(parts[2], "ppi") };
+    }
+    throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
   }
   function callHost(host, method, args = []) {
     const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
@@ -4780,19 +4860,6 @@
       }
     } catch (_) {
     }
-  }
-  function vtracerArguments(job) {
-    const args = [job.pngPath, job.svgPath];
-    const preset = job.settings.preset;
-    if (preset === "photo") {
-      args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
-    } else {
-      args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
-      if (preset === "icon") args.push("--mode", "polygon");
-    }
-    if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
-    args.push("--optimize", "1");
-    return args;
   }
   function vtracerBinary(extensionPath) {
     const override = process.env["VECTOR_PANEL_VTRACER"];
@@ -4965,11 +5032,53 @@
       }
       render();
     }
-    async function capturePixels(selection, job, mode) {
+    async function endCapture() {
+      if (host === null) return;
+      try {
+        await callHost(host, "VP_captureEnd");
+      } catch (_) {
+      }
+    }
+    async function readStrips(job, count) {
       if (host === null) throw new Error("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19");
-      const captured = parseCapture(await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity, mode]));
-      if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
-      return captured;
+      const strips = [];
+      try {
+        for (let index = 0; index < count; index += 1) {
+          if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
+          message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E " + String(index + 1) + "/" + String(count) + "\u2026");
+          render();
+          const stripPath = path2.join(job.directory, "strip-" + String(index) + ".png");
+          const written = await callHost(host, "VP_captureStrip", [String(index), stripPath]);
+          const bytes = Number(written[0] ?? "0");
+          if (!Number.isFinite(bytes) || bytes <= 0) throw new Error("\u0E44\u0E1F\u0E25\u0E4C\u0E20\u0E32\u0E1E\u0E27\u0E48\u0E32\u0E07");
+          strips.push(stripPath);
+        }
+        return strips;
+      } finally {
+        await endCapture();
+      }
+    }
+    async function beginRead(selection, mode) {
+      if (host === null) throw new Error("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19");
+      return parseBegin(await callHost(host, "VP_captureBegin", [selection.uuid, selection.documentIdentity, mode]));
+    }
+    function traceRequest(job, sourcePath, stripPaths) {
+      return {
+        binary: vtracerBinary(extensionPath),
+        sourcePath,
+        pngPath: job.pngPath,
+        svgPath: job.svgPath,
+        flags: vtracerArguments({
+          pngPath: job.pngPath,
+          svgPath: job.svgPath,
+          preset: job.settings.preset,
+          maxColors: job.settings.maxColors,
+          simplify: job.settings.simplify
+        }).slice(2),
+        maxPixels: MAX_TRACE_PIXELS,
+        maxDecodePixels: MAX_DECODE_PIXELS,
+        stripPaths
+      };
     }
     async function trace() {
       if (host === null || runner === null) return;
@@ -4983,27 +5092,27 @@
         state = { kind: "capturing", selection, job };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator\u2026");
         render();
-        let captured = await capturePixels(selection, job, "");
-        if (captured.mode === "file") {
-          const reason = await linkedFileDecision(captured.filePath, selection);
+        let begun = await beginRead(selection, "");
+        let stripPaths = [];
+        let sourcePath = "";
+        if (begun.mode === "file") {
+          const reason = await linkedFileDecision(begun.filePath, selection);
           if (reason !== null) {
             if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
             message(reason);
             render();
-            captured = await capturePixels(selection, job, "capture");
+            begun = await beginRead(selection, "capture");
+          } else {
+            sourcePath = begun.filePath;
           }
         }
-        const binary = vtracerBinary(extensionPath);
-        if (!fs4.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
-        const request = {
-          binary,
-          sourcePath: captured.filePath,
-          pngPath: job.pngPath,
-          svgPath: job.svgPath,
-          flags: vtracerArguments(job).slice(2),
-          maxPixels: MAX_TRACE_PIXELS,
-          maxDecodePixels: MAX_DECODE_PIXELS
-        };
+        if (begun.mode === "strips") {
+          stripPaths = await readStrips(job, begun.count);
+          sourcePath = job.pngPath;
+        }
+        if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
+        if (!fs4.existsSync(traceRequest(job, sourcePath, stripPaths).binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
+        const request = traceRequest(job, sourcePath, stripPaths);
         state = { kind: "tracing", selection, job, stage: "prepare" };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E\u2026");
         render();
@@ -5016,15 +5125,17 @@
             render();
           });
         } catch (error) {
-          if (captured.mode === "file" && error instanceof ImagePrepError && job !== null && !job.cancelled) {
+          if (stripPaths.length === 0 && error instanceof ImagePrepError && job !== null && !job.cancelled) {
             message("\u0E16\u0E2D\u0E14\u0E23\u0E2B\u0E31\u0E2A\u0E44\u0E1F\u0E25\u0E4C\u0E25\u0E34\u0E07\u0E01\u0E4C\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E48\u0E07\u0E2D\u0E2D\u0E01\u0E08\u0E32\u0E01\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23\u2026");
             state = { kind: "capturing", selection, job };
             render();
-            captured = await capturePixels(selection, job, "capture");
+            const forced = await beginRead(selection, "capture");
+            if (forced.mode !== "strips") throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
+            stripPaths = await readStrips(job, forced.count);
             state = { kind: "tracing", selection, job, stage: "prepare" };
             message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E\u2026");
             render();
-            result = await runner.run({ ...request, sourcePath: captured.filePath }, (stage) => {
+            result = await runner.run({ ...request, sourcePath: job.pngPath, stripPaths }, (stage) => {
               if (state.kind !== "tracing" || state.job !== job) return;
               state = { kind: "tracing", selection, job, stage };
               message(stage === "trace" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026" : stage === "svg" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E1C\u0E25\u0E25\u0E31\u0E1E\u0E18\u0E4C\u2026" : "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E20\u0E32\u0E1E\u2026");

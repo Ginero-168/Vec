@@ -176,6 +176,32 @@ function jpegSize(buffer: Buffer): RasterSize | null {
   return null;
 }
 
+export async function stitchStripPngs(stripPaths: readonly string[], destPath: string): Promise<PreparedImage> {
+  if (stripPaths.length === 0) throw new ImagePrepError("ไม่มีภาพจาก Illustrator");
+  const strips: Decoded[] = [];
+  for (const stripPath of stripPaths) {
+    strips.push(decodeRaster(await fs.promises.readFile(stripPath)));
+  }
+  const first = strips[0];
+  if (!first) throw new ImagePrepError("ไม่มีภาพจาก Illustrator");
+  const width = first.width;
+  const height = strips.reduce((sum, strip) => sum + strip.height, 0);
+  const data = new Uint8Array(width * height * 4);
+  let row = 0;
+  for (const strip of strips) {
+    const copyWidth = Math.min(width, strip.width);
+    for (let y = 0; y < strip.height; y += 1) {
+      const sourceStart = y * strip.width * 4;
+      data.set(strip.data.subarray(sourceStart, sourceStart + copyWidth * 4), (row + y) * width * 4);
+    }
+    row += strip.height;
+  }
+  const png = new PNG({ width, height });
+  Buffer.from(data).copy(png.data);
+  await fs.promises.writeFile(destPath, PNG.sync.write(png));
+  return { width, height, resized: false };
+}
+
 function isStartOfFrame(marker: number): boolean {
   if (marker >= 0xc0 && marker <= 0xc3) return true;
   if (marker >= 0xc5 && marker <= 0xc7) return true;
