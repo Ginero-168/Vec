@@ -301,6 +301,9 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     if (frame) frame.remove();
     lap("fit");
     holder.note = "VectorPanel/1|source=" + uuid + "|job=" + jobId + "|settings=" + encodeURIComponent(settings);
+    lap("note");
+    // Measured R14: doc.selection = [holder] was no faster than these two property sets (cold 166-568
+    // vs 124-836 ms, warm 106-428 vs 109-322 ms; both dominated by paging), so keep the simple form.
     source.selected = false;
     holder.selected = true;
     lap("select");

@@ -668,6 +668,7 @@
     async function captureSource(bridge, selection, job) {
       const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(EMBEDDED_TRACE_PIXELS)]);
       if (begun[0] === "link") return begun[1] ?? "";
+      let ended = false;
       try {
         const count = Number(begun[1]);
         if (!(count > 0)) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E02\u0E19\u0E32\u0E14\u0E20\u0E32\u0E1E\u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
@@ -680,11 +681,15 @@
           strips.push(await decodePng(await fs.promises.readFile(stripPath)));
           void fs.promises.unlink(stripPath).catch(() => void 0);
         }
-        const stitched = await stitchPng([await median3(await joinStrips(strips))]);
+        ended = true;
+        await callHost(bridge, "VP_captureEnd").catch(() => void 0);
+        const joined = await joinStrips(strips);
+        strips.length = 0;
+        const stitched = await stitchPng([await median3(joined)]);
         await fs.promises.writeFile(job.pngPath, stitched.png);
         return job.pngPath;
       } finally {
-        await callHost(bridge, "VP_captureEnd").catch(() => void 0);
+        if (!ended) await callHost(bridge, "VP_captureEnd").catch(() => void 0);
       }
     }
     async function apply() {

@@ -584,6 +584,7 @@ function start(): void {
   async function captureSource(bridge: CepBridge, selection: Selection, job: Job): Promise<string> {
     const begun = await callHost(bridge, "VP_captureBegin", [selection.uuid, selection.documentIdentity, String(EMBEDDED_TRACE_PIXELS)]);
     if (begun[0] === "link") return begun[1] ?? "";
+    let ended = false;
     try {
       const count = Number(begun[1]);
       if (!(count > 0)) throw new Error("Illustrator ไม่ได้ส่งขนาดภาพกลับมา");
@@ -596,11 +597,17 @@ function start(): void {
         strips.push(await decodePng(await fs.promises.readFile(stripPath)));
         void fs.promises.unlink(stripPath).catch(() => undefined);
       }
-      const stitched = await stitchPng([await median3(await joinStrips(strips))]);
+      // Pixels are all in the panel now: drop Illustrator's temporary layer before the panel-side
+      // median/stitch work instead of after it, so Illustrator frees the duplicate sooner.
+      ended = true;
+      await callHost(bridge, "VP_captureEnd").catch(() => undefined);
+      const joined = await joinStrips(strips);
+      strips.length = 0;
+      const stitched = await stitchPng([await median3(joined)]);
       await fs.promises.writeFile(job.pngPath, stitched.png);
       return job.pngPath;
     } finally {
-      await callHost(bridge, "VP_captureEnd").catch(() => undefined);
+      if (!ended) await callHost(bridge, "VP_captureEnd").catch(() => undefined);
     }
   }
 
