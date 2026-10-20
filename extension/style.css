@@ -54,6 +54,14 @@ input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 
 .phase { font-size: 11px; color: #a8dcbb; }
 
+.steps { display: flex; gap: 8px; list-style: none; margin: 0; padding: 0; }
+
+.steps li { flex: 1; text-align: center; font-size: 10px; letter-spacing: .02em; color: #b7b7bd; border-top: 2px solid #49494e; padding-top: 5px; }
+
+.steps li[data-state="done"] { color: #d9c8ff; border-top-color: #8d72bf; }
+
+.steps li[data-state="current"], .steps li[data-state="ready"] { color: #f3e9ff; border-top-color: #cfb6ff; font-weight: 700; }
+
 .preview-frame { min-height: 175px; max-height: 280px; display: grid; place-items: center; overflow: hidden; background-image: linear-gradient(45deg, #37373c 25%, transparent 25%), linear-gradient(-45deg, #37373c 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #37373c 75%), linear-gradient(-45deg, transparent 75%, #37373c 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0; }
 
 .preview-frame img { max-width: 100%; max-height: 280px; object-fit: contain; }

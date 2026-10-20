@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <main class="panel">
+    <main id="panel-root" class="panel">
       <header class="panel-header">
         <div class="mark">V</div>
         <div>
@@ -49,6 +49,12 @@
           <h2 id="preview-title">3 · ตัวอย่าง</h2>
           <span id="phase" class="phase">พร้อม</span>
         </div>
+        <ol class="steps">
+          <li id="step-check" data-state="idle">ตรวจ</li>
+          <li id="step-read" data-state="idle">อ่าน</li>
+          <li id="step-trace" data-state="idle">แปลง</li>
+          <li id="step-apply" data-state="idle">ใส่ผล</li>
+        </ol>
         <div class="preview-frame">
           <img id="preview" alt="ตัวอย่างผลลัพธ์เวกเตอร์" hidden />
           <p id="preview-empty">ผลลัพธ์จะปรากฏตรงนี้</p>
@@ -58,7 +64,7 @@
 
       <footer class="actions">
         <button id="trace" class="primary" type="button">สร้างตัวอย่าง</button>
-        <button id="cancel" class="secondary" type="button" hidden>ยกเลิก</button>
+        <button id="cancel" class="secondary" type="button">ยกเลิก</button>
         <button id="apply" class="secondary" type="button" disabled>ใส่ใน Illustrator</button>
       </footer>
     </main>
