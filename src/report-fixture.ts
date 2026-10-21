@@ -4,7 +4,7 @@ import { encodePng, decodePng } from "./color/png";
 import { rasterizeShapes, rasterizeWindow } from "./color/raster";
 import { DARK_SURROUND_L, renderRgba, segmentImage } from "./color/segment";
 import { legacySegmentImage } from "./color/legacy-segment";
-import { measureSharedEdges, traceSegmentation } from "./color/trace";
+import { contourDeviationP95, measureSharedEdges, staircaseRatio, traceSegmentation } from "./color/trace";
 import { TRANSPARENT } from "./color/model";
 import { makeStripeSample } from "./color/sample";
 
@@ -23,7 +23,8 @@ const traced = traceSegmentation(segmentation, {
   smooth: 0.5,
   originalLabels: segmentation.labels,
   coverage: segmentation.coverage,
-  partner: segmentation.partner
+  partner: segmentation.partner,
+  source: data
 });
 const traceMs = performance.now() - traceStarted;
 console.log("segmentMs", segmentMs.toFixed(0), "traceMs", traceMs.toFixed(0), "colors", segmentation.palette.length, "paths", traced.pathCount, "nodes", traced.nodeCount, "subpaths", traced.subpathCount);
@@ -335,7 +336,8 @@ const cleaned = traceSegmentation(segmentation, {
   cleanText: false,
   originalLabels: segmentation.labels,
   coverage: segmentation.coverage,
-  partner: segmentation.partner
+  partner: segmentation.partner,
+  source: data
 });
 const cleanMs = performance.now() - cleanStarted;
 const cleanRaster = rasterizeShapes(cleaned.shapes, width, height);
@@ -394,6 +396,16 @@ console.log(
   edgesOn.p90.toFixed(2)
 );
 console.log("labelFringe", countFringe(segmentation.labels), "labelChecker", countChecker(segmentation.labels));
+console.log(
+  "staircaseOff",
+  staircaseRatio(traced.shapes).toFixed(4),
+  "staircaseOn",
+  staircaseRatio(cleaned.shapes).toFixed(4),
+  "deviationOff",
+  contourDeviationP95(segmentation, data, traced.shapes).toFixed(3),
+  "deviationOn",
+  contourDeviationP95(segmentation, data, cleaned.shapes).toFixed(3)
+);
 writeCleanZoom(traced.shapes, cleaned.shapes, 118, 262, 64, 64, "zoom-squircle-clean-400.png");
 writeCleanZoom(traced.shapes, cleaned.shapes, 200, 335, 150, 130, "zoom-a-clean-400.png");
 writeCleanZoom(traced.shapes, cleaned.shapes, 660, 310, 140, 120, "zoom-star-clean-400.png");

@@ -111,7 +111,8 @@ if (compareStatus instanceof HTMLElement && compareOriginal instanceof HTMLImage
         cleanText: clean.text,
         originalLabels: segmentation.labels,
         coverage: segmentation.coverage,
-        partner: segmentation.partner
+        partner: segmentation.partner,
+        source: source.rgba
       });
       if (token !== compareToken) return;
       const seconds = ((performance.now() - started) / 1000).toFixed(2);

@@ -1579,6 +1579,7 @@
     dissolveSlivers(rgba, labels, partner, coverage, width, height, paletteLabs);
     peelPaleEdges(rgba, labels, partner, coverage, width, height, paletteLabs);
     liftNearWhite(rgba, labels, partner, coverage, width, height, paletteLabs);
+    settleEdges(rgba, labels, partner, coverage, width, height, paletteLabs);
     const compacted = compactAll(labels, partner, paletteLabs);
     return {
       width,
@@ -2421,6 +2422,411 @@
       variance += delta * delta;
     }
     return Math.sqrt(variance / labs.length);
+  }
+  function settleEdges(rgba, labels, partner, coverage, width, height, palette) {
+    const gradient = sobelLuma(rgba, width, height);
+    dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
+    mergeSoftBoundaries(rgba, labels, partner, coverage, width, height, palette, gradient);
+    dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
+    clearCheckerboards(labels, partner, coverage, width, height);
+    pinToLocalCores(rgba, labels, partner, coverage, width, height, palette, gradient);
+    pinToNearbyCores(rgba, labels, partner, coverage, width, height, palette);
+    clearCheckerboards(labels, partner, coverage, width, height);
+    clearSolidSpecks(labels, partner, coverage, width, height);
+    for (let pass = 0; pass < 4; pass++) pinToNearbyCores(rgba, labels, partner, coverage, width, height, palette);
+    dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
+    clearSolidSpecks(labels, partner, coverage, width, height);
+    reconcilePartners(labels, partner, coverage);
+  }
+  function pinToLocalCores(rgba, labels, partner, coverage, width, height, palette, gradient) {
+    const colorCount = palette.length;
+    const flat = new Uint8Array(labels.length);
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT || (gradient[index] ?? 999) >= 22) continue;
+        if (isInterior(labels, width, height, x, y, label)) flat[index] = 1;
+      }
+    }
+    const radius = 8;
+    const next = labels.slice();
+    const totals = new Int32Array(colorCount);
+    const seen = [];
+    const cache = /* @__PURE__ */ new Map();
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT || flat[index]) continue;
+        seen.length = 0;
+        const y0 = Math.max(0, y - radius);
+        const y1 = Math.min(height - 1, y + radius);
+        const x0 = Math.max(0, x - radius);
+        const x1 = Math.min(width - 1, x + radius);
+        for (let yy = y0; yy <= y1; yy++) {
+          const row = yy * width;
+          for (let xx = x0; xx <= x1; xx++) {
+            const neighborIndex = row + xx;
+            if (!flat[neighborIndex]) continue;
+            const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+            if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
+            if (totals[neighbor] === 0) seen.push(neighbor);
+            totals[neighbor] = (totals[neighbor] ?? 0) + 1;
+          }
+        }
+        let first = -1;
+        let second = -1;
+        for (const candidate of seen) {
+          if ((totals[candidate] ?? 0) < 3) continue;
+          if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
+            second = first;
+            first = candidate;
+          } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
+            second = candidate;
+          }
+        }
+        for (const candidate of seen) totals[candidate] = 0;
+        if (first < 0 || second < 0) continue;
+        const colorA = palette[first];
+        const colorB = palette[second];
+        if (!colorA || !colorB) continue;
+        const lab = cachedLab(cache, rgba, index);
+        if (keepNeutralDark(lab, palette[label], colorA, colorB)) continue;
+        const along = project(lab, colorA, colorB);
+        const distanceA = oklabDistance(lab, colorA);
+        const distanceB = oklabDistance(lab, colorB);
+        let chosen = distanceA <= distanceB ? first : second;
+        if (along && along.perp <= Math.max(0.05, 0.55 * along.length)) chosen = along.t < 0.5 ? first : second;
+        if (keepDarkLabel(lab, palette[label], palette[chosen])) continue;
+        next[index] = chosen;
+        coverage[index] = 1;
+        partner[index] = TRANSPARENT;
+      }
+    }
+    labels.set(next);
+  }
+  function pinToNearbyCores(rgba, labels, partner, coverage, width, height, palette) {
+    const colorCount = palette.length;
+    const core = new Uint8Array(labels.length);
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT) continue;
+        if (isInterior(labels, width, height, x, y, label)) core[index] = 1;
+      }
+    }
+    const next = labels.slice();
+    const totals = new Int32Array(colorCount);
+    const seen = [];
+    const cache = /* @__PURE__ */ new Map();
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT || core[index]) continue;
+        seen.length = 0;
+        for (let oy = -2; oy <= 2; oy++) {
+          const yy = y + oy;
+          if (yy < 0 || yy >= height) continue;
+          const row = yy * width;
+          for (let ox = -2; ox <= 2; ox++) {
+            const xx = x + ox;
+            if (xx < 0 || xx >= width) continue;
+            const neighborIndex = row + xx;
+            if (!core[neighborIndex]) continue;
+            const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+            if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
+            if (totals[neighbor] === 0) seen.push(neighbor);
+            totals[neighbor] = (totals[neighbor] ?? 0) + 1;
+          }
+        }
+        let first = -1;
+        let second = -1;
+        for (const candidate of seen) {
+          if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
+            second = first;
+            first = candidate;
+          } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
+            second = candidate;
+          }
+        }
+        for (const candidate of seen) totals[candidate] = 0;
+        if (first < 0 || second < 0 || label === first || label === second) continue;
+        const colorA = palette[first];
+        const colorB = palette[second];
+        if (!colorA || !colorB) continue;
+        const lab = cachedLab(cache, rgba, index);
+        if (keepNeutralDark(lab, palette[label], colorA, colorB)) continue;
+        const along = project(lab, colorA, colorB);
+        const nearer = oklabDistance(lab, colorA) <= oklabDistance(lab, colorB) ? first : second;
+        let chosen = nearer;
+        if (along && along.perp <= Math.max(0.05, 0.55 * along.length)) chosen = along.t < 0.5 ? first : second;
+        if (keepDarkLabel(lab, palette[label], palette[chosen])) continue;
+        next[index] = chosen;
+        coverage[index] = 1;
+        partner[index] = TRANSPARENT;
+      }
+    }
+    labels.set(next);
+  }
+  function keepNeutralDark(lab, current, colorA, colorB) {
+    if (!current || !(lab.l < 0.45) || oklabChroma(lab) >= 0.08) return false;
+    if (!(lab.l + 0.08 < colorA.l && lab.l + 0.08 < colorB.l)) return false;
+    return oklabChroma(current) < 0.04;
+  }
+  function keepDarkLabel(lab, current, chosen) {
+    if (!current || !chosen || !(lab.l < 0.4) || !(lab.l + 0.12 < chosen.l)) return false;
+    if (oklabChroma(lab) < 0.04 && oklabChroma(current) > 0.05) return false;
+    return oklabDistance(lab, current) <= oklabDistance(lab, chosen) + 0.04;
+  }
+  function dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette) {
+    const cache = /* @__PURE__ */ new Map();
+    for (let pass = 0; pass < 6; pass++) {
+      const jobs = [];
+      forEachComponent(labels, width, height, (region) => {
+        if (region.adjacency.size < 2 || region.pixels.length < 1) return;
+        const spanX = region.maxX - region.minX + 1;
+        const spanY = region.maxY - region.minY + 1;
+        if (spanX >= 6 && spanY >= 6 && region.pixels.length >= Math.min(spanX, spanY) * 4) return;
+        if (componentThickness2(region.pixels, width, height, 2) > 1) return;
+        const ranked = [...region.adjacency.entries()].sort((left, right) => right[1] - left[1]);
+        const first = ranked[0];
+        const second = ranked[1];
+        if (!first || !second) return;
+        const median2 = medianLab(rgba, region.pixels);
+        const colorA = palette[first[0]];
+        const colorB = palette[second[0]];
+        if (colorA && colorB && median2.l + 0.18 < colorA.l && median2.l + 0.18 < colorB.l && oklabChroma(median2) < 0.04) return;
+        jobs.push({ pixels: region.pixels, first: first[0], second: second[0] });
+      });
+      if (jobs.length === 0) break;
+      for (const job of jobs) {
+        const colorA = palette[job.first];
+        const colorB = palette[job.second];
+        if (!colorA || !colorB) continue;
+        for (const pixel of job.pixels) {
+          const lab = cachedLab(cache, rgba, pixel);
+          const nearer = oklabDistance(lab, colorA) <= oklabDistance(lab, colorB) ? job.first : job.second;
+          const nearerLab = palette[nearer];
+          if (nearerLab && lab.l < 0.4 && lab.l + 0.12 < nearerLab.l) continue;
+          labels[pixel] = nearer;
+          coverage[pixel] = 1;
+          partner[pixel] = TRANSPARENT;
+        }
+      }
+    }
+  }
+  function mergeSoftBoundaries(rgba, labels, partner, coverage, width, height, palette, sobel) {
+    const threshold = 26;
+    for (let pass = 0; pass < 5; pass++) {
+      const built = buildComponents(labels, width, height);
+      const stride = built.comps.length + 1;
+      if (stride <= 1) return;
+      const pairs = /* @__PURE__ */ new Map();
+      const consider = (left, right, leftIndex, rightIndex) => {
+        if (left < 0 || right < 0 || left === right) return;
+        const lowId = left < right ? left : right;
+        const highId = left < right ? right : left;
+        const key = lowId * stride + highId;
+        const stat = pairs.get(key) ?? { low: 0, n: 0 };
+        const magnitude = Math.max(sobel[leftIndex] ?? 999, sobel[rightIndex] ?? 999);
+        stat.n++;
+        if (magnitude < threshold) stat.low++;
+        pairs.set(key, stat);
+      };
+      for (let y = 0; y < height; y++) {
+        const row = y * width;
+        for (let x = 0; x < width; x++) {
+          const index = row + x;
+          const id = built.ids[index] ?? -1;
+          if (id < 0) continue;
+          if (x + 1 < width) consider(id, built.ids[index + 1] ?? -1, index, index + 1);
+          if (y + 1 < height) consider(id, built.ids[index + width] ?? -1, index, index + width);
+        }
+      }
+      const jobs = [];
+      for (const [key, stat] of pairs) {
+        if (stat.n < 6 || stat.low / stat.n < 0.72) continue;
+        const idA = Math.floor(key / stride);
+        const idB = key - idA * stride;
+        const left = built.comps[idA];
+        const right = built.comps[idB];
+        if (!left || !right || left.label === right.label) continue;
+        const source = left.count <= right.count ? idA : idB;
+        const target = source === idA ? idB : idA;
+        const sourceLab = palette[built.comps[source]?.label ?? -1];
+        const targetLab = palette[built.comps[target]?.label ?? -1];
+        if (sourceLab && targetLab && sourceLab.l + 0.22 < targetLab.l && oklabChroma(sourceLab) < 0.08) continue;
+        const sourceComp = built.comps[source];
+        if (targetLab && sourceComp && componentIsDarker(rgba, sourceComp.samples, targetLab.l)) continue;
+        if (sourceLab && targetLab) {
+          const sourceRgb = oklabToRgb(sourceLab);
+          const targetRgb = oklabToRgb(targetLab);
+          const sourceMax = Math.max(sourceRgb.r, sourceRgb.g, sourceRgb.b);
+          const targetMax = Math.max(targetRgb.r, targetRgb.g, targetRgb.b);
+          if (sourceMax < 110 && targetMax >= 110) continue;
+        }
+        jobs.push({ source, target, n: stat.n });
+      }
+      if (jobs.length === 0) break;
+      jobs.sort((left, right) => right.n - left.n);
+      const redirect = new Int32Array(built.comps.length);
+      redirect.fill(-1);
+      for (const job of jobs) {
+        if ((redirect[job.source] ?? -1) !== -1 || (redirect[job.target] ?? -1) !== -1) continue;
+        redirect[job.source] = job.target;
+      }
+      let changed = false;
+      for (let i = 0; i < labels.length; i++) {
+        const id = built.ids[i] ?? -1;
+        if (id < 0) continue;
+        const targetId = redirect[id] ?? -1;
+        if (targetId < 0) continue;
+        const target = built.comps[targetId];
+        if (!target) continue;
+        const previous = labels[i] ?? TRANSPARENT;
+        labels[i] = target.label;
+        const other = partner[i] ?? TRANSPARENT;
+        if (other === TRANSPARENT || other === target.label || other === previous) {
+          partner[i] = TRANSPARENT;
+          coverage[i] = 1;
+        }
+        changed = true;
+      }
+      if (!changed) break;
+    }
+  }
+  function clearCheckerboards(labels, partner, coverage, width, height) {
+    const votes = /* @__PURE__ */ new Map();
+    for (let pass = 0; pass < 8; pass++) {
+      let changed = 0;
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const index = y * width + x;
+          const label = labels[index] ?? TRANSPARENT;
+          if (label === TRANSPARENT) continue;
+          const neighbors = [index - 1, index + 1, index - width, index + width];
+          votes.clear();
+          let foreign = 0;
+          for (const neighbor of neighbors) {
+            const other = labels[neighbor] ?? TRANSPARENT;
+            if (other === label || other === TRANSPARENT) continue;
+            foreign++;
+            votes.set(other, (votes.get(other) ?? 0) + 1);
+          }
+          if (foreign < 4) continue;
+          let best = -1;
+          let bestCount = 0;
+          for (const [other, count] of votes) {
+            if (count > bestCount) {
+              best = other;
+              bestCount = count;
+            }
+          }
+          if (best < 0 || bestCount < 2) continue;
+          labels[index] = best;
+          partner[index] = TRANSPARENT;
+          coverage[index] = 1;
+          changed++;
+        }
+      }
+      if (changed === 0) break;
+    }
+  }
+  function clearSolidSpecks(labels, partner, coverage, width, height) {
+    for (let pass = 0; pass < 6; pass++) {
+      let changed = 0;
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const index = y * width + x;
+          const label = labels[index] ?? TRANSPARENT;
+          if (label === TRANSPARENT) continue;
+          const up = labels[index - width] ?? TRANSPARENT;
+          const down = labels[index + width] ?? TRANSPARENT;
+          const left = labels[index - 1] ?? TRANSPARENT;
+          const right = labels[index + 1] ?? TRANSPARENT;
+          if (up === TRANSPARENT || up !== down || up !== left || up !== right || up === label) continue;
+          labels[index] = up;
+          partner[index] = TRANSPARENT;
+          coverage[index] = 1;
+          changed++;
+        }
+      }
+      if (changed === 0) break;
+    }
+  }
+  function reconcilePartners(labels, partner, coverage) {
+    for (let i = 0; i < labels.length; i++) {
+      const other = partner[i] ?? TRANSPARENT;
+      if (other === TRANSPARENT || other === (labels[i] ?? TRANSPARENT)) {
+        partner[i] = TRANSPARENT;
+        coverage[i] = 1;
+      }
+    }
+  }
+  function sobelLuma(rgba, width, height) {
+    const magnitude = new Float32Array(width * height);
+    magnitude.fill(999);
+    const lumaAt = (x, y) => {
+      const offset = (y * width + x) * 4;
+      return 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+    };
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const gx = -lumaAt(x - 1, y - 1) + lumaAt(x + 1, y - 1) - 2 * lumaAt(x - 1, y) + 2 * lumaAt(x + 1, y) - lumaAt(x - 1, y + 1) + lumaAt(x + 1, y + 1);
+        const gy = -lumaAt(x - 1, y - 1) - 2 * lumaAt(x, y - 1) - lumaAt(x + 1, y - 1) + lumaAt(x - 1, y + 1) + 2 * lumaAt(x, y + 1) + lumaAt(x + 1, y + 1);
+        magnitude[y * width + x] = Math.hypot(gx, gy);
+      }
+    }
+    return magnitude;
+  }
+  function componentIsDarker(rgba, samples, targetL) {
+    if (samples.length === 0) return false;
+    let sum = 0;
+    for (const index of samples) {
+      const offset = index * 4;
+      sum += rgbToOklab(rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0).l;
+    }
+    const mean = sum / samples.length;
+    return mean < 0.42 && mean + 0.12 < targetL;
+  }
+  function buildComponents(labels, width, height) {
+    const ids = new Int32Array(labels.length);
+    ids.fill(-1);
+    const comps = [];
+    const stack = [];
+    for (let start2 = 0; start2 < labels.length; start2++) {
+      if ((ids[start2] ?? -1) !== -1) continue;
+      const label = labels[start2] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      const id = comps.length;
+      const comp = { label, count: 0, samples: [] };
+      comps.push(comp);
+      stack.push(start2);
+      ids[start2] = id;
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === void 0) break;
+        comp.count++;
+        if (comp.samples.length < 8 || comp.count % 40 === 0) comp.samples.push(current);
+        const x = current % width;
+        const y = (current - x) / width;
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const next of neighbors) {
+          if (next < 0 || next >= labels.length || (ids[next] ?? -1) !== -1) continue;
+          const nx = next % width;
+          const ny = (next - nx) / width;
+          if (next === current - 1 && x === 0 || next === current + 1 && x + 1 === width) continue;
+          if (ny < 0 || ny >= height) continue;
+          if ((labels[next] ?? TRANSPARENT) !== label) continue;
+          ids[next] = id;
+          stack.push(next);
+        }
+      }
+    }
+    return { ids, comps };
   }
   function compactAll(labels, partner, palette) {
     const used = new Array(palette.length).fill(false);
@@ -3700,13 +4106,206 @@
     return a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
   }
 
+  // src/color/iso.ts
+  function refineChain(points, closed, inside, outside, width, height, rgba, palette, labels) {
+    const original = points.map((point) => ({ x: point.x, y: point.y }));
+    if (outside === TRANSPARENT || inside === TRANSPARENT || points.length < 2) return { points: original, soft: false };
+    const labA = paletteLab(palette, inside);
+    const labB = paletteLab(palette, outside);
+    if (!labA || !labB) return { points: original, soft: false };
+    const edgeCount = closed ? points.length : points.length - 1;
+    if (edgeCount < 1) return { points: original, soft: false };
+    const insideRaw = [];
+    const outsideRaw = [];
+    const pixels = [];
+    for (let edge = 0; edge < edgeCount; edge++) {
+      const from = points[edge];
+      const to = points[(edge + 1) % points.length];
+      if (!from || !to) return { points: original, soft: false };
+      const ends = edgePixels(from.x, from.y, to.x, to.y);
+      if (!ends) return { points: original, soft: false };
+      pixels.push(ends);
+      insideRaw.push(sampleT(ends.inside[0], ends.inside[1], 1, width, height, rgba, labels, inside, outside, labA, labB));
+      outsideRaw.push(sampleT(ends.outside[0], ends.outside[1], 0, width, height, rgba, labels, inside, outside, labA, labB));
+    }
+    const insideT = smoothLine(smoothLine(insideRaw, closed), closed);
+    const outsideT = smoothLine(smoothLine(outsideRaw, closed), closed);
+    const crossings = [];
+    let soft = 0;
+    for (let edge = 0; edge < edgeCount; edge++) {
+      const ends = pixels[edge];
+      if (!ends) return { points: original, soft: false };
+      const near = insideT[edge] ?? 0;
+      const far = outsideT[edge] ?? 1;
+      if (near > 0.08 || far < 0.92) soft++;
+      crossings.push(dualCrossing(ends.inside[0], ends.inside[1], ends.outside[0], ends.outside[1], near, far));
+    }
+    if (soft * 5 < edgeCount) return { points: original, soft: false };
+    if (closed) {
+      const loop = relaxJogs(dedupe(crossings, true), true);
+      if (loop.length < 3) return { points: original, soft: false };
+      return { points: loop, soft: true };
+    }
+    const start2 = points[0];
+    const end = points[points.length - 1];
+    if (!start2 || !end) return { points: original, soft: false };
+    const open = relaxJogs(
+      dedupe(
+        [sharedJunction(start2, width, height, rgba, labels, palette), ...crossings, sharedJunction(end, width, height, rgba, labels, palette)],
+        false
+      ),
+      false
+    );
+    if (open.length < 2) return { points: original, soft: false };
+    return { points: open, soft: true };
+  }
+  function relaxJogs(points, closed) {
+    const count = points.length;
+    if (count < 3) return points.map((point) => ({ x: point.x, y: point.y }));
+    let current = points.map((point) => ({ x: point.x, y: point.y }));
+    for (let pass = 0; pass < 6; pass++) {
+      const next = current.map((point) => ({ x: point.x, y: point.y }));
+      const first = closed ? 0 : 1;
+      const last = closed ? count : count - 1;
+      for (let i = first; i < last; i++) {
+        const previous = current[(i - 1 + count) % count];
+        const point = current[i];
+        const following = current[(i + 1) % count];
+        const incoming = Math.hypot(point.x - previous.x, point.y - previous.y);
+        const outgoing = Math.hypot(following.x - point.x, following.y - point.y);
+        if (incoming > 2.4 && outgoing > 2.4) continue;
+        const turn = jogTurn(previous, point, following);
+        if (turn < 0.55) continue;
+        const weight = turn > 2.2 ? 0.85 : 0.62;
+        next[i] = {
+          x: point.x * (1 - weight) + (previous.x + following.x) / 2 * weight,
+          y: point.y * (1 - weight) + (previous.y + following.y) / 2 * weight
+        };
+      }
+      current = next;
+    }
+    return current;
+  }
+  function jogTurn(a, b, c) {
+    const incoming = Math.atan2(b.y - a.y, b.x - a.x);
+    const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
+    let delta = outgoing - incoming;
+    if (delta > Math.PI) delta -= Math.PI * 2;
+    if (delta < -Math.PI) delta += Math.PI * 2;
+    return Math.abs(delta);
+  }
+  function dualCrossing(insideX, insideY, outsideX, outsideY, insideT, outsideT) {
+    const denom = insideT - outsideT;
+    let u = Math.abs(denom) < 1e-4 ? 0.5 : (0.5 - outsideT) / denom;
+    if (u < 0) u = 0;
+    if (u > 1) u = 1;
+    const originX = outsideX + 0.5;
+    const originY = outsideY + 0.5;
+    return { x: originX + (insideX + 0.5 - originX) * u, y: originY + (insideY + 0.5 - originY) * u };
+  }
+  function sharedJunction(point, width, height, rgba, labels, palette) {
+    const gx = Math.round(point.x);
+    const gy = Math.round(point.y);
+    if (Math.abs(point.x - gx) > 0.01 || Math.abs(point.y - gy) > 0.01) return { x: point.x, y: point.y };
+    const pairs = [
+      [gx - 1, gy - 1, gx, gy - 1],
+      [gx - 1, gy, gx, gy],
+      [gx - 1, gy - 1, gx - 1, gy],
+      [gx, gy - 1, gx, gy]
+    ];
+    const crossings = [];
+    for (const pair of pairs) {
+      const ax = pair[0];
+      const ay = pair[1];
+      const bx = pair[2];
+      const by = pair[3];
+      if (ax < 0 || ay < 0 || bx < 0 || by < 0 || ax >= width || ay >= height || bx >= width || by >= height) continue;
+      const labelA = labels[ay * width + ax] ?? TRANSPARENT;
+      const labelB = labels[by * width + bx] ?? TRANSPARENT;
+      if (labelA === labelB || labelA === TRANSPARENT || labelB === TRANSPARENT) continue;
+      const labA = paletteLab(palette, labelA);
+      const labB = paletteLab(palette, labelB);
+      if (!labA || !labB) continue;
+      const tA = sampleT(ax, ay, 1, width, height, rgba, labels, labelA, labelB, labA, labB);
+      const tB = sampleT(bx, by, 0, width, height, rgba, labels, labelA, labelB, labA, labB);
+      if (tA <= 0.08 && tB >= 0.92) return { x: gx, y: gy };
+      crossings.push(dualCrossing(ax, ay, bx, by, tA, tB));
+    }
+    if (crossings.length === 0) return { x: gx, y: gy };
+    let x = 0;
+    let y = 0;
+    for (const crossing of crossings) {
+      x += crossing.x;
+      y += crossing.y;
+    }
+    return { x: x / crossings.length, y: y / crossings.length };
+  }
+  function smoothLine(values, closed) {
+    const count = values.length;
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const previous = values[closed ? (i - 1 + count) % count : Math.max(0, i - 1)] ?? 0;
+      const next = values[closed ? (i + 1) % count : Math.min(count - 1, i + 1)] ?? 0;
+      out.push(0.25 * previous + 0.5 * (values[i] ?? 0) + 0.25 * next);
+    }
+    return out;
+  }
+  function edgePixels(ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    if (dx === 1 && dy === 0) return { inside: [ax, ay], outside: [ax, ay - 1] };
+    if (dx === -1 && dy === 0) return { inside: [ax - 1, ay - 1], outside: [ax - 1, ay] };
+    if (dx === 0 && dy === 1) return { inside: [ax - 1, ay], outside: [ax, ay] };
+    if (dx === 0 && dy === -1) return { inside: [ax, ay - 1], outside: [ax - 1, ay - 1] };
+    return null;
+  }
+  function sampleT(x, y, k, width, height, rgba, labels, inside, outside, labA, labB) {
+    if (x < 0 || y < 0 || x >= width || y >= height) return k <= 0 ? 1 : 0;
+    const index = y * width + x;
+    if ((rgba[index * 4 + 3] ?? 0) < 128) return 1;
+    const label = labels[index] ?? TRANSPARENT;
+    const lab = rgbToOklab(rgba[index * 4] ?? 0, rgba[index * 4 + 1] ?? 0, rgba[index * 4 + 2] ?? 0);
+    const projected = coverageT(lab, labA, labB);
+    if (label !== inside && label !== outside) return projected;
+    return projected;
+  }
+  function coverageT(lab, from, to) {
+    const dl = to.l - from.l;
+    const da = to.a - from.a;
+    const db = to.b - from.b;
+    const length2 = dl * dl + da * da + db * db;
+    if (length2 < 1e-10) return 0.5;
+    const t = ((lab.l - from.l) * dl + (lab.a - from.a) * da + (lab.b - from.b) * db) / length2;
+    return Math.min(1, Math.max(0, t));
+  }
+  function dedupe(points, closed) {
+    const out = [];
+    for (const point of points) {
+      const previous = out[out.length - 1];
+      if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < 1e-3) continue;
+      out.push(point);
+    }
+    if (closed && out.length > 2) {
+      const first = out[0];
+      const last = out[out.length - 1];
+      if (first && last && Math.hypot(first.x - last.x, first.y - last.y) < 1e-3) out.pop();
+    }
+    return out;
+  }
+  function paletteLab(palette, label) {
+    const color = palette[label];
+    if (!color) return null;
+    return rgbToOklab(color.r, color.g, color.b);
+  }
+
   // src/color/trace.ts
   function traceSegmentation(segmentation, options = {}) {
     const preset = options.preset ?? "logo";
     const profile = presetProfile(preset);
     const error = curveError(options.smooth ?? profile.smooth);
     const cornerAngle = options.cornerAngle ?? profile.cornerAngle;
-    const scale = options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
+    const hasSource = !!options.source && options.source.length >= segmentation.width * segmentation.height * 4;
+    const scale = hasSource ? 1 : options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
     const field = resolveField(segmentation, options);
     const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
     const shapes = [];
@@ -3718,9 +4317,10 @@
     for (const label of order) {
       if (options.isCancelled?.()) break;
       const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
+      const iso = hasSource && options.source ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label } : null;
       const subpaths = [];
       for (const contour of contours) {
-        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean);
+        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean, iso);
         if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
       }
       const color = segmentation.palette[label];
@@ -3927,16 +4527,16 @@
     if (session.letters && boundaryHits(session.letters, session.width, session.height, points, 0.35)) return null;
     return session.tolerance;
   }
-  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache, clean) {
+  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache, clean, iso) {
     const points = contour.points.map((point) => ({ x: point.x / scale, y: point.y / scale }));
-    const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside);
+    const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside).map((chain) => prepareChain(chain, iso));
     if (chains.length === 0) return null;
     const only = chains[0];
     if (chains.length === 1 && only?.closed) {
       const canonical = canonicalizeClosed(only.points);
       if (canonical.length < 3) return null;
-      const tolerance = cleanChainTolerance(canonical, clean);
-      const commands2 = cachedClosed(canonical, error, cornerAngle, simplify, cache);
+      const tolerance = cappedTolerance(cleanChainTolerance(canonical, clean), only.soft);
+      const commands2 = cachedClosed(canonical, error, cornerAngle, simplify, cache, only.soft);
       const start3 = canonical[0];
       if (tolerance !== null && clean) {
         const fitted = cachedCleanClosed(canonical, tolerance, clean);
@@ -3950,8 +4550,8 @@
     const commands = [];
     for (const chain of chains) {
       if (chain.closed || chain.points.length < 2) continue;
-      const tolerance = cleanChainTolerance(chain.points, clean);
-      const plain = cachedOpen(chain.points, error, cornerAngle, simplify, cache);
+      const tolerance = cappedTolerance(cleanChainTolerance(chain.points, clean), chain.soft);
+      const plain = cachedOpen(chain.points, error, cornerAngle, simplify, cache, chain.soft);
       if (tolerance === null || !clean) commands.push(...plain);
       else {
         const fitted = cachedCleanOpen(chain.points, tolerance, clean);
@@ -3960,6 +4560,15 @@
     }
     if (commands.length === 0) return null;
     return { start: start2, commands };
+  }
+  function prepareChain(chain, iso) {
+    if (!iso) return { ...chain, soft: false };
+    const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels);
+    return { points: refined.points, closed: chain.closed, outside: chain.outside, soft: refined.soft };
+  }
+  function cappedTolerance(tolerance, soft) {
+    if (tolerance === null || !soft) return tolerance;
+    return Math.min(tolerance, 0.3);
   }
   function cachedCleanOpen(points, tolerance, session) {
     const canonical = canonicalizeOpen(points);
@@ -4026,7 +4635,7 @@
         break;
       }
     }
-    if (junction < 0) return [{ points: points.slice(), closed: true }];
+    if (junction < 0) return [{ points: points.slice(), closed: true, outside: outside[0] ?? TRANSPARENT }];
     const chains = [];
     let cursor = junction;
     let walked = 0;
@@ -4040,27 +4649,27 @@
         cursor = next;
         if (walked >= count || (outside[cursor] ?? TRANSPARENT) !== outsideLabel) break;
       }
-      chains.push({ points: chain, closed: false });
+      chains.push({ points: chain, closed: false, outside: outsideLabel });
     }
     return chains;
   }
-  function cachedOpen(points, error, cornerAngle, simplify, cache) {
+  function cachedOpen(points, error, cornerAngle, simplify, cache, subpixel) {
     const canonical = canonicalizeOpen(points);
-    const key = "o|" + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(canonical.points);
+    const key = (subpixel ? "s|" : "o|") + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(canonical.points);
     let fitted = cache.get(key);
     if (!fitted) {
-      fitted = fitOpenChain(canonical.points, error, cornerAngle, simplify);
+      fitted = subpixel ? fitSubpixelOpen(canonical.points, cornerAngle) : fitOpenChain(canonical.points, error, cornerAngle, simplify);
       cache.set(key, fitted);
     }
     const origin = canonical.points[0];
     if (!origin) return [];
     return canonical.reversed ? reverseCommands(fitted, origin) : fitted;
   }
-  function cachedClosed(points, error, cornerAngle, simplify, cache) {
-    const key = "c|" + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(points);
+  function cachedClosed(points, error, cornerAngle, simplify, cache, subpixel) {
+    const key = (subpixel ? "sc|" : "c|") + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(points);
     let fitted = cache.get(key);
     if (!fitted) {
-      fitted = fitClosedChain(points, error, cornerAngle, simplify);
+      fitted = subpixel ? fitSubpixelClosed(points, cornerAngle) : fitClosedChain(points, error, cornerAngle, simplify);
       cache.set(key, fitted);
     }
     return fitted;
@@ -4112,6 +4721,215 @@
     let key = "";
     for (const point of points) key += point.x.toFixed(4) + "," + point.y.toFixed(4) + ";";
     return key;
+  }
+  var SUBPIXEL_ERROR = 0.28;
+  var SUBPIXEL_EPSILON = 0.22;
+  function fitSubpixelOpen(points, cornerAngle) {
+    const keep = optimalIndices(points, SUBPIXEL_EPSILON);
+    if (keep.length < 2) return [];
+    const polygon = keep.map((index) => points[index]);
+    const cuts = subpixelCorners(polygon, false, cornerAngle);
+    const commands = [];
+    for (let i = 0; i < cuts.length - 1; i++) {
+      fitSubpixelSpan(points, keep[cuts[i]], keep[cuts[i + 1]], commands, null, null);
+    }
+    return commands;
+  }
+  function fitSubpixelClosed(points, cornerAngle) {
+    const keep = optimalClosedIndices(points, SUBPIXEL_EPSILON);
+    if (keep.length < 3 || keep[0] !== 0) return [];
+    const polygon = keep.map((index) => points[index]);
+    const corners = subpixelCorners(polygon, true, cornerAngle);
+    const commands = [];
+    if (corners.length === 0) {
+      const anchors = smoothAnchors(polygon);
+      for (let i = 0; i < anchors.length; i++) {
+        const from = keep[anchors[i]];
+        const to = keep[anchors[(i + 1) % anchors.length]];
+        const span = sliceCyclic2(points, from, to);
+        const startTangent = loopTangent(points, from);
+        const endTangent = loopTangent(points, to);
+        fitSubpixelSpan(span, 0, span.length - 1, commands, startTangent, endTangent ? { x: -endTangent.x, y: -endTangent.y } : null);
+      }
+      return commands;
+    }
+    const cuts = corners.includes(0) ? corners : [0, ...corners];
+    const bridge = !corners.includes(0);
+    for (let i = 0; i < cuts.length; i++) {
+      const fromCut = cuts[i];
+      const toCut = cuts[(i + 1) % cuts.length];
+      const from = keep[fromCut];
+      const to = keep[toCut];
+      const span = sliceCyclic2(points, from, to);
+      const startTangent = bridge && fromCut === 0 ? loopTangent(points, from) : null;
+      const endForward = bridge && toCut === 0 ? loopTangent(points, to) : null;
+      fitSubpixelSpan(span, 0, span.length - 1, commands, startTangent, endForward ? { x: -endForward.x, y: -endForward.y } : null);
+    }
+    return commands;
+  }
+  function optimalIndices(points, epsilon) {
+    const count = points.length;
+    if (count === 0) return [];
+    if (count < 3) return points.map((_, index) => index);
+    const prev = new Int32Array(count);
+    const cost = new Int32Array(count);
+    for (let end = 1; end < count; end++) {
+      let bestIndex = end - 1;
+      let bestCost = cost[end - 1] + 1;
+      const limit = Math.max(0, end - 96);
+      for (let start2 = end - 2; start2 >= limit; start2--) {
+        const candidate = cost[start2] + 1;
+        if (candidate > bestCost) continue;
+        if (maxChordError(points, start2, end) > epsilon) continue;
+        bestIndex = start2;
+        bestCost = candidate;
+      }
+      if (limit > 0 && cost[0] + 1 < bestCost && maxChordError(points, 0, end) <= epsilon) {
+        bestIndex = 0;
+        bestCost = cost[0] + 1;
+      }
+      cost[end] = bestCost;
+      prev[end] = bestIndex;
+    }
+    const chosen = [];
+    for (let cursor = count - 1; cursor >= 0; cursor = prev[cursor]) {
+      chosen.push(cursor);
+      if (cursor === 0) break;
+    }
+    chosen.reverse();
+    return mergeColinearIndices(points, chosen, epsilon);
+  }
+  function mergeColinearIndices(points, indices, epsilon) {
+    if (indices.length < 3) return indices.slice();
+    const out = [indices[0]];
+    for (let i = 1; i < indices.length - 1; i++) {
+      const previous = out[out.length - 1];
+      const next = indices[i + 1];
+      if (maxChordError(points, previous, next) > epsilon) out.push(indices[i]);
+    }
+    out.push(indices[indices.length - 1]);
+    return out;
+  }
+  function optimalClosedIndices(points, epsilon) {
+    const count = points.length;
+    if (count < 4) return points.map((_, index) => index);
+    let first = 0;
+    for (let i = 1; i < count; i++) if (comparePoint(points[i], points[first]) < 0) first = i;
+    let second = 0;
+    let best = -1;
+    for (let i = 0; i < count; i++) {
+      if (i === first) continue;
+      const distance = distance2(points[i], points[first]);
+      if (distance > best) {
+        best = distance;
+        second = i;
+      }
+    }
+    const arcIndices = (start2, end) => {
+      const local = [];
+      const global = [];
+      let cursor = start2;
+      local.push(points[cursor]);
+      global.push(cursor);
+      while (cursor !== end) {
+        cursor = (cursor + 1) % count;
+        local.push(points[cursor]);
+        global.push(cursor);
+        if (local.length > count) break;
+      }
+      return optimalIndices(local, epsilon).map((index) => global[index]);
+    };
+    const head = arcIndices(first, second);
+    const tail = arcIndices(second, first);
+    return rotateClosedIndices(head.concat(tail.slice(1, -1)));
+  }
+  function rotateClosedIndices(indices) {
+    const placed = indices.slice();
+    if (!placed.includes(0)) {
+      for (let i = 0; i < placed.length; i++) {
+        const from = placed[i];
+        const to = placed[(i + 1) % placed.length];
+        const contains = from < to ? 0 > from && 0 < to : 0 > from || 0 < to;
+        if (contains) {
+          placed.splice(i + 1, 0, 0);
+          break;
+        }
+      }
+      if (!placed.includes(0)) placed.unshift(0);
+    }
+    const at = placed.indexOf(0);
+    return placed.slice(at).concat(placed.slice(0, at));
+  }
+  function subpixelCorners(points, closed, cornerAngle) {
+    const alpha = Math.max(cornerAngle, 1);
+    if (!closed) {
+      const cuts2 = [0];
+      for (let i = 1; i < points.length - 1; i++) {
+        if (sharpCorner(points[i - 1], points[i], points[i + 1], alpha)) cuts2.push(i);
+      }
+      cuts2.push(points.length - 1);
+      return cuts2;
+    }
+    const cuts = [];
+    for (let i = 0; i < points.length; i++) {
+      const previous = points[(i + points.length - 1) % points.length];
+      const next = points[(i + 1) % points.length];
+      if (sharpCorner(previous, points[i], next, alpha)) cuts.push(i);
+    }
+    return cuts;
+  }
+  function sharpCorner(previous, current, next, alpha) {
+    const turn = Math.abs(turnAngle2(previous, current, next));
+    if (turn < alpha) return false;
+    const incoming = Math.hypot(current.x - previous.x, current.y - previous.y);
+    const outgoing = Math.hypot(next.x - current.x, next.y - current.y);
+    return incoming >= 2 && outgoing >= 2;
+  }
+  function smoothAnchors(points) {
+    const count = points.length;
+    const target = Math.max(4, Math.min(12, Math.round(count / 18)));
+    const step = Math.max(1, Math.floor(count / target));
+    const anchors = [];
+    for (let i = 0; i < count; i += step) anchors.push(i);
+    if (anchors.length < 3) return [0, Math.floor(count / 3), Math.floor(2 * count / 3)];
+    return anchors;
+  }
+  function fitSubpixelSpan(points, start2, end, out, tStart, tEnd) {
+    const from = points[start2];
+    const to = points[end];
+    if (!from || !to || end <= start2) return;
+    if (end === start2 + 1 || maxChordError(points, start2, end) <= 0.07) {
+      out.push({ op: "L", x: to.x, y: to.y });
+      return;
+    }
+    let cubic = fitCubic2(points, start2, end, tStart, tEnd);
+    if ((!cubic || cubic.error > SUBPIXEL_ERROR) && (tStart || tEnd)) {
+      const free = fitCubic2(points, start2, end, null, null);
+      if (free && (!cubic || free.error < cubic.error)) cubic = free;
+    }
+    if (cubic && cubic.error <= SUBPIXEL_ERROR && cubic.command.op === "C") {
+      out.push({ ...cubic.command, primitive: "cubic" });
+      return;
+    }
+    let split = start2 + Math.floor((end - start2) / 2);
+    let best = -1;
+    for (let i = start2 + 1; i < end; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const distance = pointSegmentDistance2(point, from, to);
+      if (distance > best) {
+        best = distance;
+        split = i;
+      }
+    }
+    if (split <= start2 || split >= end) {
+      out.push({ op: "L", x: to.x, y: to.y });
+      return;
+    }
+    const through = forwardTangent(points, split);
+    const back = through ? { x: -through.x, y: -through.y } : null;
+    fitSubpixelSpan(points, start2, split, out, tStart, back);
+    fitSubpixelSpan(points, split, end, out, through, tEnd);
   }
   function fitOpenChain(points, error, cornerAngle, simplify) {
     const simplified = douglasPeucker(points, simplify);
@@ -4251,14 +5069,14 @@
     fitRange(points, start2, split, error, out);
     fitRange(points, split, end, error, out);
   }
-  function fitCubic2(points, start2, end) {
+  function fitCubic2(points, start2, end, tStart = null, tEnd = null) {
     const p0 = points[start2];
     const p3 = points[end];
     if (!p0 || !p3) return null;
     const chord = Math.hypot(p3.x - p0.x, p3.y - p0.y);
     if (chord < 1e-6) return null;
-    const t1 = tangent(points, start2, end, false);
-    const t2 = tangent(points, start2, end, true);
+    const t1 = unitOr(tStart, tangent(points, start2, end, false));
+    const t2 = unitOr(tEnd, tangent(points, start2, end, true));
     if (!t1 || !t2) return null;
     let length = 0;
     const parameter = [0];
@@ -4283,8 +5101,8 @@
       const u = 1 - t;
       const b1 = 3 * u * u * t;
       const b2 = 3 * u * t * t;
-      const basisX = p0.x * u * u * u + p3.x * t * t * t;
-      const basisY = p0.y * u * u * u + p3.y * t * t * t;
+      const basisX = p0.x * u * u * (1 + 2 * t) + p3.x * t * t * (3 - 2 * t);
+      const basisY = p0.y * u * u * (1 + 2 * t) + p3.y * t * t * (3 - 2 * t);
       const vx = point.x - basisX;
       const vy = point.y - basisY;
       c11 += b1 * b1;
@@ -4297,7 +5115,7 @@
     if (Math.abs(determinant2) < 1e-10) return null;
     const alpha1 = (c22 * x1 - c12 * x2) / determinant2;
     const alpha2 = (c11 * x2 - c12 * x1) / determinant2;
-    if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord || alpha2 > chord) return null;
+    if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord * 4 || alpha2 > chord * 4) return null;
     const command = {
       op: "C",
       x1: p0.x + t1.x * alpha1,
@@ -4316,6 +5134,58 @@
       maxError = Math.max(maxError, Math.hypot(at.x - point.x, at.y - point.y));
     }
     return { command, error: maxError };
+  }
+  function unitOr(imposed, fallback) {
+    const source = imposed ?? fallback;
+    if (!source) return null;
+    const length = Math.hypot(source.x, source.y);
+    if (length < 1e-8) return fallback;
+    return { x: source.x / length, y: source.y / length };
+  }
+  function loopTangent(points, index) {
+    const count = points.length;
+    const origin = points[index];
+    if (!origin || count < 2) return null;
+    let x = 0;
+    let y = 0;
+    for (let step = 1; step <= 4; step++) {
+      const next = points[(index + step) % count];
+      const previous = points[(index - step + count * 4) % count];
+      const weight = 1 / step;
+      if (next) {
+        x += (next.x - origin.x) * weight;
+        y += (next.y - origin.y) * weight;
+      }
+      if (previous) {
+        x += (origin.x - previous.x) * weight;
+        y += (origin.y - previous.y) * weight;
+      }
+    }
+    const length = Math.hypot(x, y);
+    if (length < 1e-8) return null;
+    return { x: x / length, y: y / length };
+  }
+  function forwardTangent(points, index) {
+    const origin = points[index];
+    if (!origin) return null;
+    let x = 0;
+    let y = 0;
+    for (let step = 1; step <= 4; step++) {
+      const next = points[index + step];
+      const previous = points[index - step];
+      const weight = 1 / step;
+      if (next) {
+        x += (next.x - origin.x) * weight;
+        y += (next.y - origin.y) * weight;
+      }
+      if (previous) {
+        x += (origin.x - previous.x) * weight;
+        y += (origin.y - previous.y) * weight;
+      }
+    }
+    const length = Math.hypot(x, y);
+    if (length < 1e-8) return null;
+    return { x: x / length, y: y / length };
   }
   function tangent(points, start2, end, atEnd) {
     const origin = points[atEnd ? end : start2];
@@ -4772,6 +5642,8 @@
         await new Promise((resolve) => setTimeout(resolve, 0));
         if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
         const source = job.source;
+        const decoded = decodePng(fs.readFileSync(job.pngPath));
+        const sourcePixels = decoded.width === segmentation.width && decoded.height === segmentation.height ? decoded.data : void 0;
         const traced = traceSegmentation(segmentation, {
           preset: job.settings.preset,
           smooth: job.settings.simplify,
@@ -4780,7 +5652,8 @@
           smoothMask: segmentation.smoothMask,
           coverage: source?.coverage,
           partner: source?.partner,
-          originalLabels: source?.labels
+          originalLabels: source?.labels,
+          source: sourcePixels
         });
         fs.writeFileSync(job.svgPath, traced.svg, "utf8");
         const svg = traced.svg;

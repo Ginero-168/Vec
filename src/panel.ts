@@ -427,6 +427,8 @@ function start(): void {
       await new Promise((resolve) => setTimeout(resolve, 0));
       if (job.cancelled) throw new Error("ยกเลิกแล้ว");
       const source = job.source;
+      const decoded = decodePng(fs.readFileSync(job.pngPath));
+      const sourcePixels = decoded.width === segmentation.width && decoded.height === segmentation.height ? decoded.data : undefined;
       const traced = traceSegmentation(segmentation, {
         preset: job.settings.preset,
         smooth: job.settings.simplify,
@@ -435,7 +437,8 @@ function start(): void {
         smoothMask: segmentation.smoothMask,
         coverage: source?.coverage,
         partner: source?.partner,
-        originalLabels: source?.labels
+        originalLabels: source?.labels,
+        source: sourcePixels
       });
       fs.writeFileSync(job.svgPath, traced.svg, "utf8");
       const svg = traced.svg;

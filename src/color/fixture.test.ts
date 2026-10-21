@@ -6,7 +6,7 @@ import { deltaE76, rgbToCieLab, type Lab } from "./oklab";
 import { decodePng } from "./png";
 import { rasterizeShapes } from "./raster";
 import { segmentImage } from "./segment";
-import { traceSegmentation } from "./trace";
+import { contourDeviationP95, staircaseRatio, traceSegmentation } from "./trace";
 
 const decoded = decodePng(fs.readFileSync("fixtures/user-test-original.png"));
 const { width, height, data } = decoded;
@@ -16,7 +16,8 @@ const traced = traceSegmentation(segmentation, {
   smooth: 0.5,
   originalLabels: segmentation.labels,
   coverage: segmentation.coverage,
-  partner: segmentation.partner
+  partner: segmentation.partner,
+  source: data
 });
 const rendered = rasterizeShapes(traced.shapes, width, height);
 
@@ -161,6 +162,16 @@ test("edge pixels stay on the two local cores", () => {
 test("the label map has no checkerboard", () => {
   const checkerboard = countCheckerboard(segmentation.labels, width, height);
   assert.ok(checkerboard < 12, "checkerboard pixels " + checkerboard);
+});
+
+test("shared edges are not pixel staircases", () => {
+  const ratio = staircaseRatio(traced.shapes);
+  assert.ok(ratio < 0.04, "staircase ratio " + ratio.toFixed(4));
+});
+
+test("traced boundaries stay on the source half-coverage contour", () => {
+  const deviation = contourDeviationP95(segmentation, data, traced.shapes);
+  assert.ok(deviation < 0.35, "iso deviation p95 " + deviation.toFixed(3));
 });
 
 test("the black a is one region", () => {

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { deltaE76, rgbToCieLab, rgbToOklab, oklabDistance } from "./oklab";
 import { rasterizeShapes } from "./raster";
 import { DARK_SURROUND_L, segmentImage } from "./segment";
-import { traceSegmentation } from "./trace";
+import { staircaseRatio, traceSegmentation } from "./trace";
 import { TRANSPARENT, type Rgb, type Segmentation } from "./model";
 
 function paint(width: number, height: number, colorAt: (x: number, y: number) => Rgb | null): { rgba: Uint8Array; width: number; height: number } {
@@ -340,13 +340,78 @@ test("a crisp rectangle stays four corners when clean shapes is on", () => {
   for (const command of traced.shapes[0]?.subpaths[0]?.commands ?? []) assert.equal(command.primitive, "line");
 });
 
+test("an anti-aliased circle follows the half-coverage contour", () => {
+  const width = 80;
+  const height = 80;
+  const cx = 40;
+  const cy = 40;
+  const radius = 26;
+  const rgba = new Uint8Array(width * height * 4);
+  const labels = new Uint16Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const distance = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
+      const cover = Math.min(1, Math.max(0, (radius + 0.8 - distance) / 1.6));
+      const offset = (y * width + x) * 4;
+      rgba[offset] = Math.round(245 * (1 - cover) + 220 * cover);
+      rgba[offset + 1] = Math.round(245 * (1 - cover) + 90 * cover);
+      rgba[offset + 2] = Math.round(242 * (1 - cover) + 40 * cover);
+      rgba[offset + 3] = 255;
+      labels[y * width + x] = cover >= 0.5 ? 0 : TRANSPARENT;
+    }
+  }
+  const segmentation = { width, height, labels, palette: [{ r: 220, g: 90, b: 40 }] };
+  const traced = traceSegmentation(segmentation, { smooth: 0.5, upscale: 1, source: rgba });
+  assert.ok(staircaseRatio(traced.shapes) < 0.05, "staircase " + staircaseRatio(traced.shapes).toFixed(3));
+  let samples = 0;
+  let worst = 0;
+  for (const subpath of traced.shapes[0]?.subpaths ?? []) {
+    let x = subpath.start.x;
+    let y = subpath.start.y;
+    const consider = (px: number, py: number) => {
+      samples++;
+      worst = Math.max(worst, Math.abs(Math.hypot(px - cx, py - cy) - radius));
+    };
+    consider(x, y);
+    for (const command of subpath.commands) {
+      if (command.op === "C") {
+        for (let step = 1; step <= 6; step++) {
+          const t = step / 6;
+          const u = 1 - t;
+          consider(
+            u * u * u * x + 3 * u * u * t * command.x1 + 3 * u * t * t * command.x2 + t * t * t * command.x,
+            u * u * u * y + 3 * u * u * t * command.y1 + 3 * u * t * t * command.y2 + t * t * t * command.y
+          );
+        }
+      }
+      x = command.x;
+      y = command.y;
+      consider(x, y);
+    }
+  }
+  assert.ok(samples > 16);
+  assert.ok(worst <= 0.75, "radius error " + worst.toFixed(3) + " nodes " + traced.nodeCount);
+});
+
 test("a one-pixel stair on a long edge is smoothed", () => {
   const segmentation = segmentationFrom(20, 30, (x, y) => {
     if (y < 2 || y >= 28 || x >= 16) return TRANSPARENT;
     const inset = y >= 10 && y < 18 ? 5 : 4;
     return x >= inset ? 0 : TRANSPARENT;
   }, [{ r: 20, g: 180, b: 60 }]);
-  const traced = traceSegmentation(segmentation, { preset: "ui", smooth: 0.5, upscale: 1 });
+  const rgba = new Uint8Array(20 * 30 * 4);
+  for (let y = 0; y < 30; y++) {
+    for (let x = 0; x < 20; x++) {
+      const offset = (y * 20 + x) * 4;
+      if (y < 2 || y >= 28 || x >= 16) continue;
+      const cover = x <= 3 ? 0 : x >= 5 ? 1 : 0.5;
+      rgba[offset] = Math.round(255 * (1 - cover) + 20 * cover);
+      rgba[offset + 1] = Math.round(255 * (1 - cover) + 180 * cover);
+      rgba[offset + 2] = Math.round(255 * (1 - cover) + 60 * cover);
+      rgba[offset + 3] = 255;
+    }
+  }
+  const traced = traceSegmentation(segmentation, { preset: "ui", smooth: 0.5, upscale: 1, source: rgba });
   const xs: number[] = [];
   for (const subpath of traced.shapes[0]?.subpaths ?? []) {
     const points = [subpath.start];

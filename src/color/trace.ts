@@ -1,4 +1,5 @@
 import { boundaryHits, cleanTolerance, fitClosedClean, fitOpenClean, letterMask, strongCleanTolerance } from "./clean";
+import { refineChain } from "./iso";
 import { TRANSPARENT, rgbHex, type Rgb, type Segmentation } from "./model";
 import { chooseUpscale, curveError, presetProfile, type PresetName } from "./presets";
 
@@ -22,6 +23,8 @@ export type TraceOptions = {
   readonly cleanText?: boolean;
   /** Source pixels whose shared boundary the Smooth tool asked to clean. */
   readonly smoothMask?: Uint8Array;
+  /** Original pixels. Shared edges then follow the 0.5 color contour instead of the label grid. */
+  readonly source?: Uint8Array;
   readonly isCancelled?: () => boolean;
 };
 
@@ -74,7 +77,14 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
   const profile = presetProfile(preset);
   const error = curveError(options.smooth ?? profile.smooth);
   const cornerAngle = options.cornerAngle ?? profile.cornerAngle;
-  const scale = options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
+  const hasSource = !!options.source && options.source.length >= segmentation.width * segmentation.height * 4;
+  const scale = hasSource
+    ? 1
+    : options.upscale && options.upscale > 1
+      ? Math.round(options.upscale)
+      : options.upscale === 1
+        ? 1
+        : chooseUpscale(segmentation.width, segmentation.height, preset);
   const field = resolveField(segmentation, options);
   const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
   const shapes: VecShape[] = [];
@@ -87,9 +97,13 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
   for (const label of order) {
     if (options.isCancelled?.()) break;
     const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
+    const iso =
+      hasSource && options.source
+        ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label }
+        : null;
     const subpaths: VecSubpath[] = [];
     for (const contour of contours) {
-      const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean);
+      const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean, iso);
       if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
     }
     const color = segmentation.palette[label];
@@ -154,6 +168,120 @@ export function measureSharedEdges(segmentation: Segmentation, options: TraceOpt
   const mid = lengths[Math.floor(lengths.length / 2)] ?? 0;
   const p90 = lengths[Math.min(lengths.length - 1, Math.floor(lengths.length * 0.9))] ?? 0;
   return { edges: lengths.length, median: mid, p90 };
+}
+
+/** Fraction of output segments that are short axis-aligned grid steps. */
+export function staircaseRatio(shapes: readonly VecShape[]): number {
+  let total = 0;
+  let stairs = 0;
+  for (const shape of shapes) {
+    for (const subpath of shape.subpaths) {
+      let x = subpath.start.x;
+      let y = subpath.start.y;
+      for (const command of subpath.commands) {
+        total++;
+        if (command.op === "L") {
+          const dx = command.x - x;
+          const dy = command.y - y;
+          const length = Math.hypot(dx, dy);
+          const axis = Math.abs(dx) <= 0.05 || Math.abs(dy) <= 0.05;
+          const onGrid = nearInteger(x) && nearInteger(y) && nearInteger(command.x) && nearInteger(command.y);
+          if (axis && (length <= 1.35 || (onGrid && length <= 1.75))) stairs++;
+        }
+        x = command.x;
+        y = command.y;
+      }
+    }
+  }
+  return total === 0 ? 0 : stairs / total;
+}
+
+/**
+ * p95 distance, in source pixels, from the source 0.5 iso-contour to the
+ * traced boundary. Hard label edges are not part of the sample.
+ */
+export function contourDeviationP95(segmentation: Segmentation, source: Uint8Array, shapes: readonly VecShape[]): number {
+  const width = segmentation.width;
+  const height = segmentation.height;
+  const buckets = bucketSamples(sampleShapes(shapes));
+  const distances: number[] = [];
+  const counts = countLabels(segmentation.labels, segmentation.palette.length);
+  for (let label = 0; label < segmentation.palette.length; label++) {
+    if ((counts[label] ?? 0) === 0) continue;
+    const contours = traceLabel(segmentation.labels, width, height, label);
+    for (const contour of contours) {
+      const chains = splitChains(contour.points, contour.outside);
+      for (const chain of chains) {
+        const refined = refineChain(chain.points, chain.closed, label, chain.outside, width, height, source, segmentation.palette, segmentation.labels);
+        if (!refined.soft) continue;
+        for (const point of refined.points) distances.push(nearestSample(buckets, point.x, point.y));
+      }
+    }
+  }
+  if (distances.length === 0) return 0;
+  distances.sort((left, right) => left - right);
+  return distances[Math.min(distances.length - 1, Math.floor(distances.length * 0.95))] ?? 0;
+}
+
+function nearInteger(value: number): boolean {
+  return Math.abs(value - Math.round(value)) <= 0.02;
+}
+
+function sampleShapes(shapes: readonly VecShape[]): Point[] {
+  const samples: Point[] = [];
+  const pushCurve = (p0: Point, p1: Point, p2: Point, p3: Point) => {
+    const length = Math.hypot(p3.x - p0.x, p3.y - p0.y) + Math.hypot(p1.x - p0.x, p1.y - p0.y) + Math.hypot(p3.x - p2.x, p3.y - p2.y);
+    const steps = Math.max(2, Math.ceil(length / 0.3));
+    for (let step = 1; step <= steps; step++) samples.push(cubicAt(p0, p1, p2, p3, step / steps));
+  };
+  for (const shape of shapes) {
+    for (const subpath of shape.subpaths) {
+      let x = subpath.start.x;
+      let y = subpath.start.y;
+      samples.push({ x, y });
+      for (const command of subpath.commands) {
+        if (command.op === "L") {
+          const length = Math.hypot(command.x - x, command.y - y);
+          const steps = Math.max(1, Math.ceil(length / 0.3));
+          for (let step = 1; step <= steps; step++) {
+            const t = step / steps;
+            samples.push({ x: x + (command.x - x) * t, y: y + (command.y - y) * t });
+          }
+        } else pushCurve({ x, y }, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, { x: command.x, y: command.y });
+        x = command.x;
+        y = command.y;
+      }
+    }
+  }
+  return samples;
+}
+
+function bucketSamples(points: readonly Point[]): Map<string, Point[]> {
+  const buckets = new Map<string, Point[]>();
+  for (const point of points) {
+    const key = Math.round(point.x * 2) + "," + Math.round(point.y * 2);
+    const list = buckets.get(key);
+    if (list) list.push(point);
+    else buckets.set(key, [point]);
+  }
+  return buckets;
+}
+
+function nearestSample(buckets: Map<string, Point[]>, x: number, y: number): number {
+  const cx = Math.round(x * 2);
+  const cy = Math.round(y * 2);
+  let best = 2;
+  for (let oy = -3; oy <= 3; oy++) {
+    for (let ox = -3; ox <= 3; ox++) {
+      const list = buckets.get(cx + ox + "," + (cy + oy));
+      if (!list) continue;
+      for (const point of list) {
+        const distance = Math.hypot(point.x - x, point.y - y);
+        if (distance < best) best = distance;
+      }
+    }
+  }
+  return best;
 }
 
 type Field = {
@@ -349,7 +477,16 @@ function markEdge(x: number, y: number, dir: number, width: number, height: numb
   return true;
 }
 
-type Chain = { readonly points: Point[]; readonly closed: boolean };
+type Chain = { readonly points: Point[]; readonly closed: boolean; readonly outside: number };
+
+type IsoContext = {
+  readonly rgba: Uint8Array;
+  readonly palette: readonly Rgb[];
+  readonly labels: Uint16Array;
+  readonly width: number;
+  readonly height: number;
+  readonly inside: number;
+};
 
 type CleanSession = {
   readonly tolerance: number;
@@ -391,17 +528,18 @@ function contourToSubpath(
   cornerAngle: number,
   simplify: number,
   cache: Map<string, FitCommand[]>,
-  clean: CleanSession | null
+  clean: CleanSession | null,
+  iso: IsoContext | null
 ): VecSubpath | null {
   const points = contour.points.map((point) => ({ x: point.x / scale, y: point.y / scale }));
-  const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside);
+  const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside).map((chain) => prepareChain(chain, iso));
   if (chains.length === 0) return null;
   const only = chains[0];
   if (chains.length === 1 && only?.closed) {
     const canonical = canonicalizeClosed(only.points);
     if (canonical.length < 3) return null;
-    const tolerance = cleanChainTolerance(canonical, clean);
-    const commands = cachedClosed(canonical, error, cornerAngle, simplify, cache);
+    const tolerance = cappedTolerance(cleanChainTolerance(canonical, clean), only.soft);
+    const commands = cachedClosed(canonical, error, cornerAngle, simplify, cache, only.soft);
     const start = canonical[0];
     if (tolerance !== null && clean) {
       const fitted = cachedCleanClosed(canonical, tolerance, clean);
@@ -415,8 +553,8 @@ function contourToSubpath(
   const commands: FitCommand[] = [];
   for (const chain of chains) {
     if (chain.closed || chain.points.length < 2) continue;
-    const tolerance = cleanChainTolerance(chain.points, clean);
-    const plain = cachedOpen(chain.points, error, cornerAngle, simplify, cache);
+    const tolerance = cappedTolerance(cleanChainTolerance(chain.points, clean), chain.soft);
+    const plain = cachedOpen(chain.points, error, cornerAngle, simplify, cache, chain.soft);
     if (tolerance === null || !clean) commands.push(...plain);
     else {
       const fitted = cachedCleanOpen(chain.points, tolerance, clean);
@@ -425,6 +563,17 @@ function contourToSubpath(
   }
   if (commands.length === 0) return null;
   return { start, commands };
+}
+
+function prepareChain(chain: Chain, iso: IsoContext | null): Chain & { soft: boolean } {
+  if (!iso) return { ...chain, soft: false };
+  const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels);
+  return { points: refined.points, closed: chain.closed, outside: chain.outside, soft: refined.soft };
+}
+
+function cappedTolerance(tolerance: number | null, soft: boolean): number | null {
+  if (tolerance === null || !soft) return tolerance;
+  return Math.min(tolerance, 0.3);
 }
 
 function cachedCleanOpen(points: readonly Point[], tolerance: number, session: CleanSession): FitCommand[] {
@@ -495,7 +644,7 @@ function splitChains(points: readonly Point[], outside: readonly number[]): Chai
       break;
     }
   }
-  if (junction < 0) return [{ points: points.slice(), closed: true }];
+  if (junction < 0) return [{ points: points.slice(), closed: true, outside: outside[0] ?? TRANSPARENT }];
   const chains: Chain[] = [];
   let cursor = junction;
   let walked = 0;
@@ -509,17 +658,17 @@ function splitChains(points: readonly Point[], outside: readonly number[]): Chai
       cursor = next;
       if (walked >= count || (outside[cursor] ?? TRANSPARENT) !== outsideLabel) break;
     }
-    chains.push({ points: chain, closed: false });
+    chains.push({ points: chain, closed: false, outside: outsideLabel });
   }
   return chains;
 }
 
-function cachedOpen(points: readonly Point[], error: number, cornerAngle: number, simplify: number, cache: Map<string, FitCommand[]>): FitCommand[] {
+function cachedOpen(points: readonly Point[], error: number, cornerAngle: number, simplify: number, cache: Map<string, FitCommand[]>, subpixel: boolean): FitCommand[] {
   const canonical = canonicalizeOpen(points);
-  const key = "o|" + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(canonical.points);
+  const key = (subpixel ? "s|" : "o|") + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(canonical.points);
   let fitted = cache.get(key);
   if (!fitted) {
-    fitted = fitOpenChain(canonical.points, error, cornerAngle, simplify);
+    fitted = subpixel ? fitSubpixelOpen(canonical.points, cornerAngle) : fitOpenChain(canonical.points, error, cornerAngle, simplify);
     cache.set(key, fitted);
   }
   const origin = canonical.points[0];
@@ -527,11 +676,11 @@ function cachedOpen(points: readonly Point[], error: number, cornerAngle: number
   return canonical.reversed ? reverseCommands(fitted, origin) : fitted;
 }
 
-function cachedClosed(points: Point[], error: number, cornerAngle: number, simplify: number, cache: Map<string, FitCommand[]>): FitCommand[] {
-  const key = "c|" + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(points);
+function cachedClosed(points: Point[], error: number, cornerAngle: number, simplify: number, cache: Map<string, FitCommand[]>, subpixel: boolean): FitCommand[] {
+  const key = (subpixel ? "sc|" : "c|") + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(points);
   let fitted = cache.get(key);
   if (!fitted) {
-    fitted = fitClosedChain(points, error, cornerAngle, simplify);
+    fitted = subpixel ? fitSubpixelClosed(points, cornerAngle) : fitClosedChain(points, error, cornerAngle, simplify);
     cache.set(key, fitted);
   }
   return fitted;
@@ -589,6 +738,227 @@ function pointKey(points: readonly Point[]): string {
   let key = "";
   for (const point of points) key += point.x.toFixed(4) + "," + point.y.toFixed(4) + ";";
   return key;
+}
+
+const SUBPIXEL_ERROR = 0.28;
+const SUBPIXEL_EPSILON = 0.22;
+
+function fitSubpixelOpen(points: Point[], cornerAngle: number): FitCommand[] {
+  const keep = optimalIndices(points, SUBPIXEL_EPSILON);
+  if (keep.length < 2) return [];
+  const polygon = keep.map((index) => points[index]!);
+  const cuts = subpixelCorners(polygon, false, cornerAngle);
+  const commands: FitCommand[] = [];
+  for (let i = 0; i < cuts.length - 1; i++) {
+    fitSubpixelSpan(points, keep[cuts[i]!]!, keep[cuts[i + 1]!]!, commands, null, null);
+  }
+  return commands;
+}
+
+function fitSubpixelClosed(points: Point[], cornerAngle: number): FitCommand[] {
+  const keep = optimalClosedIndices(points, SUBPIXEL_EPSILON);
+  if (keep.length < 3 || keep[0] !== 0) return [];
+  const polygon = keep.map((index) => points[index]!);
+  const corners = subpixelCorners(polygon, true, cornerAngle);
+  const commands: FitCommand[] = [];
+  if (corners.length === 0) {
+    const anchors = smoothAnchors(polygon);
+    for (let i = 0; i < anchors.length; i++) {
+      const from = keep[anchors[i]!]!;
+      const to = keep[anchors[(i + 1) % anchors.length]!]!;
+      const span = sliceCyclic(points, from, to);
+      const startTangent = loopTangent(points, from);
+      const endTangent = loopTangent(points, to);
+      fitSubpixelSpan(span, 0, span.length - 1, commands, startTangent, endTangent ? { x: -endTangent.x, y: -endTangent.y } : null);
+    }
+    return commands;
+  }
+  const cuts = corners.includes(0) ? corners : [0, ...corners];
+  const bridge = !corners.includes(0);
+  for (let i = 0; i < cuts.length; i++) {
+    const fromCut = cuts[i]!;
+    const toCut = cuts[(i + 1) % cuts.length]!;
+    const from = keep[fromCut]!;
+    const to = keep[toCut]!;
+    const span = sliceCyclic(points, from, to);
+    const startTangent = bridge && fromCut === 0 ? loopTangent(points, from) : null;
+    const endForward = bridge && toCut === 0 ? loopTangent(points, to) : null;
+    fitSubpixelSpan(span, 0, span.length - 1, commands, startTangent, endForward ? { x: -endForward.x, y: -endForward.y } : null);
+  }
+  return commands;
+}
+
+/** Minimum-link polygon: vertex indices whose chords stay within epsilon of the polyline. */
+function optimalIndices(points: readonly Point[], epsilon: number): number[] {
+  const count = points.length;
+  if (count === 0) return [];
+  if (count < 3) return points.map((_, index) => index);
+  const prev = new Int32Array(count);
+  const cost = new Int32Array(count);
+  for (let end = 1; end < count; end++) {
+    let bestIndex = end - 1;
+    let bestCost = cost[end - 1]! + 1;
+    const limit = Math.max(0, end - 96);
+    for (let start = end - 2; start >= limit; start--) {
+      const candidate = cost[start]! + 1;
+      if (candidate > bestCost) continue;
+      if (maxChordError(points, start, end) > epsilon) continue;
+      bestIndex = start;
+      bestCost = candidate;
+    }
+    if (limit > 0 && cost[0]! + 1 < bestCost && maxChordError(points, 0, end) <= epsilon) {
+      bestIndex = 0;
+      bestCost = cost[0]! + 1;
+    }
+    cost[end] = bestCost;
+    prev[end] = bestIndex;
+  }
+  const chosen: number[] = [];
+  for (let cursor = count - 1; cursor >= 0; cursor = prev[cursor]!) {
+    chosen.push(cursor);
+    if (cursor === 0) break;
+  }
+  chosen.reverse();
+  return mergeColinearIndices(points, chosen, epsilon);
+}
+
+function mergeColinearIndices(points: readonly Point[], indices: readonly number[], epsilon: number): number[] {
+  if (indices.length < 3) return indices.slice();
+  const out = [indices[0]!];
+  for (let i = 1; i < indices.length - 1; i++) {
+    const previous = out[out.length - 1]!;
+    const next = indices[i + 1]!;
+    if (maxChordError(points, previous, next) > epsilon) out.push(indices[i]!);
+  }
+  out.push(indices[indices.length - 1]!);
+  return out;
+}
+
+function optimalClosedIndices(points: readonly Point[], epsilon: number): number[] {
+  const count = points.length;
+  if (count < 4) return points.map((_, index) => index);
+  let first = 0;
+  for (let i = 1; i < count; i++) if (comparePoint(points[i]!, points[first]!) < 0) first = i;
+  let second = 0;
+  let best = -1;
+  for (let i = 0; i < count; i++) {
+    if (i === first) continue;
+    const distance = distance2(points[i]!, points[first]!);
+    if (distance > best) {
+      best = distance;
+      second = i;
+    }
+  }
+  const arcIndices = (start: number, end: number): number[] => {
+    const local: Point[] = [];
+    const global: number[] = [];
+    let cursor = start;
+    local.push(points[cursor]!);
+    global.push(cursor);
+    while (cursor !== end) {
+      cursor = (cursor + 1) % count;
+      local.push(points[cursor]!);
+      global.push(cursor);
+      if (local.length > count) break;
+    }
+    return optimalIndices(local, epsilon).map((index) => global[index]!);
+  };
+  const head = arcIndices(first, second);
+  const tail = arcIndices(second, first);
+  return rotateClosedIndices(head.concat(tail.slice(1, -1)));
+}
+
+function rotateClosedIndices(indices: readonly number[]): number[] {
+  const placed = indices.slice();
+  if (!placed.includes(0)) {
+    for (let i = 0; i < placed.length; i++) {
+      const from = placed[i]!;
+      const to = placed[(i + 1) % placed.length]!;
+      const contains = from < to ? 0 > from && 0 < to : 0 > from || 0 < to;
+      if (contains) {
+        placed.splice(i + 1, 0, 0);
+        break;
+      }
+    }
+    if (!placed.includes(0)) placed.unshift(0);
+  }
+  const at = placed.indexOf(0);
+  return placed.slice(at).concat(placed.slice(0, at));
+}
+
+function subpixelCorners(points: readonly Point[], closed: boolean, cornerAngle: number): number[] {
+  const alpha = Math.max(cornerAngle, 1);
+  if (!closed) {
+    const cuts = [0];
+    for (let i = 1; i < points.length - 1; i++) {
+      if (sharpCorner(points[i - 1]!, points[i]!, points[i + 1]!, alpha)) cuts.push(i);
+    }
+    cuts.push(points.length - 1);
+    return cuts;
+  }
+  const cuts: number[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const previous = points[(i + points.length - 1) % points.length]!;
+    const next = points[(i + 1) % points.length]!;
+    if (sharpCorner(previous, points[i]!, next, alpha)) cuts.push(i);
+  }
+  return cuts;
+}
+
+function sharpCorner(previous: Point, current: Point, next: Point, alpha: number): boolean {
+  const turn = Math.abs(turnAngle(previous, current, next));
+  if (turn < alpha) return false;
+  const incoming = Math.hypot(current.x - previous.x, current.y - previous.y);
+  const outgoing = Math.hypot(next.x - current.x, next.y - current.y);
+  return incoming >= 2 && outgoing >= 2;
+}
+
+function smoothAnchors(points: readonly Point[]): number[] {
+  const count = points.length;
+  const target = Math.max(4, Math.min(12, Math.round(count / 18)));
+  const step = Math.max(1, Math.floor(count / target));
+  const anchors: number[] = [];
+  for (let i = 0; i < count; i += step) anchors.push(i);
+  if (anchors.length < 3) return [0, Math.floor(count / 3), Math.floor((2 * count) / 3)];
+  return anchors;
+}
+
+function fitSubpixelSpan(points: readonly Point[], start: number, end: number, out: FitCommand[], tStart: Point | null, tEnd: Point | null): void {
+  const from = points[start];
+  const to = points[end];
+  if (!from || !to || end <= start) return;
+  if (end === start + 1 || maxChordError(points, start, end) <= 0.07) {
+    out.push({ op: "L", x: to.x, y: to.y });
+    return;
+  }
+  let cubic = fitCubic(points, start, end, tStart, tEnd);
+  if ((!cubic || cubic.error > SUBPIXEL_ERROR) && (tStart || tEnd)) {
+    const free = fitCubic(points, start, end, null, null);
+    if (free && (!cubic || free.error < cubic.error)) cubic = free;
+  }
+  if (cubic && cubic.error <= SUBPIXEL_ERROR && cubic.command.op === "C") {
+    out.push({ ...cubic.command, primitive: "cubic" });
+    return;
+  }
+  let split = start + Math.floor((end - start) / 2);
+  let best = -1;
+  for (let i = start + 1; i < end; i++) {
+    const point = points[i];
+    if (!point) continue;
+    const distance = pointSegmentDistance(point, from, to);
+    if (distance > best) {
+      best = distance;
+      split = i;
+    }
+  }
+  if (split <= start || split >= end) {
+    out.push({ op: "L", x: to.x, y: to.y });
+    return;
+  }
+  const through = forwardTangent(points, split);
+  const back = through ? { x: -through.x, y: -through.y } : null;
+  fitSubpixelSpan(points, start, split, out, tStart, back);
+  fitSubpixelSpan(points, split, end, out, through, tEnd);
 }
 
 function fitOpenChain(points: Point[], error: number, cornerAngle: number, simplify: number): FitCommand[] {
@@ -735,14 +1105,14 @@ function fitRange(points: readonly Point[], start: number, end: number, error: n
   fitRange(points, split, end, error, out);
 }
 
-function fitCubic(points: readonly Point[], start: number, end: number): { command: FitCommand; error: number } | null {
+function fitCubic(points: readonly Point[], start: number, end: number, tStart: Point | null = null, tEnd: Point | null = null): { command: FitCommand; error: number } | null {
   const p0 = points[start];
   const p3 = points[end];
   if (!p0 || !p3) return null;
   const chord = Math.hypot(p3.x - p0.x, p3.y - p0.y);
   if (chord < 1e-6) return null;
-  const t1 = tangent(points, start, end, false);
-  const t2 = tangent(points, start, end, true);
+  const t1 = unitOr(tStart, tangent(points, start, end, false));
+  const t2 = unitOr(tEnd, tangent(points, start, end, true));
   if (!t1 || !t2) return null;
   let length = 0;
   const parameter: number[] = [0];
@@ -767,8 +1137,8 @@ function fitCubic(points: readonly Point[], start: number, end: number): { comma
     const u = 1 - t;
     const b1 = 3 * u * u * t;
     const b2 = 3 * u * t * t;
-    const basisX = p0.x * u * u * u + p3.x * t * t * t;
-    const basisY = p0.y * u * u * u + p3.y * t * t * t;
+    const basisX = p0.x * u * u * (1 + 2 * t) + p3.x * t * t * (3 - 2 * t);
+    const basisY = p0.y * u * u * (1 + 2 * t) + p3.y * t * t * (3 - 2 * t);
     const vx = point.x - basisX;
     const vy = point.y - basisY;
     c11 += b1 * b1;
@@ -781,7 +1151,7 @@ function fitCubic(points: readonly Point[], start: number, end: number): { comma
   if (Math.abs(determinant) < 1e-10) return null;
   const alpha1 = (c22 * x1 - c12 * x2) / determinant;
   const alpha2 = (c11 * x2 - c12 * x1) / determinant;
-  if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord || alpha2 > chord) return null;
+  if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord * 4 || alpha2 > chord * 4) return null;
   const command: FitCommand = {
     op: "C",
     x1: p0.x + t1.x * alpha1,
@@ -800,6 +1170,61 @@ function fitCubic(points: readonly Point[], start: number, end: number): { comma
     maxError = Math.max(maxError, Math.hypot(at.x - point.x, at.y - point.y));
   }
   return { command, error: maxError };
+}
+
+function unitOr(imposed: Point | null, fallback: Point | null): Point | null {
+  const source = imposed ?? fallback;
+  if (!source) return null;
+  const length = Math.hypot(source.x, source.y);
+  if (length < 1e-8) return fallback;
+  return { x: source.x / length, y: source.y / length };
+}
+
+function loopTangent(points: readonly Point[], index: number): Point | null {
+  const count = points.length;
+  const origin = points[index];
+  if (!origin || count < 2) return null;
+  let x = 0;
+  let y = 0;
+  for (let step = 1; step <= 4; step++) {
+    const next = points[(index + step) % count];
+    const previous = points[(index - step + count * 4) % count];
+    const weight = 1 / step;
+    if (next) {
+      x += (next.x - origin.x) * weight;
+      y += (next.y - origin.y) * weight;
+    }
+    if (previous) {
+      x += (origin.x - previous.x) * weight;
+      y += (origin.y - previous.y) * weight;
+    }
+  }
+  const length = Math.hypot(x, y);
+  if (length < 1e-8) return null;
+  return { x: x / length, y: y / length };
+}
+
+function forwardTangent(points: readonly Point[], index: number): Point | null {
+  const origin = points[index];
+  if (!origin) return null;
+  let x = 0;
+  let y = 0;
+  for (let step = 1; step <= 4; step++) {
+    const next = points[index + step];
+    const previous = points[index - step];
+    const weight = 1 / step;
+    if (next) {
+      x += (next.x - origin.x) * weight;
+      y += (next.y - origin.y) * weight;
+    }
+    if (previous) {
+      x += (origin.x - previous.x) * weight;
+      y += (origin.y - previous.y) * weight;
+    }
+  }
+  const length = Math.hypot(x, y);
+  if (length < 1e-8) return null;
+  return { x: x / length, y: y / length };
 }
 
 function tangent(points: readonly Point[], start: number, end: number, atEnd: boolean): Point | null {
