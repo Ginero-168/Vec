@@ -4,7 +4,7 @@
 
 ## สถานะ
 
-- มี CEP Panel, คำสั่ง ExtendScript สำหรับภาพ linked/embedded, ตัวแปลง VTracer แบบ binary และหน้าตัวอย่าง SVG
+- มี CEP Panel, คำสั่ง ExtendScript สำหรับภาพ linked/embedded, ตัวแยกสีและลากเส้นในตัว Panel (ไม่ต้องใช้ VTracer ตอนแปลง) และหน้าตัวอย่าง SVG
 - เครื่องนี้มี Illustrator 30.8.2 ที่กำลังใช้ CEP 12.1.1; development link ถูกติดตั้งในบัญชีผู้ใช้แล้ว
 - Panel ใช้ `PageItem.uuid` และตัวระบุเอกสารตรวจภาพที่เลือกก่อนใส่ผล และลบ layer ที่สร้างหาก Illustrator ไม่สร้าง path
 - เลือกกลุ่มผลเดิมแล้วสร้างเวอร์ชันใหม่ได้จาก UUID ของภาพต้นฉบับ โดยไม่ลบผลที่แก้มือไว้
@@ -27,9 +27,10 @@ npm run build
 
 1. เปิดเอกสาร Illustrator และเลือก `PlacedItem` หรือ `RasterItem` หนึ่งภาพ
 2. เปิด Vector Panel แล้วกด **ตรวจภาพ**
-3. เลือก preset, จำนวนสี และความเรียบ จากนั้นกด **สร้างตัวอย่าง**
-4. ตรวจภาพตัวอย่างแล้วกด **ใส่ใน Illustrator** ผลจะอยู่ใน layer ใหม่ ต้นฉบับยังอยู่
-5. เมื่อต้องการแปลงใหม่ ให้เลือกกลุ่ม `Trace ...` ที่ Panel สร้าง กด **ตรวจภาพ** แล้วกด **สร้างเวอร์ชันใหม่**
+3. เลือก preset, จำนวนสี และความเรียบ จากนั้นกด **สร้างตัวอย่าง** Panel แยกสีเป็นแผนที่พิกเซลก่อนทำเส้น
+4. ใช้ Zap, Fill, Pencil, Color และแผนภาพสีแก้แผนที่สี จำนวนสีที่แสดงคือจำนวนที่ใช้จริง การกดสร้างตัวอย่างหรือแปลงใหม่หลังแก้แล้วจะถามก่อนล้างงานแก้ ส่วน **ดูเส้น** สร้างเวกเตอร์จากสีที่แก้โดยไม่ล้าง
+5. ตรวจภาพตัวอย่างแล้วกด **ใส่ใน Illustrator** ผลจะอยู่ใน layer ใหม่ ต้นฉบับยังอยู่ กด **ใส่ Swatches** เพื่อนำพาเลตต์เข้าเป็นกลุ่ม Swatches
+6. เมื่อต้องการแปลงใหม่ ให้เลือกกลุ่ม `Trace ...` ที่ Panel สร้าง กด **ตรวจภาพ** แล้วกด **สร้างเวอร์ชันใหม่**
 
 ขั้นตอนอ่านภาพจะคัดลอกภาพที่เลือกไปยังเอกสารชั่วคราวแล้วใช้ `Document.imageCapture()` ทำ PNG วิธีนี้เปลี่ยนเนื้อหา clipboard ของระบบและสร้างไฟล์ชั่วคราวในโฟลเดอร์ระบบ ซึ่ง Panel ลบเมื่อจบงาน
 
@@ -39,9 +40,10 @@ npm run build
 |---|---|
 | `extension/CSXS/manifest.xml` | ประกาศ CEP Panel สำหรับ Illustrator |
 | `extension/index.html`, `extension/style.css` | UI ใน Panel |
-| `src/panel.ts` | สถานะ UI, เรียก JSX, เรียก worker และ preview |
+| `src/panel.ts` | สถานะ UI, เรียก JSX, แยกสี และลากเส้น |
+| `src/color/` | พาเลตต์ OKLab, แผนที่สี, เส้น Bézier ที่ใช้ขอบร่วม |
 | `extension/jsx/host.jsx` | อ่าน selection/capture ภาพ/นำ SVG เข้าเอกสาร |
-| `extension/bin/vtracer` | VTracer CLI สำหรับ macOS arm64 |
+| `extension/bin/vtracer` | binary เดิมของ macOS arm64 ไม่ได้อยู่ในเส้นทางแปลงแล้ว |
 | `scripts/` | Build worker และติดตั้ง/ถอด link สำหรับพัฒนา |
 
 เป้าหมายการพัฒนาฉบับเต็มอยู่ที่ [แผนงาน](docs/roadmap-th.md) และข้อกำหนดของไลบรารีอยู่ที่ [THIRD_PARTY.md](THIRD_PARTY.md)
