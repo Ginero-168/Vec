@@ -1,8 +1,8 @@
 import * as fs from "fs";
-import { deltaE76, rgbToCieLab, type Lab } from "./color/oklab";
+import { deltaE76, oklabChroma, rgbToCieLab, rgbToOklab, type Lab } from "./color/oklab";
 import { encodePng, decodePng } from "./color/png";
-import { rasterizeShapes } from "./color/raster";
-import { renderRgba, segmentImage } from "./color/segment";
+import { rasterizeShapes, rasterizeWindow } from "./color/raster";
+import { DARK_SURROUND_L, renderRgba, segmentImage } from "./color/segment";
 import { legacySegmentImage } from "./color/legacy-segment";
 import { traceSegmentation } from "./color/trace";
 import { TRANSPARENT } from "./color/model";
@@ -245,6 +245,69 @@ for (let label = 0; label < segmentation.palette.length; label++) {
   console.log("orangeCore", label, "pixels", samples.length, "src", core.r + "," + core.g + "," + core.b, "pal", color.r + "," + color.g + "," + color.b, "dE", delta.toFixed(2));
 }
 
+const plate = coreDelta(541, 223, 305, 304, (color) => color.r > 20 && color.r < 90 && color.g < 24 && color.b < 24 && color.r > color.g + 15);
+console.log("maroonCore", plate ? plate.label + " pixels " + plate.pixels + " src " + plate.src + " pal " + plate.pal + " dE " + plate.delta.toFixed(2) : "missing");
+
+let blurDark = 0;
+const blurSeen = new Uint8Array(width * height);
+for (let start = 0; start < width * height; start++) {
+  const label = segmentation.labels[start] ?? TRANSPARENT;
+  if (label === TRANSPARENT || blurSeen[start]) continue;
+  const stack = [start];
+  blurSeen[start] = 1;
+  const pixels: number[] = [];
+  let inBand = 0;
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === undefined) break;
+    pixels.push(current);
+    const x = current % width;
+    const y = (current - x) / width;
+    if (y >= 540 || (x >= 1280 && y <= 180)) inBand++;
+    const neighbors = [current - 1, current + 1, current - width, current + width];
+    for (const next of neighbors) {
+      if (next < 0 || next >= width * height || blurSeen[next]) continue;
+      if ((segmentation.labels[next] ?? TRANSPARENT) !== label) continue;
+      const nx = next % width;
+      if (Math.abs(nx - x) + Math.abs(Math.floor(next / width) - y) !== 1) continue;
+      blurSeen[next] = 1;
+      stack.push(next);
+    }
+  }
+  if (inBand < pixels.length * 0.8 || pixels.length < 6 || pixels.length > 5000) continue;
+  const own = segmentation.palette[label];
+  if (!own) continue;
+  const ownL = rgbToOklab(own.r, own.g, own.b).l;
+  let neighborL = ownL;
+  let touches = 0;
+  for (const pixel of pixels) {
+    const x = pixel % width;
+    const y = (pixel - x) / width;
+    const neighbors = [pixel - 1, pixel + 1, pixel - width, pixel + width];
+    for (const next of neighbors) {
+      if (next < 0 || next >= width * height) continue;
+      const nx = next % width;
+      const ny = Math.floor(next / width);
+      if (Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
+      const other = segmentation.labels[next] ?? TRANSPARENT;
+      if (other === TRANSPARENT || other === label) continue;
+      const color = segmentation.palette[other];
+      if (!color) continue;
+      neighborL += rgbToOklab(color.r, color.g, color.b).l;
+      touches++;
+    }
+  }
+  if (touches === 0) continue;
+  const gapL = neighborL / touches - ownL;
+  if (gapL > DARK_SURROUND_L && oklabChroma(rgbToOklab(own.r, own.g, own.b)) < 0.04) {
+    blurDark++;
+    const x0 = pixels[0]! % width;
+    const y0 = Math.floor(pixels[0]! / width);
+    console.log("blur-dark", pixels.length, "at", x0, y0, "gap", gapL.toFixed(3), own.r + "," + own.g + "," + own.b);
+  }
+}
+console.log("blurDarkComponents", blurDark, "threshold", DARK_SURROUND_L);
+
 fs.mkdirSync("/opt/cursor/artifacts", { recursive: true });
 fs.writeFileSync("/tmp/trace-result.svg", traced.svg);
 const gap = 8;
@@ -256,8 +319,11 @@ const legacySheet = new Uint8Array(width * height * 4);
 legacySheet.set(legacyRgba);
 fs.writeFileSync("/opt/cursor/artifacts/trace-legacy.png", encodePng(width, height, legacySheet));
 fs.writeFileSync("/opt/cursor/artifacts/trace-result.png", encodePng(width, height, preview));
-writeCrop(180, 70, 520, 160, "trace-crop-title.png");
-writeCrop(180, 250, 980, 220, "trace-crop-icons.png");
+writeZoom(36, 160, 260, 64, "zoom-title.png");
+writeCrop(120, 210, 340, 330, "crop-green.png");
+writeCrop(500, 200, 820, 360, "crop-icons.png");
+writeZoom(100, 280, 80, 200, "zoom-green-edge-400.png");
+writeZoom(530, 210, 330, 330, "zoom-ai-400.png");
 console.log("wrote artifacts");
 
 const balloon = makeStripeSample();
@@ -291,6 +357,84 @@ function paintSheet(target: Uint8Array, source: Uint8Array, originX: number, she
       target[to + 3] = 255;
     }
   }
+}
+
+function coreDelta(
+  x0: number,
+  y0: number,
+  boxWidth: number,
+  boxHeight: number,
+  match: (color: { r: number; g: number; b: number }) => boolean
+): { label: number; pixels: number; src: string; pal: string; delta: number } | null {
+  const counts = new Map<number, number>();
+  for (let y = y0; y < y0 + boxHeight && y < height; y++) {
+    for (let x = x0; x < x0 + boxWidth && x < width; x++) {
+      const label = segmentation.labels[y * width + x] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      const color = segmentation.palette[label];
+      if (!color || !match(color)) continue;
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+  }
+  let label = -1;
+  let pixels = 0;
+  for (const [index, count] of counts) {
+    if (count > pixels) {
+      label = index;
+      pixels = count;
+    }
+  }
+  const color = segmentation.palette[label];
+  if (!color || pixels < 30) return null;
+  const samples: number[] = [];
+  for (let y = y0 + 1; y < y0 + boxHeight - 1 && y < height - 1; y++) {
+    for (let x = x0 + 1; x < x0 + boxWidth - 1 && x < width - 1; x++) {
+      const index = y * width + x;
+      if (segmentation.labels[index] !== label) continue;
+      if (segmentation.labels[index - 1] !== label || segmentation.labels[index + 1] !== label) continue;
+      if (segmentation.labels[index - width] !== label || segmentation.labels[index + width] !== label) continue;
+      samples.push(index);
+    }
+  }
+  if (samples.length < 20) return null;
+  const channel = (shift: number) => {
+    const values = samples.map((index) => data[index * 4 + shift] ?? 0).sort((a, b) => a - b);
+    return values[Math.floor(values.length / 2)] ?? 0;
+  };
+  const core = { r: channel(0), g: channel(1), b: channel(2) };
+  return {
+    label,
+    pixels: samples.length,
+    src: core.r + "," + core.g + "," + core.b,
+    pal: color.r + "," + color.g + "," + color.b,
+    delta: deltaE76(rgbToCieLab(core.r, core.g, core.b), rgbToCieLab(color.r, color.g, color.b))
+  };
+}
+
+function writeZoom(x0: number, y0: number, cropWidth: number, cropHeight: number, name: string): void {
+  const scale = 4;
+  const zoomedWidth = cropWidth * scale;
+  const zoomedHeight = cropHeight * scale;
+  const vector = rasterizeWindow(traced.shapes, x0, y0, cropWidth, cropHeight, scale);
+  const image = new Uint8Array(zoomedWidth * 2 * zoomedHeight * 4);
+  for (let y = 0; y < zoomedHeight; y++) {
+    for (let x = 0; x < zoomedWidth; x++) {
+      const sx = Math.min(width - 1, x0 + Math.floor(x / scale));
+      const sy = Math.min(height - 1, y0 + Math.floor(y / scale));
+      const from = (sy * width + sx) * 4;
+      const left = (y * zoomedWidth * 2 + x) * 4;
+      const right = (y * zoomedWidth * 2 + zoomedWidth + x) * 4;
+      image[left] = data[from] ?? 0;
+      image[left + 1] = data[from + 1] ?? 0;
+      image[left + 2] = data[from + 2] ?? 0;
+      image[left + 3] = 255;
+      image[right] = vector[(y * zoomedWidth + x) * 4] ?? 0;
+      image[right + 1] = vector[(y * zoomedWidth + x) * 4 + 1] ?? 0;
+      image[right + 2] = vector[(y * zoomedWidth + x) * 4 + 2] ?? 0;
+      image[right + 3] = 255;
+    }
+  }
+  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(zoomedWidth * 2, zoomedHeight, image));
 }
 
 function writeCrop(x0: number, y0: number, cropWidth: number, cropHeight: number, name: string): void {

@@ -1209,8 +1209,13 @@
     reassignBlends(rgba, labels, width, height, paletteLabs, coverage, partner, blend);
     writeRobustPalette(rgba, labels, width, height, paletteLabs, blend);
     mergeClusters(labels, partner, coverage, paletteLabs, sensitivity, smoothContrast, colors);
+    detachNeutrals(rgba, labels, partner, coverage, paletteLabs);
     smoothLowContrast(labels, partner, coverage, width, height, paletteLabs, smoothContrast);
     removeWeakSpeckles(labels, partner, coverage, width, height, paletteLabs);
+    absorbDarkBlobs(rgba, labels, partner, coverage, width, height, paletteLabs);
+    dissolveSlivers(rgba, labels, partner, coverage, width, height, paletteLabs);
+    peelPaleEdges(rgba, labels, partner, coverage, width, height, paletteLabs);
+    liftNearWhite(rgba, labels, partner, coverage, width, height, paletteLabs);
     const compacted = compactAll(labels, partner, paletteLabs);
     return {
       width,
@@ -1292,7 +1297,7 @@
     for (const bin of minorities) {
       if (seeds.length >= maxColors2) break;
       const isolated = seeds.every((seed) => oklabDistance(seed, bin.lab) > 0.12);
-      const vivid = oklabChroma(bin.lab) > 0.08 || bin.lab.l < 0.22 || bin.lab.l > 0.93;
+      const vivid = oklabChroma(bin.lab) > 0.08 || bin.lab.l > 0.93;
       if (isolated && vivid) {
         seeds.push(bin.lab);
         protectedLabs.push(bin.lab);
@@ -1489,7 +1494,7 @@
   function mergeClusters(labels, partner, coverage, palette, sensitivity, smoothContrast, maxColors2) {
     const counts = countLabels(labels, palette.length);
     const active = palette.map((_, index) => (counts[index] ?? 0) > 0);
-    const protectedSlot = palette.map((lab) => oklabChroma(lab) > 0.08 || lab.l < 0.2 || lab.l > 0.93);
+    const protectedSlot = palette.map((lab) => oklabChroma(lab) > 0.045 || lab.l > 0.93);
     const activeCount = () => active.filter(Boolean).length;
     for (; ; ) {
       let bestI = -1;
@@ -1504,12 +1509,12 @@
           if (!active[j]) continue;
           const right = palette[j];
           if (!right) continue;
+          if (huesApart(left, right)) continue;
           const distance = oklabDistance(left, right);
-          const bothDark = left.l < 0.34 && right.l < 0.34 && oklabChroma(left) < 0.08 && oklabChroma(right) < 0.08;
           const lowChroma = oklabChroma(left) < 0.05 && oklabChroma(right) < 0.05;
-          const limit = bothDark ? 0.22 : lowChroma ? Math.max(sensitivity, smoothContrast) : sensitivity;
-          const bothProtected = (protectedSlot[i] ?? false) && (protectedSlot[j] ?? false) && !bothDark;
-          const underLimit = distance < limit && !bothProtected;
+          const limit = lowChroma ? Math.max(sensitivity, smoothContrast) : sensitivity;
+          const bothProtected = (protectedSlot[i] ?? false) && (protectedSlot[j] ?? false);
+          const underLimit = sameHueClose(left, right) || distance < limit && !bothProtected;
           const overBudget = activeCount() > maxColors2 && !bothProtected;
           if (!underLimit && !overBudget) continue;
           const prefer = underLimit && !bestAllowed ? true : underLimit === bestAllowed && distance < bestD;
@@ -1522,10 +1527,7 @@
         }
       }
       if (bestI < 0 || bestJ < 0) break;
-      const leftLab = palette[bestI];
-      const rightLab = palette[bestJ];
-      const darkPair = !!leftLab && !!rightLab && leftLab.l < 0.34 && rightLab.l < 0.34 && oklabChroma(leftLab) < 0.08 && oklabChroma(rightLab) < 0.08;
-      const source = darkPair ? leftLab.l <= rightLab.l ? bestJ : bestI : (counts[bestI] ?? 0) <= (counts[bestJ] ?? 0) ? bestI : bestJ;
+      const source = (counts[bestI] ?? 0) <= (counts[bestJ] ?? 0) ? bestI : bestJ;
       const target = source === bestI ? bestJ : bestI;
       relabel(labels, partner, coverage, source, target);
       counts[target] = (counts[target] ?? 0) + (counts[source] ?? 0);
@@ -1657,7 +1659,7 @@
         }
       }
       if (target < 0) continue;
-      const vivid = oklabChroma(own) > 0.08 || own.l < 0.22 || own.l > 0.92;
+      const vivid = oklabChroma(own) > 0.08 || own.l > 0.92;
       if (vivid && contrast > 0.05) continue;
       if (contrast >= 0.1) continue;
       for (const pixel of pixels) {
@@ -1666,6 +1668,376 @@
         partner[pixel] = TRANSPARENT;
       }
     }
+  }
+  var DARK_SURROUND_L = 0.12;
+  function sameHueClose(left, right) {
+    const leftChroma = oklabChroma(left);
+    const rightChroma = oklabChroma(right);
+    if (leftChroma < 0.08 || rightChroma < 0.08) return false;
+    let angle = Math.abs(Math.atan2(left.b, left.a) - Math.atan2(right.b, right.a));
+    if (angle > Math.PI) angle = Math.PI * 2 - angle;
+    if (angle > 0.22) return false;
+    if (Math.abs(left.l - right.l) > 0.08) return false;
+    return oklabDistance(left, right) < 0.09;
+  }
+  function detachNeutrals(rgba, labels, partner, coverage, palette) {
+    const counts = countLabels(labels, palette.length);
+    const neutral = [];
+    const chromatic = new Array(palette.length).fill(false);
+    for (let i = 0; i < palette.length; i++) {
+      const lab = palette[i];
+      if (!lab || (counts[i] ?? 0) === 0) continue;
+      if (oklabChroma(lab) < 0.03) neutral.push(i);
+      chromatic[i] = oklabChroma(lab) >= 0.045;
+    }
+    if (neutral.length === 0) return;
+    const cache = /* @__PURE__ */ new Map();
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? TRANSPARENT;
+      if (label === TRANSPARENT || !chromatic[label]) continue;
+      if ((partner[i] ?? TRANSPARENT) !== TRANSPARENT) continue;
+      const offset = i * 4;
+      const key = (rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0);
+      let next = cache.get(key);
+      if (next === void 0) {
+        const lab = rgbToOklab(key >> 16 & 255, key >> 8 & 255, key & 255);
+        if (oklabChroma(lab) >= 0.03) next = label;
+        else {
+          let best = label;
+          let bestDistance = Infinity;
+          for (const candidate of neutral) {
+            const color = palette[candidate];
+            if (!color) continue;
+            const distance = oklabDistance(lab, color);
+            if (distance < bestDistance) {
+              bestDistance = distance;
+              best = candidate;
+            }
+          }
+          next = bestDistance < 0.4 ? best : label;
+        }
+        cache.set(key, next);
+      }
+      if (next !== label) {
+        labels[i] = next;
+        coverage[i] = 1;
+        partner[i] = TRANSPARENT;
+      }
+    }
+  }
+  function huesApart(left, right) {
+    const leftChroma = oklabChroma(left);
+    const rightChroma = oklabChroma(right);
+    if (leftChroma >= 0.035 && rightChroma < 0.025 || rightChroma >= 0.035 && leftChroma < 0.025) return true;
+    if (leftChroma > 0.04 && rightChroma > 0.04) {
+      let angle = Math.abs(Math.atan2(left.b, left.a) - Math.atan2(right.b, right.a));
+      if (angle > Math.PI) angle = Math.PI * 2 - angle;
+      if (angle > 0.45) return true;
+    }
+    return false;
+  }
+  function forEachComponent(labels, width, height, body) {
+    const seen = new Uint8Array(labels.length);
+    const stack = [];
+    for (let start = 0; start < labels.length; start++) {
+      const label = labels[start] ?? TRANSPARENT;
+      if (label === TRANSPARENT || seen[start]) continue;
+      stack.push(start);
+      seen[start] = 1;
+      const pixels = [];
+      const adjacency = /* @__PURE__ */ new Map();
+      let minX = width;
+      let maxX = 0;
+      let minY = height;
+      let maxY = 0;
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === void 0) break;
+        pixels.push(current);
+        const x = current % width;
+        const y = (current - x) / width;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const next of neighbors) {
+          if (next < 0 || next >= labels.length) continue;
+          const nx = next % width;
+          const ny = (next - nx) / width;
+          if (next === current - 1 && x === 0 || next === current + 1 && x + 1 === width) continue;
+          if (ny < 0 || ny >= height) continue;
+          const neighbor = labels[next] ?? TRANSPARENT;
+          if (neighbor === label) {
+            if (!seen[next]) {
+              seen[next] = 1;
+              stack.push(next);
+            }
+          } else if (neighbor !== TRANSPARENT) {
+            adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+          }
+        }
+      }
+      body({ label, pixels, minX, maxX, minY, maxY, adjacency });
+    }
+  }
+  function absorbDarkBlobs(rgba, labels, partner, coverage, width, height, palette) {
+    const areaCap2 = Math.max(160, Math.round(width * height * 4e-3));
+    const mark = new Uint8Array(labels.length);
+    forEachComponent(labels, width, height, (region) => {
+      if (region.pixels.length < 4 || region.pixels.length > areaCap2 || region.adjacency.size === 0) return;
+      const spanX = region.maxX - region.minX + 1;
+      const spanY = region.maxY - region.minY + 1;
+      const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+      if (aspect >= 2.2) return;
+      if (region.pixels.length >= 6 && componentThickness2(region.pixels, width, height, 2) <= 2) return;
+      const own = medianLab(rgba, region.pixels);
+      if (oklabChroma(own) >= 0.045) return;
+      const ring = ringLabs(rgba, labels, region.pixels, width, height, mark);
+      if (ring.length < 6) return;
+      const surround = medianOf(ring);
+      if (oklabChroma(surround) > 0.05) return;
+      if (spreadL(ring) > 0.055) return;
+      const gap = surround.l - own.l;
+      if (gap <= DARK_SURROUND_L) return;
+      if (own.l < 0.16 && gap > 0.5) return;
+      const target = surroundLabel(region.adjacency, palette, surround);
+      if (target < 0 || target === region.label) return;
+      for (const pixel of region.pixels) {
+        labels[pixel] = target;
+        coverage[pixel] = 1;
+        partner[pixel] = TRANSPARENT;
+      }
+    });
+  }
+  function dissolveSlivers(rgba, labels, partner, coverage, width, height, palette) {
+    forEachComponent(labels, width, height, (region) => {
+      if (region.pixels.length < 2 || region.adjacency.size === 0) return;
+      const spanX = region.maxX - region.minX + 1;
+      const spanY = region.maxY - region.minY + 1;
+      const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+      const narrow = Math.min(spanX, spanY) <= 2 || aspect >= 2.4;
+      if (!narrow && region.pixels.length > 80) return;
+      const thick = componentThickness2(region.pixels, width, height, 3);
+      const thinStrip = Math.min(spanX, spanY) <= 2 || thick <= 1 || thick <= 2 && aspect >= 2.4;
+      if (!thinStrip) return;
+      const target = sliverTarget(rgba, region, palette);
+      if (target < 0 || target === region.label) return;
+      for (const pixel of region.pixels) {
+        labels[pixel] = target;
+        coverage[pixel] = 1;
+        partner[pixel] = TRANSPARENT;
+      }
+    });
+  }
+  function peelPaleEdges(rgba, labels, partner, coverage, width, height, palette) {
+    const paleSlot = palette.map((lab) => lab.l > 0.9 && oklabChroma(lab) < 0.04);
+    const next = labels.slice();
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT || !paleSlot[label]) continue;
+        const offset = index * 4;
+        const red = rgba[offset] ?? 0;
+        const green = rgba[offset + 1] ?? 0;
+        const blue = rgba[offset + 2] ?? 0;
+        const lab = rgbToOklab(red, green, blue);
+        if (lab.l > 0.94 && oklabChroma(lab) < 0.025) continue;
+        const neighbors = [index - 1, index + 1, index - width, index + width];
+        let best = -1;
+        let bestDistance = Infinity;
+        let contacts = 0;
+        for (const neighbor of neighbors) {
+          if (neighbor < 0 || neighbor >= labels.length) continue;
+          const nx = neighbor % width;
+          if (neighbor === index - 1 && x === 0 || neighbor === index + 1 && x + 1 === width) continue;
+          const ny = (neighbor - nx) / width;
+          if (ny < 0 || ny >= height) continue;
+          const other = labels[neighbor] ?? TRANSPARENT;
+          if (other === TRANSPARENT || other === label || paleSlot[other]) continue;
+          contacts++;
+          const color = palette[other];
+          if (!color) continue;
+          const distance = oklabDistance(lab, color);
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            best = other;
+          }
+        }
+        const nearWhitePixel = red > 226 && green > 226 && blue > 226;
+        if (nearWhitePixel && contacts < 2) continue;
+        if (best < 0 || bestDistance > 0.28) continue;
+        next[index] = best;
+        coverage[index] = 1;
+        partner[index] = TRANSPARENT;
+      }
+    }
+    labels.set(next);
+  }
+  function liftNearWhite(rgba, labels, partner, coverage, width, height, palette) {
+    let lightest = -1;
+    let lightestL = -1;
+    for (let i = 0; i < palette.length; i++) {
+      const lab = palette[i];
+      if (!lab || lab.l <= lightestL) continue;
+      lightestL = lab.l;
+      lightest = i;
+    }
+    const target = palette[lightest];
+    if (!target || lightest < 0 || lightestL < 0.9) return;
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? TRANSPARENT;
+      if (label === TRANSPARENT || label === lightest) continue;
+      const own = palette[label];
+      if (!own || own.l > 0.9) continue;
+      const offset = i * 4;
+      const red = rgba[offset] ?? 0;
+      const green = rgba[offset + 1] ?? 0;
+      const blue = rgba[offset + 2] ?? 0;
+      if (red < 232 || green < 232 || blue < 232) continue;
+      const x = i % width;
+      const y = (i - x) / width;
+      let chromaticNeighbor = false;
+      const neighbors = [i - 1, i + 1, i - width, i + width];
+      for (const neighbor of neighbors) {
+        if (neighbor < 0 || neighbor >= labels.length) continue;
+        const nx = neighbor % width;
+        const ny = (neighbor - nx) / width;
+        if (neighbor === i - 1 && x === 0 || neighbor === i + 1 && x + 1 === width) continue;
+        if (ny < 0 || ny >= height) continue;
+        const other = labels[neighbor] ?? TRANSPARENT;
+        const color = other === TRANSPARENT ? void 0 : palette[other];
+        if (color && oklabChroma(color) > 0.08) chromaticNeighbor = true;
+      }
+      if (chromaticNeighbor) continue;
+      const lab = rgbToOklab(red, green, blue);
+      if (oklabDistance(lab, target) + 0.015 >= oklabDistance(lab, own)) continue;
+      labels[i] = lightest;
+      coverage[i] = 1;
+      partner[i] = TRANSPARENT;
+    }
+  }
+  function sliverTarget(rgba, region, palette) {
+    const ranked = [...region.adjacency.entries()].sort((a, b) => b[1] - a[1]);
+    const first = ranked[0];
+    if (!first) return -1;
+    const second = ranked[1];
+    const colorA = palette[first[0]];
+    const colorB = second ? palette[second[0]] : void 0;
+    const median2 = medianLab(rgba, region.pixels);
+    const own = palette[region.label];
+    if (median2.l < 0.22 && oklabChroma(median2) < 0.05) return -1;
+    if (colorA && isHalo(median2, colorA)) return first[0];
+    if (colorB && second && isHalo(median2, colorB)) return second[0];
+    if (colorA && colorB) {
+      const along = project(median2, colorA, colorB);
+      if (along && along.t > 0.05 && along.t < 0.95 && along.perp < Math.min(0.05, 0.45 * along.length)) {
+        return along.t < 0.5 ? first[0] : second ? second[0] : first[0];
+      }
+    }
+    const pale = median2.l > 0.82 && oklabChroma(median2) < 0.06;
+    const paleSwatch = !!own && own.l > 0.88 && oklabChroma(own) < 0.05;
+    if (!pale && !paleSwatch) return -1;
+    let best = -1;
+    let bestScore = Infinity;
+    for (const [other] of ranked) {
+      const color = palette[other];
+      if (!color || color.l > 0.9 && oklabChroma(color) < 0.04) continue;
+      const distance = oklabDistance(median2, color);
+      if (distance < bestScore) {
+        bestScore = distance;
+        best = other;
+      }
+    }
+    return bestScore < 0.45 ? best : -1;
+  }
+  function isHalo(pixel, neighbor) {
+    const pixelChroma = oklabChroma(pixel);
+    const neighborChroma = oklabChroma(neighbor);
+    if (neighborChroma < 0.05 || pixelChroma < 0.02) return false;
+    let angle = Math.abs(Math.atan2(pixel.b, pixel.a) - Math.atan2(neighbor.b, neighbor.a));
+    if (angle > Math.PI) angle = Math.PI * 2 - angle;
+    if (angle > 0.4) return false;
+    if (oklabDistance(pixel, neighbor) > 0.14) return false;
+    if (pixel.l + 0.12 < neighbor.l) return false;
+    return true;
+  }
+  function ringLabs(rgba, labels, pixels, width, height, mark) {
+    for (const pixel of pixels) mark[pixel] = 1;
+    const ring = [];
+    const seenRing = /* @__PURE__ */ new Set();
+    for (const pixel of pixels) {
+      const x = pixel % width;
+      const y = (pixel - x) / width;
+      const neighbors = [pixel - 1, pixel + 1, pixel - width, pixel + width];
+      for (const next of neighbors) {
+        if (next < 0 || next >= labels.length || seenRing.has(next)) continue;
+        const nx = next % width;
+        const ny = (next - nx) / width;
+        if (next === pixel - 1 && x === 0 || next === pixel + 1 && x + 1 === width) continue;
+        if (ny < 0 || ny >= height || mark[next]) continue;
+        seenRing.add(next);
+        const offset = next * 4;
+        ring.push(rgbToOklab(rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0));
+      }
+    }
+    for (const pixel of pixels) mark[pixel] = 0;
+    return ring;
+  }
+  function surroundLabel(adjacency, palette, surround) {
+    let best = -1;
+    let bestScore = Infinity;
+    for (const [other, touches] of adjacency) {
+      const color = palette[other];
+      if (!color || touches <= 0) continue;
+      const distance = oklabDistance(color, surround);
+      const score = distance - Math.min(touches, 40) * 5e-4;
+      if (score < bestScore) {
+        bestScore = score;
+        best = other;
+      }
+    }
+    return best;
+  }
+  function medianLab(rgba, pixels) {
+    const step = Math.max(1, Math.floor(pixels.length / 480));
+    const l = [];
+    const a = [];
+    const b = [];
+    for (let i = 0; i < pixels.length; i += step) {
+      const index = pixels[i];
+      if (index === void 0) continue;
+      const offset = index * 4;
+      const lab = rgbToOklab(rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0);
+      l.push(lab.l);
+      a.push(lab.a);
+      b.push(lab.b);
+    }
+    return { l: median(l), a: median(a), b: median(b) };
+  }
+  function medianOf(labs) {
+    return {
+      l: median(labs.map((lab) => lab.l)),
+      a: median(labs.map((lab) => lab.a)),
+      b: median(labs.map((lab) => lab.b))
+    };
+  }
+  function median(values) {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((left, right) => left - right);
+    return sorted[Math.floor(sorted.length / 2)] ?? 0;
+  }
+  function spreadL(labs) {
+    let mean = 0;
+    for (const lab of labs) mean += lab.l;
+    mean /= labs.length;
+    let variance = 0;
+    for (const lab of labs) {
+      const delta = lab.l - mean;
+      variance += delta * delta;
+    }
+    return Math.sqrt(variance / labs.length);
   }
   function compactAll(labels, partner, palette) {
     const used = new Array(palette.length).fill(false);
@@ -1851,7 +2223,7 @@
       const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
       const subpaths = [];
       for (const contour of contours) {
-        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(error * 0.75, 1.15 / scale), cache);
+        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache);
         if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
       }
       const color = segmentation.palette[label];
@@ -2162,7 +2534,7 @@
     if (simplified.length < 2) return [];
     const corners = [0];
     for (let i = 1; i < simplified.length - 1; i++) {
-      if (Math.abs(turnAngle(simplified[i - 1], simplified[i], simplified[i + 1])) >= cornerAngle) corners.push(i);
+      if (keptCorner(simplified[i - 1], simplified[i], simplified[i + 1], cornerAngle)) corners.push(i);
     }
     corners.push(simplified.length - 1);
     const commands = [];
@@ -2176,7 +2548,7 @@
     for (let i = 0; i < simplified.length; i++) {
       const previous = simplified[(i + simplified.length - 1) % simplified.length];
       const next = simplified[(i + 1) % simplified.length];
-      if (Math.abs(turnAngle(previous, simplified[i], next)) >= cornerAngle) corners.push(i);
+      if (keptCorner(previous, simplified[i], next, cornerAngle)) corners.push(i);
     }
     const commands = [];
     if (corners.length === 0) {
@@ -2408,6 +2780,15 @@
     if (length < 1e-8) return Math.hypot(point.x - from.x, point.y - from.y);
     return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
   }
+  function keptCorner(previous, current, next, cornerAngle) {
+    const turn = Math.abs(turnAngle(previous, current, next));
+    if (turn < cornerAngle) return false;
+    const incoming = Math.hypot(current.x - previous.x, current.y - previous.y);
+    const outgoing = Math.hypot(next.x - current.x, next.y - current.y);
+    if (incoming < 1.35 && outgoing < 1.35) return false;
+    if (Math.min(incoming, outgoing) < 0.8 && turn < 1.15) return false;
+    return true;
+  }
   function turnAngle(a, b, c) {
     const incoming = Math.atan2(b.y - a.y, b.x - a.x);
     const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
@@ -2469,7 +2850,7 @@
         }
         return path + "Z";
       }).join("");
-      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.75" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
+      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.4" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
     }).join("");
     return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + body + "</svg>";
   }

@@ -67,7 +67,7 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
     const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
     const subpaths: VecSubpath[] = [];
     for (const contour of contours) {
-      const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(error * 0.75, 1.15 / scale), cache);
+      const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache);
       if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
     }
     const color = segmentation.palette[label];
@@ -421,7 +421,7 @@ function fitOpenChain(points: Point[], error: number, cornerAngle: number, simpl
   if (simplified.length < 2) return [];
   const corners = [0];
   for (let i = 1; i < simplified.length - 1; i++) {
-    if (Math.abs(turnAngle(simplified[i - 1]!, simplified[i]!, simplified[i + 1]!)) >= cornerAngle) corners.push(i);
+    if (keptCorner(simplified[i - 1]!, simplified[i]!, simplified[i + 1]!, cornerAngle)) corners.push(i);
   }
   corners.push(simplified.length - 1);
   const commands: FitCommand[] = [];
@@ -436,7 +436,7 @@ function fitClosedChain(points: Point[], error: number, cornerAngle: number, sim
   for (let i = 0; i < simplified.length; i++) {
     const previous = simplified[(i + simplified.length - 1) % simplified.length]!;
     const next = simplified[(i + 1) % simplified.length]!;
-    if (Math.abs(turnAngle(previous, simplified[i]!, next)) >= cornerAngle) corners.push(i);
+    if (keptCorner(previous, simplified[i]!, next, cornerAngle)) corners.push(i);
   }
   const commands: FitCommand[] = [];
   if (corners.length === 0) {
@@ -678,6 +678,16 @@ function pointSegmentDistance(point: Point, from: Point, to: Point): number {
   return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
 }
 
+function keptCorner(previous: Point, current: Point, next: Point, cornerAngle: number): boolean {
+  const turn = Math.abs(turnAngle(previous, current, next));
+  if (turn < cornerAngle) return false;
+  const incoming = Math.hypot(current.x - previous.x, current.y - previous.y);
+  const outgoing = Math.hypot(next.x - current.x, next.y - current.y);
+  if (incoming < 1.35 && outgoing < 1.35) return false;
+  if (Math.min(incoming, outgoing) < 0.8 && turn < 1.15) return false;
+  return true;
+}
+
 function turnAngle(a: Point, b: Point, c: Point): number {
   const incoming = Math.atan2(b.y - a.y, b.x - a.x);
   const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
@@ -758,7 +768,7 @@ function shapesToSvg(shapes: readonly VecShape[], width: number, height: number)
           return path + "Z";
         })
         .join("");
-      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.75" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
+      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.4" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
     })
     .join("");
   return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + body + "</svg>";

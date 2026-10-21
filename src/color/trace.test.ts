@@ -2,7 +2,7 @@ import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import { deltaE76, rgbToCieLab, rgbToOklab, oklabDistance } from "./oklab";
 import { rasterizeShapes } from "./raster";
-import { segmentImage } from "./segment";
+import { DARK_SURROUND_L, segmentImage } from "./segment";
 import { traceSegmentation } from "./trace";
 import { TRANSPARENT, type Rgb, type Segmentation } from "./model";
 
@@ -125,3 +125,152 @@ test("anti-aliased orange keeps the core color and a thin stroke survives", () =
   assert.ok(center < 80, "rasterized stroke stays dark");
   assert.ok(oklabDistance(rgbToOklab(orange.r, orange.g, orange.b), rgbToOklab(248, 220, 180)) > 0.05);
 });
+
+test("a dark maroon plate stays separate from black", () => {
+  const maroon: Rgb = { r: 50, g: 0, b: 0 };
+  const black: Rgb = { r: 4, g: 4, b: 4 };
+  const image = paint(96, 72, (x, y) => {
+    if (x >= 12 && x < 52 && y >= 8 && y < 48) {
+      if (x === 12 || y === 8 || x === 51 || y === 47) return { r: 30, g: 6, b: 4 };
+      return maroon;
+    }
+    if (y >= 58 && y <= 60 && x >= 6 && x < 88) return black;
+    const n = (x * 13 + y * 9) % 17;
+    return { r: 108 + n, g: 104 + (n % 5), b: 116 + (n % 7) };
+  });
+  const segmentation = segmentImage(image.rgba, image.width, image.height, 6, { preset: "ui" });
+  const plate = segmentation.labels[28 * image.width + 32] ?? TRANSPARENT;
+  const ink = segmentation.labels[59 * image.width + 40] ?? TRANSPARENT;
+  const plateColor = segmentation.palette[plate];
+  const inkColor = segmentation.palette[ink];
+  assert.ok(plateColor && inkColor);
+  assert.notEqual(plate, ink);
+  const delta = deltaE76(rgbToCieLab(plateColor.r, plateColor.g, plateColor.b), rgbToCieLab(maroon.r, maroon.g, maroon.b));
+  assert.ok(delta < 8, "maroon swatch deltaE " + delta.toFixed(2));
+  assert.ok(rgbToOklab(inkColor.r, inkColor.g, inkColor.b).l < 0.2, "text ink stays dark");
+  assert.ok(oklabChroma(rgbToOklab(plateColor.r, plateColor.g, plateColor.b)) > 0.03);
+});
+
+test("a low-contrast blur does not keep a darker component", () => {
+  const image = paint(72, 48, (x, y) => {
+    const base = 96 + Math.round((x / 71) * 36);
+    if (x >= 22 && x < 31 && y >= 14 && y < 23) return { r: 18, g: 16, b: 20 };
+    if (y === 40 && x >= 4 && x < 64) return { r: 6, g: 6, b: 6 };
+    return { r: base, g: base - 1, b: base + 3 };
+  });
+  const segmentation = segmentImage(image.rgba, image.width, image.height, 6, { preset: "ui" });
+  const seen = new Uint8Array(image.width * image.height);
+  for (let start = 0; start < seen.length; start++) {
+    const label = segmentation.labels[start] ?? TRANSPARENT;
+    if (label === TRANSPARENT || seen[start]) continue;
+    const stack = [start];
+    seen[start] = 1;
+    const pixels: number[] = [];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === undefined) break;
+      pixels.push(current);
+      const x = current % image.width;
+      const y = (current - x) / image.width;
+      if (y >= 36) continue;
+      const neighbors = [current - 1, current + 1, current - image.width, current + image.width];
+      for (const next of neighbors) {
+        if (next < 0 || next >= seen.length || seen[next]) continue;
+        if ((segmentation.labels[next] ?? TRANSPARENT) !== label) continue;
+        const nx = next % image.width;
+        if (Math.abs(nx - x) + Math.abs(Math.floor(next / image.width) - y) !== 1) continue;
+        seen[next] = 1;
+        stack.push(next);
+      }
+    }
+    const upper = pixels.filter((pixel) => Math.floor(pixel / image.width) < 36);
+    if (upper.length < 4) continue;
+    const componentL = medianChannel(
+      upper.map((pixel) => rgbToOklab(image.rgba[pixel * 4] ?? 0, image.rgba[pixel * 4 + 1] ?? 0, image.rgba[pixel * 4 + 2] ?? 0).l)
+    );
+    const ring: number[] = [];
+    for (const pixel of upper) {
+      const x = pixel % image.width;
+      const y = Math.floor(pixel / image.width);
+      const neighbors = [pixel - 1, pixel + 1, pixel - image.width, pixel + image.width];
+      for (const next of neighbors) {
+        if (next < 0 || next >= seen.length) continue;
+        const nx = next % image.width;
+        const ny = Math.floor(next / image.width);
+        if (ny >= 36 || Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
+        if (upper.includes(next)) continue;
+        ring.push(rgbToOklab(image.rgba[next * 4] ?? 0, image.rgba[next * 4 + 1] ?? 0, image.rgba[next * 4 + 2] ?? 0).l);
+      }
+    }
+    if (ring.length < 4) continue;
+    const gap = medianChannel(ring) - componentL;
+    assert.ok(gap <= DARK_SURROUND_L, "darker than surround by " + gap.toFixed(3));
+  }
+  const stroke = segmentation.palette[segmentation.labels[40 * image.width + 20] ?? TRANSPARENT];
+  assert.ok(stroke);
+  assert.ok(rgbToOklab(stroke.r, stroke.g, stroke.b).l < 0.25, "the dark stroke stays");
+});
+
+test("thin fringes on a green square are reassigned", () => {
+  const green: Rgb = { r: 170, g: 239, b: 114 };
+  const purple: Rgb = { r: 118, g: 114, b: 129 };
+  const image = paint(48, 48, (x, y) => {
+    const inside = x >= 12 && x < 36 && y >= 12 && y < 36;
+    if (y >= 23 && y <= 24 && x >= 16 && x < 34) return { r: 8, g: 8, b: 8 };
+    if (x >= 14 && x < 34 && y >= 14 && y < 34) return green;
+    if (inside && (y === 12 || y === 35)) return { r: 248, g: 248, b: 246 };
+    if (inside && (x === 12 || x === 35 || x === 13 || x === 34)) return { r: 206, g: 242, b: 168 };
+    if (inside) return green;
+    return purple;
+  });
+  const segmentation = segmentImage(image.rgba, image.width, image.height, 4, { preset: "ui" });
+  const swatchAt = (x: number, y: number) => segmentation.palette[segmentation.labels[y * image.width + x] ?? TRANSPARENT];
+  for (const [x, y] of [
+    [18, 12],
+    [18, 35],
+    [12, 24],
+    [35, 20]
+  ] as const) {
+    const color = swatchAt(x, y);
+    assert.ok(color);
+    const lab = rgbToOklab(color.r, color.g, color.b);
+    assert.ok(!(lab.l > 0.85 && oklabChroma(lab) < 0.05), "white sliver at " + x + "," + y + " " + color.r + "," + color.g + "," + color.b);
+  }
+  const core = swatchAt(24, 20);
+  const fringe = swatchAt(12, 22);
+  assert.ok(core && fringe);
+  const fringeDelta = deltaE76(rgbToCieLab(core.r, core.g, core.b), rgbToCieLab(fringe.r, fringe.g, fringe.b));
+  const fringeToPurple = deltaE76(rgbToCieLab(purple.r, purple.g, purple.b), rgbToCieLab(fringe.r, fringe.g, fringe.b));
+  assert.ok(fringeDelta < 12 || fringeToPurple < 12, "fringe stayed a third color dE " + fringeDelta.toFixed(1));
+  const ink = swatchAt(22, 23);
+  assert.ok(ink);
+  assert.ok(rgbToOklab(ink.r, ink.g, ink.b).l < 0.25, "the dark mark inside the square stays");
+});
+
+test("a one-pixel stair on a long edge is smoothed", () => {
+  const segmentation = segmentationFrom(20, 30, (x, y) => {
+    if (y < 2 || y >= 28 || x >= 16) return TRANSPARENT;
+    const inset = y >= 10 && y < 18 ? 5 : 4;
+    return x >= inset ? 0 : TRANSPARENT;
+  }, [{ r: 20, g: 180, b: 60 }]);
+  const traced = traceSegmentation(segmentation, { preset: "ui", smooth: 0.5, upscale: 1 });
+  const xs: number[] = [];
+  for (const subpath of traced.shapes[0]?.subpaths ?? []) {
+    const points = [subpath.start];
+    for (const command of subpath.commands) points.push({ x: command.x, y: command.y });
+    for (const point of points) if (point.x < 8) xs.push(point.x);
+  }
+  assert.ok(xs.length >= 2);
+  const span = Math.max(...xs) - Math.min(...xs);
+  assert.ok(span < 0.45, "left edge still stairs by " + span.toFixed(2));
+  assert.ok(traced.nodeCount <= 8, "node count " + traced.nodeCount);
+});
+
+function medianChannel(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] ?? 0;
+}
+
+function oklabChroma(lab: { a: number; b: number }): number {
+  return Math.hypot(lab.a, lab.b);
+}

@@ -30,6 +30,42 @@ export function rasterizeShapes(shapes: readonly VecShape[], width: number, heig
   return rgba;
 }
 
+/** Rasterize one source-pixel window at `scale` (4 is a 400% zoom) from the vector fills. */
+export function rasterizeWindow(
+  shapes: readonly VecShape[],
+  originX: number,
+  originY: number,
+  cropWidth: number,
+  cropHeight: number,
+  scale: number
+): Uint8Array {
+  const zoom = Math.max(1, scale);
+  const placed = shapes.map((shape) => ({
+    color: shape.color,
+    area: shape.area,
+    subpaths: shape.subpaths.map((subpath) => ({
+      start: { x: (subpath.start.x - originX) * zoom, y: (subpath.start.y - originY) * zoom },
+      commands: subpath.commands.map((command) => scaleCommand(command, originX, originY, zoom))
+    }))
+  }));
+  return rasterizeShapes(placed, Math.max(1, Math.round(cropWidth * zoom)), Math.max(1, Math.round(cropHeight * zoom)));
+}
+
+function scaleCommand(command: VecCommand, originX: number, originY: number, zoom: number): VecCommand {
+  if (command.op === "L") {
+    return { op: "L", x: (command.x - originX) * zoom, y: (command.y - originY) * zoom };
+  }
+  return {
+    op: "C",
+    x1: (command.x1 - originX) * zoom,
+    y1: (command.y1 - originY) * zoom,
+    x2: (command.x2 - originX) * zoom,
+    y2: (command.y2 - originY) * zoom,
+    x: (command.x - originX) * zoom,
+    y: (command.y - originY) * zoom
+  };
+}
+
 function flattenCubic(start: Point, command: Extract<VecCommand, { op: "C" }>, out: Point[], depth = 0): void {
   const end = { x: command.x, y: command.y };
   const controlA = { x: command.x1, y: command.y1 };
