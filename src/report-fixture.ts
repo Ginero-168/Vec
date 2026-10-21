@@ -1,7 +1,10 @@
 import * as fs from "fs";
 import { deltaE76, oklabChroma, rgbToCieLab, rgbToOklab, type Lab } from "./color/oklab";
 import { encodePng, decodePng } from "./color/png";
+import { buildGlyphIndex } from "./color/glyph";
+import { measureGlyphBox } from "./color/glyph-quality";
 import { rasterizeShapes, rasterizeWindow } from "./color/raster";
+import type { VecShape, VecSubpath } from "./color/trace";
 import { DARK_SURROUND_L, renderRgba, segmentImage } from "./color/segment";
 import { legacySegmentImage } from "./color/legacy-segment";
 import { boundaryWobble, contourDeviationP95, measureSharedEdges, staircaseRatio, traceSegmentation } from "./color/trace";
@@ -416,6 +419,26 @@ writeCleanZoom(traced.shapes, cleaned.shapes, 660, 310, 140, 120, "zoom-star-cle
 writeCleanZoom(traced.shapes, cleaned.shapes, 730, 360, 140, 110, "zoom-ai-letters-clean-400.png");
 writeCleanZoom(traced.shapes, cleaned.shapes, 174, 208, 64, 52, "zoom-next-clean-400.png");
 console.log("wrote clean zooms");
+const glyphIndex = buildGlyphIndex(data, segmentation.labels, segmentation.palette, width, height);
+for (const box of [
+  { name: "Selection", x: 92, y: 204, w: 84, h: 56 },
+  { name: "Next", x: 174, y: 204, w: 62, h: 56 }
+]) {
+  const pair = glyphIndex.pairInBox(box.x, box.y, box.w, box.h);
+  if (!pair) {
+    console.log(box.name, "no glyph");
+    continue;
+  }
+  const quality = measureGlyphBox(traced.shapes, data, width, height, box.x, box.y, box.w, box.h, pair.ink, pair.bg);
+  console.log(box.name, "iou", quality.iou.toFixed(3), "hausdorff", quality.hausdorffP95.toFixed(3), "spikes", quality.spikes);
+}
+writeHero(rendered, 1, "hero-100.png");
+const heroZoom = rasterizeWindow(traced.shapes, 0, 0, width, height, 3);
+writeHero(heroZoom, 3, "hero-300.png");
+writeAnchorOverlay(traced.shapes, 112, 254, 80, 84, "anchors-green.png");
+writeAnchorOverlay(cleaned.shapes, 112, 254, 80, 84, "anchors-green-clean.png");
+writeAnchorOverlay(traced.shapes, 88, 198, 96, 66, "anchors-selection.png");
+console.log("wrote hero and anchor overlays");
 
 const balloon = makeStripeSample();
 const balloonStarted = performance.now();
@@ -627,6 +650,160 @@ function countFringe(labels: Uint16Array): number {
     }
   }
   return fringe;
+}
+
+function writeHero(vector: Uint8Array, scale: number, name: string): void {
+  const panelW = width * scale;
+  const panelH = height * scale;
+  const image = new Uint8Array(panelW * 2 * panelH * 4);
+  for (let y = 0; y < panelH; y++) {
+    for (let x = 0; x < panelW; x++) {
+      const sx = Math.min(width - 1, Math.floor(x / scale));
+      const sy = Math.min(height - 1, Math.floor(y / scale));
+      const from = (sy * width + sx) * 4;
+      const left = (y * panelW * 2 + x) * 4;
+      const right = (y * panelW * 2 + panelW + x) * 4;
+      const vectorIndex = (y * panelW + x) * 4;
+      const alpha = vector[vectorIndex + 3] ?? 0;
+      image[left] = data[from] ?? 0;
+      image[left + 1] = data[from + 1] ?? 0;
+      image[left + 2] = data[from + 2] ?? 0;
+      image[left + 3] = 255;
+      image[right] = alpha ? (vector[vectorIndex] ?? 255) : 255;
+      image[right + 1] = alpha ? (vector[vectorIndex + 1] ?? 255) : 255;
+      image[right + 2] = alpha ? (vector[vectorIndex + 2] ?? 255) : 255;
+      image[right + 3] = 255;
+    }
+  }
+  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(panelW * 2, panelH, image));
+}
+
+function writeAnchorOverlay(shapes: readonly VecShape[], x0: number, y0: number, cropWidth: number, cropHeight: number, name: string): void {
+  const scale = 4;
+  const zoomW = cropWidth * scale;
+  const zoomH = cropHeight * scale;
+  const base = rasterizeWindow(shapes, x0, y0, cropWidth, cropHeight, scale);
+  const image = new Uint8Array(zoomW * zoomH * 4);
+  for (let i = 0; i < zoomW * zoomH; i++) {
+    image[i * 4] = Math.round(((base[i * 4] ?? 255) * 2 + 255) / 3);
+    image[i * 4 + 1] = Math.round(((base[i * 4 + 1] ?? 255) * 2 + 255) / 3);
+    image[i * 4 + 2] = Math.round(((base[i * 4 + 2] ?? 255) * 2 + 255) / 3);
+    image[i * 4 + 3] = 255;
+  }
+  const project = (x: number, y: number) => ({ x: (x - x0) * scale, y: (y - y0) * scale });
+  for (const shape of shapes) {
+    for (const subpath of shape.subpaths) {
+      if (!subpathHits(subpath, x0 - 2, y0 - 2, x0 + cropWidth + 2, y0 + cropHeight + 2)) continue;
+      let x = subpath.start.x;
+      let y = subpath.start.y;
+      const anchors = [project(x, y)];
+      for (const command of subpath.commands) {
+        if (command.op === "C") {
+          const from = project(x, y);
+          const c1 = project(command.x1, command.y1);
+          const c2 = project(command.x2, command.y2);
+          const to = project(command.x, command.y);
+          strokeLine(image, zoomW, zoomH, from.x, from.y, c1.x, c1.y, 196, 90, 170);
+          strokeLine(image, zoomW, zoomH, to.x, to.y, c2.x, c2.y, 196, 90, 170);
+          strokeCubic(image, zoomW, zoomH, from, c1, c2, to);
+          fillDot(image, zoomW, zoomH, c1.x, c1.y, 2, 196, 90, 170);
+          fillDot(image, zoomW, zoomH, c2.x, c2.y, 2, 196, 90, 170);
+          anchors.push(to);
+        } else {
+          const from = project(x, y);
+          const to = project(command.x, command.y);
+          strokeLine(image, zoomW, zoomH, from.x, from.y, to.x, to.y, 12, 92, 168);
+          anchors.push(to);
+        }
+        x = command.x;
+        y = command.y;
+      }
+      for (const anchor of anchors) fillSquare(image, zoomW, zoomH, anchor.x, anchor.y, 12, 36, 120);
+    }
+  }
+  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(zoomW, zoomH, image));
+}
+
+function subpathHits(subpath: VecSubpath, x0: number, y0: number, x1: number, y1: number): boolean {
+  const inside = (x: number, y: number) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  if (inside(subpath.start.x, subpath.start.y)) return true;
+  for (const command of subpath.commands) {
+    if (inside(command.x, command.y)) return true;
+    if (command.op === "C" && (inside(command.x1, command.y1) || inside(command.x2, command.y2))) return true;
+  }
+  return false;
+}
+
+function strokeCubic(
+  image: Uint8Array,
+  imageWidth: number,
+  imageHeight: number,
+  p0: { x: number; y: number },
+  p1: { x: number; y: number },
+  p2: { x: number; y: number },
+  p3: { x: number; y: number }
+): void {
+  let previous = p0;
+  for (let step = 1; step <= 24; step++) {
+    const t = step / 24;
+    const u = 1 - t;
+    const point = {
+      x: u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
+      y: u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * p3.y
+    };
+    strokeLine(image, imageWidth, imageHeight, previous.x, previous.y, point.x, point.y, 12, 92, 168);
+    previous = point;
+  }
+}
+
+function strokeLine(
+  image: Uint8Array,
+  imageWidth: number,
+  imageHeight: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  red: number,
+  green: number,
+  blue: number
+): void {
+  const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0)));
+  for (let step = 0; step <= steps; step++) {
+    const t = step / steps;
+    fillDot(image, imageWidth, imageHeight, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, 1, red, green, blue);
+  }
+}
+
+function fillDot(image: Uint8Array, imageWidth: number, imageHeight: number, x: number, y: number, radius: number, red: number, green: number, blue: number): void {
+  const cx = Math.round(x);
+  const cy = Math.round(y);
+  for (let oy = -radius; oy <= radius; oy++) {
+    for (let ox = -radius; ox <= radius; ox++) {
+      if (ox * ox + oy * oy > radius * radius + 0.2) continue;
+      setPixel(image, imageWidth, imageHeight, cx + ox, cy + oy, red, green, blue);
+    }
+  }
+}
+
+function fillSquare(image: Uint8Array, imageWidth: number, imageHeight: number, x: number, y: number, red: number, green: number, blue: number): void {
+  const cx = Math.round(x);
+  const cy = Math.round(y);
+  for (let oy = -3; oy <= 3; oy++) {
+    for (let ox = -3; ox <= 3; ox++) {
+      const edge = Math.abs(ox) === 3 || Math.abs(oy) === 3;
+      setPixel(image, imageWidth, imageHeight, cx + ox, cy + oy, edge ? 255 : red, edge ? 255 : green, edge ? 255 : blue);
+    }
+  }
+}
+
+function setPixel(image: Uint8Array, imageWidth: number, imageHeight: number, x: number, y: number, red: number, green: number, blue: number): void {
+  if (x < 0 || y < 0 || x >= imageWidth || y >= imageHeight) return;
+  const offset = (y * imageWidth + x) * 4;
+  image[offset] = red;
+  image[offset + 1] = green;
+  image[offset + 2] = blue;
+  image[offset + 3] = 255;
 }
 
 function writeCleanZoom(

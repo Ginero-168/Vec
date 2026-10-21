@@ -393,6 +393,65 @@ test("an anti-aliased circle follows the half-coverage contour", () => {
   assert.ok(worst <= 0.75, "radius error " + worst.toFixed(3) + " nodes " + traced.nodeCount);
 });
 
+test("a thin high-contrast stem fits to straight lines", () => {
+  const width = 48;
+  const height = 40;
+  const rgba = new Uint8Array(width * height * 4);
+  const labels = new Uint16Array(width * height);
+  const ink = { r: 96, g: 94, b: 92 };
+  const bg = { r: 226, g: 222, b: 218 };
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const stem = x >= 14 && x <= 15 && y >= 6 && y <= 30;
+      const bar = y >= 14 && y <= 15 && x >= 8 && x <= 24;
+      let cover = stem || bar ? 1 : 0;
+      if (!cover && y >= 6 && y <= 30) {
+        const edge = (x === 13 || x === 16) && y >= 6 && y <= 30;
+        const barEdge = (y === 13 || y === 16) && x >= 8 && x <= 24;
+        if (edge || barEdge) cover = 0.45;
+      }
+      const offset = (y * width + x) * 4;
+      rgba[offset] = Math.round(bg.r * (1 - cover) + ink.r * cover);
+      rgba[offset + 1] = Math.round(bg.g * (1 - cover) + ink.g * cover);
+      rgba[offset + 2] = Math.round(bg.b * (1 - cover) + ink.b * cover);
+      rgba[offset + 3] = 255;
+      labels[y * width + x] = cover >= 0.5 ? 0 : 1;
+    }
+  }
+  const traced = traceSegmentation(
+    { width, height, labels, palette: [ink, bg] },
+    { preset: "ui", smooth: 0.5, upscale: 1, source: rgba }
+  );
+  const shape = traced.shapes.find((entry) => entry.color.r === ink.r);
+  assert.ok(shape);
+  let longest = 0;
+  let spikes = 0;
+  for (const subpath of shape?.subpaths ?? []) {
+    const points = [subpath.start];
+    for (const command of subpath.commands) points.push({ x: command.x, y: command.y });
+    for (let i = 1; i < points.length; i++) {
+      const from = points[i - 1];
+      const to = points[i];
+      if (!from || !to) continue;
+      longest = Math.max(longest, Math.hypot(to.x - from.x, to.y - from.y));
+    }
+    for (let i = 1; i < points.length - 1; i++) {
+      const before = points[i - 1];
+      const point = points[i];
+      const after = points[i + 1];
+      if (!before || !point || !after) continue;
+      const incoming = Math.atan2(point.y - before.y, point.x - before.x);
+      const outgoing = Math.atan2(after.y - point.y, after.x - point.x);
+      let delta = outgoing - incoming;
+      if (delta > Math.PI) delta -= Math.PI * 2;
+      if (delta < -Math.PI) delta += Math.PI * 2;
+      if (Math.abs(delta) > (120 * Math.PI) / 180) spikes++;
+    }
+  }
+  assert.ok(longest >= 8, "longest stem " + longest.toFixed(2) + " nodes " + traced.nodeCount);
+  assert.equal(spikes, 0);
+});
+
 test("a one-pixel stair on a long edge is smoothed", () => {
   const segmentation = segmentationFrom(20, 30, (x, y) => {
     if (y < 2 || y >= 28 || x >= 16) return TRANSPARENT;

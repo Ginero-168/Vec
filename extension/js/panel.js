@@ -4208,7 +4208,97 @@
     if (points.length < 3) return points.map((point) => ({ x: point.x, y: point.y }));
     let current = points.map((point) => ({ x: point.x, y: point.y }));
     for (let pass = 0; pass < 2; pass++) current = flattenStairs(current, closed);
+    current = clipContourBites(current, closed);
     return dedupe(current, closed);
+  }
+  function clipContourBites(points, closed) {
+    const count = points.length;
+    if (count < 6) return points.map((point) => ({ x: point.x, y: point.y }));
+    const next = points.map((point) => ({ x: point.x, y: point.y }));
+    for (let i = 0; i < count; i++) {
+      const left = pointAtArc(points, i, -1.45, closed);
+      const right = pointAtArc(points, i, 1.45, closed);
+      if (!left || !right) continue;
+      const chord = Math.hypot(right.point.x - left.point.x, right.point.y - left.point.y);
+      if (chord < 0.9 || chord > 3.3) continue;
+      const point = points[i];
+      if (!point) continue;
+      const depth = segmentDistance(point, left.point, right.point);
+      if (depth < 0.72 || depth > 1) continue;
+      if (deviantWidth(points, i, left.point, right.point, closed) > 1.5) continue;
+      if (!shouldersContinue(points, left.index, right.index, closed)) continue;
+      const dx = right.point.x - left.point.x;
+      const dy = right.point.y - left.point.y;
+      const length2 = dx * dx + dy * dy;
+      if (length2 < 1e-6) continue;
+      const t = Math.min(1, Math.max(0, ((point.x - left.point.x) * dx + (point.y - left.point.y) * dy) / length2));
+      next[i] = { x: left.point.x + dx * t, y: left.point.y + dy * t };
+    }
+    return next;
+  }
+  function pointAtArc(points, index, distance, closed) {
+    const count = points.length;
+    const step = distance < 0 ? -1 : 1;
+    let walked = 0;
+    let cursor = index;
+    for (let hop = 0; hop < count; hop++) {
+      const next = cursor + step;
+      if (!closed && (next < 0 || next >= count)) return null;
+      const wrapped = (next + count) % count;
+      const from = points[cursor];
+      const to = points[wrapped];
+      if (!from || !to) return null;
+      const span = Math.hypot(to.x - from.x, to.y - from.y);
+      if (walked + span >= Math.abs(distance) - 1e-6) return { point: to, index: wrapped };
+      walked += span;
+      cursor = wrapped;
+      if (wrapped === index) return null;
+    }
+    return null;
+  }
+  function deviantWidth(points, index, left, right, closed) {
+    const count = points.length;
+    let width = 0;
+    for (const step of [-1, 1]) {
+      let cursor = index;
+      for (let hop = 0; hop < count; hop++) {
+        const next = cursor + step;
+        if (!closed && (next < 0 || next >= count)) break;
+        const wrapped = (next + count) % count;
+        const from = points[cursor];
+        const to = points[wrapped];
+        if (!from || !to) break;
+        if (segmentDistance(to, left, right) <= 0.12) break;
+        width += Math.hypot(to.x - from.x, to.y - from.y);
+        cursor = wrapped;
+        if (wrapped === index) break;
+      }
+    }
+    return width;
+  }
+  function shouldersContinue(points, leftIndex, rightIndex, closed) {
+    const count = points.length;
+    if (!closed && (leftIndex < 1 || rightIndex + 1 >= count)) return false;
+    const prev = points[(leftIndex - 1 + count) % count];
+    const left = points[leftIndex];
+    const right = points[rightIndex];
+    const next = points[(rightIndex + 1) % count];
+    if (!prev || !left || !right || !next) return false;
+    const inX = left.x - prev.x;
+    const inY = left.y - prev.y;
+    const outX = next.x - right.x;
+    const outY = next.y - right.y;
+    const inLength = Math.hypot(inX, inY);
+    const outLength = Math.hypot(outX, outY);
+    if (inLength < 0.05 || outLength < 0.05) return false;
+    return (inX * outX + inY * outY) / (inLength * outLength) > 0.8;
+  }
+  function segmentDistance(point, from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-8) return Math.hypot(point.x - from.x, point.y - from.y);
+    return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
   }
   function flattenStairs(points, closed) {
     const count = points.length;
@@ -4398,6 +4488,779 @@
     return rgbToOklab(color.r, color.g, color.b);
   }
 
+  // src/color/glyph.ts
+  function buildGlyphIndex(rgba, labels, palette, width, height) {
+    const found = findThinComponents(rgba, labels, palette, width, height);
+    return {
+      replace(points, closed, inside, outside) {
+        return replaceChain(found.components, found.owner, points, closed, inside, outside, rgba, labels, palette, width, height);
+      },
+      pairInBox(x0, y0, boxWidth, boxHeight) {
+        let best = null;
+        let bestCount = 0;
+        const seen = /* @__PURE__ */ new Set();
+        for (let y = y0; y < y0 + boxHeight; y++) {
+          if (y < 0 || y >= height) continue;
+          for (let x = x0; x < x0 + boxWidth; x++) {
+            if (x < 0 || x >= width) continue;
+            const id = found.owner[y * width + x] ?? -1;
+            if (id < 0 || seen.has(id)) continue;
+            seen.add(id);
+            let count = 0;
+            const component = found.components[id];
+            if (!component) continue;
+            for (let yy = y0; yy < y0 + boxHeight; yy++) {
+              if (yy < 0 || yy >= height) continue;
+              for (let xx = x0; xx < x0 + boxWidth; xx++) {
+                if (xx < 0 || xx >= width) continue;
+                if ((found.owner[yy * width + xx] ?? -1) === id) count++;
+              }
+            }
+            if (count > bestCount) {
+              bestCount = count;
+              best = component;
+            }
+          }
+        }
+        if (!best || bestCount < 8) return null;
+        const ink = palette[best.label];
+        const bg = palette[best.outside];
+        if (!ink || !bg) return null;
+        return { ink, bg };
+      }
+    };
+  }
+  function findThinComponents(rgba, labels, palette, width, height) {
+    const owner = new Int32Array(labels.length);
+    owner.fill(-1);
+    const components = [];
+    const labs = palette.map((color) => rgbToOklab(color.r, color.g, color.b));
+    const stack = [];
+    const seen = -3;
+    for (let start2 = 0; start2 < labels.length; start2++) {
+      const label = labels[start2] ?? TRANSPARENT;
+      if (label === TRANSPARENT || owner[start2] !== -1) continue;
+      const pixels = [];
+      const adjacency = /* @__PURE__ */ new Map();
+      stack.push(start2);
+      owner[start2] = -2;
+      let minX = width;
+      let maxX = 0;
+      let minY = height;
+      let maxY = 0;
+      let dark = 0;
+      let oversized = false;
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === void 0) break;
+        const x = current % width;
+        const y = (current - x) / width;
+        if (!oversized) {
+          pixels.push(current);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          const offset = current * 4;
+          if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
+          if (pixels.length > 1200 || maxX - minX > 96 || maxY - minY > 96) oversized = true;
+        }
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const next of neighbors) {
+          if (next < 0 || next >= labels.length) {
+            if (!oversized) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+            continue;
+          }
+          const nx = next % width;
+          if (Math.abs(nx - x) + Math.abs(Math.floor(next / width) - y) !== 1) {
+            if (!oversized) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+            continue;
+          }
+          const neighbor = labels[next] ?? TRANSPARENT;
+          if (neighbor === label) {
+            if (owner[next] === -1) {
+              owner[next] = oversized ? seen : -2;
+              stack.push(next);
+            }
+          } else if (!oversized) adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+        }
+      }
+      if (oversized) {
+        for (const pixel of pixels) owner[pixel] = seen;
+        continue;
+      }
+      const reject = !acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label);
+      if (reject) {
+        for (const pixel of pixels) owner[pixel] = seen;
+        continue;
+      }
+      let outside = TRANSPARENT;
+      let outsideCount = 0;
+      for (const [neighbor, count] of adjacency) {
+        if (count > outsideCount) {
+          outside = neighbor;
+          outsideCount = count;
+        }
+      }
+      const ink = labs[label];
+      const bg = outside === TRANSPARENT || outside >= labs.length ? null : labs[outside];
+      if (!ink || !bg) {
+        for (const pixel of pixels) owner[pixel] = seen;
+        continue;
+      }
+      const id = components.length;
+      for (const pixel of pixels) owner[pixel] = id;
+      const pad = 3;
+      const originX = minX - pad;
+      const originY = minY - pad;
+      const fieldW = maxX - minX + 1 + pad * 2;
+      const fieldH = maxY - minY + 1 + pad * 2;
+      const field = new Float32Array(fieldW * fieldH);
+      for (let iy = 0; iy < fieldH; iy++) {
+        for (let ix = 0; ix < fieldW; ix++) {
+          field[iy * fieldW + ix] = pixelCoverage(originX + ix, originY + iy, width, height, rgba, ink, bg, label, labels);
+        }
+      }
+      const component = {
+        label,
+        outside,
+        ink,
+        bg,
+        originX,
+        originY,
+        field,
+        fieldW,
+        fieldH,
+        rings: null,
+        coverage(x, y) {
+          return bicubic(field, fieldW, fieldH, x - originX - 0.5, y - originY - 0.5);
+        }
+      };
+      components.push(component);
+    }
+    return { components, owner };
+  }
+  function acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label) {
+    if (pixels.length < 8 || pixels.length > 1200) return false;
+    if (Math.max(maxX - minX, maxY - minY) > 96) return false;
+    if (dark * 2 > pixels.length) return false;
+    const radius = inradiusStats(pixels, width, height);
+    if (radius.median > 2.5 || radius.max > 7) return false;
+    if (rayLike2(pixels, width, minX, minY, maxX, maxY)) return false;
+    let dominant = TRANSPARENT;
+    let dominantCount = 0;
+    for (const [neighbor, count] of adjacency) {
+      if (count > dominantCount) {
+        dominant = neighbor;
+        dominantCount = count;
+      }
+    }
+    const own = labs[label];
+    if (!own) return false;
+    if (dominant === TRANSPARENT || dominant >= labs.length) return true;
+    const other = labs[dominant];
+    if (!other) return false;
+    return oklabDistance(own, other) >= 0.18;
+  }
+  function replaceChain(components, owner, points, closed, inside, outside, rgba, labels, palette, width, height) {
+    if (points.length < 4) return null;
+    const id = componentAlong(points, owner, labels, width, height, inside, outside);
+    const component = id < 0 ? void 0 : components[id];
+    if (!component) return null;
+    const rings = ensureRings(component);
+    let best = null;
+    let bestDistance = Infinity;
+    for (const ring of rings) {
+      const distance = distanceQuantile(points, ring, 0.5);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = ring;
+      }
+    }
+    if (!best) return null;
+    if (closed) {
+      if (distanceQuantile(points, best, 0.5) > 0.85) return null;
+      return { points: best.map((point) => ({ x: point.x, y: point.y })), coverage: component.coverage };
+    }
+    const snapped = snapOpenChain(points, best);
+    if (!snapped) return null;
+    const first = snapped[0];
+    const last = snapped[snapped.length - 1];
+    const origin = points[0];
+    const tail = points[points.length - 1];
+    if (!first || !last || !origin || !tail) return null;
+    const start2 = sharedJunction(origin, width, height, rgba, labels, palette);
+    const end = sharedJunction(tail, width, height, rgba, labels, palette);
+    first.x = start2.x;
+    first.y = start2.y;
+    last.x = end.x;
+    last.y = end.y;
+    return { points: snapped, coverage: component.coverage };
+  }
+  function snapOpenChain(points, ring) {
+    const distances = points.map((point) => nearestDistance(point, ring));
+    let close = 0;
+    for (const distance of distances) if (distance <= 0.9) close++;
+    if (close < points.length * 0.72) return null;
+    const out = [];
+    let changed = false;
+    let cursor = 0;
+    while (cursor < points.length) {
+      const distance = distances[cursor] ?? Infinity;
+      if (distance > 0.9) {
+        const point = points[cursor];
+        if (point) out.push({ x: point.x, y: point.y });
+        cursor++;
+        continue;
+      }
+      let end = cursor;
+      while (end < points.length && (distances[end] ?? Infinity) <= 0.9) end++;
+      const run = points.slice(cursor, end);
+      const arc = run.length >= 6 ? projectRun(ring, run) : null;
+      if (arc) {
+        changed = true;
+        const start2 = out.length > 0 ? 1 : 0;
+        for (let i = start2; i < arc.length; i++) {
+          const point = arc[i];
+          if (point) out.push(point);
+        }
+      } else {
+        for (const point of run) out.push({ x: point.x, y: point.y });
+      }
+      cursor = end;
+    }
+    return changed && out.length >= 2 ? out : null;
+  }
+  function projectRun(ring, run) {
+    const start2 = run[0];
+    const end = run[run.length - 1];
+    if (!start2 || !end) return null;
+    const arc = extractArc(ring, start2, end, run);
+    if (!arc || arc.length < 2) return null;
+    if (distanceQuantile(run, arc, 0.8) > 1.1) return null;
+    if (polylineLength(arc) < polylineLength(run) * 0.55) return null;
+    return arc;
+  }
+  function nearestDistance(point, ring) {
+    let best = Infinity;
+    for (const other of ring) {
+      const distance = (other.x - point.x) ** 2 + (other.y - point.y) ** 2;
+      if (distance < best) best = distance;
+    }
+    return Math.sqrt(best);
+  }
+  function distanceQuantile(guide, ring, quantile) {
+    if (guide.length === 0 || ring.length === 0) return Infinity;
+    const step = Math.max(1, Math.floor(guide.length / 48));
+    const distances = [];
+    for (let i = 0; i < guide.length; i += step) {
+      const point = guide[i];
+      if (point) distances.push(nearestDistance(point, ring));
+    }
+    if (distances.length === 0) return Infinity;
+    distances.sort((left, right) => left - right);
+    return distances[Math.min(distances.length - 1, Math.floor(distances.length * quantile))] ?? Infinity;
+  }
+  function polylineLength(points) {
+    let length = 0;
+    for (let i = 1; i < points.length; i++) {
+      const from = points[i - 1];
+      const to = points[i];
+      if (from && to) length += Math.hypot(to.x - from.x, to.y - from.y);
+    }
+    return length;
+  }
+  function componentAlong(points, owner, labels, width, height, inside, outside) {
+    const step = Math.max(1, Math.floor(points.length / 8));
+    for (let i = 0; i < points.length - 1; i += step) {
+      const from = points[i];
+      const to = points[i + 1];
+      if (!from || !to) continue;
+      const edge = unitEdge(from.x, from.y, to.x, to.y);
+      if (!edge) continue;
+      const insideIndex = edge.inside[1] * width + edge.inside[0];
+      const outsideIndex = edge.outside[1] * width + edge.outside[0];
+      if (insideIndex >= 0 && insideIndex < labels.length && (labels[insideIndex] ?? TRANSPARENT) === inside) {
+        const id = owner[insideIndex] ?? -1;
+        if (id >= 0) return id;
+      }
+      if (outsideIndex >= 0 && outsideIndex < labels.length && (labels[outsideIndex] ?? TRANSPARENT) === outside) {
+        const id = owner[outsideIndex] ?? -1;
+        if (id >= 0) return id;
+      }
+    }
+    return -1;
+  }
+  function ensureRings(component) {
+    if (component.rings) return component.rings;
+    const scale = 4;
+    const maskW = component.fieldW * scale;
+    const maskH = component.fieldH * scale;
+    const mask = new Uint16Array(maskW * maskH);
+    for (let fy = 0; fy < maskH; fy++) {
+      for (let fx = 0; fx < maskW; fx++) {
+        const sx = component.originX + (fx + 0.5) / scale;
+        const sy = component.originY + (fy + 0.5) / scale;
+        if (component.coverage(sx, sy) >= 0.5) mask[fy * maskW + fx] = 1;
+      }
+    }
+    const contours = traceBinary(mask, maskW, maskH);
+    const rings = contours.filter((contour) => contour.length >= 8).map((contour) => {
+      const scaled = contour.map((point) => ({
+        x: component.originX + point.x / scale,
+        y: component.originY + point.y / scale
+      }));
+      const sampled = resampleClosed(scaled, 0.42);
+      const simplified = simplifyRing(sampled, 0.16);
+      return simplified.length > 700 ? simplified : regularizeWidth(simplified, component.coverage);
+    });
+    component.rings = rings;
+    return rings;
+  }
+  function resampleClosed(points, spacing) {
+    if (points.length < 4) return points;
+    const first = points[0];
+    if (!first) return points;
+    const out = [{ x: first.x, y: first.y }];
+    let carried = 0;
+    let previous = first;
+    const count = points.length;
+    for (let i = 1; i <= count; i++) {
+      const next = points[i % count];
+      if (!next) continue;
+      let dx = next.x - previous.x;
+      let dy = next.y - previous.y;
+      let length = Math.hypot(dx, dy);
+      let guard = 0;
+      while (length > 1e-6 && carried + length >= spacing && guard++ < 8) {
+        const t = (spacing - carried) / length;
+        const x = previous.x + dx * t;
+        const y = previous.y + dy * t;
+        if (i === count && Math.hypot(x - first.x, y - first.y) < spacing * 0.6) {
+          carried = spacing;
+          break;
+        }
+        out.push({ x, y });
+        previous = { x, y };
+        dx = next.x - x;
+        dy = next.y - y;
+        length = Math.hypot(dx, dy);
+        carried = 0;
+      }
+      carried += length;
+      previous = next;
+    }
+    if (out.length >= 2) {
+      const last = out[out.length - 1];
+      if (last && Math.hypot(last.x - first.x, last.y - first.y) < spacing * 0.45) out.pop();
+    }
+    return out.length >= 4 ? out : points;
+  }
+  function simplifyRing(points, epsilon) {
+    if (points.length < 8) return points.map((point) => ({ x: point.x, y: point.y }));
+    let far = 1;
+    let best = 0;
+    const origin = points[0];
+    if (!origin) return points.map((point) => ({ x: point.x, y: point.y }));
+    for (let i = 1; i < points.length; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const distance = (point.x - origin.x) ** 2 + (point.y - origin.y) ** 2;
+      if (distance > best) {
+        best = distance;
+        far = i;
+      }
+    }
+    const first = douglas(points, 0, far, epsilon);
+    const second = douglas(points, far, points.length, epsilon);
+    const merged = first.concat(second.slice(1));
+    const last = merged[merged.length - 1];
+    const head = merged[0];
+    if (last && head && Math.hypot(last.x - head.x, last.y - head.y) < 0.02) merged.pop();
+    return merged.length >= 4 ? merged : points.map((point) => ({ x: point.x, y: point.y }));
+  }
+  function douglas(points, start2, end, epsilon) {
+    const from = points[start2];
+    const to = points[end] ?? points[0];
+    if (!from || !to || end <= start2 + 1) return from ? [{ x: from.x, y: from.y }] : [];
+    let farthest = start2;
+    let worst = 0;
+    for (let i = start2 + 1; i < end; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const distance = pointLineDistance(point.x, point.y, from.x, from.y, to.x, to.y);
+      if (distance > worst) {
+        worst = distance;
+        farthest = i;
+      }
+    }
+    if (worst <= epsilon) return [{ x: from.x, y: from.y }, { x: to.x, y: to.y }];
+    const left = douglas(points, start2, farthest, epsilon);
+    const right = douglas(points, farthest, end, epsilon);
+    return left.concat(right.slice(1));
+  }
+  function regularizeWidth(points, coverage) {
+    const count = points.length;
+    if (count < 16) return points;
+    const widths = [];
+    const hits = [];
+    for (let i = 0; i < count; i++) {
+      const previous = points[(i - 2 + count) % count];
+      const point = points[i];
+      const next = points[(i + 2) % count];
+      if (!previous || !point || !next) continue;
+      if (Math.abs(headingChange(previous, point, next)) > 0.7) continue;
+      const tx = next.x - previous.x;
+      const ty = next.y - previous.y;
+      const length = Math.hypot(tx, ty);
+      if (length < 0.3) continue;
+      const nx = -ty / length;
+      const ny = tx / length;
+      const width = rayWidth(points, i, nx, ny);
+      if (width === null || width < 0.7 || width > 3.6) continue;
+      widths.push(width);
+      hits.push({ index: i, width, nx, ny });
+    }
+    if (widths.length < 8) return points;
+    widths.sort((left, right) => left - right);
+    const median2 = widths[Math.floor(widths.length / 2)] ?? 0;
+    const out = points.map((point) => ({ x: point.x, y: point.y }));
+    for (const hit of hits) {
+      const shift = Math.max(-0.28, Math.min(0.28, (hit.width - median2) / 2));
+      if (Math.abs(shift) < 0.08) continue;
+      const point = points[hit.index];
+      if (!point) continue;
+      const moved = clampCoverage({ x: point.x + hit.nx * shift, y: point.y + hit.ny * shift }, point, coverage);
+      const slot = out[hit.index];
+      if (slot) {
+        slot.x = moved.x;
+        slot.y = moved.y;
+      }
+    }
+    return out;
+  }
+  function clampCoverage(moved, origin, coverage) {
+    let x = moved.x;
+    let y = moved.y;
+    if (Math.hypot(x - origin.x, y - origin.y) > 0.36) return { x: origin.x, y: origin.y };
+    for (let iteration = 0; iteration < 6; iteration++) {
+      const value2 = coverage(x, y);
+      if (Number.isNaN(value2) || value2 >= 0.2 && value2 <= 0.8) return { x, y };
+      const target = value2 < 0.2 ? 0.32 : 0.68;
+      const dx = coverage(x + 0.2, y) - coverage(x - 0.2, y);
+      const dy = coverage(x, y + 0.2) - coverage(x, y - 0.2);
+      const gradient = dx * dx + dy * dy;
+      if (gradient < 1e-8) break;
+      const scale = (target - value2) / gradient * 0.2;
+      x += dx * scale;
+      y += dy * scale;
+      if (Math.hypot(x - origin.x, y - origin.y) > 0.4) return { x: origin.x, y: origin.y };
+    }
+    const value = coverage(x, y);
+    if (!Number.isNaN(value) && value >= 0.2 && value <= 0.8) return { x, y };
+    return { x: origin.x, y: origin.y };
+  }
+  function rayWidth(points, index, nx, ny) {
+    const origin = points[index];
+    if (!origin) return null;
+    const count = points.length;
+    let best = Infinity;
+    for (let i = 0; i < count; i++) {
+      const gap = Math.min(Math.abs(i - index), count - Math.abs(i - index));
+      if (gap < 6) continue;
+      const from = points[i];
+      const to = points[(i + 1) % count];
+      if (!from || !to) continue;
+      const hit = raySegment(origin, nx, ny, from, to);
+      if (hit !== null && hit < best) best = hit;
+    }
+    return best < 4 ? best : null;
+  }
+  function raySegment(origin, nx, ny, from, to) {
+    const sx = to.x - from.x;
+    const sy = to.y - from.y;
+    const denom = nx * sy - ny * sx;
+    if (Math.abs(denom) < 1e-8) return null;
+    const qx = from.x - origin.x;
+    const qy = from.y - origin.y;
+    const t = (qx * sy - qy * sx) / denom;
+    const u = (qx * ny - qy * nx) / denom;
+    if (t < 0.45 || u < -0.02 || u > 1.02) return null;
+    return t;
+  }
+  function extractArc(ring, start2, end, guide) {
+    const from = nearestIndex(ring, start2);
+    const to = nearestIndex(ring, end);
+    if (from === to) return null;
+    const forward = sliceRing(ring, from, to, 1);
+    const backward = sliceRing(ring, from, to, -1);
+    const useForward = meanDistance(guide, forward) <= meanDistance(guide, backward);
+    const arc = (useForward ? forward : backward).map((point) => ({ x: point.x, y: point.y }));
+    if (arc.length < 2) return null;
+    arc[0] = { x: start2.x, y: start2.y };
+    arc[arc.length - 1] = { x: end.x, y: end.y };
+    return arc;
+  }
+  function sliceRing(ring, from, to, step) {
+    const count = ring.length;
+    const out = [];
+    for (let hop = 0; hop <= count; hop++) {
+      const index = (from + hop * step + count * 2) % count;
+      const point = ring[index];
+      if (point) out.push(point);
+      if (index === to) break;
+    }
+    return out;
+  }
+  function nearestIndex(points, target) {
+    let best = 0;
+    let bestDistance = Infinity;
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const distance = (point.x - target.x) ** 2 + (point.y - target.y) ** 2;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = i;
+      }
+    }
+    return best;
+  }
+  function meanDistance(guide, ring) {
+    if (guide.length === 0 || ring.length === 0) return Infinity;
+    const step = Math.max(1, Math.floor(guide.length / 24));
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < guide.length; i += step) {
+      const point = guide[i];
+      if (!point) continue;
+      let best = Infinity;
+      for (const other of ring) {
+        const distance = (other.x - point.x) ** 2 + (other.y - point.y) ** 2;
+        if (distance < best) best = distance;
+      }
+      sum += Math.sqrt(best);
+      count++;
+    }
+    return count === 0 ? Infinity : sum / count;
+  }
+  function pixelCoverage(x, y, width, height, rgba, ink, bg, inkLabel, labels) {
+    if (x < 0 || y < 0 || x >= width || y >= height) return 0;
+    const index = y * width + x;
+    const offset = index * 4;
+    if ((rgba[offset + 3] ?? 0) < 128) return 0;
+    const lab = rgbToOklab(rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0);
+    const t = projectCoverage(lab, bg, ink);
+    if (offSegment(lab, bg, ink, t) > 0.14) {
+      if (labels.length !== width * height) return 0;
+      return (labels[index] ?? TRANSPARENT) === inkLabel ? 1 : 0;
+    }
+    return t;
+  }
+  function projectCoverage(lab, from, to) {
+    const dl = to.l - from.l;
+    const da = to.a - from.a;
+    const db = to.b - from.b;
+    const length2 = dl * dl + da * da + db * db;
+    if (length2 < 1e-10) return 0.5;
+    const t = ((lab.l - from.l) * dl + (lab.a - from.a) * da + (lab.b - from.b) * db) / length2;
+    return Math.min(1, Math.max(0, t));
+  }
+  function offSegment(lab, from, to, t) {
+    const point = {
+      l: from.l + (to.l - from.l) * t,
+      a: from.a + (to.a - from.a) * t,
+      b: from.b + (to.b - from.b) * t
+    };
+    return Math.hypot(lab.l - point.l, lab.a - point.a, lab.b - point.b);
+  }
+  function bicubic(field, width, height, x, y) {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    let sum = 0;
+    let weightSum = 0;
+    for (let j = -1; j <= 2; j++) {
+      const yy = y0 + j;
+      const wy = cubicWeight(y - yy);
+      if (wy === 0) continue;
+      const clampedY = Math.min(height - 1, Math.max(0, yy));
+      for (let i = -1; i <= 2; i++) {
+        const xx = x0 + i;
+        const wx = cubicWeight(x - xx);
+        if (wx === 0) continue;
+        const weight = wx * wy;
+        const sample2 = yy < 0 || xx < 0 || yy >= height || xx >= width ? 0 : field[clampedY * width + Math.min(width - 1, Math.max(0, xx))] ?? 0;
+        sum += sample2 * weight;
+        weightSum += weight;
+      }
+    }
+    if (weightSum <= 1e-8) return 0;
+    return sum / weightSum;
+  }
+  function cubicWeight(distance) {
+    const t = Math.abs(distance);
+    const a = -0.5;
+    if (t < 1) return (a + 2) * t * t * t - (a + 3) * t * t + 1;
+    if (t < 2) return a * t * t * t - 5 * a * t * t + 8 * a * t - 4 * a;
+    return 0;
+  }
+  function inradiusStats(pixels, width, height) {
+    const alive = new Set(pixels);
+    const distance = /* @__PURE__ */ new Map();
+    const queue = [];
+    for (const pixel of pixels) {
+      const x = pixel % width;
+      const y = (pixel - x) / width;
+      const exposed = x === 0 || y === 0 || x + 1 === width || y + 1 === height || !alive.has(pixel - 1) || !alive.has(pixel + 1) || !alive.has(pixel - width) || !alive.has(pixel + width);
+      if (!exposed) continue;
+      distance.set(pixel, 1);
+      queue.push(pixel);
+    }
+    let head = 0;
+    while (head < queue.length) {
+      const current = queue[head++];
+      if (current === void 0) break;
+      const currentDistance = distance.get(current) ?? 1;
+      const x = current % width;
+      const y = (current - x) / width;
+      const neighbors = [current - 1, current + 1, current - width, current + width];
+      for (const next of neighbors) {
+        if (!alive.has(next) || distance.has(next)) continue;
+        const nx = next % width;
+        if (Math.abs(nx - x) + Math.abs(Math.floor(next / width) - y) !== 1) continue;
+        distance.set(next, currentDistance + 1);
+        queue.push(next);
+      }
+    }
+    const values = [];
+    let max = 1;
+    for (const pixel of pixels) {
+      const value = distance.get(pixel) ?? 1;
+      values.push(value);
+      if (value > max) max = value;
+    }
+    values.sort((left, right) => left - right);
+    return { median: values[Math.floor(values.length / 2)] ?? 1, max };
+  }
+  function rayLike2(pixels, width, minX, minY, maxX, maxY) {
+    const dx = maxX - minX;
+    const dy = maxY - minY;
+    const length = Math.hypot(dx, dy);
+    if (length < 10) return false;
+    let maxDistance = 0;
+    for (const pixel of pixels) {
+      const x = pixel % width;
+      const y = (pixel - x) / width;
+      maxDistance = Math.max(maxDistance, pointLineDistance(x, y, minX, minY, maxX, maxY));
+    }
+    return maxDistance <= 2.4 && length / Math.max(1, maxDistance) >= 8;
+  }
+  function pointLineDistance(x, y, x0, y0, x1, y1) {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-8) return Math.hypot(x - x0, y - y0);
+    return Math.abs((x - x0) * dy - (y - y0) * dx) / length;
+  }
+  function unitEdge(ax, ay, bx, by) {
+    const dx = Math.round(bx - ax);
+    const dy = Math.round(by - ay);
+    if (Math.abs(bx - ax - dx) > 0.05 || Math.abs(by - ay - dy) > 0.05) return null;
+    const x = Math.round(ax);
+    const y = Math.round(ay);
+    if (dx === 1 && dy === 0) return { inside: [x, y], outside: [x, y - 1] };
+    if (dx === -1 && dy === 0) return { inside: [x - 1, y - 1], outside: [x - 1, y] };
+    if (dx === 0 && dy === 1) return { inside: [x - 1, y], outside: [x, y] };
+    if (dx === 0 && dy === -1) return { inside: [x, y - 1], outside: [x - 1, y - 1] };
+    return null;
+  }
+  function headingChange(a, b, c) {
+    const incoming = Math.atan2(b.y - a.y, b.x - a.x);
+    const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
+    let delta = outgoing - incoming;
+    if (delta > Math.PI) delta -= Math.PI * 2;
+    if (delta < -Math.PI) delta += Math.PI * 2;
+    return delta;
+  }
+  function traceBinary(labels, width, height) {
+    const horizontal = new Uint8Array(width * (height + 1));
+    const vertical = new Uint8Array((width + 1) * height);
+    const contours = [];
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if ((labels[y * width + x] ?? 0) !== 1) continue;
+        if (binarySample(labels, width, height, x, y - 1) === 1) continue;
+        if ((horizontal[y * width + x] ?? 0) & 1) continue;
+        const contour = walkBinary(labels, width, height, x, y, horizontal, vertical);
+        if (contour && contour.length >= 4) contours.push(contour);
+      }
+    }
+    return contours;
+  }
+  function walkBinary(labels, width, height, startX, startY, horizontal, vertical) {
+    let x = startX;
+    let y = startY;
+    let dir = 0;
+    const points = [];
+    const limit = (width + 1) * (height + 1) * 2;
+    for (let step = 0; step < limit; step++) {
+      if (step > 0 && x === startX && y === startY && dir === 0) break;
+      if (!markBinary(x, y, dir, width, height, horizontal, vertical)) break;
+      points.push({ x, y });
+      if (dir === 0) x += 1;
+      else if (dir === 1) y += 1;
+      else if (dir === 2) x -= 1;
+      else y -= 1;
+      const turn = [dir + 1 & 3, dir, dir + 3 & 3, dir + 2 & 3];
+      let next = -1;
+      for (const candidate of turn) {
+        const right = rightBinary(x, y, candidate);
+        const other = leftBinary(x, y, candidate);
+        if (binarySample(labels, width, height, right[0], right[1]) === 1 && binarySample(labels, width, height, other[0], other[1]) !== 1) {
+          next = candidate;
+          break;
+        }
+      }
+      if (next < 0) break;
+      dir = next;
+    }
+    return points.length >= 4 ? points : null;
+  }
+  function binarySample(labels, width, height, x, y) {
+    if (x < 0 || y < 0 || x >= width || y >= height) return 0;
+    return labels[y * width + x] ?? 0;
+  }
+  function rightBinary(x, y, dir) {
+    if (dir === 0) return [x, y];
+    if (dir === 1) return [x - 1, y];
+    if (dir === 2) return [x - 1, y - 1];
+    return [x, y - 1];
+  }
+  function leftBinary(x, y, dir) {
+    if (dir === 0) return [x, y - 1];
+    if (dir === 1) return [x, y];
+    if (dir === 2) return [x - 1, y];
+    return [x - 1, y - 1];
+  }
+  function markBinary(x, y, dir, width, height, horizontal, vertical) {
+    if (dir === 0 || dir === 2) {
+      const edgeX = dir === 0 ? x : x - 1;
+      if (edgeX < 0 || y < 0 || edgeX >= width || y > height) return false;
+      const index2 = y * width + edgeX;
+      const bit2 = dir === 0 ? 1 : 2;
+      if ((horizontal[index2] ?? 0) & bit2) return false;
+      horizontal[index2] = (horizontal[index2] ?? 0) | bit2;
+      return true;
+    }
+    const edgeY = dir === 1 ? y : y - 1;
+    if (x < 0 || edgeY < 0 || x > width || edgeY >= height) return false;
+    const index = edgeY * (width + 1) + x;
+    const bit = dir === 1 ? 1 : 2;
+    if ((vertical[index] ?? 0) & bit) return false;
+    vertical[index] = (vertical[index] ?? 0) | bit;
+    return true;
+  }
+
   // src/color/trace.ts
   function traceSegmentation(segmentation, options = {}) {
     const preset = options.preset ?? "logo";
@@ -4411,6 +5274,7 @@
     const shapes = [];
     const cache = /* @__PURE__ */ new Map();
     const clean = cleanSession(segmentation, options);
+    const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
     const counts = countLabels2(scaled.labels, segmentation.palette.length);
     const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
     order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
@@ -4420,7 +5284,7 @@
       const iso = hasSource && options.source ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label } : null;
       const subpaths = [];
       for (const contour of contours) {
-        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean, iso);
+        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean, iso, glyphs);
         if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
       }
       const color = segmentation.palette[label];
@@ -4441,6 +5305,32 @@
       colorCount: shapes.length,
       shapes
     };
+  }
+  function sampleSubpath(subpath, spacing) {
+    const samples = [{ x: subpath.start.x, y: subpath.start.y }];
+    let x = subpath.start.x;
+    let y = subpath.start.y;
+    for (const command of subpath.commands) {
+      if (command.op === "L") {
+        const length = Math.hypot(command.x - x, command.y - y);
+        const steps = Math.max(1, Math.ceil(length / spacing));
+        for (let step = 1; step <= steps; step++) {
+          const t = step / steps;
+          samples.push({ x: x + (command.x - x) * t, y: y + (command.y - y) * t });
+        }
+      } else {
+        const p0 = { x, y };
+        const p1 = { x: command.x1, y: command.y1 };
+        const p2 = { x: command.x2, y: command.y2 };
+        const p3 = { x: command.x, y: command.y };
+        const length = Math.hypot(p3.x - p0.x, p3.y - p0.y) + Math.hypot(p1.x - p0.x, p1.y - p0.y) + Math.hypot(p3.x - p2.x, p3.y - p2.y);
+        const steps = Math.max(2, Math.ceil(length / spacing));
+        for (let step = 1; step <= steps; step++) samples.push(cubicAt2(p0, p1, p2, p3, step / steps));
+      }
+      x = command.x;
+      y = command.y;
+    }
+    return samples;
   }
   function resolveField(segmentation, options) {
     const count = segmentation.width * segmentation.height;
@@ -4627,18 +5517,23 @@
     if (session.letters && boundaryHits(session.letters, session.width, session.height, points, 0.35)) return null;
     return session.tolerance;
   }
-  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache, clean, iso) {
+  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache, clean, iso, glyphs) {
     const points = contour.points.map((point) => ({ x: point.x / scale, y: point.y / scale }));
-    const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside).map((chain) => prepareChain(chain, iso));
+    const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside).map((chain) => prepareChain(chain, iso, glyphs));
     if (chains.length === 0) return null;
     const only = chains[0];
     if (chains.length === 1 && only?.closed) {
       const canonical = canonicalizeClosed(only.points);
       if (canonical.length < 3) return null;
+      const start3 = canonical[0];
+      if (only.coverage) {
+        const fitted = cachedGlyphClosed(canonical, only.coverage, cache);
+        if (!start3 || fitted.length === 0) return null;
+        return { start: start3, commands: fitted };
+      }
       const tolerance = cappedTolerance(cleanChainTolerance(canonical, clean), only.soft);
       const fitError = fairnessError(error, canonical, clean, only.soft);
       const commands2 = cachedClosed(canonical, fitError, cornerAngle, simplify, cache, only.soft);
-      const start3 = canonical[0];
       if (tolerance !== null && clean) {
         const fitted = cachedCleanClosed(canonical, tolerance, clean);
         if (fitted && fitted.commands.length > 0 && (only.soft || fitted.commands.length <= commands2.length)) return fitted;
@@ -4651,6 +5546,10 @@
     const commands = [];
     for (const chain of chains) {
       if (chain.closed || chain.points.length < 2) continue;
+      if (chain.coverage) {
+        commands.push(...cachedGlyphOpen(chain.points, chain.coverage, cache));
+        continue;
+      }
       const tolerance = cappedTolerance(cleanChainTolerance(chain.points, clean), chain.soft);
       const fitError = fairnessError(error, chain.points, clean, chain.soft);
       const plain = cachedOpen(chain.points, fitError, cornerAngle, simplify, cache, chain.soft);
@@ -4663,10 +5562,14 @@
     if (commands.length === 0) return null;
     return { start: start2, commands };
   }
-  function prepareChain(chain, iso) {
-    if (!iso) return { ...chain, soft: false };
+  function prepareChain(chain, iso, glyphs) {
+    if (iso && glyphs) {
+      const replaced = glyphs.replace(chain.points, chain.closed, iso.inside, chain.outside);
+      if (replaced) return { points: replaced.points, closed: chain.closed, outside: chain.outside, soft: true, coverage: replaced.coverage };
+    }
+    if (!iso) return { ...chain, soft: false, coverage: null };
     const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels);
-    return { points: refined.points, closed: chain.closed, outside: chain.outside, soft: refined.soft };
+    return { points: refined.points, closed: chain.closed, outside: chain.outside, soft: refined.soft, coverage: null };
   }
   function cappedTolerance(tolerance, soft) {
     if (tolerance === null || !soft) return tolerance;
@@ -4784,6 +5687,27 @@
     }
     return fitted;
   }
+  function cachedGlyphOpen(points, coverage, cache) {
+    const canonical = canonicalizeOpen(points);
+    const key = "g|" + pointKey(canonical.points);
+    let fitted = cache.get(key);
+    if (!fitted) {
+      fitted = fitGlyphOpen(canonical.points, coverage);
+      cache.set(key, fitted);
+    }
+    const origin = canonical.points[0];
+    if (!origin) return [];
+    return canonical.reversed ? reverseCommands(fitted, origin) : fitted;
+  }
+  function cachedGlyphClosed(points, coverage, cache) {
+    const key = "gc|" + pointKey(points);
+    let fitted = cache.get(key);
+    if (!fitted) {
+      fitted = fitGlyphClosed(points, coverage);
+      cache.set(key, fitted);
+    }
+    return fitted;
+  }
   function canonicalizeOpen(points) {
     const forward = points.slice();
     const backward = points.slice().reverse();
@@ -4832,32 +5756,535 @@
     for (const point of points) key += point.x.toFixed(4) + "," + point.y.toFixed(4) + ";";
     return key;
   }
+  function backwardTangent(forward) {
+    if (!forward) return null;
+    return { x: -forward.x, y: -forward.y };
+  }
+  function anchorCuts(points, closed, corners) {
+    const extrema = axisExtrema(points, closed).filter((extra) => !nearIndex(points, extra.index, corners, closed, 1.8));
+    const inflections = inflectionIndexes(points, closed).filter((index) => {
+      if (nearIndex(points, index, corners, closed, 2.8)) return false;
+      return !nearIndex(points, index, extrema.map((extra) => extra.index), closed, 2.8);
+    });
+    const merged = [
+      ...corners.map((index) => ({ index, forward: null })),
+      ...extrema,
+      ...inflections.map((index) => ({ index, forward: null }))
+    ];
+    merged.sort((a, b) => a.index - b.index);
+    const unique = [];
+    for (const cut of merged) {
+      const previous = unique[unique.length - 1];
+      if (previous && previous.index === cut.index) {
+        if (!previous.forward && cut.forward) previous.forward = cut.forward;
+        continue;
+      }
+      unique.push({ index: cut.index, forward: cut.forward });
+    }
+    if (!closed) {
+      if (unique[0]?.index !== 0) unique.unshift({ index: 0, forward: null });
+      if (unique[unique.length - 1]?.index !== points.length - 1) unique.push({ index: points.length - 1, forward: null });
+    }
+    return unique;
+  }
+  var AXIS_TANGENT = Math.tan(12 * Math.PI / 180);
+  function axisExtrema(points, closed) {
+    const count = points.length;
+    if (count < 8) return [];
+    const found = [];
+    for (let i = 0; i < count; i++) {
+      if (!closed && (i === 0 || i === count - 1)) continue;
+      const back = arcIndex(points, i, -8, closed);
+      const fore = arcIndex(points, i, 8, closed);
+      const tangentBack = arcIndex(points, i, -1.2, closed);
+      const tangentFore = arcIndex(points, i, 1.2, closed);
+      if (back < 0 || fore < 0 || tangentBack < 0 || tangentFore < 0) continue;
+      const tangentA = points[tangentBack];
+      const tangentB = points[tangentFore];
+      if (!tangentA || !tangentB) continue;
+      const dx = tangentB.x - tangentA.x;
+      const dy = tangentB.y - tangentA.y;
+      const horizontal = Math.abs(dy) <= Math.abs(dx) * AXIS_TANGENT && Math.abs(dx) > 1e-4;
+      const vertical = Math.abs(dx) <= Math.abs(dy) * AXIS_TANGENT && Math.abs(dy) > 1e-4;
+      if (!horizontal && !vertical) continue;
+      const spot = extremumSpot(points, back, fore, horizontal ? "y" : "x", closed);
+      if (!spot || spot.index !== i || spot.flat > 6 || spot.prominence < 0.35) continue;
+      found.push({
+        index: i,
+        forward: horizontal ? { x: dx >= 0 ? 1 : -1, y: 0 } : { x: 0, y: dy >= 0 ? 1 : -1 },
+        prominence: spot.prominence
+      });
+    }
+    const ranked = found.slice().sort((a, b) => b.prominence - a.prominence || a.index - b.index);
+    const kept = [];
+    for (const candidate of ranked) {
+      if (kept.some((other) => separation(points, other.index, candidate.index, closed) < 3.5)) continue;
+      kept.push({ index: candidate.index, forward: candidate.forward });
+    }
+    kept.sort((a, b) => a.index - b.index);
+    return kept;
+  }
+  function extremumSpot(points, from, to, axis, closed) {
+    const count = points.length;
+    const indexes = [];
+    let cursor = from;
+    for (let hop = 0; hop <= count; hop++) {
+      indexes.push(cursor);
+      if (cursor === to) break;
+      const next = closed ? (cursor + 1) % count : cursor + 1;
+      if (!closed && next >= count) return null;
+      cursor = next;
+      if (hop > 0 && cursor === from) return null;
+    }
+    if (indexes.length < 3) return null;
+    let peak = -Infinity;
+    let valley = Infinity;
+    for (const index of indexes) {
+      const point = points[index];
+      if (!point) return null;
+      const value = point[axis];
+      if (value > peak) peak = value;
+      if (value < valley) valley = value;
+    }
+    const first = points[indexes[0] ?? -1];
+    const last = points[indexes[indexes.length - 1] ?? -1];
+    if (!first || !last) return null;
+    const high = peak - Math.max(first[axis], last[axis]);
+    const low = Math.min(first[axis], last[axis]) - valley;
+    const prominence = Math.max(high, low);
+    const level = high >= low ? peak : valley;
+    const run = indexes.filter((index) => {
+      const point = points[index];
+      return !!point && Math.abs(point[axis] - level) <= 0.08;
+    });
+    if (run.length === 0) return null;
+    let flat = 0;
+    for (let i = 1; i < run.length; i++) {
+      const a = points[run[i - 1] ?? -1];
+      const b = points[run[i] ?? -1];
+      if (a && b) flat += Math.hypot(b.x - a.x, b.y - a.y);
+    }
+    const mid = run[Math.floor(run.length / 2)];
+    if (mid === void 0) return null;
+    return { index: mid, prominence, flat };
+  }
+  function inflectionIndexes(points, closed) {
+    const count = points.length;
+    if (count < 12) return [];
+    const found = [];
+    for (let i = 0; i < count; i++) {
+      if (!closed && (i < 2 || i > count - 3)) continue;
+      const farBack = arcIndex(points, i, -4.5, closed);
+      const nearBack = arcIndex(points, i, -1.2, closed);
+      const nearFore = arcIndex(points, i, 1.2, closed);
+      const farFore = arcIndex(points, i, 4.5, closed);
+      if (farBack < 0 || nearBack < 0 || nearFore < 0 || farFore < 0) continue;
+      const before = headingDelta(points, farBack, nearBack, i);
+      const after = headingDelta(points, i, nearFore, farFore);
+      if (before === null || after === null) continue;
+      if (before * after >= 0) continue;
+      const strength = Math.min(Math.abs(before), Math.abs(after));
+      if (strength < 0.32) continue;
+      const localBack = points[nearBack];
+      const local = points[i];
+      const localFore = points[nearFore];
+      if (!localBack || !local || !localFore) continue;
+      if (Math.abs(turnAngle2(localBack, local, localFore)) > 0.5) continue;
+      found.push({ index: i, strength });
+    }
+    const ranked = found.slice().sort((a, b) => b.strength - a.strength || a.index - b.index);
+    const kept = [];
+    for (const candidate of ranked) {
+      if (kept.some((other) => separation(points, other, candidate.index, closed) < 4)) continue;
+      kept.push(candidate.index);
+    }
+    kept.sort((a, b) => a - b);
+    return kept;
+  }
+  function headingDelta(points, from, mid, to) {
+    const a = points[from];
+    const b = points[mid];
+    const c = points[to];
+    if (!a || !b || !c) return null;
+    const first = Math.hypot(b.x - a.x, b.y - a.y);
+    const second = Math.hypot(c.x - b.x, c.y - b.y);
+    if (first < 0.35 || second < 0.35) return null;
+    return Math.atan2((b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x), (b.x - a.x) * (c.x - b.x) + (b.y - a.y) * (c.y - b.y));
+  }
+  function nearIndex(points, index, others, closed, limit) {
+    for (const other of others) {
+      if (separation(points, index, other, closed) < limit) return true;
+    }
+    return false;
+  }
+  function separation(points, a, b, closed) {
+    if (a === b) return 0;
+    if (closed) return Math.min(arcBetween(points, a, b, true), arcBetween(points, b, a, true));
+    return a < b ? arcBetween(points, a, b, false) : arcBetween(points, b, a, false);
+  }
   function fitSubpixelOpen(points, cornerAngle, tolerance) {
-    const cuts = denseCorners(points, false, cornerAngle);
-    const commands = [];
-    for (let i = 0; i < cuts.length - 1; i++) fitFairSpan(points, cuts[i], cuts[i + 1], tolerance, null, null, commands);
-    return commands;
+    return polishBites(fitFairOpen(points, cornerAngle, tolerance), points[0] ?? null, false, cornerAngle, tolerance);
   }
   function fitSubpixelClosed(points, cornerAngle, tolerance) {
+    return polishBites(fitFairClosed(points, cornerAngle, tolerance), points[0] ?? null, true, cornerAngle, tolerance);
+  }
+  function fitFairOpen(points, cornerAngle, tolerance) {
+    const cuts = anchorCuts(points, false, denseCorners(points, false, cornerAngle));
     const commands = [];
-    const corners = denseCorners(points, true, cornerAngle);
-    if (corners.length === 0) {
-      const span = sliceCyclic2(points, 0, 0);
-      const tangent2 = loopTangent(points, 0);
-      fitFairSpan(span, 0, span.length - 1, tolerance, tangent2, tangent2 ? { x: -tangent2.x, y: -tangent2.y } : null, commands);
-      return commands;
-    }
-    const cuts = corners.includes(0) ? corners : [0, ...corners];
-    const bridge = !corners.includes(0);
-    for (let i = 0; i < cuts.length; i++) {
-      const fromCut = cuts[i];
-      const toCut = cuts[(i + 1) % cuts.length];
-      const span = sliceCyclic2(points, fromCut, toCut);
-      const startTangent = bridge && fromCut === 0 ? loopTangent(points, 0) : null;
-      const endForward = bridge && toCut === 0 ? loopTangent(points, 0) : null;
-      fitFairSpan(span, 0, span.length - 1, tolerance, startTangent, endForward ? { x: -endForward.x, y: -endForward.y } : null, commands);
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const from = cuts[i];
+      const to = cuts[i + 1];
+      if (!from || !to) continue;
+      fitFairSpan(points, from.index, to.index, tolerance, from.forward, backwardTangent(to.forward), commands);
     }
     return commands;
+  }
+  function fitFairClosed(points, cornerAngle, tolerance) {
+    const commands = [];
+    const anchors = anchorCuts(points, true, denseCorners(points, true, cornerAngle));
+    if (anchors.length === 0) {
+      const span = sliceCyclic2(points, 0, 0);
+      const tangent2 = loopTangent(points, 0);
+      fitFairSpan(span, 0, span.length - 1, tolerance, tangent2, backwardTangent(tangent2), commands);
+      return commands;
+    }
+    const cuts = anchors.some((anchor) => anchor.index === 0) ? anchors : [{ index: 0, forward: loopTangent(points, 0) }, ...anchors];
+    for (let i = 0; i < cuts.length; i++) {
+      const from = cuts[i];
+      const to = cuts[(i + 1) % cuts.length];
+      if (!from || !to) continue;
+      const span = sliceCyclic2(points, from.index, to.index);
+      fitFairSpan(span, 0, span.length - 1, tolerance, from.forward, backwardTangent(to.forward), commands);
+    }
+    return commands;
+  }
+  var GLYPH_TOLERANCE = 0.4;
+  function fitGlyphOpen(points, coverage) {
+    const prepared = prepareGlyphPoints(points, false, coverage);
+    const cuts = anchorCuts(prepared, false, glyphCorners(prepared, false));
+    const commands = [];
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const from = cuts[i];
+      const to = cuts[i + 1];
+      if (!from || !to) continue;
+      fitGlyphSpan(prepared, from.index, to.index, coverage, from.forward, backwardTangent(to.forward), commands);
+    }
+    return coalesceLines(commands, prepared[0] ?? points[0] ?? { x: 0, y: 0 }, 0.28);
+  }
+  function fitGlyphClosed(points, coverage) {
+    const prepared = prepareGlyphPoints(points, true, coverage);
+    const commands = [];
+    const anchors = anchorCuts(prepared, true, glyphCorners(prepared, true));
+    if (anchors.length === 0) {
+      const span = sliceCyclic2(prepared, 0, 0);
+      const tangent2 = loopTangent(prepared, 0);
+      fitGlyphSpan(span, 0, span.length - 1, coverage, tangent2, backwardTangent(tangent2), commands);
+      return commands;
+    }
+    const cuts = anchors.some((anchor) => anchor.index === 0) ? anchors : [{ index: 0, forward: loopTangent(prepared, 0) }, ...anchors];
+    for (let i = 0; i < cuts.length; i++) {
+      const from = cuts[i];
+      const to = cuts[(i + 1) % cuts.length];
+      if (!from || !to) continue;
+      const span = sliceCyclic2(prepared, from.index, to.index);
+      fitGlyphSpan(span, 0, span.length - 1, coverage, from.forward, backwardTangent(to.forward), commands);
+    }
+    return coalesceLines(commands, prepared[0] ?? points[0] ?? { x: 0, y: 0 }, 0.28);
+  }
+  function prepareGlyphPoints(points, closed, coverage) {
+    const clamped = points.map((point, index) => {
+      const pinned = closed && index === 0 || !closed && (index === 0 || index === points.length - 1);
+      return pinned ? { x: point.x, y: point.y } : clampToBand(point, coverage);
+    });
+    const clipped = clipContourBites(clamped, closed);
+    const origin = points[0];
+    if (origin && clipped[0]) clipped[0] = { x: origin.x, y: origin.y };
+    if (!closed) {
+      const last = points[points.length - 1];
+      const tail = clipped[clipped.length - 1];
+      if (last && tail) {
+        tail.x = last.x;
+        tail.y = last.y;
+      }
+    }
+    const out = [];
+    for (const point of clipped) {
+      const previous = out[out.length - 1];
+      if (previous && Math.hypot(previous.x - point.x, previous.y - point.y) < 0.02) continue;
+      out.push({ x: point.x, y: point.y });
+    }
+    if (closed && out.length > 2) {
+      const first = out[0];
+      const last = out[out.length - 1];
+      if (first && last && Math.hypot(first.x - last.x, first.y - last.y) < 0.02) out.pop();
+    }
+    return out.length >= 2 ? out : points.map((point) => ({ x: point.x, y: point.y }));
+  }
+  function clampToBand(point, coverage) {
+    let x = point.x;
+    let y = point.y;
+    const initial = coverage(x, y);
+    if (Number.isNaN(initial) || initial >= 0.2 && initial <= 0.8) return { x, y };
+    for (let iteration = 0; iteration < 8; iteration++) {
+      const value = coverage(x, y);
+      if (Number.isNaN(value) || value >= 0.2 && value <= 0.8) return { x, y };
+      const target = value < 0.2 ? 0.35 : 0.65;
+      const dx = coverage(x + 0.15, y) - coverage(x - 0.15, y);
+      const dy = coverage(x, y + 0.15) - coverage(x, y - 0.15);
+      const gradient = dx * dx + dy * dy;
+      if (gradient < 1e-8) break;
+      const scale = (target - value) / gradient * 0.15;
+      const nextX = x + dx * scale;
+      const nextY = y + dy * scale;
+      if (Math.hypot(nextX - point.x, nextY - point.y) > 1.25) break;
+      x = nextX;
+      y = nextY;
+    }
+    return { x, y };
+  }
+  function glyphCorners(points, closed) {
+    const count = points.length;
+    const found = [];
+    for (let i = 0; i < count; i++) {
+      const nearA = arcIndex(points, i, -1.15, closed);
+      const nearB = arcIndex(points, i, 1.15, closed);
+      const farA = arcIndex(points, i, -2.5, closed);
+      const farB = arcIndex(points, i, 2.5, closed);
+      if (nearA < 0 || nearB < 0 || farA < 0 || farB < 0) continue;
+      const previous = points[nearA];
+      const point = points[i];
+      const next = points[nearB];
+      const before = points[farA];
+      const after = points[farB];
+      if (!previous || !point || !next || !before || !after) continue;
+      const near = Math.abs(turnAngle2(previous, point, next));
+      const far = Math.abs(turnAngle2(before, point, after));
+      if (near < 0.85 || far < 0.48) continue;
+      found.push({ index: i, turn: near });
+    }
+    const kept = [];
+    for (const corner of found) {
+      const previous = kept[kept.length - 1];
+      if (previous && arcBetween(points, previous.index, corner.index, closed) < 1.25) {
+        if (corner.turn > previous.turn) kept[kept.length - 1] = corner;
+        continue;
+      }
+      kept.push(corner);
+    }
+    if (closed && kept.length >= 2) {
+      const first = kept[0];
+      const last = kept[kept.length - 1];
+      if (first && last && arcBetween(points, last.index, first.index, true) < 1.25) {
+        if (last.turn > first.turn) kept.shift();
+        else kept.pop();
+      }
+    }
+    if (!closed) return [0, ...kept.map((corner) => corner.index), count - 1];
+    return kept.map((corner) => corner.index);
+  }
+  function arcIndex(points, index, distance, closed) {
+    const count = points.length;
+    const step = distance < 0 ? -1 : 1;
+    let walked = 0;
+    let cursor = index;
+    for (let hop = 0; hop < count; hop++) {
+      const next = cursor + step;
+      if (!closed && (next < 0 || next >= count)) return -1;
+      const wrapped = (next + count) % count;
+      const from = points[cursor];
+      const to = points[wrapped];
+      if (!from || !to) return -1;
+      walked += Math.hypot(to.x - from.x, to.y - from.y);
+      cursor = wrapped;
+      if (walked >= Math.abs(distance) - 1e-6) return wrapped;
+      if (wrapped === index) return -1;
+    }
+    return -1;
+  }
+  function arcBetween(points, from, to, closed) {
+    const count = points.length;
+    let walked = 0;
+    let cursor = from;
+    for (let hop = 0; hop < count; hop++) {
+      if (cursor === to) return walked;
+      const next = closed ? (cursor + 1) % count : cursor + 1;
+      if (!closed && next >= count) return Infinity;
+      const start2 = points[cursor];
+      const end = points[next];
+      if (!start2 || !end) return Infinity;
+      walked += Math.hypot(end.x - start2.x, end.y - start2.y);
+      cursor = next;
+      if (cursor === from) return walked;
+    }
+    return Infinity;
+  }
+  function fitGlyphSpan(points, start2, end, coverage, tStart, tEnd, out) {
+    let cursor = start2;
+    let incoming = tStart;
+    while (cursor < end) {
+      const lineTo = farthestCorridorLine(points, cursor, end, coverage);
+      const origin = points[cursor];
+      const cubicLimit = Math.min(end, Math.max(lineTo + 1, cursor + 36));
+      const cubic = lineTo < end ? farthestGlyphCubic(points, cursor, cubicLimit, coverage, incoming, tEnd) : null;
+      if (cubic && cubic.index > lineTo) {
+        let command = cubic.command;
+        if (cubic.index < end) {
+          const travel = forwardTangent(points, cubic.index);
+          if (travel) {
+            const joined = fairCubic(points, cursor, cubic.index, GLYPH_TOLERANCE, incoming, { x: -travel.x, y: -travel.y });
+            if (joined && origin && curveInCorridor(origin, joined, coverage)) command = joined;
+          }
+        }
+        out.push(command);
+        incoming = cubic.index < end ? forwardTangent(points, cubic.index) : null;
+        cursor = cubic.index;
+        continue;
+      }
+      const to = points[lineTo];
+      if (!to || lineTo <= cursor) {
+        const step = points[cursor + 1];
+        if (!step) return;
+        out.push({ op: "L", x: step.x, y: step.y });
+        incoming = null;
+        cursor += 1;
+        continue;
+      }
+      out.push({ op: "L", x: to.x, y: to.y });
+      incoming = lineTo < end ? forwardTangent(points, lineTo) : null;
+      cursor = lineTo;
+    }
+  }
+  function coalesceLines(commands, start2, tolerance) {
+    const out = [];
+    let cursor = { x: start2.x, y: start2.y };
+    let index = 0;
+    while (index < commands.length) {
+      const command = commands[index];
+      if (!command || command.op !== "L") {
+        if (command) {
+          out.push(command);
+          cursor = { x: command.x, y: command.y };
+        }
+        index++;
+        continue;
+      }
+      let end = index;
+      while (end + 1 < commands.length && commands[end + 1]?.op === "L") {
+        const candidate = commands[end + 1];
+        if (!candidate || !lineRunWithin(commands, index, end + 1, cursor, tolerance)) break;
+        end++;
+      }
+      const last = commands[end];
+      if (last) out.push({ op: "L", x: last.x, y: last.y });
+      if (last) cursor = { x: last.x, y: last.y };
+      index = end + 1;
+    }
+    return out;
+  }
+  function lineRunWithin(commands, from, to, origin, tolerance) {
+    const end = commands[to];
+    if (!end) return false;
+    for (let index = from; index < to; index++) {
+      const point = commands[index];
+      if (!point || pointSegmentDistance2({ x: point.x, y: point.y }, origin, { x: end.x, y: end.y }) > tolerance) return false;
+    }
+    return true;
+  }
+  function farthestCorridorLine(points, start2, end, coverage) {
+    if (end <= start2 + 1) return Math.min(end, start2 + 1);
+    let geometric = start2 + 1;
+    let low = start2 + 1;
+    let high = end;
+    while (low <= high) {
+      const mid = low + high >> 1;
+      if (maxChordError(points, start2, mid) <= GLYPH_TOLERANCE) {
+        geometric = mid;
+        low = mid + 1;
+      } else high = mid - 1;
+    }
+    const origin = points[start2];
+    if (!origin) return start2 + 1;
+    low = start2 + 1;
+    high = geometric;
+    let best = start2 + 1;
+    while (low <= high) {
+      const mid = low + high >> 1;
+      const target = points[mid];
+      if (target && segmentInCorridor(origin, target, coverage)) {
+        best = mid;
+        low = mid + 1;
+      } else high = mid - 1;
+    }
+    return best;
+  }
+  function farthestGlyphCubic(points, start2, end, coverage, tStart, tEnd) {
+    if (end < start2 + 2) return null;
+    const origin = points[start2];
+    if (!origin) return null;
+    const step = Math.max(1, Math.floor((end - start2) / 12));
+    let bestIndex = -1;
+    let bestCommand = null;
+    for (let j = end; j >= start2 + 2; j -= step) {
+      const command = fairCubic(points, start2, j, GLYPH_TOLERANCE, tStart, j === end ? tEnd : null);
+      if (!command || !curveInCorridor(origin, command, coverage)) continue;
+      bestIndex = j;
+      bestCommand = command;
+      break;
+    }
+    if (!bestCommand || bestIndex < 0) return null;
+    const limit = Math.min(end, bestIndex + step - 1);
+    for (let j = bestIndex + 1; j <= limit; j++) {
+      const command = fairCubic(points, start2, j, GLYPH_TOLERANCE, tStart, j === end ? tEnd : null);
+      if (!command || !curveInCorridor(origin, command, coverage)) continue;
+      bestIndex = j;
+      bestCommand = command;
+    }
+    return { index: bestIndex, command: bestCommand };
+  }
+  function segmentInCorridor(from, to, coverage) {
+    const length = Math.hypot(to.x - from.x, to.y - from.y);
+    const steps = Math.max(1, Math.ceil(length / 0.28));
+    for (let step = 0; step <= steps; step++) {
+      const t = step / steps;
+      const value = coverage(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+      if (Number.isNaN(value)) continue;
+      if (value < 0.05 || value > 0.95) return false;
+    }
+    return true;
+  }
+  function curveInCorridor(origin, command, coverage) {
+    if (command.op !== "C") return false;
+    for (const t of [0.2, 0.4, 0.6, 0.8]) {
+      const point = cubicAt2(origin, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, { x: command.x, y: command.y }, t);
+      const value = coverage(point.x, point.y);
+      if (Number.isNaN(value)) continue;
+      if (value < 0.05 || value > 0.95) return false;
+    }
+    return true;
+  }
+  function polishBites(commands, start2, closed, cornerAngle, tolerance) {
+    if (!start2 || commands.length === 0) return commands;
+    const samples = sampleSubpath({ start: start2, commands }, 0.3);
+    if (samples.length < 6) return commands;
+    const loop = closed && Math.hypot((samples[0]?.x ?? 0) - (samples[samples.length - 1]?.x ?? 0), (samples[0]?.y ?? 0) - (samples[samples.length - 1]?.y ?? 0)) < 0.05;
+    const body = loop ? samples.slice(0, -1) : samples;
+    if (body.length < 6) return commands;
+    const clipped = clipContourBites(body, loop);
+    let moved = 0;
+    for (let i = 0; i < body.length; i++) {
+      const before = body[i];
+      const after = clipped[i];
+      if (before && after && Math.hypot(before.x - after.x, before.y - after.y) > 0.05) moved++;
+    }
+    if (moved === 0) return commands;
+    const cleaned = [];
+    for (const point of clipped) {
+      const previous = cleaned[cleaned.length - 1];
+      if (previous && Math.hypot(previous.x - point.x, previous.y - point.y) < 0.02) continue;
+      cleaned.push({ x: point.x, y: point.y });
+    }
+    if (cleaned.length < 3) return commands;
+    return loop ? fitFairClosed(cleaned, cornerAngle, tolerance) : fitFairOpen(cleaned, cornerAngle, tolerance);
   }
   function sharpCorner(previous, current, next, alpha) {
     const turn = Math.abs(turnAngle2(previous, current, next));

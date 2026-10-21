@@ -4,6 +4,8 @@ import { test } from "node:test";
 import { TRANSPARENT } from "./model";
 import { deltaE76, rgbToCieLab, type Lab } from "./oklab";
 import { decodePng } from "./png";
+import { buildGlyphIndex } from "./glyph";
+import { measureGlyphBox } from "./glyph-quality";
 import { rasterizeShapes } from "./raster";
 import { segmentImage } from "./segment";
 import { boundaryWobble, contourDeviationP95, staircaseRatio, traceSegmentation } from "./trace";
@@ -172,6 +174,23 @@ test("shared edges are not pixel staircases", () => {
 test("traced boundaries stay on the source half-coverage contour", () => {
   const deviation = contourDeviationP95(segmentation, data, traced.shapes);
   assert.ok(deviation < 0.6, "iso deviation p95 " + deviation.toFixed(3));
+});
+
+test("Next and Selection read as clean glyphs", () => {
+  const glyphs = buildGlyphIndex(data, segmentation.labels, segmentation.palette, width, height);
+  const boxes = [
+    { name: "Selection", x: 92, y: 204, w: 84, h: 56 },
+    { name: "Next", x: 174, y: 204, w: 62, h: 56 }
+  ];
+  for (const box of boxes) {
+    const pair = glyphs.pairInBox(box.x, box.y, box.w, box.h);
+    assert.ok(pair, box.name + " has no thin text component");
+    if (!pair) continue;
+    const quality = measureGlyphBox(traced.shapes, data, width, height, box.x, box.y, box.w, box.h, pair.ink, pair.bg);
+    assert.ok(quality.iou >= 0.9, box.name + " IoU " + quality.iou.toFixed(3));
+    assert.ok(quality.hausdorffP95 <= 0.5, box.name + " boundary p95 " + quality.hausdorffP95.toFixed(3));
+    assert.equal(quality.spikes, 0, box.name + " spikes " + quality.spikes);
+  }
 });
 
 test("smooth edges do not wobble once per pixel", () => {

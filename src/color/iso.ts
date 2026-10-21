@@ -96,7 +96,112 @@ function smoothContour(points: readonly IsoPoint[], closed: boolean): IsoPoint[]
   if (points.length < 3) return points.map((point) => ({ x: point.x, y: point.y }));
   let current = points.map((point) => ({ x: point.x, y: point.y }));
   for (let pass = 0; pass < 2; pass++) current = flattenStairs(current, closed);
+  current = clipContourBites(current, closed);
   return dedupe(current, closed);
+}
+
+/**
+ * Drop a concave or convex chip that is narrower than 1.5px and shallower than 1px.
+ * The shoulders on either side have to keep going the same way, so a real corner
+ * and an open-chain junction stay put.
+ */
+export function clipContourBites(points: readonly IsoPoint[], closed: boolean): IsoPoint[] {
+  const count = points.length;
+  if (count < 6) return points.map((point) => ({ x: point.x, y: point.y }));
+  const next = points.map((point) => ({ x: point.x, y: point.y }));
+  for (let i = 0; i < count; i++) {
+    const left = pointAtArc(points, i, -1.45, closed);
+    const right = pointAtArc(points, i, 1.45, closed);
+    if (!left || !right) continue;
+    const chord = Math.hypot(right.point.x - left.point.x, right.point.y - left.point.y);
+    if (chord < 0.9 || chord > 3.3) continue;
+    const point = points[i];
+    if (!point) continue;
+    const depth = segmentDistance(point, left.point, right.point);
+    if (depth < 0.72 || depth > 1) continue;
+    if (deviantWidth(points, i, left.point, right.point, closed) > 1.5) continue;
+    if (!shouldersContinue(points, left.index, right.index, closed)) continue;
+    const dx = right.point.x - left.point.x;
+    const dy = right.point.y - left.point.y;
+    const length2 = dx * dx + dy * dy;
+    if (length2 < 1e-6) continue;
+    const t = Math.min(1, Math.max(0, ((point.x - left.point.x) * dx + (point.y - left.point.y) * dy) / length2));
+    next[i] = { x: left.point.x + dx * t, y: left.point.y + dy * t };
+  }
+  return next;
+}
+
+function pointAtArc(
+  points: readonly IsoPoint[],
+  index: number,
+  distance: number,
+  closed: boolean
+): { point: IsoPoint; index: number } | null {
+  const count = points.length;
+  const step = distance < 0 ? -1 : 1;
+  let walked = 0;
+  let cursor = index;
+  for (let hop = 0; hop < count; hop++) {
+    const next = cursor + step;
+    if (!closed && (next < 0 || next >= count)) return null;
+    const wrapped = (next + count) % count;
+    const from = points[cursor];
+    const to = points[wrapped];
+    if (!from || !to) return null;
+    const span = Math.hypot(to.x - from.x, to.y - from.y);
+    if (walked + span >= Math.abs(distance) - 1e-6) return { point: to, index: wrapped };
+    walked += span;
+    cursor = wrapped;
+    if (wrapped === index) return null;
+  }
+  return null;
+}
+
+function deviantWidth(points: readonly IsoPoint[], index: number, left: IsoPoint, right: IsoPoint, closed: boolean): number {
+  const count = points.length;
+  let width = 0;
+  for (const step of [-1, 1]) {
+    let cursor = index;
+    for (let hop = 0; hop < count; hop++) {
+      const next = cursor + step;
+      if (!closed && (next < 0 || next >= count)) break;
+      const wrapped = (next + count) % count;
+      const from = points[cursor];
+      const to = points[wrapped];
+      if (!from || !to) break;
+      if (segmentDistance(to, left, right) <= 0.12) break;
+      width += Math.hypot(to.x - from.x, to.y - from.y);
+      cursor = wrapped;
+      if (wrapped === index) break;
+    }
+  }
+  return width;
+}
+
+function shouldersContinue(points: readonly IsoPoint[], leftIndex: number, rightIndex: number, closed: boolean): boolean {
+  const count = points.length;
+  if (!closed && (leftIndex < 1 || rightIndex + 1 >= count)) return false;
+  const prev = points[(leftIndex - 1 + count) % count];
+  const left = points[leftIndex];
+  const right = points[rightIndex];
+  const next = points[(rightIndex + 1) % count];
+  if (!prev || !left || !right || !next) return false;
+  const inX = left.x - prev.x;
+  const inY = left.y - prev.y;
+  const outX = next.x - right.x;
+  const outY = next.y - right.y;
+  const inLength = Math.hypot(inX, inY);
+  const outLength = Math.hypot(outX, outY);
+  if (inLength < 0.05 || outLength < 0.05) return false;
+  return (inX * outX + inY * outY) / (inLength * outLength) > 0.8;
+}
+
+function segmentDistance(point: IsoPoint, from: IsoPoint, to: IsoPoint): number {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-8) return Math.hypot(point.x - from.x, point.y - from.y);
+  return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
 }
 
 /** Pull marching-squares kinks onto the local chord. A real corner, sharp at both scales, stays put. */
@@ -245,7 +350,7 @@ function dualCrossing(insideX: number, insideY: number, outsideX: number, outsid
  * One sub-pixel point for a grid vertex, agreed by every chain that ends there.
  * A binary step keeps the integer vertex so a hard edge still meets its neighbor.
  */
-function sharedJunction(
+export function sharedJunction(
   point: IsoPoint,
   width: number,
   height: number,
