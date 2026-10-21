@@ -324,6 +324,7 @@ writeCrop(120, 210, 340, 330, "crop-green.png");
 writeCrop(500, 200, 820, 360, "crop-icons.png");
 writeZoom(100, 280, 80, 200, "zoom-green-edge-400.png");
 writeZoom(530, 210, 330, 330, "zoom-ai-400.png");
+writeHeatmap("delta-heatmap.png");
 console.log("wrote artifacts");
 
 const balloon = makeStripeSample();
@@ -409,6 +410,62 @@ function coreDelta(
     pal: color.r + "," + color.g + "," + color.b,
     delta: deltaE76(rgbToCieLab(core.r, core.g, core.b), rgbToCieLab(color.r, color.g, color.b))
   };
+}
+
+function heatColor(delta: number): [number, number, number] {
+  const t = Math.min(1, Math.max(0, delta / 18));
+  if (t < 0.35) {
+    const u = t / 0.35;
+    return [Math.round(30 + 210 * u), Math.round(150 + 40 * u), 48];
+  }
+  const u = (t - 0.35) / 0.65;
+  return [220, Math.round(170 * (1 - u)), 36];
+}
+
+function writeHeatmap(name: string): void {
+  const cell = 16;
+  const image = new Uint8Array(width * height * 4);
+  const worst: { x: number; y: number; delta: number; n: number }[] = [];
+  for (let y0 = 0; y0 < height; y0 += cell) {
+    for (let x0 = 0; x0 < width; x0 += cell) {
+      let sum = 0;
+      let n = 0;
+      const y1 = Math.min(height, y0 + cell);
+      const x1 = Math.min(width, x0 + cell);
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const index = y * width + x;
+          if ((data[index * 4 + 3] ?? 0) < 128) continue;
+          const origin = originalLabs[index];
+          const sample = renderedLabs[index];
+          if (!origin || !sample) continue;
+          sum += deltaE76(origin, sample);
+          n++;
+        }
+      }
+      const delta = n ? sum / n : 0;
+      if (n > 0) worst.push({ x: x0, y: y0, delta, n });
+      const [red, green, blue] = heatColor(delta);
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const to = (y * width + x) * 4;
+          image[to] = red;
+          image[to + 1] = green;
+          image[to + 2] = blue;
+          image[to + 3] = 255;
+        }
+      }
+    }
+  }
+  worst.sort((a, b) => b.delta - a.delta);
+  console.log(
+    "heatmapWorst",
+    worst
+      .slice(0, 6)
+      .map((entry) => entry.x + "," + entry.y + " dE " + entry.delta.toFixed(1))
+      .join(" | ")
+  );
+  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(width, height, image));
 }
 
 function writeZoom(x0: number, y0: number, cropWidth: number, cropHeight: number, name: string): void {

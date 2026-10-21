@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js && esbuild src/demo.ts --bundle --platform=browser --format=iife --target=chrome99 --outfile=demo/editor.js",
     "watch": "esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js --watch",
-    "test": "esbuild src/color/model.test.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/model.test.cjs && esbuild src/color/trace.test.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/trace.test.cjs && node --test dist/model.test.cjs dist/trace.test.cjs"
+    "test": "esbuild src/color/model.test.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/model.test.cjs && esbuild src/color/trace.test.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/trace.test.cjs && esbuild src/color/fixture.test.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/fixture.test.cjs && node --test dist/model.test.cjs dist/trace.test.cjs dist/fixture.test.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",

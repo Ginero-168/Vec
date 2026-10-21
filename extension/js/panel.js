@@ -1432,6 +1432,16 @@
     const lightest = populous[populous.length - 1];
     if (darkest) remember(darkest.lab, darkest.lab.l < 0.35);
     if (lightest) remember(lightest.lab, lightest.lab.l > 0.9);
+    const opaque = bins.reduce((sum, bin) => sum + bin.n, 0);
+    const largeNeutral = Math.max(64, opaque * 5e-3);
+    const neutrals = bins.filter((bin) => oklabChroma(bin.lab) < 0.035 && bin.n >= largeNeutral).sort((a, b) => b.n - a.n);
+    for (const bin of neutrals) {
+      if (seeds.length >= maxColors) break;
+      const distinct = seeds.every((seed) => oklabChroma(seed) >= 0.05 || Math.abs(seed.l - bin.lab.l) > 0.07);
+      if (!distinct) continue;
+      seeds.push(bin.lab);
+      protectedLabs.push(bin.lab);
+    }
     const minorities = bins.filter((bin) => bin.n >= 4).sort((a, b) => b.n - a.n);
     for (const bin of minorities) {
       if (seeds.length >= maxColors) break;
@@ -1634,6 +1644,7 @@
     const counts = countLabels(labels, palette.length);
     const active = palette.map((_, index) => (counts[index] ?? 0) > 0);
     const protectedSlot = palette.map((lab) => oklabChroma(lab) > 0.045 || lab.l > 0.93);
+    const largeArea = labels.length * 5e-3;
     const activeCount = () => active.filter(Boolean).length;
     for (; ; ) {
       let bestI = -1;
@@ -1650,6 +1661,10 @@
           if (!right) continue;
           if (huesApart(left, right)) continue;
           const distance = oklabDistance(left, right);
+          const bothNeutral = oklabChroma(left) < 0.05 && oklabChroma(right) < 0.05;
+          const leftLarge = (counts[i] ?? 0) >= largeArea;
+          const rightLarge = (counts[j] ?? 0) >= largeArea;
+          if (bothNeutral && leftLarge && rightLarge && Math.abs(left.l - right.l) > 0.06) continue;
           const lowChroma = oklabChroma(left) < 0.05 && oklabChroma(right) < 0.05;
           const limit = lowChroma ? Math.max(sensitivity, smoothContrast) : sensitivity;
           const bothProtected = (protectedSlot[i] ?? false) && (protectedSlot[j] ?? false);
@@ -1922,6 +1937,8 @@
   }
   function absorbDarkBlobs(rgba, labels, partner, coverage, width, height, palette) {
     const areaCap2 = Math.max(160, Math.round(width * height * 4e-3));
+    const counts = countLabels(labels, palette.length);
+    const largeArea = width * height * 5e-3;
     const mark = new Uint8Array(labels.length);
     forEachComponent(labels, width, height, (region) => {
       if (region.pixels.length < 4 || region.pixels.length > areaCap2 || region.adjacency.size === 0) return;
@@ -1929,8 +1946,11 @@
       const spanY = region.maxY - region.minY + 1;
       const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
       if (aspect >= 2.2) return;
-      if (region.pixels.length >= 6 && componentThickness2(region.pixels, width, height, 2) <= 2) return;
+      if (region.pixels.length >= 6 && componentThickness2(region.pixels, width, height, 3) <= 3) return;
       const own = medianLab(rgba, region.pixels);
+      const swatch = palette[region.label];
+      const outside = (counts[region.label] ?? 0) - region.pixels.length;
+      if (swatch && outside >= Math.max(largeArea, 400) && oklabDistance(own, swatch) < 0.08) return;
       if (oklabChroma(own) >= 0.045) return;
       const ring = ringLabs(rgba, labels, region.pixels, width, height, mark);
       if (ring.length < 6) return;
