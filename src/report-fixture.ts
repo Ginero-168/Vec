@@ -4,7 +4,7 @@ import { encodePng, decodePng } from "./color/png";
 import { rasterizeShapes, rasterizeWindow } from "./color/raster";
 import { DARK_SURROUND_L, renderRgba, segmentImage } from "./color/segment";
 import { legacySegmentImage } from "./color/legacy-segment";
-import { traceSegmentation } from "./color/trace";
+import { measureSharedEdges, traceSegmentation } from "./color/trace";
 import { TRANSPARENT } from "./color/model";
 import { makeStripeSample } from "./color/sample";
 
@@ -370,10 +370,35 @@ console.log(
   "p95",
   cleanP95.toFixed(2)
 );
-writeCleanZoom(traced.shapes, cleaned.shapes, 132, 220, 110, 110, "zoom-squircle-clean-400.png");
-writeCleanZoom(traced.shapes, cleaned.shapes, 210, 330, 160, 150, "zoom-a-clean-400.png");
-writeCleanZoom(traced.shapes, cleaned.shapes, 640, 290, 180, 160, "zoom-star-clean-400.png");
-writeCleanZoom(traced.shapes, cleaned.shapes, 700, 340, 180, 150, "zoom-ai-letters-clean-400.png");
+const edgeOptions = {
+  preset: "ui" as const,
+  smooth: 0.5,
+  originalLabels: segmentation.labels,
+  coverage: segmentation.coverage,
+  partner: segmentation.partner
+};
+const edgesOff = measureSharedEdges(segmentation, edgeOptions);
+const edgesOn = measureSharedEdges(segmentation, { ...edgeOptions, cleanShapes: 0.55, cleanText: false });
+console.log(
+  "edgesOff",
+  edgesOff.edges,
+  "median",
+  edgesOff.median.toFixed(2),
+  "p90",
+  edgesOff.p90.toFixed(2),
+  "edgesOn",
+  edgesOn.edges,
+  "median",
+  edgesOn.median.toFixed(2),
+  "p90",
+  edgesOn.p90.toFixed(2)
+);
+console.log("labelFringe", countFringe(segmentation.labels), "labelChecker", countChecker(segmentation.labels));
+writeCleanZoom(traced.shapes, cleaned.shapes, 118, 262, 64, 64, "zoom-squircle-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 200, 335, 150, 130, "zoom-a-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 660, 310, 140, 120, "zoom-star-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 730, 360, 140, 110, "zoom-ai-letters-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 174, 208, 64, 52, "zoom-next-clean-400.png");
 console.log("wrote clean zooms");
 
 const balloon = makeStripeSample();
@@ -522,6 +547,72 @@ function writeHeatmap(name: string): void {
   fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(width, height, image));
 }
 
+function countChecker(labels: Uint16Array): number {
+  let count = 0;
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const index = y * width + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      const neighbors = [index - 1, index + 1, index - width, index + width];
+      if (neighbors.every((neighbor) => (labels[neighbor] ?? TRANSPARENT) !== label)) count++;
+    }
+  }
+  return count;
+}
+
+function countFringe(labels: Uint16Array): number {
+  const core = new Uint8Array(labels.length);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const index = y * width + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (
+        label !== TRANSPARENT &&
+        labels[index - 1] === label &&
+        labels[index + 1] === label &&
+        labels[index - width] === label &&
+        labels[index + width] === label
+      ) {
+        core[index] = 1;
+      }
+    }
+  }
+  let fringe = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      if (core[index]) continue;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      let boundary = false;
+      for (const neighbor of [index - 1, index + 1, index - width, index + width]) {
+        if (neighbor < 0 || neighbor >= labels.length) continue;
+        if (Math.abs((neighbor % width) - x) > 1) continue;
+        if ((labels[neighbor] ?? TRANSPARENT) !== label) boundary = true;
+      }
+      if (!boundary) continue;
+      const cores = new Map<number, number>();
+      for (let oy = -2; oy <= 2; oy++) {
+        const yy = y + oy;
+        if (yy < 0 || yy >= height) continue;
+        for (let ox = -2; ox <= 2; ox++) {
+          const xx = x + ox;
+          if (xx < 0 || xx >= width) continue;
+          const neighborIndex = yy * width + xx;
+          const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+          if (neighbor !== TRANSPARENT && core[neighborIndex]) cores.set(neighbor, (cores.get(neighbor) ?? 0) + 1);
+        }
+      }
+      const ranked = [...cores.entries()].sort((left, right) => right[1] - left[1]);
+      const first = ranked[0];
+      const second = ranked[1];
+      if (first && second && label !== first[0] && label !== second[0]) fringe++;
+    }
+  }
+  return fringe;
+}
+
 function writeCleanZoom(
   before: typeof traced.shapes,
   after: typeof traced.shapes,
@@ -532,28 +623,31 @@ function writeCleanZoom(
   name: string
 ): void {
   const scale = 4;
-  const left = rasterizeWindow(before, x0, y0, cropWidth, cropHeight, scale);
-  const right = rasterizeWindow(after, x0, y0, cropWidth, cropHeight, scale);
+  const cleanOff = rasterizeWindow(before, x0, y0, cropWidth, cropHeight, scale);
+  const cleanOn = rasterizeWindow(after, x0, y0, cropWidth, cropHeight, scale);
   const zoomedWidth = Math.max(1, Math.round(cropWidth * scale));
   const zoomedHeight = Math.max(1, Math.round(cropHeight * scale));
-  const image = new Uint8Array(zoomedWidth * 2 * zoomedHeight * 4);
+  const panels = 3;
+  const image = new Uint8Array(zoomedWidth * panels * zoomedHeight * 4);
   for (let y = 0; y < zoomedHeight; y++) {
     for (let x = 0; x < zoomedWidth; x++) {
-      const fromLeft = (y * zoomedWidth + x) * 4;
-      const fromRight = fromLeft;
-      const toLeft = (y * zoomedWidth * 2 + x) * 4;
-      const toRight = (y * zoomedWidth * 2 + zoomedWidth + x) * 4;
-      image[toLeft] = left[fromLeft] ?? 0;
-      image[toLeft + 1] = left[fromLeft + 1] ?? 0;
-      image[toLeft + 2] = left[fromLeft + 2] ?? 0;
-      image[toLeft + 3] = 255;
-      image[toRight] = right[fromRight] ?? 0;
-      image[toRight + 1] = right[fromRight + 1] ?? 0;
-      image[toRight + 2] = right[fromRight + 2] ?? 0;
-      image[toRight + 3] = 255;
+      const sx = Math.min(width - 1, x0 + Math.floor(x / scale));
+      const sy = Math.min(height - 1, y0 + Math.floor(y / scale));
+      const source = (sy * width + sx) * 4;
+      const vector = (y * zoomedWidth + x) * 4;
+      const row = y * zoomedWidth * panels;
+      for (let panel = 0; panel < panels; panel++) {
+        const sample = panel === 0 ? data : panel === 1 ? cleanOff : cleanOn;
+        const from = panel === 0 ? source : vector;
+        const to = (row + panel * zoomedWidth + x) * 4;
+        image[to] = sample[from] ?? 0;
+        image[to + 1] = sample[from + 1] ?? 0;
+        image[to + 2] = sample[from + 2] ?? 0;
+        image[to + 3] = 255;
+      }
     }
   }
-  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(zoomedWidth * 2, zoomedHeight, image));
+  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(zoomedWidth * panels, zoomedHeight, image));
 }
 
 function writeZoom(x0: number, y0: number, cropWidth: number, cropHeight: number, name: string): void {

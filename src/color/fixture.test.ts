@@ -153,6 +153,32 @@ test("large flat regions keep a mean color within delta E 6", () => {
   assert.deepEqual(failures, []);
 });
 
+test("edge pixels stay on the two local cores", () => {
+  const fringe = countFringe(segmentation.labels, width, height);
+  assert.ok(fringe < 100, "fringe pixels " + fringe);
+});
+
+test("the label map has no checkerboard", () => {
+  const checkerboard = countCheckerboard(segmentation.labels, width, height);
+  assert.ok(checkerboard < 12, "checkerboard pixels " + checkerboard);
+});
+
+test("the black a is one region", () => {
+  const mask = blackAMask(data, width, height);
+  assert.ok(mask.length > 400, "black a pixels " + mask.length);
+  const counts = new Map<number, number>();
+  for (const index of mask) {
+    const label = segmentation.labels[index] ?? TRANSPARENT;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort((left, right) => right[1] - left[1]);
+  const top = ranked[0];
+  const second = ranked[1];
+  assert.ok(top);
+  assert.ok(top[1] / mask.length >= 0.95, "modal coverage " + (top[1] / mask.length).toFixed(3) + " labels " + ranked.length);
+  if (second) assert.ok(second[1] / mask.length < 0.04, "second label share " + (second[1] / mask.length).toFixed(3));
+});
+
 test("small dark components all survive", () => {
   let kept = 0;
   let total = 0;
@@ -214,6 +240,122 @@ function maskIoU(x0: number, y0: number, boxWidth: number, boxHeight: number): {
   }
   const union = original + vector - intersection;
   return { iou: union === 0 ? 0 : intersection / union, original };
+}
+
+function countCheckerboard(labels: Uint16Array, imageWidth: number, imageHeight: number): number {
+  let count = 0;
+  for (let y = 1; y < imageHeight - 1; y++) {
+    for (let x = 1; x < imageWidth - 1; x++) {
+      const index = y * imageWidth + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      const neighbors = [index - 1, index + 1, index - imageWidth, index + imageWidth];
+      let foreign = 0;
+      for (const neighbor of neighbors) {
+        const other = labels[neighbor] ?? TRANSPARENT;
+        if (other !== label) foreign++;
+      }
+      if (foreign === 4) count++;
+    }
+  }
+  return count;
+}
+
+function countFringe(labels: Uint16Array, imageWidth: number, imageHeight: number): number {
+  const core = new Uint8Array(labels.length);
+  for (let y = 1; y < imageHeight - 1; y++) {
+    for (let x = 1; x < imageWidth - 1; x++) {
+      const index = y * imageWidth + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      if (
+        labels[index - 1] === label &&
+        labels[index + 1] === label &&
+        labels[index - imageWidth] === label &&
+        labels[index + imageWidth] === label
+      ) {
+        core[index] = 1;
+      }
+    }
+  }
+  const totals = new Map<number, number>();
+  const cores = new Map<number, number>();
+  let fringe = 0;
+  for (let y = 0; y < imageHeight; y++) {
+    for (let x = 0; x < imageWidth; x++) {
+      const index = y * imageWidth + x;
+      if (core[index]) continue;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      let boundary = false;
+      if (x > 0 && (labels[index - 1] ?? TRANSPARENT) !== label) boundary = true;
+      if (x + 1 < imageWidth && (labels[index + 1] ?? TRANSPARENT) !== label) boundary = true;
+      if (y > 0 && (labels[index - imageWidth] ?? TRANSPARENT) !== label) boundary = true;
+      if (y + 1 < imageHeight && (labels[index + imageWidth] ?? TRANSPARENT) !== label) boundary = true;
+      if (!boundary) continue;
+      totals.clear();
+      cores.clear();
+      for (let oy = -2; oy <= 2; oy++) {
+        const yy = y + oy;
+        if (yy < 0 || yy >= imageHeight) continue;
+        for (let ox = -2; ox <= 2; ox++) {
+          const xx = x + ox;
+          if (xx < 0 || xx >= imageWidth) continue;
+          const neighborIndex = yy * imageWidth + xx;
+          const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+          if (neighbor === TRANSPARENT) continue;
+          totals.set(neighbor, (totals.get(neighbor) ?? 0) + 1);
+          if (core[neighborIndex]) cores.set(neighbor, (cores.get(neighbor) ?? 0) + 1);
+        }
+      }
+      const ranked = [...cores.entries()].filter((entry) => entry[1] > 0).sort((left, right) => right[1] - left[1] || (totals.get(right[0]) ?? 0) - (totals.get(left[0]) ?? 0));
+      const first = ranked[0];
+      const second = ranked[1];
+      if (!first || !second) continue;
+      if (label !== first[0] && label !== second[0]) fringe++;
+    }
+  }
+  return fringe;
+}
+
+function blackAMask(rgba: Uint8Array, imageWidth: number, imageHeight: number): number[] {
+  let minX = imageWidth;
+  let minY = imageHeight;
+  let maxX = 0;
+  let maxY = 0;
+  let green = 0;
+  for (let y = 0; y < imageHeight; y++) {
+    for (let x = 0; x < imageWidth; x++) {
+      const offset = (y * imageWidth + x) * 4;
+      const red = rgba[offset] ?? 0;
+      const greenChannel = rgba[offset + 1] ?? 0;
+      const blue = rgba[offset + 2] ?? 0;
+      if (greenChannel > 90 && greenChannel > red + 25 && greenChannel > blue + 15) {
+        green++;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (green < 1000) return [];
+  const pixels: number[] = [];
+  const x0 = minX + 18;
+  const y0 = minY + 28;
+  const x1 = maxX - 18;
+  const y1 = maxY - 18;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const offset = (y * imageWidth + x) * 4;
+      const red = rgba[offset] ?? 255;
+      const greenChannel = rgba[offset + 1] ?? 255;
+      const blue = rgba[offset + 2] ?? 255;
+      const luma = 0.2126 * red + 0.7152 * greenChannel + 0.0722 * blue;
+      if (luma < 42 && greenChannel < 80) pixels.push(y * imageWidth + x);
+    }
+  }
+  return pixels;
 }
 
 function isDark(rgba: Uint8Array, index: number): boolean {

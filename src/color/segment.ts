@@ -90,6 +90,7 @@ export function segmentImage(
   dissolveSlivers(rgba, labels, partner, coverage, width, height, paletteLabs);
   peelPaleEdges(rgba, labels, partner, coverage, width, height, paletteLabs);
   liftNearWhite(rgba, labels, partner, coverage, width, height, paletteLabs);
+  settleEdges(rgba, labels, partner, coverage, width, height, paletteLabs);
   const compacted = compactAll(labels, partner, paletteLabs);
   return {
     width,
@@ -1124,6 +1125,498 @@ function spreadL(labs: readonly Lab[]): number {
     variance += delta * delta;
   }
   return Math.sqrt(variance / labs.length);
+}
+
+/**
+ * Edge pixels belong to the two local core regions only, and a soft shade
+ * inside one shape stays one label. Runs after the palette has settled.
+ */
+function settleEdges(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number,
+  palette: readonly Lab[]
+): void {
+  const gradient = sobelLuma(rgba, width, height);
+  dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
+  mergeSoftBoundaries(rgba, labels, partner, coverage, width, height, palette, gradient);
+  dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
+  clearCheckerboards(labels, partner, coverage, width, height);
+  pinToLocalCores(rgba, labels, partner, coverage, width, height, palette, gradient);
+  pinToNearbyCores(rgba, labels, partner, coverage, width, height, palette);
+  clearCheckerboards(labels, partner, coverage, width, height);
+  clearSolidSpecks(labels, partner, coverage, width, height);
+  for (let pass = 0; pass < 4; pass++) pinToNearbyCores(rgba, labels, partner, coverage, width, height, palette);
+  dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
+  clearSolidSpecks(labels, partner, coverage, width, height);
+  reconcilePartners(labels, partner, coverage);
+}
+
+function pinToLocalCores(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number,
+  palette: readonly Lab[],
+  gradient: Float32Array
+): void {
+  const colorCount = palette.length;
+  const flat = new Uint8Array(labels.length);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const index = y * width + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT || (gradient[index] ?? 999) >= 22) continue;
+      if (isInterior(labels, width, height, x, y, label)) flat[index] = 1;
+    }
+  }
+  const radius = 8;
+  const next = labels.slice();
+  const totals = new Int32Array(colorCount);
+  const seen: number[] = [];
+  const cache = new Map<number, Lab>();
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT || flat[index]) continue;
+      seen.length = 0;
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(height - 1, y + radius);
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width - 1, x + radius);
+      for (let yy = y0; yy <= y1; yy++) {
+        const row = yy * width;
+        for (let xx = x0; xx <= x1; xx++) {
+          const neighborIndex = row + xx;
+          if (!flat[neighborIndex]) continue;
+          const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+          if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
+          if (totals[neighbor] === 0) seen.push(neighbor);
+          totals[neighbor] = (totals[neighbor] ?? 0) + 1;
+        }
+      }
+      let first = -1;
+      let second = -1;
+      for (const candidate of seen) {
+        if ((totals[candidate] ?? 0) < 3) continue;
+        if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
+          second = first;
+          first = candidate;
+        } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
+          second = candidate;
+        }
+      }
+      for (const candidate of seen) totals[candidate] = 0;
+      if (first < 0 || second < 0) continue;
+      const colorA = palette[first];
+      const colorB = palette[second];
+      if (!colorA || !colorB) continue;
+      const lab = cachedLab(cache, rgba, index);
+      if (keepNeutralDark(lab, palette[label], colorA, colorB)) continue;
+      const along = project(lab, colorA, colorB);
+      const distanceA = oklabDistance(lab, colorA);
+      const distanceB = oklabDistance(lab, colorB);
+      let chosen = distanceA <= distanceB ? first : second;
+      if (along && along.perp <= Math.max(0.05, 0.55 * along.length)) chosen = along.t < 0.5 ? first : second;
+      if (keepDarkLabel(lab, palette[label], palette[chosen])) continue;
+      next[index] = chosen;
+      coverage[index] = 1;
+      partner[index] = TRANSPARENT;
+    }
+  }
+  labels.set(next);
+}
+
+function pinToNearbyCores(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number,
+  palette: readonly Lab[]
+): void {
+  const colorCount = palette.length;
+  const core = new Uint8Array(labels.length);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const index = y * width + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT) continue;
+      if (isInterior(labels, width, height, x, y, label)) core[index] = 1;
+    }
+  }
+  const next = labels.slice();
+  const totals = new Int32Array(colorCount);
+  const seen: number[] = [];
+  const cache = new Map<number, Lab>();
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      const label = labels[index] ?? TRANSPARENT;
+      if (label === TRANSPARENT || core[index]) continue;
+      seen.length = 0;
+      for (let oy = -2; oy <= 2; oy++) {
+        const yy = y + oy;
+        if (yy < 0 || yy >= height) continue;
+        const row = yy * width;
+        for (let ox = -2; ox <= 2; ox++) {
+          const xx = x + ox;
+          if (xx < 0 || xx >= width) continue;
+          const neighborIndex = row + xx;
+          if (!core[neighborIndex]) continue;
+          const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+          if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
+          if (totals[neighbor] === 0) seen.push(neighbor);
+          totals[neighbor] = (totals[neighbor] ?? 0) + 1;
+        }
+      }
+      let first = -1;
+      let second = -1;
+      for (const candidate of seen) {
+        if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
+          second = first;
+          first = candidate;
+        } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
+          second = candidate;
+        }
+      }
+      for (const candidate of seen) totals[candidate] = 0;
+      if (first < 0 || second < 0 || label === first || label === second) continue;
+      const colorA = palette[first];
+      const colorB = palette[second];
+      if (!colorA || !colorB) continue;
+      const lab = cachedLab(cache, rgba, index);
+      if (keepNeutralDark(lab, palette[label], colorA, colorB)) continue;
+      const along = project(lab, colorA, colorB);
+      const nearer = oklabDistance(lab, colorA) <= oklabDistance(lab, colorB) ? first : second;
+      let chosen = nearer;
+      if (along && along.perp <= Math.max(0.05, 0.55 * along.length)) chosen = along.t < 0.5 ? first : second;
+      if (keepDarkLabel(lab, palette[label], palette[chosen])) continue;
+      next[index] = chosen;
+      coverage[index] = 1;
+      partner[index] = TRANSPARENT;
+    }
+  }
+  labels.set(next);
+}
+
+function keepNeutralDark(lab: Lab, current: Lab | undefined, colorA: Lab, colorB: Lab): boolean {
+  if (!current || !(lab.l < 0.45) || oklabChroma(lab) >= 0.08) return false;
+  if (!(lab.l + 0.08 < colorA.l && lab.l + 0.08 < colorB.l)) return false;
+  return oklabChroma(current) < 0.04;
+}
+
+function keepDarkLabel(lab: Lab, current: Lab | undefined, chosen: Lab | undefined): boolean {
+  if (!current || !chosen || !(lab.l < 0.4) || !(lab.l + 0.12 < chosen.l)) return false;
+  if (oklabChroma(lab) < 0.04 && oklabChroma(current) > 0.05) return false;
+  return oklabDistance(lab, current) <= oklabDistance(lab, chosen) + 0.04;
+}
+
+function dissolveBoundarySlivers(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number,
+  palette: readonly Lab[]
+): void {
+  const cache = new Map<number, Lab>();
+  for (let pass = 0; pass < 6; pass++) {
+    const jobs: { pixels: number[]; first: number; second: number }[] = [];
+    forEachComponent(labels, width, height, (region) => {
+      if (region.adjacency.size < 2 || region.pixels.length < 1) return;
+      const spanX = region.maxX - region.minX + 1;
+      const spanY = region.maxY - region.minY + 1;
+      if (spanX >= 6 && spanY >= 6 && region.pixels.length >= Math.min(spanX, spanY) * 4) return;
+      if (componentThickness(region.pixels, width, height, 2) > 1) return;
+      const ranked = [...region.adjacency.entries()].sort((left, right) => right[1] - left[1]);
+      const first = ranked[0];
+      const second = ranked[1];
+      if (!first || !second) return;
+      const median = medianLab(rgba, region.pixels);
+      const colorA = palette[first[0]];
+      const colorB = palette[second[0]];
+      if (colorA && colorB && median.l + 0.18 < colorA.l && median.l + 0.18 < colorB.l && oklabChroma(median) < 0.04) return;
+      jobs.push({ pixels: region.pixels, first: first[0], second: second[0] });
+    });
+    if (jobs.length === 0) break;
+    for (const job of jobs) {
+      const colorA = palette[job.first];
+      const colorB = palette[job.second];
+      if (!colorA || !colorB) continue;
+      for (const pixel of job.pixels) {
+        const lab = cachedLab(cache, rgba, pixel);
+        const nearer = oklabDistance(lab, colorA) <= oklabDistance(lab, colorB) ? job.first : job.second;
+        const nearerLab = palette[nearer];
+        if (nearerLab && lab.l < 0.4 && lab.l + 0.12 < nearerLab.l) continue;
+        labels[pixel] = nearer;
+        coverage[pixel] = 1;
+        partner[pixel] = TRANSPARENT;
+      }
+    }
+  }
+}
+
+function mergeSoftBoundaries(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number,
+  palette: readonly Lab[],
+  sobel: Float32Array
+): void {
+  const threshold = 26;
+  for (let pass = 0; pass < 5; pass++) {
+    const built = buildComponents(labels, width, height);
+    const stride = built.comps.length + 1;
+    if (stride <= 1) return;
+    const pairs = new Map<number, { low: number; n: number }>();
+    const consider = (left: number, right: number, leftIndex: number, rightIndex: number) => {
+      if (left < 0 || right < 0 || left === right) return;
+      const lowId = left < right ? left : right;
+      const highId = left < right ? right : left;
+      const key = lowId * stride + highId;
+      const stat = pairs.get(key) ?? { low: 0, n: 0 };
+      const magnitude = Math.max(sobel[leftIndex] ?? 999, sobel[rightIndex] ?? 999);
+      stat.n++;
+      if (magnitude < threshold) stat.low++;
+      pairs.set(key, stat);
+    };
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      for (let x = 0; x < width; x++) {
+        const index = row + x;
+        const id = built.ids[index] ?? -1;
+        if (id < 0) continue;
+        if (x + 1 < width) consider(id, built.ids[index + 1] ?? -1, index, index + 1);
+        if (y + 1 < height) consider(id, built.ids[index + width] ?? -1, index, index + width);
+      }
+    }
+    const jobs: { source: number; target: number; n: number }[] = [];
+    for (const [key, stat] of pairs) {
+      if (stat.n < 6 || stat.low / stat.n < 0.72) continue;
+      const idA = Math.floor(key / stride);
+      const idB = key - idA * stride;
+      const left = built.comps[idA];
+      const right = built.comps[idB];
+      if (!left || !right || left.label === right.label) continue;
+      const source = left.count <= right.count ? idA : idB;
+      const target = source === idA ? idB : idA;
+      const sourceLab = palette[built.comps[source]?.label ?? -1];
+      const targetLab = palette[built.comps[target]?.label ?? -1];
+      if (sourceLab && targetLab && sourceLab.l + 0.22 < targetLab.l && oklabChroma(sourceLab) < 0.08) continue;
+      const sourceComp = built.comps[source];
+      if (targetLab && sourceComp && componentIsDarker(rgba, sourceComp.samples, targetLab.l)) continue;
+      if (sourceLab && targetLab) {
+        const sourceRgb = oklabToRgb(sourceLab);
+        const targetRgb = oklabToRgb(targetLab);
+        const sourceMax = Math.max(sourceRgb.r, sourceRgb.g, sourceRgb.b);
+        const targetMax = Math.max(targetRgb.r, targetRgb.g, targetRgb.b);
+        if (sourceMax < 110 && targetMax >= 110) continue;
+      }
+      jobs.push({ source, target, n: stat.n });
+    }
+    if (jobs.length === 0) break;
+    jobs.sort((left, right) => right.n - left.n);
+    const redirect = new Int32Array(built.comps.length);
+    redirect.fill(-1);
+    for (const job of jobs) {
+      if ((redirect[job.source] ?? -1) !== -1 || (redirect[job.target] ?? -1) !== -1) continue;
+      redirect[job.source] = job.target;
+    }
+    let changed = false;
+    for (let i = 0; i < labels.length; i++) {
+      const id = built.ids[i] ?? -1;
+      if (id < 0) continue;
+      const targetId = redirect[id] ?? -1;
+      if (targetId < 0) continue;
+      const target = built.comps[targetId];
+      if (!target) continue;
+      const previous = labels[i] ?? TRANSPARENT;
+      labels[i] = target.label;
+      const other = partner[i] ?? TRANSPARENT;
+      if (other === TRANSPARENT || other === target.label || other === previous) {
+        partner[i] = TRANSPARENT;
+        coverage[i] = 1;
+      }
+      changed = true;
+    }
+    if (!changed) break;
+  }
+}
+
+function clearCheckerboards(
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number
+): void {
+  const votes = new Map<number, number>();
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = 0;
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT) continue;
+        const neighbors = [index - 1, index + 1, index - width, index + width];
+        votes.clear();
+        let foreign = 0;
+        for (const neighbor of neighbors) {
+          const other = labels[neighbor] ?? TRANSPARENT;
+          if (other === label || other === TRANSPARENT) continue;
+          foreign++;
+          votes.set(other, (votes.get(other) ?? 0) + 1);
+        }
+        if (foreign < 4) continue;
+        let best = -1;
+        let bestCount = 0;
+        for (const [other, count] of votes) {
+          if (count > bestCount) {
+            best = other;
+            bestCount = count;
+          }
+        }
+        if (best < 0 || bestCount < 2) continue;
+        labels[index] = best;
+        partner[index] = TRANSPARENT;
+        coverage[index] = 1;
+        changed++;
+      }
+    }
+    if (changed === 0) break;
+  }
+}
+
+function clearSolidSpecks(
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number
+): void {
+  for (let pass = 0; pass < 6; pass++) {
+    let changed = 0;
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT) continue;
+        const up = labels[index - width] ?? TRANSPARENT;
+        const down = labels[index + width] ?? TRANSPARENT;
+        const left = labels[index - 1] ?? TRANSPARENT;
+        const right = labels[index + 1] ?? TRANSPARENT;
+        if (up === TRANSPARENT || up !== down || up !== left || up !== right || up === label) continue;
+        labels[index] = up;
+        partner[index] = TRANSPARENT;
+        coverage[index] = 1;
+        changed++;
+      }
+    }
+    if (changed === 0) break;
+  }
+}
+
+function reconcilePartners(labels: Uint16Array, partner: Uint16Array, coverage: Float32Array): void {
+  for (let i = 0; i < labels.length; i++) {
+    const other = partner[i] ?? TRANSPARENT;
+    if (other === TRANSPARENT || other === (labels[i] ?? TRANSPARENT)) {
+      partner[i] = TRANSPARENT;
+      coverage[i] = 1;
+    }
+  }
+}
+
+function sobelLuma(rgba: Uint8Array, width: number, height: number): Float32Array {
+  const magnitude = new Float32Array(width * height);
+  magnitude.fill(999);
+  const lumaAt = (x: number, y: number) => {
+    const offset = (y * width + x) * 4;
+    return 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+  };
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const gx =
+        -lumaAt(x - 1, y - 1) +
+        lumaAt(x + 1, y - 1) -
+        2 * lumaAt(x - 1, y) +
+        2 * lumaAt(x + 1, y) -
+        lumaAt(x - 1, y + 1) +
+        lumaAt(x + 1, y + 1);
+      const gy =
+        -lumaAt(x - 1, y - 1) -
+        2 * lumaAt(x, y - 1) -
+        lumaAt(x + 1, y - 1) +
+        lumaAt(x - 1, y + 1) +
+        2 * lumaAt(x, y + 1) +
+        lumaAt(x + 1, y + 1);
+      magnitude[y * width + x] = Math.hypot(gx, gy);
+    }
+  }
+  return magnitude;
+}
+
+function componentIsDarker(rgba: Uint8Array, samples: readonly number[], targetL: number): boolean {
+  if (samples.length === 0) return false;
+  let sum = 0;
+  for (const index of samples) {
+    const offset = index * 4;
+    sum += rgbToOklab(rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0).l;
+  }
+  const mean = sum / samples.length;
+  return mean < 0.42 && mean + 0.12 < targetL;
+}
+
+function buildComponents(
+  labels: Uint16Array,
+  width: number,
+  height: number
+): { ids: Int32Array; comps: { label: number; count: number; samples: number[] }[] } {
+  const ids = new Int32Array(labels.length);
+  ids.fill(-1);
+  const comps: { label: number; count: number; samples: number[] }[] = [];
+  const stack: number[] = [];
+  for (let start = 0; start < labels.length; start++) {
+    if ((ids[start] ?? -1) !== -1) continue;
+    const label = labels[start] ?? TRANSPARENT;
+    if (label === TRANSPARENT) continue;
+    const id = comps.length;
+    const comp = { label, count: 0, samples: [] as number[] };
+    comps.push(comp);
+    stack.push(start);
+    ids[start] = id;
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === undefined) break;
+      comp.count++;
+      if (comp.samples.length < 8 || comp.count % 40 === 0) comp.samples.push(current);
+      const x = current % width;
+      const y = (current - x) / width;
+      const neighbors = [current - 1, current + 1, current - width, current + width];
+      for (const next of neighbors) {
+        if (next < 0 || next >= labels.length || (ids[next] ?? -1) !== -1) continue;
+        const nx = next % width;
+        const ny = (next - nx) / width;
+        if ((next === current - 1 && x === 0) || (next === current + 1 && x + 1 === width)) continue;
+        if (ny < 0 || ny >= height) continue;
+        if ((labels[next] ?? TRANSPARENT) !== label) continue;
+        ids[next] = id;
+        stack.push(next);
+      }
+    }
+  }
+  return { ids, comps };
 }
 
 function compactAll(

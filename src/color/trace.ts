@@ -113,6 +113,49 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
   };
 }
 
+export type SharedEdgeStats = {
+  readonly edges: number;
+  readonly median: number;
+  readonly p90: number;
+};
+
+/** Open shared boundaries in source pixels. Each boundary is counted once. */
+export function measureSharedEdges(segmentation: Segmentation, options: TraceOptions = {}): SharedEdgeStats {
+  const preset = options.preset ?? "logo";
+  const scale =
+    options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
+  const field = resolveField(segmentation, options);
+  const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
+  const counts = countLabels(scaled.labels, segmentation.palette.length);
+  const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
+  const seen = new Set<string>();
+  const lengths: number[] = [];
+  const clean = (options.cleanShapes ?? 0) > 0;
+  for (const label of order) {
+    const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
+    for (const contour of contours) {
+      const outside = clean ? stabilizeOutside(contour.outside) : contour.outside;
+      const chains = splitChains(contour.points, outside);
+      for (const chain of chains) {
+        if (chain.closed || chain.points.length < 2) continue;
+        const start = chain.points[0];
+        const end = chain.points[chain.points.length - 1];
+        if (!start || !end) continue;
+        const startKey = Math.round(start.x) + "," + Math.round(start.y);
+        const endKey = Math.round(end.x) + "," + Math.round(end.y);
+        const key = startKey < endKey ? startKey + ">" + endKey : endKey + ">" + startKey;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        lengths.push((chain.points.length - 1) / scale);
+      }
+    }
+  }
+  lengths.sort((left, right) => left - right);
+  const mid = lengths[Math.floor(lengths.length / 2)] ?? 0;
+  const p90 = lengths[Math.min(lengths.length - 1, Math.floor(lengths.length * 0.9))] ?? 0;
+  return { edges: lengths.length, median: mid, p90 };
+}
+
 type Field = {
   readonly labels: Uint16Array;
   readonly coverage: Float32Array;
