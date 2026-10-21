@@ -190,6 +190,7 @@ test("Next and Selection read as clean glyphs", () => {
     assert.ok(quality.iou >= 0.9, box.name + " IoU " + quality.iou.toFixed(3));
     assert.ok(quality.hausdorffP95 <= 0.5, box.name + " boundary p95 " + quality.hausdorffP95.toFixed(3));
     assert.equal(quality.spikes, 0, box.name + " spikes " + quality.spikes);
+    assert.equal(quality.cracks, 0, box.name + " cracks " + quality.cracks);
   }
 });
 

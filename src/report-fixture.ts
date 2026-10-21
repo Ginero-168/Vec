@@ -430,7 +430,31 @@ for (const box of [
     continue;
   }
   const quality = measureGlyphBox(traced.shapes, data, width, height, box.x, box.y, box.w, box.h, pair.ink, pair.bg);
-  console.log(box.name, "iou", quality.iou.toFixed(3), "hausdorff", quality.hausdorffP95.toFixed(3), "spikes", quality.spikes);
+  const anchors = glyphIndex.outlines
+    .filter((outline) => {
+      let inside = 0;
+      for (let i = 0; i < outline.pixels.length; i += 3) {
+        const pixel = outline.pixels[i] ?? 0;
+        const x = pixel % width;
+        const y = (pixel - x) / width;
+        if (x >= box.x && x < box.x + box.w && y >= box.y && y < box.y + box.h) inside++;
+      }
+      return inside > 2;
+    })
+    .map((outline) => outline.paths.reduce((sum, path) => sum + path.commands.length, 0));
+  console.log(
+    box.name,
+    "iou",
+    quality.iou.toFixed(3),
+    "hausdorff",
+    quality.hausdorffP95.toFixed(3),
+    "spikes",
+    quality.spikes,
+    "cracks",
+    quality.cracks,
+    "anchors",
+    anchors.join(",")
+  );
 }
 writeHero(rendered, 1, "hero-100.png");
 const heroZoom = rasterizeWindow(traced.shapes, 0, 0, width, height, 3);

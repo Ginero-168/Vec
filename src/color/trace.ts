@@ -1,6 +1,6 @@
 import { boundaryHits, cleanTolerance, fitClosedClean, fitOpenClean, letterMask, strongCleanTolerance } from "./clean";
 import { detectGradients, findRadialDiscs, type RadialDisc, type VecGradient } from "./gradient";
-import { buildGlyphIndex, type GlyphIndex } from "./glyph";
+import { buildGlyphIndex, type GlyphIndex, type GlyphScope } from "./glyph";
 import { clipContourBites, createIsoCache, refineChain, type IsoCache } from "./iso";
 import { TRANSPARENT, rgbHex, type Rgb, type Segmentation } from "./model";
 import { chooseUpscale, curveError, gradientsDefault, presetProfile, type PresetName } from "./presets";
@@ -29,8 +29,8 @@ export type TraceOptions = {
   readonly source?: Uint8Array;
   /**
    * Replace a flat swatch with an SVG gradient when the source inside that
-   * shape is a smooth ramp. Unset follows the preset: on for photo and
-   * illustration, off for logo, icon, and ui.
+   * shape is a smooth ramp. Unset follows the preset: on for photo,
+   * illustration, and ui backgrounds, off for logo and icon.
    */
   readonly gradients?: boolean;
   readonly isCancelled?: () => boolean;
@@ -129,14 +129,26 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
         ? 1
         : chooseUpscale(segmentation.width, segmentation.height, preset);
   const field = resolveField(segmentation, options);
-  const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
   const shapes: VecShape[] = [];
   const cache = new Map<string, FitCommand[]>();
   const clean = cleanSession(segmentation, options);
-  const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
+  const glyphScope: GlyphScope = preset === "logo" || preset === "icon" ? "regions" : "text";
+  const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height, glyphScope) : null;
+  const paintLabels = glyphs && glyphs.outlines.length > 0 ? glyphs.reassign(field.labels) : field.labels;
+  const scaled =
+    scale <= 1
+      ? { labels: paintLabels, width: segmentation.width, height: segmentation.height }
+      : upscaleField({ ...field, labels: paintLabels }, segmentation.width, segmentation.height, scale);
   const gradientByLabel =
     useGradients && hasSource && options.source
-      ? detectGradients(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height)
+      ? detectGradients(
+          options.source,
+          field.labels,
+          segmentation.palette,
+          segmentation.width,
+          segmentation.height,
+          preset === "ui" ? "background" : "all"
+        )
       : null;
   const counts = countLabels(scaled.labels, segmentation.palette.length);
   const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
@@ -148,7 +160,7 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
     const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
     const iso =
       hasSource && options.source
-        ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label, cache: isoCache }
+        ? { rgba: options.source, palette: segmentation.palette, labels: paintLabels, width: segmentation.width, height: segmentation.height, inside: label, cache: isoCache }
         : null;
     const subpaths: VecSubpath[] = [];
     for (const contour of contours) {
@@ -158,6 +170,25 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
     const color = segmentation.palette[label];
     if (!color || subpaths.length === 0) continue;
     shapes.push({ color, area: counts[label] ?? 0, subpaths, gradient: gradientByLabel?.[label] });
+  }
+
+  if (glyphs) {
+    for (const outline of glyphs.outlines) {
+      const color = segmentation.palette[outline.label];
+      if (!color || outline.paths.length === 0) continue;
+      shapes.push({
+        color,
+        area: Math.max(1, outline.area),
+        subpaths: outline.paths.map((path) => ({
+          start: { x: path.start.x, y: path.start.y },
+          commands: path.commands.map((command) =>
+            command.op === "L"
+              ? { op: "L" as const, x: command.x, y: command.y, primitive: "line" as const }
+              : { op: "C" as const, x1: command.x1, y1: command.y1, x2: command.x2, y2: command.y2, x: command.x, y: command.y, primitive: "cubic" as const }
+          )
+        }))
+      });
+    }
   }
 
   if (useGradients && hasSource && options.source && scale <= 1) {

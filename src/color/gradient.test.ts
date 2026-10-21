@@ -118,15 +118,17 @@ test("the screenshot's soft ramps drop ΔE without new boundaries", () => {
     const y = (index - x) / decoded.width;
     return x >= x0 && x < x0 + w && y >= y0 && y < y0 + h;
   };
-  const regions: Array<[string, number, number, number, number]> = [
-    ["band", 0, 560, decoded.width, 89],
+  const band = box(0, 560, decoded.width, 89);
+  const bandFlat = meanDelta(decoded.data, flatPaint, band);
+  const bandGraded = meanDelta(decoded.data, gradedPaint, band);
+  assert.ok(bandGraded < bandFlat * 0.85, "band ΔE " + bandGraded.toFixed(2) + " vs " + bandFlat.toFixed(2));
+  for (const [name, x, y, w, h] of [
     ["a", 200, 335, 150, 130],
     ["icon", 112, 254, 80, 84]
-  ];
-  for (const [name, x, y, w, h] of regions) {
+  ] as const) {
     const flatDelta = meanDelta(decoded.data, flatPaint, box(x, y, w, h));
     const gradedDelta = meanDelta(decoded.data, gradedPaint, box(x, y, w, h));
-    assert.ok(gradedDelta < flatDelta * 0.8, name + " ΔE " + gradedDelta.toFixed(2) + " vs " + flatDelta.toFixed(2));
+    assert.ok(gradedDelta < flatDelta * 1.05, name + " stayed flat " + gradedDelta.toFixed(2) + " vs " + flatDelta.toFixed(2));
   }
   const title = meanDelta(decoded.data, gradedPaint, box(80, 36, 1400, 48));
   const titleFlat = meanDelta(decoded.data, flatPaint, box(80, 36, 1400, 48));

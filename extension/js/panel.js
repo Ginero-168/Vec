@@ -1555,7 +1555,7 @@
     return minor <= 400 ? 3 : minor <= 1200 ? 2 : 1;
   }
   function gradientsDefault(preset) {
-    return preset === "photo" || preset === "illustration";
+    return preset === "photo" || preset === "illustration" || preset === "ui";
   }
   function prefilterDefault(preset) {
     return preset === "photo";
@@ -2526,6 +2526,7 @@
     dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
     clearSolidSpecks(labels, partner, coverage, width, height);
     absorbInteriorSpecks(rgba, labels, partner, coverage, width, height);
+    absorbBlurSpecks(rgba, labels, partner, coverage, width, height, palette);
     reconcilePartners(labels, partner, coverage);
   }
   function pinToLocalCores(rgba, labels, partner, coverage, width, height, palette, gradient) {
@@ -2943,6 +2944,96 @@
         coverage[pixel] = 1;
       }
     }, (info) => info.count <= 8);
+  }
+  function absorbBlurSpecks(rgba, labels, partner, coverage, width, height, palette) {
+    const areaLimit = Math.max(12, Math.round(width * height * 5e-4));
+    const luma = new Float32Array(width * height);
+    for (let index = 0; index < luma.length; index++) {
+      const offset = index * 4;
+      luma[index] = 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+    }
+    const blurred = boxBlur(luma, width, height, 6);
+    forEachComponent(
+      labels,
+      width,
+      height,
+      (region) => {
+        const spanX = region.maxX - region.minX;
+        const spanY = region.maxY - region.minY;
+        if (spanX > 48 || spanY > 48) return;
+        if (region.pixels.length < 2 || region.pixels.length > areaLimit) return;
+        const own = palette[region.label];
+        if (!own) return;
+        let dominant = TRANSPARENT;
+        let dominantCount = 0;
+        let border = 0;
+        for (const [neighbor, count] of region.adjacency) {
+          border += count;
+          if (count > dominantCount) {
+            dominant = neighbor;
+            dominantCount = count;
+          }
+        }
+        if (dominant === TRANSPARENT || dominant === region.label || border === 0) return;
+        if (dominantCount / border < 0.6) return;
+        const other = palette[dominant];
+        if (!other || oklabDistance(own, other) > 0.085) return;
+        let dark = 0;
+        for (const pixel of region.pixels) {
+          const offset = pixel * 4;
+          if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
+        }
+        if (dark * 2 > region.pixels.length) return;
+        let ramp = 0;
+        let samples = 0;
+        for (const pixel of region.pixels) {
+          const x = pixel % width;
+          const y = (pixel - x) / width;
+          const cx = Math.min(width - 2, Math.max(1, x));
+          const cy = Math.min(height - 2, Math.max(1, y));
+          const dx = (blurred[cy * width + cx + 1] ?? 0) - (blurred[cy * width + cx - 1] ?? 0);
+          const dy = (blurred[(cy + 1) * width + cx] ?? 0) - (blurred[(cy - 1) * width + cx] ?? 0);
+          ramp += Math.hypot(dx, dy) / 2;
+          samples++;
+        }
+        const slope = samples === 0 ? 0 : ramp / samples;
+        if (slope < 0.35 || slope > 8) return;
+        for (const pixel of region.pixels) {
+          labels[pixel] = dominant;
+          partner[pixel] = TRANSPARENT;
+          coverage[pixel] = 1;
+        }
+      },
+      (info) => info.count <= areaLimit
+    );
+  }
+  function boxBlur(source, width, height, radius) {
+    const horizontal = new Float32Array(source.length);
+    const out = new Float32Array(source.length);
+    const span = radius * 2 + 1;
+    for (let y = 0; y < height; y++) {
+      let sum = 0;
+      for (let x = -radius; x <= radius; x++) sum += source[y * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+      for (let x = 0; x < width; x++) {
+        horizontal[y * width + x] = sum / span;
+        const leave = x - radius;
+        const enter = x + radius + 1;
+        sum -= source[y * width + Math.min(width - 1, Math.max(0, leave))] ?? 0;
+        sum += source[y * width + Math.min(width - 1, Math.max(0, enter))] ?? 0;
+      }
+    }
+    for (let x = 0; x < width; x++) {
+      let sum = 0;
+      for (let y = -radius; y <= radius; y++) sum += horizontal[Math.min(height - 1, Math.max(0, y)) * width + x] ?? 0;
+      for (let y = 0; y < height; y++) {
+        out[y * width + x] = sum / span;
+        const leave = y - radius;
+        const enter = y + radius + 1;
+        sum -= horizontal[Math.min(height - 1, Math.max(0, leave)) * width + x] ?? 0;
+        sum += horizontal[Math.min(height - 1, Math.max(0, enter)) * width + x] ?? 0;
+      }
+    }
+    return out;
   }
   function reconcilePartners(labels, partner, coverage) {
     for (let i = 0; i < labels.length; i++) {
@@ -4385,7 +4476,7 @@
   }
 
   // src/color/gradient.ts
-  function detectGradients(rgba, labels, palette, width, height) {
+  function detectGradients(rgba, labels, palette, width, height, scope = "all") {
     const result = palette.map(() => void 0);
     if (palette.length === 0 || rgba.length < width * height * 4) return result;
     const populations = new Int32Array(palette.length);
@@ -4411,10 +4502,16 @@
       if (population < 80) continue;
       const flat = palette[label];
       if (!flat) continue;
+      if (scope === "background") {
+        if (population < width * height * 0.02) continue;
+        const neutral = rgbToCieLab(flat.r, flat.g, flat.b);
+        if (Math.hypot(neutral.a, neutral.b) > 18) continue;
+      }
       const samples = labelSamples(rgba, labels, label, width, population);
       if (samples.length < 24) continue;
-      const chosen = bestRamp(samples, flat, minX[label] ?? 0, minY[label] ?? 0, maxX[label] ?? 0, maxY[label] ?? 0);
+      const chosen = bestRamp(samples, flat, minX[label] ?? 0, minY[label] ?? 0, maxX[label] ?? 0, maxY[label] ?? 0, scope === "background");
       if (!chosen) continue;
+      if (scope === "background" && !stopsNear(chosen, flat, 22)) continue;
       result[label] = chosen;
     }
     return result;
@@ -4680,6 +4777,28 @@
   function acceptable(scored) {
     return scored.range >= 8 && scored.flat >= 3 && scored.residual <= 8 && scored.residual <= scored.flat * 0.65;
   }
+  function coreStays(samples, gradient, flat) {
+    const origin = rgbToCieLab(flat.r, flat.g, flat.b);
+    let count = 0;
+    let sum = 0;
+    for (const sample2 of samples) {
+      const source = rgbToCieLab(sample2.r, sample2.g, sample2.b);
+      if (deltaE76(source, origin) > 8) continue;
+      const predicted = colorAtGradient(gradient, sample2.x + 0.5, sample2.y + 0.5);
+      sum += deltaE76(source, rgbToCieLab(predicted.r, predicted.g, predicted.b));
+      count++;
+    }
+    if (count < 12) return true;
+    return sum / count <= 4.5;
+  }
+  function stopsNear(gradient, palette, limit) {
+    const origin = rgbToCieLab(palette.r, palette.g, palette.b);
+    for (const stop of gradient.stops) {
+      const lab = rgbToCieLab(stop.color.r, stop.color.g, stop.color.b);
+      if (deltaE76(origin, lab) > limit) return false;
+    }
+    return true;
+  }
   function stopsStayInFamily(gradient, palette) {
     const origin = rgbToCieLab(palette.r, palette.g, palette.b);
     const originChroma = Math.hypot(origin.a, origin.b);
@@ -4696,7 +4815,7 @@
     }
     return true;
   }
-  function bestRamp(samples, palette, minX, minY, maxX, maxY) {
+  function bestRamp(samples, palette, minX, minY, maxX, maxY, protectCore = false) {
     const found = [];
     let bestGain = 0;
     const consider = (subset, partial) => {
@@ -4718,6 +4837,7 @@
         fit = { gradient: plateau, ...residuals(subset, plateau) };
       }
       if (!fit || !acceptable(fit)) return;
+      if (protectCore && !coreStays(samples, fit.gradient, palette)) return;
       if (partial && !stopsStayInFamily(fit.gradient, palette)) return;
       if (fit.gradient.kind === "radial") {
         const origin = rgbToCieLab(palette.r, palette.g, palette.b);
@@ -5313,11 +5433,742 @@
     return rgbToOklab(color.r, color.g, color.b);
   }
 
-  // src/color/glyph.ts
-  function buildGlyphIndex(rgba, labels, palette, width, height) {
-    const found = findThinComponents(rgba, labels, palette, width, height);
+  // src/color/potrace.ts
+  var DX = [1, 0, -1, 0];
+  var DY = [0, 1, 0, -1];
+  function traceMask(mask, width, height, options = {}) {
+    if (width < 1 || height < 1 || mask.length < width * height) return [];
+    const alphamax = options.alphamax ?? 1;
+    const opttolerance = options.opttolerance ?? 0.2;
+    const turdsize = options.turdsize ?? 2;
+    const straightness = options.straightness ?? 1;
+    const original = mask;
+    const work = new Uint8Array(width * height);
+    for (let i = 0; i < width * height; i++) work[i] = mask[i] ? 1 : 0;
+    const paths = [];
+    const guard = width * height + 2;
+    for (let pass = 0; pass < guard; pass++) {
+      const start2 = findStart(work, width, height);
+      if (!start2) break;
+      const walked = walkPath(work, original, width, height, start2.x, start2.y);
+      if (walked.length < 4) {
+        invertInterior(work, width, height, walked);
+        continue;
+      }
+      const area = polygonArea(walked);
+      invertInterior(work, width, height, walked);
+      if (Math.abs(area) < turdsize) continue;
+      const fitted = fitPath(walked, alphamax, opttolerance, area, straightness);
+      if (fitted && fitted.commands.length >= 3) paths.push(fitted);
+    }
+    return paths;
+  }
+  function findStart(mask, width, height) {
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      for (let x = 0; x < width; x++) {
+        if (mask[row + x] !== 1) continue;
+        if (x === 0 || mask[row + x - 1] !== 1) return { x, y };
+      }
+    }
+    return null;
+  }
+  function on(mask, width, height, x, y) {
+    if (x < 0 || y < 0 || x >= width || y >= height) return false;
+    return mask[y * width + x] === 1;
+  }
+  function leftOf(x, y, dir) {
+    const stepX = DX[dir] ?? 0;
+    const stepY = DY[dir] ?? 0;
+    return { x: Math.floor(x + stepX / 2 + stepY * 0.5), y: Math.floor(y + stepY / 2 - stepX * 0.5) };
+  }
+  function rightOf(x, y, dir) {
+    const stepX = DX[dir] ?? 0;
+    const stepY = DY[dir] ?? 0;
+    return { x: Math.floor(x + stepX / 2 - stepY * 0.5), y: Math.floor(y + stepY / 2 + stepX * 0.5) };
+  }
+  function edgeLegal(mask, width, height, x, y, dir) {
+    const left = leftOf(x, y, dir);
+    const right = rightOf(x, y, dir);
+    return on(mask, width, height, left.x, left.y) && !on(mask, width, height, right.x, right.y);
+  }
+  function blackMajority(mask, width, height, x, y) {
+    for (let radius = 2; radius <= 4; radius++) {
+      let score = 0;
+      for (let a = -radius + 1; a <= radius - 1; a++) {
+        score += on(mask, width, height, x + a, y + radius - 1) ? 1 : -1;
+        score += on(mask, width, height, x + radius - 1, y + a - 1) ? 1 : -1;
+        score += on(mask, width, height, x + a - 1, y - radius) ? 1 : -1;
+        score += on(mask, width, height, x - radius, y + a) ? 1 : -1;
+      }
+      if (score > 0) return true;
+      if (score < 0) return false;
+    }
+    return false;
+  }
+  function chooseDir(work, original, width, height, x, y, incoming) {
+    let straight = false;
+    let left = false;
+    let right = false;
+    const leftDir = incoming + 3 & 3;
+    const rightDir = incoming + 1 & 3;
+    if (edgeLegal(work, width, height, x, y, incoming)) straight = true;
+    if (edgeLegal(work, width, height, x, y, leftDir)) left = true;
+    if (edgeLegal(work, width, height, x, y, rightDir)) right = true;
+    if (straight) return incoming;
+    if (left && !right) return leftDir;
+    if (right && !left) return rightDir;
+    if (left && right) {
+      const connectBlack = !blackMajority(original, width, height, x, y);
+      const leftPixel = leftOf(x, y, leftDir);
+      const rightPixel = leftOf(x, y, rightDir);
+      const leftBlack = on(original, width, height, leftPixel.x, leftPixel.y);
+      const rightBlack = on(original, width, height, rightPixel.x, rightPixel.y);
+      if (connectBlack) {
+        if (leftBlack && !rightBlack) return leftDir;
+        if (rightBlack && !leftBlack) return rightDir;
+      } else {
+        if (leftBlack && !rightBlack) return rightDir;
+        if (rightBlack && !leftBlack) return leftDir;
+      }
+      return connectBlack ? leftDir : rightDir;
+    }
+    for (let dir = 0; dir < 4; dir++) if (edgeLegal(work, width, height, x, y, dir)) return dir;
+    return incoming;
+  }
+  function walkPath(work, original, width, height, x, y) {
+    let dir = 1;
+    if (!edgeLegal(work, width, height, x, y, dir)) {
+      for (let candidate = 0; candidate < 4; candidate++) {
+        if (edgeLegal(work, width, height, x, y, candidate)) {
+          dir = candidate;
+          break;
+        }
+      }
+    }
+    const path2 = [{ x, y }];
+    const startX = x;
+    const startY = y;
+    const startDir = dir;
+    const limit = (width + 1) * (height + 1) * 2;
+    for (let step = 0; step < limit; step++) {
+      x += DX[dir] ?? 0;
+      y += DY[dir] ?? 0;
+      path2.push({ x, y });
+      if (x === startX && y === startY && dir === startDir) break;
+      if (x === startX && y === startY) break;
+      dir = chooseDir(work, original, width, height, x, y, dir);
+    }
+    return path2;
+  }
+  function polygonArea(path2) {
+    let area = 0;
+    for (let i = 0; i < path2.length - 1; i++) {
+      const from = path2[i];
+      const to = path2[i + 1];
+      if (!from || !to || from.y !== to.y) continue;
+      area += from.y * (to.x - from.x);
+    }
+    return area;
+  }
+  function invertInterior(mask, width, height, path2) {
+    const spans = [];
+    for (let y = 0; y < height; y++) spans.push([]);
+    for (let i = 0; i < path2.length - 1; i++) {
+      const from = path2[i];
+      const to = path2[i + 1];
+      if (!from || !to || from.x !== to.x) continue;
+      const y0 = Math.min(from.y, to.y);
+      const y1 = Math.max(from.y, to.y);
+      for (let y = y0; y < y1; y++) {
+        if (y >= 0 && y < height) spans[y]?.push(from.x);
+      }
+    }
+    for (let y = 0; y < height; y++) {
+      const xs = spans[y];
+      if (!xs || xs.length === 0) continue;
+      xs.sort((left, right) => left - right);
+      const cleaned = [];
+      for (let i = 0; i < xs.length; ) {
+        let j = i + 1;
+        while (j < xs.length && xs[j] === xs[i]) j++;
+        if ((j - i) % 2 === 1) cleaned.push(xs[i] ?? 0);
+        i = j;
+      }
+      const row = y * width;
+      for (let k = 0; k + 1 < cleaned.length; k += 2) {
+        const left = cleaned[k] ?? 0;
+        const right = cleaned[k + 1] ?? 0;
+        for (let x = left; x < right; x++) {
+          if (x >= 0 && x < width) mask[row + x] = mask[row + x] === 1 ? 0 : 1;
+        }
+      }
+    }
+  }
+  function fitPath(path2, alphamax, opttolerance, area, straightness) {
+    const n = path2.length - 1;
+    if (n < 4) return null;
+    const xs = new Int32Array(n);
+    const ys = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      xs[i] = path2[i]?.x ?? 0;
+      ys[i] = path2[i]?.y ?? 0;
+    }
+    const reach = straightReach(xs, ys, n, straightness);
+    const polygon = optimalPolygon(xs, ys, n, reach);
+    let maxReach = 0;
+    for (let i = 0; i < n; i++) if ((reach[i] ?? 0) > maxReach) maxReach = reach[i] ?? 0;
+    if (polygon.length < 3) return null;
+    const adjusted = adjustVertices(xs, ys, n, polygon);
+    return smoothAdjusted(adjusted, alphamax, opttolerance, area);
+  }
+  function dirBit(x0, y0, x1, y1) {
+    if (x1 > x0) return 1;
+    if (y1 > y0) return 2;
+    if (x1 < x0) return 4;
+    if (y1 < y0) return 8;
+    return 0;
+  }
+  function bitCount(value) {
+    let count = 0;
+    let bits = value;
+    while (bits > 0) {
+      count += bits & 1;
+      bits >>= 1;
+    }
+    return count;
+  }
+  function straightReach(xs, ys, n, straightness) {
+    const reach = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      if ((reach[i] ?? 0) > 0) continue;
+      const best = farthestStraight(xs, ys, n, i, straightness);
+      reach[i] = best;
+      if (best >= 24 && chordDeviation(xs, ys, n, i, best) <= 0.9) {
+        for (let k = 1; k < best - 16; k++) {
+          const index = (i + k) % n;
+          const rest = best - k;
+          if (rest > (reach[index] ?? 0)) reach[index] = rest;
+        }
+      }
+    }
+    return reach;
+  }
+  function farthestStraight(xs, ys, n, start2, straightness) {
+    const cap = Math.min(n - 1, 96);
+    let dirs = 0;
+    let best = 1;
+    let prevX = xs[start2] ?? 0;
+    let prevY = ys[start2] ?? 0;
+    for (let len = 1; len <= cap; len++) {
+      const index = (start2 + len) % n;
+      const x = xs[index] ?? 0;
+      const y = ys[index] ?? 0;
+      dirs |= dirBit(prevX, prevY, x, y);
+      prevX = x;
+      prevY = y;
+      if (bitCount(dirs) >= 4) break;
+      if (len <= 3 || chordFits(xs, ys, n, start2, len, straightness)) best = len;
+      else break;
+    }
+    return best;
+  }
+  function chordFits(xs, ys, n, start2, edges, straightness) {
+    const x0 = xs[start2] ?? 0;
+    const y0 = ys[start2] ?? 0;
+    const end = (start2 + edges) % n;
+    const x1 = xs[end] ?? 0;
+    const y1 = ys[end] ?? 0;
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    if (dx === 0 && dy === 0) return edges <= 3;
+    for (let step = 1; step < edges; step++) {
+      const index = (start2 + step) % n;
+      const prev = (start2 + step - 1 + n) % n;
+      const next = (start2 + step + 1) % n;
+      const px = xs[index] ?? 0;
+      const py = ys[index] ?? 0;
+      if ((xs[next] ?? 0) - px === px - (xs[prev] ?? 0) && (ys[next] ?? 0) - py === py - (ys[prev] ?? 0)) continue;
+      if (!lineHitsSquare(x0, y0, x1, y1, px, py, straightness)) return false;
+    }
+    return true;
+  }
+  function chordDeviation(xs, ys, n, start2, edges) {
+    const x0 = xs[start2] ?? 0;
+    const y0 = ys[start2] ?? 0;
+    const end = (start2 + edges) % n;
+    const x1 = xs[end] ?? 0;
+    const y1 = ys[end] ?? 0;
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-6) return 0;
+    let worst = 0;
+    for (let step = 1; step < edges; step++) {
+      const index = (start2 + step) % n;
+      const cross = Math.abs(((xs[index] ?? 0) - x0) * dy - ((ys[index] ?? 0) - y0) * dx);
+      const distance = cross / length;
+      if (distance > worst) worst = distance;
+    }
+    return worst;
+  }
+  function lineHitsSquare(ax, ay, bx, by, px, py, radius) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    if (dx === 0 && dy === 0) return Math.max(Math.abs(px - ax), Math.abs(py - ay)) <= radius;
+    let low = -1e18;
+    let high = 1e18;
+    const constrain = (delta, span) => {
+      if (span === 0) return Math.abs(delta) <= radius;
+      const left = (delta - radius) / span;
+      const right = (delta + radius) / span;
+      low = Math.max(low, Math.min(left, right));
+      high = Math.min(high, Math.max(left, right));
+      return low <= high + 1e-8;
+    };
+    return constrain(px - ax, dx) && constrain(py - ay, dy);
+  }
+  function optimalPolygon(xs, ys, n, reach) {
+    let origin = 0;
+    let sharpest = -1;
+    const window2 = Math.min(6, Math.floor(n / 4));
+    for (let i = 0; i < n; i++) {
+      const previous2 = (i - window2 + n) % n;
+      const next = (i + window2) % n;
+      const turn = Math.abs(cornerTurn2(xs[previous2] ?? 0, ys[previous2] ?? 0, xs[i] ?? 0, ys[i] ?? 0, xs[next] ?? 0, ys[next] ?? 0));
+      if (turn > sharpest) {
+        sharpest = turn;
+        origin = i;
+      }
+    }
+    const count = new Int32Array(n + 1);
+    const penalty = new Float64Array(n + 1);
+    const previous = new Int32Array(n + 1);
+    count.fill(1e6);
+    penalty.fill(Infinity);
+    previous.fill(-1);
+    count[0] = 0;
+    penalty[0] = 0;
+    const prefix = prefixSums(xs, ys, n, origin);
+    for (let i = 0; i < n; i++) {
+      if ((count[i] ?? 0) >= 1e6) continue;
+      const at = (origin + i) % n;
+      const pred = (at - 1 + n) % n;
+      const maxLen = Math.min(n - 3, Math.max(0, (reach[pred] ?? 0) - 2));
+      for (let len = 1; len <= maxLen && i + len <= n; len++) {
+        if (i === 0 && i + len === n) continue;
+        const j = i + len;
+        const add = segmentPenalty(prefix, i, j, n);
+        const nextCount = (count[i] ?? 0) + 1;
+        const nextPenalty = (penalty[i] ?? 0) + add;
+        if (nextCount < (count[j] ?? 0) || nextCount === count[j] && nextPenalty < (penalty[j] ?? Infinity)) {
+          count[j] = nextCount;
+          penalty[j] = nextPenalty;
+          previous[j] = i;
+        }
+      }
+    }
+    if ((count[n] ?? 0) >= 1e6 || (count[n] ?? 0) < 3) return decimate(xs, ys, n, origin);
+    const indices = [];
+    let cursor = n;
+    while (cursor > 0) {
+      const prior = previous[cursor] ?? -1;
+      if (prior < 0) break;
+      indices.push((origin + prior) % n);
+      cursor = prior;
+    }
+    indices.reverse();
+    return indices.length >= 3 ? indices : decimate(xs, ys, n, origin);
+  }
+  function cornerTurn2(ax, ay, bx, by, cx, cy) {
+    const inX = bx - ax;
+    const inY = by - ay;
+    const outX = cx - bx;
+    const outY = cy - by;
+    const cross = inX * outY - inY * outX;
+    const dot = inX * outX + inY * outY;
+    return Math.atan2(cross, dot);
+  }
+  function prefixSums(xs, ys, n, origin) {
+    const x = new Float64Array(n + 1);
+    const y = new Float64Array(n + 1);
+    const xx = new Float64Array(n + 1);
+    const yy = new Float64Array(n + 1);
+    const xy = new Float64Array(n + 1);
+    for (let i = 0; i < n; i++) {
+      const px = xs[(origin + i) % n] ?? 0;
+      const py = ys[(origin + i) % n] ?? 0;
+      x[i + 1] = (x[i] ?? 0) + px;
+      y[i + 1] = (y[i] ?? 0) + py;
+      xx[i + 1] = (xx[i] ?? 0) + px * px;
+      yy[i + 1] = (yy[i] ?? 0) + py * py;
+      xy[i + 1] = (xy[i] ?? 0) + px * py;
+    }
+    return { x, y, xx, yy, xy, ox: xs[origin] ?? 0, oy: ys[origin] ?? 0 };
+  }
+  function segmentPenalty(sums, i, j, n) {
+    const count = j - i + 1;
+    if (count <= 1) return 0;
+    const closed = j === n;
+    const sx = closed ? (sums.x[n] ?? 0) - (sums.x[i] ?? 0) + sums.ox : (sums.x[j + 1] ?? 0) - (sums.x[i] ?? 0);
+    const sy = closed ? (sums.y[n] ?? 0) - (sums.y[i] ?? 0) + sums.oy : (sums.y[j + 1] ?? 0) - (sums.y[i] ?? 0);
+    const sxx = closed ? (sums.xx[n] ?? 0) - (sums.xx[i] ?? 0) + sums.ox * sums.ox : (sums.xx[j + 1] ?? 0) - (sums.xx[i] ?? 0);
+    const syy = closed ? (sums.yy[n] ?? 0) - (sums.yy[i] ?? 0) + sums.oy * sums.oy : (sums.yy[j + 1] ?? 0) - (sums.yy[i] ?? 0);
+    const sxy = closed ? (sums.xy[n] ?? 0) - (sums.xy[i] ?? 0) + sums.ox * sums.oy : (sums.xy[j + 1] ?? 0) - (sums.xy[i] ?? 0);
+    const x0 = pointAt(sums, i);
+    const x1 = pointAt(sums, closed ? 0 : j);
+    const vx = x1.x - x0.x;
+    const vy = x1.y - x0.y;
+    const mx = (x0.x + x1.x) / 2;
+    const my = (x0.y + x1.y) / 2;
+    const ex = sx / count;
+    const ey = sy / count;
+    const a = sxx / count - 2 * mx * ex + mx * mx;
+    const b = sxy / count - mx * ey - my * ex + mx * my;
+    const c = syy / count - 2 * my * ey + my * my;
+    return Math.sqrt(Math.max(0, c * vx * vx + 2 * b * vx * vy + a * vy * vy));
+  }
+  function pointAt(sums, index) {
     return {
+      x: (sums.x[index + 1] ?? 0) - (sums.x[index] ?? 0),
+      y: (sums.y[index + 1] ?? 0) - (sums.y[index] ?? 0)
+    };
+  }
+  function decimate(xs, ys, n, origin) {
+    const indices = [];
+    const step = Math.max(1, Math.floor(n / 12));
+    for (let i = 0; i < n; i += step) indices.push((origin + i) % n);
+    return indices.length >= 3 ? indices : [0, Math.floor(n / 3), Math.floor(2 * n / 3)];
+  }
+  function adjustVertices(xs, ys, n, polygon) {
+    const m = polygon.length;
+    const lines = polygon.map((start2, index) => {
+      const end = polygon[(index + 1) % m] ?? start2;
+      return fitLine(xs, ys, n, start2, end);
+    });
+    return polygon.map((index, vertex) => {
+      const original = { x: xs[index] ?? 0, y: ys[index] ?? 0 };
+      const left = lines[(vertex - 1 + m) % m];
+      const right = lines[vertex];
+      if (!left || !right) return original;
+      const hit = intersectLines(left, right);
+      if (!hit) return original;
+      return clampSquare(hit, original, 0.5);
+    });
+  }
+  function fitLine(xs, ys, n, start2, end) {
+    let count = 0;
+    let sx = 0;
+    let sy = 0;
+    let sxx = 0;
+    let syy = 0;
+    let sxy = 0;
+    let cursor = start2;
+    const guard = n + 1;
+    for (let step = 0; step < guard; step++) {
+      const x = xs[cursor] ?? 0;
+      const y = ys[cursor] ?? 0;
+      sx += x;
+      sy += y;
+      sxx += x * x;
+      syy += y * y;
+      sxy += x * y;
+      count++;
+      if (cursor === end) break;
+      cursor = (cursor + 1) % n;
+    }
+    const mx = sx / count;
+    const my = sy / count;
+    const a = sxx / count - mx * mx;
+    const b = sxy / count - mx * my;
+    const c = syy / count - my * my;
+    let dx = 1;
+    let dy = 0;
+    if (Math.abs(b) > 1e-8 || Math.abs(a - c) > 1e-8) {
+      const theta = 0.5 * Math.atan2(2 * b, a - c);
+      dx = Math.cos(theta);
+      dy = Math.sin(theta);
+    } else if (c > a) {
+      dx = 0;
+      dy = 1;
+    }
+    return { px: mx, py: my, dx, dy };
+  }
+  function intersectLines(left, right) {
+    const cross = left.dx * right.dy - left.dy * right.dx;
+    if (Math.abs(cross) < 1e-8) return null;
+    const t = ((right.px - left.px) * right.dy - (right.py - left.py) * right.dx) / cross;
+    return { x: left.px + left.dx * t, y: left.py + left.dy * t };
+  }
+  function clampSquare(point, origin, radius) {
+    return {
+      x: Math.min(origin.x + radius, Math.max(origin.x - radius, point.x)),
+      y: Math.min(origin.y + radius, Math.max(origin.y - radius, point.y))
+    };
+  }
+  function smoothAdjusted(points, alphamax, opttolerance, area) {
+    const count = points.length;
+    if (count < 3) return null;
+    const mid = [];
+    const corner = [];
+    const alpha = [];
+    for (let i = 0; i < count; i++) {
+      const current = points[i];
+      const next = points[(i + 1) % count];
+      if (!current || !next) return null;
+      mid.push({ x: (current.x + next.x) / 2, y: (current.y + next.y) / 2 });
+      const previous = points[(i - 1 + count) % count];
+      if (!previous) return null;
+      const value = cornerParameter(previous, current, next);
+      const sharp = value > alphamax;
+      corner.push(sharp);
+      alpha.push(sharp ? value : Math.min(1, Math.max(0.55, value)));
+    }
+    const merged = mergeSmooth(points, mid, corner, alpha, opttolerance);
+    const flat = flattenStraight(merged.start, merged.commands, Math.max(opttolerance, 0.85));
+    return { area, start: flat.start, commands: flat.commands };
+  }
+  function flattenStraight(start2, commands, tolerance) {
+    const ends = [start2];
+    const kinds = [];
+    let x = start2.x;
+    let y = start2.y;
+    for (const command of commands) {
+      if (command.op === "L" || controlDeviation(x, y, command) <= tolerance) kinds.push("L");
+      else kinds.push("C");
+      ends.push({ x: command.x, y: command.y });
+      x = command.x;
+      y = command.y;
+    }
+    const keep = new Uint8Array(kinds.length).fill(1);
+    const count = kinds.length;
+    for (let i = 1; i < count; i++) {
+      if (kinds[i] !== "L" || kinds[i - 1] !== "L") continue;
+      const before = ends[i - 1];
+      const middle = ends[i];
+      const after = ends[i + 1];
+      if (!before || !middle || !after) continue;
+      if (pointSegmentDistance2(middle, before, after) <= tolerance) keep[i - 1] = 0;
+    }
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      if (!keep[i]) continue;
+      const end = ends[i + 1];
+      const command = commands[i];
+      if (!end || !command) continue;
+      if (kinds[i] === "L") out.push({ op: "L", x: end.x, y: end.y });
+      else out.push(command);
+    }
+    return { start: start2, commands: out.length >= 3 ? out : commands.slice() };
+  }
+  function controlDeviation(x, y, command) {
+    if (command.op === "L") return 0;
+    const end = { x: command.x, y: command.y };
+    const origin = { x, y };
+    return Math.max(pointSegmentDistance2({ x: command.x1, y: command.y1 }, origin, end), pointSegmentDistance2({ x: command.x2, y: command.y2 }, origin, end));
+  }
+  function cornerParameter(previous, current, next) {
+    const b0 = { x: (previous.x + current.x) / 2, y: (previous.y + current.y) / 2 };
+    const b1 = { x: (current.x + next.x) / 2, y: (current.y + next.y) / 2 };
+    const dx = b1.x - b0.x;
+    const dy = b1.y - b0.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-8) return 4 / 3;
+    const nx = -dy / length;
+    const ny = dx / length;
+    const lineS = (b0.x - current.x) * nx + (b0.y - current.y) * ny;
+    if (Math.abs(lineS) < 1e-8) return 4 / 3;
+    const support = 0.5 * (Math.abs(nx) + Math.abs(ny));
+    const touch = Math.abs(lineS - support) <= Math.abs(lineS + support) ? support : -support;
+    const gamma = 1 - touch / lineS;
+    return 4 / 3 * gamma;
+  }
+  function mergeSmooth(points, mid, corner, alpha, tolerance) {
+    const count = points.length;
+    const drop = new Uint8Array(count);
+    if (tolerance > 0) {
+      let index = 0;
+      while (index < count) {
+        if (corner[index]) {
+          index++;
+          continue;
+        }
+        let end = index;
+        while (end < count && !corner[end]) end++;
+        greedyMerge(points, corner, drop, index, end, tolerance);
+        index = end;
+      }
+    }
+    const kept = [];
+    for (let i = 0; i < count; i++) if (!drop[i]) kept.push(i);
+    if (kept.length < 3) {
+      for (let i = 0; i < count; i++) drop[i] = 0;
+      kept.length = 0;
+      for (let i = 0; i < count; i++) kept.push(i);
+    }
+    const startIndex = kept[kept.length - 1] ?? 0;
+    const start2 = mid[startIndex] ?? { x: 0, y: 0 };
+    const commands = [];
+    for (let k = 0; k < kept.length; k++) {
+      const i = kept[k] ?? 0;
+      const next = kept[(k + 1) % kept.length] ?? i;
+      const current = points[i];
+      const bCur = mid[i];
+      const bPrev = mid[(i - 1 + count) % count];
+      if (!current || !bCur || !bPrev) continue;
+      if (corner[i]) {
+        commands.push({ op: "L", x: current.x, y: current.y });
+        if (!corner[next]) commands.push({ op: "L", x: bCur.x, y: bCur.y });
+        continue;
+      }
+      const t = 0.5 + 0.5 * (alpha[i] ?? 0.8);
+      commands.push({
+        op: "C",
+        x1: bPrev.x + (current.x - bPrev.x) * t,
+        y1: bPrev.y + (current.y - bPrev.y) * t,
+        x2: bCur.x + (current.x - bCur.x) * t,
+        y2: bCur.y + (current.y - bCur.y) * t,
+        x: bCur.x,
+        y: bCur.y
+      });
+    }
+    return { start: start2, commands };
+  }
+  function greedyMerge(points, corner, drop, from, to, tolerance) {
+    const run = to - from;
+    if (run < 2) return;
+    let cursor = from;
+    while (cursor < to - 1) {
+      let best = cursor;
+      for (let end = cursor + 1; end < to; end++) {
+        if (!sameConvexity(points, cursor, end) || !withinTolerance(points, cursor, end, tolerance)) break;
+        best = end;
+      }
+      for (let i = cursor + 1; i <= best; i++) if (!corner[i]) drop[i] = 1;
+      cursor = best + 1;
+    }
+  }
+  function sameConvexity(points, from, to) {
+    let sign = 0;
+    for (let i = from; i <= to; i++) {
+      const previous = points[(i - 1 + points.length) % points.length];
+      const current = points[i];
+      const next = points[(i + 1) % points.length];
+      if (!previous || !current || !next) return false;
+      const cross = (current.x - previous.x) * (next.y - current.y) - (current.y - previous.y) * (next.x - current.x);
+      const nextSign = cross > 1e-6 ? 1 : cross < -1e-6 ? -1 : 0;
+      if (nextSign === 0) continue;
+      if (sign === 0) sign = nextSign;
+      else if (sign !== nextSign) return false;
+    }
+    return true;
+  }
+  function withinTolerance(points, from, to, tolerance) {
+    const start2 = points[from];
+    const end = points[(to + 1) % points.length];
+    if (!start2 || !end) return false;
+    for (let i = from; i <= to; i++) {
+      const point = points[i];
+      if (!point) return false;
+      if (pointSegmentDistance2(point, start2, end) > tolerance + 0.5) return false;
+    }
+    const samples = sampleRange(points, from, to);
+    const curve = approximatingCubic(points, from, to);
+    if (!curve) return false;
+    for (const sample2 of samples) {
+      if (distanceToCubic(sample2, curve) > tolerance) return false;
+    }
+    return true;
+  }
+  function pointSegmentDistance2(point, from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = dx * dx + dy * dy;
+    if (length < 1e-8) return Math.hypot(point.x - from.x, point.y - from.y);
+    let t = ((point.x - from.x) * dx + (point.y - from.y) * dy) / length;
+    t = Math.min(1, Math.max(0, t));
+    return Math.hypot(point.x - (from.x + dx * t), point.y - (from.y + dy * t));
+  }
+  function sampleRange(points, from, to) {
+    const out = [];
+    for (let i = from; i <= to; i++) {
+      const current = points[i];
+      const next = points[(i + 1) % points.length];
+      if (!current || !next) continue;
+      out.push(current);
+      out.push({ x: (current.x + next.x) / 2, y: (current.y + next.y) / 2 });
+    }
+    return out;
+  }
+  function approximatingCubic(points, from, to) {
+    const count = points.length;
+    const p0 = points[from];
+    const p3 = points[(to + 1) % count];
+    const incoming = points[(from - 1 + count) % count];
+    const outgoing = points[(to + 2) % count];
+    if (!p0 || !p3 || !incoming || !outgoing) return null;
+    const t0 = unit(p0.x - incoming.x, p0.y - incoming.y);
+    const t1 = unit(p3.x - outgoing.x, p3.y - outgoing.y);
+    if (!t0 || !t1) return null;
+    const cross = t0.x * t1.y - t0.y * t1.x;
+    const length = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+    const handle = Math.max(0.5, length * 0.35);
+    if (Math.abs(cross) < 1e-4) {
+      return {
+        p0,
+        p1: { x: p0.x + t0.x * handle, y: p0.y + t0.y * handle },
+        p2: { x: p3.x + t1.x * handle, y: p3.y + t1.y * handle },
+        p3
+      };
+    }
+    const denom = t0.x * t1.y - t0.y * t1.x;
+    const t = ((p3.x - p0.x) * t1.y - (p3.y - p0.y) * t1.x) / denom;
+    const origin = { x: p0.x + t0.x * t, y: p0.y + t0.y * t };
+    const alpha = 0.75;
+    return {
+      p0,
+      p1: { x: p0.x + (origin.x - p0.x) * alpha, y: p0.y + (origin.y - p0.y) * alpha },
+      p2: { x: p3.x + (origin.x - p3.x) * alpha, y: p3.y + (origin.y - p3.y) * alpha },
+      p3
+    };
+  }
+  function unit(x, y) {
+    const length = Math.hypot(x, y);
+    if (length < 1e-6) return null;
+    return { x: x / length, y: y / length };
+  }
+  function distanceToCubic(point, curve) {
+    let best = Infinity;
+    for (let step = 0; step <= 8; step++) {
+      const t = step / 8;
+      const u = 1 - t;
+      const x = u * u * u * curve.p0.x + 3 * u * u * t * curve.p1.x + 3 * u * t * t * curve.p2.x + t * t * t * curve.p3.x;
+      const y = u * u * u * curve.p0.y + 3 * u * u * t * curve.p1.y + 3 * u * t * t * curve.p2.y + t * t * t * curve.p3.y;
+      const distance = Math.hypot(point.x - x, point.y - y);
+      if (distance < best) best = distance;
+    }
+    return best;
+  }
+
+  // src/color/glyph.ts
+  function buildGlyphIndex(rgba, labels, palette, width, height, scope = "text") {
+    const found = findThinComponents(rgba, labels, palette, width, height, scope);
+    return {
+      outlines: found.outlines,
+      reassign(source) {
+        const copy = new Uint16Array(source);
+        for (const outline of found.outlines) {
+          if (outline.paths.length === 0) continue;
+          for (let i = 0; i < outline.pixels.length; i++) {
+            const pixel = outline.pixels[i];
+            if (pixel === void 0) continue;
+            copy[pixel] = outline.outside;
+          }
+        }
+        return copy;
+      },
       replace(points, closed, inside, outside) {
+        if (found.outlines.length > 0) return null;
         return replaceChain(found.components, found.owner, points, closed, inside, outside, rgba, labels, palette, width, height);
       },
       pairInBox(x0, y0, boxWidth, boxHeight) {
@@ -5355,10 +6206,15 @@
       }
     };
   }
-  function findThinComponents(rgba, labels, palette, width, height) {
+  function findThinComponents(rgba, labels, palette, width, height, scope) {
     const owner = new Int32Array(labels.length);
     owner.fill(-1);
     const components = [];
+    const outlines = [];
+    const pixelCap = scope === "regions" ? Math.floor(width * height * 0.35) : 9e3;
+    const sideCap = scope === "regions" ? Math.max(width, height) : 180;
+    const storeCap = scope === "text" ? 42e3 : pixelCap;
+    const storeSide = scope === "text" ? 340 : sideCap;
     const labs = palette.map((color) => rgbToOklab(color.r, color.g, color.b));
     const stack = [];
     const seen = -3;
@@ -5375,61 +6231,76 @@
       let maxY = 0;
       let dark = 0;
       let oversized = false;
+      let truncated = false;
       while (stack.length > 0) {
         const current = stack.pop();
         if (current === void 0) break;
         const x = current % width;
         const y = (current - x) / width;
-        if (!oversized) {
-          pixels.push(current);
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-          const offset = current * 4;
-          if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
-          if (pixels.length > 1200 || maxX - minX > 96 || maxY - minY > 96) oversized = true;
+        if (!truncated) {
+          const spanX = Math.max(maxX, x) - Math.min(minX, x);
+          const spanY = Math.max(maxY, y) - Math.min(minY, y);
+          if (pixels.length >= storeCap || spanX > storeSide || spanY > storeSide) {
+            truncated = true;
+            oversized = true;
+            owner[current] = seen;
+          } else {
+            pixels.push(current);
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            const offset = current * 4;
+            if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
+            if (pixels.length > pixelCap || maxX - minX > sideCap || maxY - minY > sideCap) oversized = true;
+          }
         }
         const neighbors = [current - 1, current + 1, current - width, current + width];
         for (const next of neighbors) {
           if (next < 0 || next >= labels.length) {
-            if (!oversized) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+            if (!truncated) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
             continue;
           }
           const nx = next % width;
           if (Math.abs(nx - x) + Math.abs(Math.floor(next / width) - y) !== 1) {
-            if (!oversized) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+            if (!truncated) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
             continue;
           }
-          const neighbor = labels[next] ?? TRANSPARENT;
-          if (neighbor === label) {
+          const neighbor2 = labels[next] ?? TRANSPARENT;
+          if (neighbor2 === label) {
             if (owner[next] === -1) {
-              owner[next] = oversized ? seen : -2;
+              owner[next] = truncated ? seen : -2;
               stack.push(next);
             }
-          } else if (!oversized) adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+          } else if (!truncated) adjacency.set(neighbor2, (adjacency.get(neighbor2) ?? 0) + 1);
         }
       }
-      if (oversized) {
+      const display = oversized && !truncated && acceptDisplay(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label);
+      if ((truncated || oversized) && !display) {
         for (const pixel of pixels) owner[pixel] = seen;
         continue;
       }
-      const reject = !acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label);
-      if (reject) {
+      const kind = display ? "stroke" : classifyComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label, scope);
+      if (!kind) {
         for (const pixel of pixels) owner[pixel] = seen;
         continue;
       }
       let outside = TRANSPARENT;
       let outsideCount = 0;
-      for (const [neighbor, count] of adjacency) {
+      for (const [neighbor2, count] of adjacency) {
         if (count > outsideCount) {
-          outside = neighbor;
+          outside = neighbor2;
           outsideCount = count;
         }
       }
       const ink = labs[label];
-      const bg = outside === TRANSPARENT || outside >= labs.length ? null : labs[outside];
-      if (!ink || !bg) {
+      const neighbor = outside === TRANSPARENT || outside >= labs.length ? null : labs[outside];
+      if (!ink) {
+        for (const pixel of pixels) owner[pixel] = seen;
+        continue;
+      }
+      const bg = neighbor ?? (ink.l > 0.6 ? { l: 0.05, a: 0, b: 0 } : { l: 0.98, a: 0, b: 0 });
+      if ((kind === "icon" || kind === "region") && !softBoundary(pixels, rgba, width, height, labels, label, ink, bg)) {
         for (const pixel of pixels) owner[pixel] = seen;
         continue;
       }
@@ -5440,6 +6311,10 @@
       const originY = minY - pad;
       const fieldW = maxX - minX + 1 + pad * 2;
       const fieldH = maxY - minY + 1 + pad * 2;
+      if (fieldW > 360 || fieldH > 360) {
+        for (const pixel of pixels) owner[pixel] = seen;
+        continue;
+      }
       const field = new Float32Array(fieldW * fieldH);
       for (let iy = 0; iy < fieldH; iy++) {
         for (let ix = 0; ix < fieldW; ix++) {
@@ -5461,9 +6336,194 @@
           return bicubic(field, fieldW, fieldH, x - originX - 0.5, y - originY - 0.5);
         }
       };
+      const paths = coverageOutline(field, fieldW, fieldH, originX, originY);
+      if (paths.length === 0) {
+        for (const pixel of pixels) owner[pixel] = seen;
+        continue;
+      }
       components.push(component);
+      outlines.push({
+        label,
+        outside,
+        area: pixels.length,
+        pixels: Int32Array.from(pixels),
+        paths
+      });
     }
-    return { components, owner };
+    outlines.sort((left, right) => right.area - left.area);
+    return { components, owner, outlines };
+  }
+  function classifyComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label, scope) {
+    if (acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label)) return "thin";
+    if (acceptStroke(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label)) return "stroke";
+    if (scope !== "regions") return null;
+    if (acceptIcon(pixels, width, height, minX, minY, maxX, maxY, adjacency, labs, label)) return "icon";
+    if (acceptRegion(pixels, width, height, minX, minY, maxX, maxY)) return "region";
+    return null;
+  }
+  function acceptDisplay(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label) {
+    if (pixels.length < 4e3 || pixels.length > 42e3) return false;
+    if (dark * 2 <= pixels.length) return false;
+    const side = Math.max(maxX - minX, maxY - minY);
+    if (side < 80 || side > 340) return false;
+    if (minX <= 1 || minY <= 1 || maxX >= width - 2 || maxY >= height - 2) return false;
+    const fill = pixels.length / Math.max(1, (maxX - minX + 1) * (maxY - minY + 1));
+    if (fill < 0.2 || fill > 0.55) return false;
+    return neighborContrast(adjacency, labs, label, 0.2, 0.55);
+  }
+  function acceptStroke(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label) {
+    if (pixels.length < 40 || pixels.length > 4500) return false;
+    if (dark * 2 <= pixels.length) return false;
+    if (Math.max(maxX - minX, maxY - minY) > 120) return false;
+    if (minX <= 0 || minY <= 0 || maxX >= width - 1 || maxY >= height - 1) return false;
+    const box = Math.max(1, maxX - minX + 1) * Math.max(1, maxY - minY + 1);
+    if (pixels.length / box > 0.58) return false;
+    const radius = inradiusStats(pixels, width, height);
+    if (radius.median > 6.5 || radius.max > 14) return false;
+    return neighborContrast(adjacency, labs, label, 0.16, 0.45);
+  }
+  function acceptIcon(pixels, width, height, minX, minY, maxX, maxY, adjacency, labs, label) {
+    if (pixels.length < 80 || pixels.length > 2200) return false;
+    const side = Math.max(maxX - minX, maxY - minY);
+    if (side > 96 || side < 8) return false;
+    if (minX <= 0 || minY <= 0 || maxX >= width - 1 || maxY >= height - 1) return false;
+    const radius = inradiusStats(pixels, width, height);
+    if (radius.median < 2.2 || radius.median > 48) return false;
+    const box = Math.max(1, maxX - minX + 1) * Math.max(1, maxY - minY + 1);
+    if (pixels.length / box > 0.9) return false;
+    const aspect = Math.max(maxX - minX, maxY - minY) / Math.max(1, Math.min(maxX - minX, maxY - minY));
+    if (aspect > 2.4) return false;
+    return neighborContrast(adjacency, labs, label, 0.18, 0.4);
+  }
+  function acceptRegion(pixels, width, height, minX, minY, maxX, maxY) {
+    if (pixels.length < 12 || pixels.length > width * height * 0.35) return false;
+    const side = Math.max(maxX - minX, maxY - minY);
+    return side <= Math.max(width, height) * 0.92;
+  }
+  function neighborContrast(adjacency, labs, label, minDistance, minShare) {
+    let total = 0;
+    let dominant = TRANSPARENT;
+    let dominantCount = 0;
+    for (const [neighbor, count] of adjacency) {
+      total += count;
+      if (count > dominantCount) {
+        dominant = neighbor;
+        dominantCount = count;
+      }
+    }
+    if (total <= 0 || dominantCount / total < minShare) return false;
+    const own = labs[label];
+    if (!own) return false;
+    if (dominant === TRANSPARENT || dominant >= labs.length) return true;
+    const other = labs[dominant];
+    if (!other) return false;
+    return oklabDistance(own, other) >= minDistance;
+  }
+  function coverageOutline(field, fieldW, fieldH, originX, originY) {
+    const side = Math.max(fieldW, fieldH);
+    const scale = side > 150 ? 2 : 4;
+    const maskW = fieldW * scale;
+    const maskH = fieldH * scale;
+    if (maskW > 1400 || maskH > 1400) return [];
+    const mask = softMask(field, fieldW, fieldH, scale);
+    const traced = traceMask(mask, maskW, maskH, {
+      alphamax: 1,
+      opttolerance: 0.2,
+      turdsize: Math.round(1.5 * scale * scale),
+      straightness: 0.5 * scale
+    });
+    const paths = [];
+    for (const path2 of traced) {
+      const scaled = scalePath(path2, originX, originY, scale);
+      if (scaled.commands.length >= 3 && (scaled.area >= 8 || traced.length === 1)) paths.push(scaled);
+    }
+    return paths;
+  }
+  function scalePath(path2, originX, originY, scale) {
+    const mapX = (value) => originX + value / scale;
+    const mapY = (value) => originY + value / scale;
+    const commands = path2.commands.map((command) => {
+      if (command.op === "L") return { op: "L", x: mapX(command.x), y: mapY(command.y) };
+      return {
+        op: "C",
+        x1: mapX(command.x1),
+        y1: mapY(command.y1),
+        x2: mapX(command.x2),
+        y2: mapY(command.y2),
+        x: mapX(command.x),
+        y: mapY(command.y)
+      };
+    });
+    return {
+      area: Math.abs(path2.area) / (scale * scale),
+      start: { x: mapX(path2.start.x), y: mapY(path2.start.y) },
+      commands
+    };
+  }
+  function softMask(field, fieldW, fieldH, scale) {
+    const maskW = fieldW * scale;
+    const maskH = fieldH * scale;
+    const coverage = upsampleBicubic(field, fieldW, fieldH, scale);
+    if (Math.max(maskW, maskH) <= 480) boxBlur2(coverage, maskW, maskH, 1);
+    const mask = new Uint8Array(maskW * maskH);
+    for (let i = 0; i < coverage.length; i++) if ((coverage[i] ?? 0) >= 0.5) mask[i] = 1;
+    return mask;
+  }
+  function boxBlur2(field, width, height, radius) {
+    const tmp = new Float32Array(field.length);
+    const span = radius * 2 + 1;
+    const widthLimit = width - 1;
+    const heightLimit = height - 1;
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      let sum = 0;
+      for (let x = -radius; x <= radius; x++) sum += field[row + Math.min(widthLimit, Math.max(0, x))] ?? 0;
+      for (let x = 0; x < width; x++) {
+        tmp[row + x] = sum / span;
+        sum -= field[row + Math.min(widthLimit, Math.max(0, x - radius))] ?? 0;
+        sum += field[row + Math.min(widthLimit, Math.max(0, x + radius + 1))] ?? 0;
+      }
+    }
+    for (let x = 0; x < width; x++) {
+      let sum = 0;
+      for (let y = -radius; y <= radius; y++) sum += tmp[Math.min(heightLimit, Math.max(0, y)) * width + x] ?? 0;
+      for (let y = 0; y < height; y++) {
+        field[y * width + x] = sum / span;
+        sum -= tmp[Math.min(heightLimit, Math.max(0, y - radius)) * width + x] ?? 0;
+        sum += tmp[Math.min(heightLimit, Math.max(0, y + radius + 1)) * width + x] ?? 0;
+      }
+    }
+  }
+  function softBoundary(pixels, rgba, width, height, labels, label, ink, bg) {
+    let border = 0;
+    let partial = 0;
+    for (const pixel of pixels) {
+      const x = pixel % width;
+      const y = (pixel - x) / width;
+      const neighbors = [pixel - 1, pixel + 1, pixel - width, pixel + width];
+      let edge = false;
+      for (const next of neighbors) {
+        if (next < 0 || next >= labels.length) {
+          edge = true;
+          break;
+        }
+        const nx = next % width;
+        if (Math.abs(nx - x) + Math.abs((next - nx) / width - y) !== 1) {
+          edge = true;
+          break;
+        }
+        if ((labels[next] ?? TRANSPARENT) !== label) {
+          edge = true;
+          break;
+        }
+      }
+      if (!edge) continue;
+      border++;
+      const coverage = pixelCoverage(x, y, width, height, rgba, ink, bg, label, labels);
+      if (coverage > 0.18 && coverage < 0.82) partial++;
+    }
+    if (border < 12) return true;
+    return partial / border >= 0.1;
   }
   function acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label) {
     if (pixels.length < 8 || pixels.length > 1200) return false;
@@ -5899,6 +6959,58 @@
     };
     return Math.hypot(lab.l - point.l, lab.a - point.a, lab.b - point.b);
   }
+  function upsampleBicubic(field, fieldW, fieldH, scale) {
+    const maskW = fieldW * scale;
+    const maskH = fieldH * scale;
+    const weights = new Float32Array(scale * 4);
+    const base = new Int32Array(scale);
+    for (let phase = 0; phase < scale; phase++) {
+      const sample2 = (phase + 0.5) / scale - 0.5;
+      const origin = Math.floor(sample2);
+      base[phase] = origin;
+      for (let tap = 0; tap < 4; tap++) weights[phase * 4 + tap] = cubicWeight(sample2 - (origin - 1 + tap));
+    }
+    const horizontal = new Float32Array(maskW * fieldH);
+    for (let y = 0; y < fieldH; y++) {
+      const row = y * fieldW;
+      const dest = y * maskW;
+      for (let x = 0; x < maskW; x++) {
+        const phase = x % scale;
+        const block = (x - phase) / scale;
+        const origin = block + (base[phase] ?? 0);
+        let sum = 0;
+        let weightSum = 0;
+        for (let tap = 0; tap < 4; tap++) {
+          const weight = weights[phase * 4 + tap] ?? 0;
+          weightSum += weight;
+          const sx = origin - 1 + tap;
+          if (sx < 0 || sx >= fieldW) continue;
+          sum += (field[row + sx] ?? 0) * weight;
+        }
+        horizontal[dest + x] = weightSum === 0 ? 0 : sum / weightSum;
+      }
+    }
+    const out = new Float32Array(maskW * maskH);
+    for (let y = 0; y < maskH; y++) {
+      const phase = y % scale;
+      const block = (y - phase) / scale;
+      const origin = block + (base[phase] ?? 0);
+      for (let x = 0; x < maskW; x++) {
+        let sum = 0;
+        let weightSum = 0;
+        for (let tap = 0; tap < 4; tap++) {
+          const weight = weights[phase * 4 + tap] ?? 0;
+          weightSum += weight;
+          const sy = origin - 1 + tap;
+          if (sy < 0 || sy >= fieldH) continue;
+          sum += (horizontal[sy * maskW + x] ?? 0) * weight;
+        }
+        const value = weightSum === 0 ? 0 : sum / weightSum;
+        out[y * maskW + x] = value < 0 ? 0 : value > 1 ? 1 : value;
+      }
+    }
+    return out;
+  }
   function bicubic(field, width, height, x, y) {
     const x0 = Math.floor(x);
     const y0 = Math.floor(y);
@@ -6128,12 +7240,21 @@
     const hasSource = !!options.source && options.source.length >= segmentation.width * segmentation.height * 4;
     const scale = hasSource ? 1 : options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
     const field = resolveField(segmentation, options);
-    const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
     const shapes = [];
     const cache = /* @__PURE__ */ new Map();
     const clean = cleanSession(segmentation, options);
-    const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
-    const gradientByLabel = useGradients && hasSource && options.source ? detectGradients(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
+    const glyphScope = preset === "logo" || preset === "icon" ? "regions" : "text";
+    const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height, glyphScope) : null;
+    const paintLabels = glyphs && glyphs.outlines.length > 0 ? glyphs.reassign(field.labels) : field.labels;
+    const scaled = scale <= 1 ? { labels: paintLabels, width: segmentation.width, height: segmentation.height } : upscaleField({ ...field, labels: paintLabels }, segmentation.width, segmentation.height, scale);
+    const gradientByLabel = useGradients && hasSource && options.source ? detectGradients(
+      options.source,
+      field.labels,
+      segmentation.palette,
+      segmentation.width,
+      segmentation.height,
+      preset === "ui" ? "background" : "all"
+    ) : null;
     const counts = countLabels2(scaled.labels, segmentation.palette.length);
     const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
     order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
@@ -6141,7 +7262,7 @@
     for (const label of order) {
       if (options.isCancelled?.()) break;
       const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
-      const iso = hasSource && options.source ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label, cache: isoCache } : null;
+      const iso = hasSource && options.source ? { rgba: options.source, palette: segmentation.palette, labels: paintLabels, width: segmentation.width, height: segmentation.height, inside: label, cache: isoCache } : null;
       const subpaths = [];
       for (const contour of contours) {
         const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean, iso, glyphs);
@@ -6150,6 +7271,22 @@
       const color = segmentation.palette[label];
       if (!color || subpaths.length === 0) continue;
       shapes.push({ color, area: counts[label] ?? 0, subpaths, gradient: gradientByLabel?.[label] });
+    }
+    if (glyphs) {
+      for (const outline of glyphs.outlines) {
+        const color = segmentation.palette[outline.label];
+        if (!color || outline.paths.length === 0) continue;
+        shapes.push({
+          color,
+          area: Math.max(1, outline.area),
+          subpaths: outline.paths.map((path2) => ({
+            start: { x: path2.start.x, y: path2.start.y },
+            commands: path2.commands.map(
+              (command) => command.op === "L" ? { op: "L", x: command.x, y: command.y, primitive: "line" } : { op: "C", x1: command.x1, y1: command.y1, x2: command.x2, y2: command.y2, x: command.x, y: command.y, primitive: "cubic" }
+            )
+          }))
+        });
+      }
     }
     if (useGradients && hasSource && options.source && scale <= 1) {
       const discs = findRadialDiscs(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height);
@@ -6304,7 +7441,7 @@
       if (step > 0 && x === startX && y === startY && dir === 0) break;
       if (!markEdge(x, y, dir, width, height, horizontal, vertical)) break;
       points.push({ x, y });
-      const left = leftOf(x, y, dir);
+      const left = leftOf2(x, y, dir);
       outside.push(sample(labels, width, height, left[0], left[1]));
       if (dir === 0) x += 1;
       else if (dir === 1) y += 1;
@@ -6313,8 +7450,8 @@
       const turn = [dir + 1 & 3, dir, dir + 3 & 3, dir + 2 & 3];
       let next = -1;
       for (const candidate of turn) {
-        const right = rightOf(x, y, candidate);
-        const other = leftOf(x, y, candidate);
+        const right = rightOf2(x, y, candidate);
+        const other = leftOf2(x, y, candidate);
         if (sample(labels, width, height, right[0], right[1]) === label && sample(labels, width, height, other[0], other[1]) !== label) {
           next = candidate;
           break;
@@ -6330,13 +7467,13 @@
     if (x < 0 || y < 0 || x >= width || y >= height) return TRANSPARENT;
     return labels[y * width + x] ?? TRANSPARENT;
   }
-  function rightOf(x, y, dir) {
+  function rightOf2(x, y, dir) {
     if (dir === 0) return [x, y];
     if (dir === 1) return [x - 1, y];
     if (dir === 2) return [x - 1, y - 1];
     return [x, y - 1];
   }
-  function leftOf(x, y, dir) {
+  function leftOf2(x, y, dir) {
     if (dir === 0) return [x, y - 1];
     if (dir === 1) return [x, y];
     if (dir === 2) return [x - 1, y];
@@ -7073,7 +8210,7 @@
     if (!end) return false;
     for (let index = from; index < to; index++) {
       const point = commands[index];
-      if (!point || pointSegmentDistance2({ x: point.x, y: point.y }, origin, { x: end.x, y: end.y }) > tolerance) return false;
+      if (!point || pointSegmentDistance3({ x: point.x, y: point.y }, origin, { x: end.x, y: end.y }) > tolerance) return false;
     }
     return true;
   }
@@ -7438,7 +8575,7 @@
         const from = points[start2];
         const to = points[end];
         if (!point || !from || !to) continue;
-        const distance = pointSegmentDistance2(point, from, to);
+        const distance = pointSegmentDistance3(point, from, to);
         const key = point.x * 1e6 + point.y;
         if (distance > bestDistance + 1e-8 || Math.abs(distance - bestDistance) <= 1e-8 && key < bestKey) {
           bestDistance = distance;
@@ -7473,7 +8610,7 @@
     for (let i = start2 + 1; i < end; i++) {
       const point = points[i];
       if (!point) continue;
-      const distance = pointSegmentDistance2(point, from, to);
+      const distance = pointSegmentDistance3(point, from, to);
       if (distance > best) {
         best = distance;
         split = i;
@@ -7640,11 +8777,11 @@
     for (let i = start2 + 1; i < end; i++) {
       const point = points[i];
       if (!point) continue;
-      max = Math.max(max, pointSegmentDistance2(point, from, to));
+      max = Math.max(max, pointSegmentDistance3(point, from, to));
     }
     return max;
   }
-  function pointSegmentDistance2(point, from, to) {
+  function pointSegmentDistance3(point, from, to) {
     const dx = to.x - from.x;
     const dy = to.y - from.y;
     const length = Math.hypot(dx, dy);
@@ -8166,9 +9303,9 @@
       ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
     });
     const syncClean = () => {
-      const on = ui.cleanShapes.checked;
-      ui.cleanStrength.disabled = !on;
-      ui.cleanText.disabled = !on;
+      const on2 = ui.cleanShapes.checked;
+      ui.cleanStrength.disabled = !on2;
+      ui.cleanText.disabled = !on2;
       ui.cleanStrengthValue.value = ui.cleanStrength.value;
     };
     ui.cleanShapes.addEventListener("change", syncClean);

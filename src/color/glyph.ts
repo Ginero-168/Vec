@@ -1,12 +1,27 @@
 import { sharedJunction } from "./iso";
 import { TRANSPARENT, type Rgb } from "./model";
 import { oklabDistance, rgbToOklab, type Lab } from "./oklab";
+import { traceMask, type PotraceCommand, type PotracePath } from "./potrace";
 
 type Point = { x: number; y: number };
+
+export type GlyphScope = "text" | "regions";
+
+export type GlyphOutline = {
+  readonly label: number;
+  readonly outside: number;
+  readonly area: number;
+  readonly pixels: Int32Array;
+  /** One compound path per component, in source pixels. Holes are further paths. */
+  readonly paths: readonly PotracePath[];
+};
 
 export type GlyphIndex = {
   replace(points: readonly Point[], closed: boolean, inside: number, outside: number): GlyphHit | null;
   pairInBox(x0: number, y0: number, boxWidth: number, boxHeight: number): { ink: Rgb; bg: Rgb } | null;
+  readonly outlines: readonly GlyphOutline[];
+  /** Paint each outlined component with its surrounding label so that shape extends underneath. */
+  reassign(labels: Uint16Array): Uint16Array;
 };
 
 export type GlyphHit = {
@@ -30,19 +45,35 @@ type Component = {
 };
 
 /**
- * Thin, high-contrast strokes (letters). Their outline is the 0.5 level of a
- * 4× bicubic upsample of the coverage field, not the native pixel contour.
+ * Thin, high-contrast strokes (letters). Their outline is Potrace on an
+ * upsampled soft mask: bicubic coverage, a gradient signed-distance smooth,
+ * then a 0.5 threshold. One compound path, no stem seams.
  */
 export function buildGlyphIndex(
   rgba: Uint8Array,
   labels: Uint16Array,
   palette: readonly Rgb[],
   width: number,
-  height: number
+  height: number,
+  scope: GlyphScope = "text"
 ): GlyphIndex {
-  const found = findThinComponents(rgba, labels, palette, width, height);
+  const found = findThinComponents(rgba, labels, palette, width, height, scope);
   return {
+    outlines: found.outlines,
+    reassign(source) {
+      const copy = new Uint16Array(source);
+      for (const outline of found.outlines) {
+        if (outline.paths.length === 0) continue;
+        for (let i = 0; i < outline.pixels.length; i++) {
+          const pixel = outline.pixels[i];
+          if (pixel === undefined) continue;
+          copy[pixel] = outline.outside;
+        }
+      }
+      return copy;
+    },
     replace(points, closed, inside, outside) {
+      if (found.outlines.length > 0) return null;
       return replaceChain(found.components, found.owner, points, closed, inside, outside, rgba, labels, palette, width, height);
     },
     pairInBox(x0, y0, boxWidth, boxHeight) {
@@ -155,11 +186,17 @@ function findThinComponents(
   labels: Uint16Array,
   palette: readonly Rgb[],
   width: number,
-  height: number
-): { components: Component[]; owner: Int32Array } {
+  height: number,
+  scope: GlyphScope
+): { components: Component[]; owner: Int32Array; outlines: GlyphOutline[] } {
   const owner = new Int32Array(labels.length);
   owner.fill(-1);
   const components: Component[] = [];
+  const outlines: GlyphOutline[] = [];
+  const pixelCap = scope === "regions" ? Math.floor(width * height * 0.35) : 9000;
+  const sideCap = scope === "regions" ? Math.max(width, height) : 180;
+  const storeCap = scope === "text" ? 42000 : pixelCap;
+  const storeSide = scope === "text" ? 340 : sideCap;
   const labs = palette.map((color) => rgbToOklab(color.r, color.g, color.b));
   const stack: number[] = [];
   const seen = -3;
@@ -176,47 +213,57 @@ function findThinComponents(
     let maxY = 0;
     let dark = 0;
     let oversized = false;
+    let truncated = false;
     while (stack.length > 0) {
       const current = stack.pop();
       if (current === undefined) break;
       const x = current % width;
       const y = (current - x) / width;
-      if (!oversized) {
-        pixels.push(current);
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        const offset = current * 4;
-        if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
-        if (pixels.length > 1200 || maxX - minX > 96 || maxY - minY > 96) oversized = true;
+      if (!truncated) {
+        const spanX = Math.max(maxX, x) - Math.min(minX, x);
+        const spanY = Math.max(maxY, y) - Math.min(minY, y);
+        if (pixels.length >= storeCap || spanX > storeSide || spanY > storeSide) {
+          truncated = true;
+          oversized = true;
+          owner[current] = seen;
+        } else {
+          pixels.push(current);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          const offset = current * 4;
+          if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
+          if (pixels.length > pixelCap || maxX - minX > sideCap || maxY - minY > sideCap) oversized = true;
+        }
       }
       const neighbors = [current - 1, current + 1, current - width, current + width];
       for (const next of neighbors) {
         if (next < 0 || next >= labels.length) {
-          if (!oversized) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+          if (!truncated) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
           continue;
         }
         const nx = next % width;
         if (Math.abs(nx - x) + Math.abs(Math.floor(next / width) - y) !== 1) {
-          if (!oversized) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+          if (!truncated) adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
           continue;
         }
         const neighbor = labels[next] ?? TRANSPARENT;
         if (neighbor === label) {
           if (owner[next] === -1) {
-            owner[next] = oversized ? seen : -2;
+            owner[next] = truncated ? seen : -2;
             stack.push(next);
           }
-        } else if (!oversized) adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+        } else if (!truncated) adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
       }
     }
-    if (oversized) {
+    const display = oversized && !truncated && acceptDisplay(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label);
+    if ((truncated || oversized) && !display) {
       for (const pixel of pixels) owner[pixel] = seen;
       continue;
     }
-    const reject = !acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label);
-    if (reject) {
+    const kind = display ? "stroke" : classifyComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label, scope);
+    if (!kind) {
       for (const pixel of pixels) owner[pixel] = seen;
       continue;
     }
@@ -229,8 +276,13 @@ function findThinComponents(
       }
     }
     const ink = labs[label];
-    const bg = outside === TRANSPARENT || outside >= labs.length ? null : labs[outside];
-    if (!ink || !bg) {
+    const neighbor = outside === TRANSPARENT || outside >= labs.length ? null : labs[outside];
+    if (!ink) {
+      for (const pixel of pixels) owner[pixel] = seen;
+      continue;
+    }
+    const bg = neighbor ?? (ink.l > 0.6 ? { l: 0.05, a: 0, b: 0 } : { l: 0.98, a: 0, b: 0 });
+    if ((kind === "icon" || kind === "region") && !softBoundary(pixels, rgba, width, height, labels, label, ink, bg)) {
       for (const pixel of pixels) owner[pixel] = seen;
       continue;
     }
@@ -241,6 +293,10 @@ function findThinComponents(
     const originY = minY - pad;
     const fieldW = maxX - minX + 1 + pad * 2;
     const fieldH = maxY - minY + 1 + pad * 2;
+    if (fieldW > 360 || fieldH > 360) {
+      for (const pixel of pixels) owner[pixel] = seen;
+      continue;
+    }
     const field = new Float32Array(fieldW * fieldH);
     for (let iy = 0; iy < fieldH; iy++) {
       for (let ix = 0; ix < fieldW; ix++) {
@@ -262,9 +318,277 @@ function findThinComponents(
         return bicubic(field, fieldW, fieldH, x - originX - 0.5, y - originY - 0.5);
       }
     };
+    const paths = coverageOutline(field, fieldW, fieldH, originX, originY);
+    if (paths.length === 0) {
+      for (const pixel of pixels) owner[pixel] = seen;
+      continue;
+    }
     components.push(component);
+    outlines.push({
+      label,
+      outside,
+      area: pixels.length,
+      pixels: Int32Array.from(pixels),
+      paths
+    });
   }
-  return { components, owner };
+  outlines.sort((left, right) => right.area - left.area);
+  return { components, owner, outlines };
+}
+
+function classifyComponent(
+  pixels: number[],
+  width: number,
+  height: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  dark: number,
+  adjacency: Map<number, number>,
+  labs: Lab[],
+  label: number,
+  scope: GlyphScope
+): "thin" | "stroke" | "icon" | "region" | null {
+  if (acceptComponent(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label)) return "thin";
+  if (acceptStroke(pixels, width, height, minX, minY, maxX, maxY, dark, adjacency, labs, label)) return "stroke";
+  if (scope !== "regions") return null;
+  if (acceptIcon(pixels, width, height, minX, minY, maxX, maxY, adjacency, labs, label)) return "icon";
+  if (acceptRegion(pixels, width, height, minX, minY, maxX, maxY)) return "region";
+  return null;
+}
+
+/** A single large dark letter, such as the black “a”, kept off the shared-edge fitter. */
+function acceptDisplay(
+  pixels: number[],
+  width: number,
+  height: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  dark: number,
+  adjacency: Map<number, number>,
+  labs: Lab[],
+  label: number
+): boolean {
+  if (pixels.length < 4000 || pixels.length > 42000) return false;
+  if (dark * 2 <= pixels.length) return false;
+  const side = Math.max(maxX - minX, maxY - minY);
+  if (side < 80 || side > 340) return false;
+  if (minX <= 1 || minY <= 1 || maxX >= width - 2 || maxY >= height - 2) return false;
+  const fill = pixels.length / Math.max(1, (maxX - minX + 1) * (maxY - minY + 1));
+  if (fill < 0.2 || fill > 0.55) return false;
+  return neighborContrast(adjacency, labs, label, 0.2, 0.55);
+}
+
+/** Thicker high-contrast ink, such as the black “a”, that the thin-stroke test rejects. */
+function acceptStroke(
+  pixels: number[],
+  width: number,
+  height: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  dark: number,
+  adjacency: Map<number, number>,
+  labs: Lab[],
+  label: number
+): boolean {
+  if (pixels.length < 40 || pixels.length > 4500) return false;
+  if (dark * 2 <= pixels.length) return false;
+  if (Math.max(maxX - minX, maxY - minY) > 120) return false;
+  if (minX <= 0 || minY <= 0 || maxX >= width - 1 || maxY >= height - 1) return false;
+  const box = Math.max(1, maxX - minX + 1) * Math.max(1, maxY - minY + 1);
+  if (pixels.length / box > 0.58) return false;
+  const radius = inradiusStats(pixels, width, height);
+  if (radius.median > 6.5 || radius.max > 14) return false;
+  return neighborContrast(adjacency, labs, label, 0.16, 0.45);
+}
+
+/** Compact filled icons. Large panels and flat backgrounds stay on the shared-edge fitter. */
+function acceptIcon(
+  pixels: number[],
+  width: number,
+  height: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  adjacency: Map<number, number>,
+  labs: Lab[],
+  label: number
+): boolean {
+  if (pixels.length < 80 || pixels.length > 2200) return false;
+  const side = Math.max(maxX - minX, maxY - minY);
+  if (side > 96 || side < 8) return false;
+  if (minX <= 0 || minY <= 0 || maxX >= width - 1 || maxY >= height - 1) return false;
+  const radius = inradiusStats(pixels, width, height);
+  if (radius.median < 2.2 || radius.median > 48) return false;
+  const box = Math.max(1, maxX - minX + 1) * Math.max(1, maxY - minY + 1);
+  if (pixels.length / box > 0.9) return false;
+  const aspect = Math.max(maxX - minX, maxY - minY) / Math.max(1, Math.min(maxX - minX, maxY - minY));
+  if (aspect > 2.4) return false;
+  return neighborContrast(adjacency, labs, label, 0.18, 0.4);
+}
+
+function acceptRegion(pixels: number[], width: number, height: number, minX: number, minY: number, maxX: number, maxY: number): boolean {
+  if (pixels.length < 12 || pixels.length > width * height * 0.35) return false;
+  const side = Math.max(maxX - minX, maxY - minY);
+  return side <= Math.max(width, height) * 0.92;
+}
+
+function neighborContrast(adjacency: Map<number, number>, labs: Lab[], label: number, minDistance: number, minShare: number): boolean {
+  let total = 0;
+  let dominant = TRANSPARENT;
+  let dominantCount = 0;
+  for (const [neighbor, count] of adjacency) {
+    total += count;
+    if (count > dominantCount) {
+      dominant = neighbor;
+      dominantCount = count;
+    }
+  }
+  if (total <= 0 || dominantCount / total < minShare) return false;
+  const own = labs[label];
+  if (!own) return false;
+  if (dominant === TRANSPARENT || dominant >= labs.length) return true;
+  const other = labs[dominant];
+  if (!other) return false;
+  return oklabDistance(own, other) >= minDistance;
+}
+
+/**
+ * Bicubic coverage, signed-distance smoothing, then Potrace.
+ * Small text is traced at 4×, the same scale as the glyph gate. A display
+ * letter uses 2× so the contour still fits the trace budget.
+ * One compound path, no stem seams.
+ */
+function coverageOutline(field: Float32Array, fieldW: number, fieldH: number, originX: number, originY: number): PotracePath[] {
+  const side = Math.max(fieldW, fieldH);
+  const scale = side > 150 ? 2 : 4;
+  const maskW = fieldW * scale;
+  const maskH = fieldH * scale;
+  if (maskW > 1400 || maskH > 1400) return [];
+  const mask = softMask(field, fieldW, fieldH, scale);
+  const traced = traceMask(mask, maskW, maskH, {
+    alphamax: 1,
+    opttolerance: 0.2,
+    turdsize: Math.round(1.5 * scale * scale),
+    straightness: 0.5 * scale
+  });
+  const paths: PotracePath[] = [];
+  for (const path of traced) {
+    const scaled = scalePath(path, originX, originY, scale);
+    if (scaled.commands.length >= 3 && (scaled.area >= 8 || traced.length === 1)) paths.push(scaled);
+  }
+  return paths;
+}
+
+function scalePath(path: PotracePath, originX: number, originY: number, scale: number): PotracePath {
+  const mapX = (value: number) => originX + value / scale;
+  const mapY = (value: number) => originY + value / scale;
+  const commands: PotraceCommand[] = path.commands.map((command) => {
+    if (command.op === "L") return { op: "L", x: mapX(command.x), y: mapY(command.y) };
+    return {
+      op: "C",
+      x1: mapX(command.x1),
+      y1: mapY(command.y1),
+      x2: mapX(command.x2),
+      y2: mapY(command.y2),
+      x: mapX(command.x),
+      y: mapY(command.y)
+    };
+  });
+  return {
+    area: Math.abs(path.area) / (scale * scale),
+    start: { x: mapX(path.start.x), y: mapY(path.start.y) },
+    commands
+  };
+}
+
+/**
+ * Bicubic coverage, a short box blur, then a 0.5 threshold.
+ * The blur is a fraction of a source pixel so a straight edge stays put
+ * and a one-pixel stair softens before Potrace sees it.
+ */
+function softMask(field: Float32Array, fieldW: number, fieldH: number, scale: number): Uint8Array {
+  const maskW = fieldW * scale;
+  const maskH = fieldH * scale;
+  const coverage = upsampleBicubic(field, fieldW, fieldH, scale);
+  if (Math.max(maskW, maskH) <= 480) boxBlur(coverage, maskW, maskH, 1);
+  const mask = new Uint8Array(maskW * maskH);
+  for (let i = 0; i < coverage.length; i++) if ((coverage[i] ?? 0) >= 0.5) mask[i] = 1;
+  return mask;
+}
+
+function boxBlur(field: Float32Array, width: number, height: number, radius: number): void {
+  const tmp = new Float32Array(field.length);
+  const span = radius * 2 + 1;
+  const widthLimit = width - 1;
+  const heightLimit = height - 1;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    let sum = 0;
+    for (let x = -radius; x <= radius; x++) sum += field[row + Math.min(widthLimit, Math.max(0, x))] ?? 0;
+    for (let x = 0; x < width; x++) {
+      tmp[row + x] = sum / span;
+      sum -= field[row + Math.min(widthLimit, Math.max(0, x - radius))] ?? 0;
+      sum += field[row + Math.min(widthLimit, Math.max(0, x + radius + 1))] ?? 0;
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let y = -radius; y <= radius; y++) sum += tmp[Math.min(heightLimit, Math.max(0, y)) * width + x] ?? 0;
+    for (let y = 0; y < height; y++) {
+      field[y * width + x] = sum / span;
+      sum -= tmp[Math.min(heightLimit, Math.max(0, y - radius)) * width + x] ?? 0;
+      sum += tmp[Math.min(heightLimit, Math.max(0, y + radius + 1)) * width + x] ?? 0;
+    }
+  }
+}
+
+/** Hard pixel edges stay on the shared-edge fitter. Antialiased marks use Potrace. */
+function softBoundary(
+  pixels: number[],
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  labels: Uint16Array,
+  label: number,
+  ink: Lab,
+  bg: Lab
+): boolean {
+  let border = 0;
+  let partial = 0;
+  for (const pixel of pixels) {
+    const x = pixel % width;
+    const y = (pixel - x) / width;
+    const neighbors = [pixel - 1, pixel + 1, pixel - width, pixel + width];
+    let edge = false;
+    for (const next of neighbors) {
+      if (next < 0 || next >= labels.length) {
+        edge = true;
+        break;
+      }
+      const nx = next % width;
+      if (Math.abs(nx - x) + Math.abs((next - nx) / width - y) !== 1) {
+        edge = true;
+        break;
+      }
+      if ((labels[next] ?? TRANSPARENT) !== label) {
+        edge = true;
+        break;
+      }
+    }
+    if (!edge) continue;
+    border++;
+    const coverage = pixelCoverage(x, y, width, height, rgba, ink, bg, label, labels);
+    if (coverage > 0.18 && coverage < 0.82) partial++;
+  }
+  if (border < 12) return true;
+  return partial / border >= 0.1;
 }
 
 function acceptComponent(
@@ -766,6 +1090,60 @@ function offSegment(lab: Lab, from: Lab, to: Lab, t: number): number {
     b: from.b + (to.b - from.b) * t
   };
   return Math.hypot(lab.l - point.l, lab.a - point.a, lab.b - point.b);
+}
+
+/** Separable bicubic upsample. Outside samples are zero, matching `bicubic`. */
+function upsampleBicubic(field: Float32Array, fieldW: number, fieldH: number, scale: number): Float32Array {
+  const maskW = fieldW * scale;
+  const maskH = fieldH * scale;
+  const weights = new Float32Array(scale * 4);
+  const base = new Int32Array(scale);
+  for (let phase = 0; phase < scale; phase++) {
+    const sample = (phase + 0.5) / scale - 0.5;
+    const origin = Math.floor(sample);
+    base[phase] = origin;
+    for (let tap = 0; tap < 4; tap++) weights[phase * 4 + tap] = cubicWeight(sample - (origin - 1 + tap));
+  }
+  const horizontal = new Float32Array(maskW * fieldH);
+  for (let y = 0; y < fieldH; y++) {
+    const row = y * fieldW;
+    const dest = y * maskW;
+    for (let x = 0; x < maskW; x++) {
+      const phase = x % scale;
+      const block = (x - phase) / scale;
+      const origin = block + (base[phase] ?? 0);
+      let sum = 0;
+      let weightSum = 0;
+      for (let tap = 0; tap < 4; tap++) {
+        const weight = weights[phase * 4 + tap] ?? 0;
+        weightSum += weight;
+        const sx = origin - 1 + tap;
+        if (sx < 0 || sx >= fieldW) continue;
+        sum += (field[row + sx] ?? 0) * weight;
+      }
+      horizontal[dest + x] = weightSum === 0 ? 0 : sum / weightSum;
+    }
+  }
+  const out = new Float32Array(maskW * maskH);
+  for (let y = 0; y < maskH; y++) {
+    const phase = y % scale;
+    const block = (y - phase) / scale;
+    const origin = block + (base[phase] ?? 0);
+    for (let x = 0; x < maskW; x++) {
+      let sum = 0;
+      let weightSum = 0;
+      for (let tap = 0; tap < 4; tap++) {
+        const weight = weights[phase * 4 + tap] ?? 0;
+        weightSum += weight;
+        const sy = origin - 1 + tap;
+        if (sy < 0 || sy >= fieldH) continue;
+        sum += (horizontal[sy * maskW + x] ?? 0) * weight;
+      }
+      const value = weightSum === 0 ? 0 : sum / weightSum;
+      out[y * maskW + x] = value < 0 ? 0 : value > 1 ? 1 : value;
+    }
+  }
+  return out;
 }
 
 function bicubic(field: Float32Array, width: number, height: number, x: number, y: number): number {

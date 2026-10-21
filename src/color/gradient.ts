@@ -31,7 +31,8 @@ export function detectGradients(
   labels: Uint16Array,
   palette: readonly Rgb[],
   width: number,
-  height: number
+  height: number,
+  scope: "all" | "background" = "all"
 ): (VecGradient | undefined)[] {
   const result: (VecGradient | undefined)[] = palette.map(() => undefined);
   if (palette.length === 0 || rgba.length < width * height * 4) return result;
@@ -58,10 +59,16 @@ export function detectGradients(
     if (population < 80) continue;
     const flat = palette[label];
     if (!flat) continue;
+    if (scope === "background") {
+      if (population < width * height * 0.02) continue;
+      const neutral = rgbToCieLab(flat.r, flat.g, flat.b);
+      if (Math.hypot(neutral.a, neutral.b) > 18) continue;
+    }
     const samples = labelSamples(rgba, labels, label, width, population);
     if (samples.length < 24) continue;
-    const chosen = bestRamp(samples, flat, minX[label] ?? 0, minY[label] ?? 0, maxX[label] ?? 0, maxY[label] ?? 0);
+    const chosen = bestRamp(samples, flat, minX[label] ?? 0, minY[label] ?? 0, maxX[label] ?? 0, maxY[label] ?? 0, scope === "background");
     if (!chosen) continue;
+    if (scope === "background" && !stopsNear(chosen, flat, 22)) continue;
     result[label] = chosen;
   }
   return result;
@@ -345,7 +352,35 @@ function acceptable(scored: Scored): boolean {
   return scored.range >= 8 && scored.flat >= 3 && scored.residual <= 8 && scored.residual <= scored.flat * 0.65;
 }
 
+/**
+ * Pixels already close to the flat swatch have to stay there. A ramp fit to
+ * one band of a large background must not recolor a flat patch of that swatch.
+ */
+function coreStays(samples: readonly Sample[], gradient: VecGradient, flat: Rgb): boolean {
+  const origin = rgbToCieLab(flat.r, flat.g, flat.b);
+  let count = 0;
+  let sum = 0;
+  for (const sample of samples) {
+    const source = rgbToCieLab(sample.r, sample.g, sample.b);
+    if (deltaE76(source, origin) > 8) continue;
+    const predicted = colorAtGradient(gradient, sample.x + 0.5, sample.y + 0.5);
+    sum += deltaE76(source, rgbToCieLab(predicted.r, predicted.g, predicted.b));
+    count++;
+  }
+  if (count < 12) return true;
+  return sum / count <= 4.5;
+}
+
 /** Reject a ramp that changes hue. A neutral swatch may only shift lightness a little. */
+function stopsNear(gradient: VecGradient, palette: Rgb, limit: number): boolean {
+  const origin = rgbToCieLab(palette.r, palette.g, palette.b);
+  for (const stop of gradient.stops) {
+    const lab = rgbToCieLab(stop.color.r, stop.color.g, stop.color.b);
+    if (deltaE76(origin, lab) > limit) return false;
+  }
+  return true;
+}
+
 function stopsStayInFamily(gradient: VecGradient, palette: Rgb): boolean {
   const origin = rgbToCieLab(palette.r, palette.g, palette.b);
   const originChroma = Math.hypot(origin.a, origin.b);
@@ -363,7 +398,15 @@ function stopsStayInFamily(gradient: VecGradient, palette: Rgb): boolean {
   return true;
 }
 
-function bestRamp(samples: readonly Sample[], palette: Rgb, minX: number, minY: number, maxX: number, maxY: number): VecGradient | null {
+function bestRamp(
+  samples: readonly Sample[],
+  palette: Rgb,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  protectCore = false
+): VecGradient | null {
   const found: Scored[] = [];
   let bestGain = 0;
   const consider = (subset: readonly Sample[], partial: boolean) => {
@@ -385,6 +428,7 @@ function bestRamp(samples: readonly Sample[], palette: Rgb, minX: number, minY: 
       fit = { gradient: plateau, ...residuals(subset, plateau) };
     }
     if (!fit || !acceptable(fit)) return;
+    if (protectCore && !coreStays(samples, fit.gradient, palette)) return;
     if (partial && !stopsStayInFamily(fit.gradient, palette)) return;
     if (fit.gradient.kind === "radial") {
       const origin = rgbToCieLab(palette.r, palette.g, palette.b);

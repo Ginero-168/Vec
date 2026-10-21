@@ -9,6 +9,8 @@ export type GlyphQuality = {
   readonly iou: number;
   readonly hausdorffP95: number;
   readonly spikes: number;
+  /** Interior gaps in the ink that are not counters of the source mask. */
+  readonly cracks: number;
 };
 
 /** Compare a text box to the 4× bicubic half-coverage mask of the original. */
@@ -53,8 +55,54 @@ export function measureGlyphBox(
   return {
     iou: union === 0 ? 0 : intersection / union,
     hausdorffP95: hausdorff,
-    spikes: spikeCount(shapes, x0, y0, x0 + boxWidth, y0 + boxHeight, ink, corners)
+    spikes: spikeCount(shapes, x0, y0, x0 + boxWidth, y0 + boxHeight, ink, corners),
+    cracks: interiorCracks(mask, raster, ink, zoomWidth, zoomHeight)
   };
+}
+
+/** Missed ink that sits inside the letter instead of on its silhouette. */
+function interiorCracks(mask: Uint8Array, raster: Uint8Array, ink: Rgb, width: number, height: number): number {
+  const missed = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      if (mask[index] !== 1) continue;
+      const offset = index * 4;
+      const filled = (raster[offset + 3] ?? 0) > 0 && raster[offset] === ink.r && raster[offset + 1] === ink.g && raster[offset + 2] === ink.b;
+      if (!filled) missed[index] = 1;
+    }
+  }
+  const seen = new Uint8Array(missed.length);
+  let cracks = 0;
+  for (let start = 0; start < missed.length; start++) {
+    if (!missed[start] || seen[start]) continue;
+    const stack = [start];
+    seen[start] = 1;
+    let area = 0;
+    let interior = true;
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === undefined) break;
+      area++;
+      const x = current % width;
+      const y = (current - x) / width;
+      const neighbors = [current - 1, current + 1, current - width, current + width];
+      for (const next of neighbors) {
+        const nx = next % width;
+        const ny = (next - nx) / width;
+        if (next < 0 || next >= missed.length || Math.abs(nx - x) + Math.abs(ny - y) !== 1) {
+          interior = false;
+          continue;
+        }
+        if (mask[next] !== 1) interior = false;
+        if (!missed[next] || seen[next]) continue;
+        seen[next] = 1;
+        stack.push(next);
+      }
+    }
+    if (interior && area >= 4 && area <= 240) cracks++;
+  }
+  return cracks;
 }
 
 function maskBoundary(mask: Uint8Array, width: number, height: number, x: number, y: number): boolean {

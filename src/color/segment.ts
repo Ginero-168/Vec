@@ -1241,6 +1241,7 @@ function settleEdges(
   dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
   clearSolidSpecks(labels, partner, coverage, width, height);
   absorbInteriorSpecks(rgba, labels, partner, coverage, width, height);
+  absorbBlurSpecks(rgba, labels, partner, coverage, width, height, palette);
   reconcilePartners(labels, partner, coverage);
 }
 
@@ -1726,6 +1727,111 @@ function absorbInteriorSpecks(
       coverage[pixel] = 1;
     }
   }, (info) => info.count <= 8);
+}
+
+/**
+ * Specks inside a blur or ramp, under about 0.05% of the image and close in
+ * colour to the surrounding swatch, fold into that swatch. High-contrast ink
+ * and the white counters of letters stay put.
+ */
+function absorbBlurSpecks(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number,
+  palette: readonly Lab[]
+): void {
+  const areaLimit = Math.max(12, Math.round(width * height * 0.0005));
+  const luma = new Float32Array(width * height);
+  for (let index = 0; index < luma.length; index++) {
+    const offset = index * 4;
+    luma[index] = 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+  }
+  const blurred = boxBlur(luma, width, height, 6);
+  forEachComponent(
+    labels,
+    width,
+    height,
+    (region) => {
+      const spanX = region.maxX - region.minX;
+      const spanY = region.maxY - region.minY;
+      if (spanX > 48 || spanY > 48) return;
+      if (region.pixels.length < 2 || region.pixels.length > areaLimit) return;
+      const own = palette[region.label];
+      if (!own) return;
+      let dominant = TRANSPARENT;
+      let dominantCount = 0;
+      let border = 0;
+      for (const [neighbor, count] of region.adjacency) {
+        border += count;
+        if (count > dominantCount) {
+          dominant = neighbor;
+          dominantCount = count;
+        }
+      }
+      if (dominant === TRANSPARENT || dominant === region.label || border === 0) return;
+      if (dominantCount / border < 0.6) return;
+      const other = palette[dominant];
+      if (!other || oklabDistance(own, other) > 0.085) return;
+      let dark = 0;
+      for (const pixel of region.pixels) {
+        const offset = pixel * 4;
+        if (Math.max(rgba[offset] ?? 255, rgba[offset + 1] ?? 255, rgba[offset + 2] ?? 255) < 70) dark++;
+      }
+      if (dark * 2 > region.pixels.length) return;
+      let ramp = 0;
+      let samples = 0;
+      for (const pixel of region.pixels) {
+        const x = pixel % width;
+        const y = (pixel - x) / width;
+        const cx = Math.min(width - 2, Math.max(1, x));
+        const cy = Math.min(height - 2, Math.max(1, y));
+        const dx = (blurred[cy * width + cx + 1] ?? 0) - (blurred[cy * width + cx - 1] ?? 0);
+        const dy = (blurred[(cy + 1) * width + cx] ?? 0) - (blurred[(cy - 1) * width + cx] ?? 0);
+        ramp += Math.hypot(dx, dy) / 2;
+        samples++;
+      }
+      const slope = samples === 0 ? 0 : ramp / samples;
+      if (slope < 0.35 || slope > 8) return;
+      for (const pixel of region.pixels) {
+        labels[pixel] = dominant;
+        partner[pixel] = TRANSPARENT;
+        coverage[pixel] = 1;
+      }
+    },
+    (info) => info.count <= areaLimit
+  );
+}
+
+function boxBlur(source: Float32Array, width: number, height: number, radius: number): Float32Array {
+  const horizontal = new Float32Array(source.length);
+  const out = new Float32Array(source.length);
+  const span = radius * 2 + 1;
+  for (let y = 0; y < height; y++) {
+    let sum = 0;
+    for (let x = -radius; x <= radius; x++) sum += source[y * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+    for (let x = 0; x < width; x++) {
+      horizontal[y * width + x] = sum / span;
+      const leave = x - radius;
+      const enter = x + radius + 1;
+      sum -= source[y * width + Math.min(width - 1, Math.max(0, leave))] ?? 0;
+      sum += source[y * width + Math.min(width - 1, Math.max(0, enter))] ?? 0;
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let y = -radius; y <= radius; y++) sum += horizontal[Math.min(height - 1, Math.max(0, y)) * width + x] ?? 0;
+    for (let y = 0; y < height; y++) {
+      out[y * width + x] = sum / span;
+      const leave = y - radius;
+      const enter = y + radius + 1;
+      sum -= horizontal[Math.min(height - 1, Math.max(0, leave)) * width + x] ?? 0;
+      sum += horizontal[Math.min(height - 1, Math.max(0, enter)) * width + x] ?? 0;
+    }
+  }
+  return out;
 }
 
 function reconcilePartners(labels: Uint16Array, partner: Uint16Array, coverage: Float32Array): void {
