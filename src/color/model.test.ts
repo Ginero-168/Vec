@@ -248,3 +248,17 @@ test("sample stripes: zap removes speckle remnants and reports the true count", 
       countsBefore[orange]
   );
 });
+
+test("zap refuses a high-contrast stroke so text is not deleted", () => {
+  const black: Rgb = { r: 15, g: 15, b: 18 };
+  const white: Rgb = { r: 245, g: 245, b: 242 };
+  const segmentation = solid(40, 16, (_x, y) => (y === 8 ? 1 : 0), [white, black]);
+  const doc = ColorDocument.fromSegmentation(segmentation);
+  const before = doc.labels.slice();
+  const result = doc.zap(3, 8);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.match(result.reason, /คมชัด/);
+  assert.deepEqual(doc.labels, before);
+  assert.equal(doc.dirty(), false);
+});

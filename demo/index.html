@@ -8,7 +8,14 @@
     <style>
       body { min-height: 100vh; background: #161618; }
       .desk { max-width: 400px; margin: 0 auto; padding: 24px 0 48px; }
-      .desk .panel { background: #252528; min-height: 100vh; }
+      .desk .panel { background: #252528; min-height: auto; }
+      .compare { max-width: 1100px; margin: 0 auto 48px; padding: 0 16px; color: #f4f1ea; }
+      .compare h2 { font-size: 16px; margin: 0 0 8px; }
+      .compare p { color: #b9b4c7; font-size: 13px; }
+      .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .compare figure { margin: 0; }
+      .compare figcaption { font-size: 12px; margin-bottom: 6px; color: #d9d3e6; }
+      .compare img { width: 100%; height: auto; background: #111; border-radius: 8px; }
     </style>
   </head>
   <body>
@@ -39,6 +46,20 @@
         </section>
       </main>
     </div>
+    <section class="compare" aria-labelledby="compare-title">
+      <h2 id="compare-title">ภาพจาก Illustrator</h2>
+      <p id="compare-status">รอผลแยกสี</p>
+      <div class="compare-grid">
+        <figure>
+          <figcaption>ต้นฉบับ</figcaption>
+          <img id="compare-original" alt="ภาพต้นฉบับจากหน้าจอ" src="../fixtures/user-test-original.png" hidden />
+        </figure>
+        <figure>
+          <figcaption>เส้นใหม่</figcaption>
+          <img id="compare-result" alt="ผลเวกเตอร์จากภาพต้นฉบับ" hidden />
+        </figure>
+      </div>
+    </section>
     <script src="editor.js"></script>
   </body>
 </html>

@@ -1,12 +1,13 @@
-import * as childProcess from "child_process";
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { createColorEditor, type ColorEditor } from "./editor-ui";
-import type { Rgb } from "./color/model";
-import { decodePng, encodePng } from "./color/png";
-import { countSvgFills, renderRgba, segmentImage, segmentationToSvg } from "./color/segment";
+import type { Rgb, Segmentation } from "./color/model";
+import { decodePng } from "./color/png";
+import { countSvgFills, segmentImage } from "./color/segment";
+import { isPresetName, presetProfile, type PresetName } from "./color/presets";
+import { traceSegmentation } from "./color/trace";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -36,7 +37,7 @@ type Selection = {
 };
 
 type Settings = {
-  readonly preset: "logo" | "icon" | "photo";
+  readonly preset: PresetName;
   readonly maxColors: number;
   readonly simplify: number;
 };
@@ -49,6 +50,8 @@ type Job = {
   readonly svgPath: string;
   settings: Settings;
   cancelled: boolean;
+  /** Segmentation before manual edits, including edge coverage for the tracer. */
+  source: Segmentation | null;
 };
 
 type State =
@@ -57,7 +60,7 @@ type State =
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
   | { readonly kind: "editing"; readonly selection: Selection; readonly job: Job }
-  | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: childProcess.ChildProcess | null }
+  | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job }
   | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string }
   | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string };
 
@@ -208,7 +211,8 @@ function newJob(settings: Settings): Job {
     flatPath: path.join(directory, "flat.png"),
     svgPath: path.join(directory, "result.svg"),
     settings,
-    cancelled: false
+    cancelled: false,
+    source: null
   };
 }
 
@@ -236,45 +240,9 @@ function cleanStaleJobs(): void {
   }
 }
 
-function vtracerArguments(job: Job, maxColors: number): string[] {
-  const args = [job.flatPath, job.svgPath];
-  const preset = job.settings.preset;
-  const colors = String(Math.max(2, maxColors));
-  if (preset === "photo") {
-    args.push("--preset", "photo", "--max-colors", colors);
-  } else {
-    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", colors);
-    if (preset === "icon") args.push("--mode", "polygon");
-  }
-  if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
-  args.push("--optimize", "1");
-  return args;
-}
-
-function runVtracer(binary: string, job: Job, maxColors: number, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(binary, vtracerArguments(job, maxColors), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-    onStart(child);
-    let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < 4000) stderr += chunk.toString("utf8").slice(0, 4000 - stderr.length);
-    });
-    child.once("error", (error) => reject(error));
-    child.once("close", (code) => {
-      if (job.cancelled) {
-        reject(new Error("ยกเลิกแล้ว"));
-      } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
-        resolve();
-      } else {
-        reject(new Error("VTracer แปลงภาพไม่สำเร็จ" + (stderr ? ": " + stderr.trim() : "")));
-      }
-    });
-  });
-}
-
 function readSettings(ui: Ui): Settings {
   const preset = ui.preset.value;
-  if (preset !== "logo" && preset !== "icon" && preset !== "photo") throw new Error("Preset ไม่ถูกต้อง");
+  if (!isPresetName(preset)) throw new Error("Preset ไม่ถูกต้อง");
   const maxColors = Number(ui.colors.value);
   const simplify = Number(ui.smooth.value) / 10;
   if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("จำนวนสีไม่ถูกต้อง");
@@ -323,7 +291,6 @@ function swatchPayload(palette: readonly Rgb[]): string {
 function start(): void {
   const ui = getUi();
   let state: State = { kind: "empty" };
-  const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
   const host = typeof CSInterface === "undefined" ? null : new CSInterface();
   const editor: ColorEditor = createColorEditor(ui.editorRoot, {
     onVectorPreview: () => { void vectorize(); },
@@ -347,7 +314,7 @@ function start(): void {
     ui.trace.disabled = busy || state.kind === "empty";
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
     ui.apply.disabled = state.kind !== "preview";
-    ui.cancel.hidden = state.kind !== "tracing";
+    ui.cancel.hidden = true;
     ui.editorRoot.hidden = !editor.hasDocument();
     const count = editor.hasDocument() ? " · " + editor.colorCount() + " สี" : "";
     const phase = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "editing" ? "แก้สี" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
@@ -365,7 +332,9 @@ function start(): void {
 
   function openSegmentation(job: Job): void {
     const decoded = decodePng(fs.readFileSync(job.pngPath));
-    editor.load(segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors));
+    const segmentation = segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors, { preset: job.settings.preset });
+    job.source = segmentation;
+    editor.load(segmentation);
   }
 
   async function refresh(): Promise<void> {
@@ -438,24 +407,23 @@ function start(): void {
     try {
       const segmentation = editor.segmentation();
       if (segmentation.palette.length === 0) throw new Error("ไม่มีสีให้แปลง");
-      fs.writeFileSync(job.flatPath, encodePng(segmentation.width, segmentation.height, renderRgba(segmentation)));
-      const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
-      let note = "";
-      if (!fs.existsSync(binary)) {
-        fs.writeFileSync(job.svgPath, segmentationToSvg(segmentation), "utf8");
-        note = "ไม่พบ VTracer จึงแสดงสีที่แก้แบบพิกเซล";
-      } else {
-        message("กำลังสร้างเส้นจากสีที่แก้…");
-        state = { kind: "tracing", selection, job, child: null };
-        render();
-        await runVtracer(binary, job, segmentation.palette.length, (child) => {
-          state = { kind: "tracing", selection, job, child };
-          render();
-        });
-      }
-      const svg = fs.readFileSync(job.svgPath, "utf8");
+      message("กำลังสร้างเส้นจากสีที่แก้…");
+      state = { kind: "tracing", selection, job };
+      render();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (job.cancelled) throw new Error("ยกเลิกแล้ว");
+      const source = job.source;
+      const traced = traceSegmentation(segmentation, {
+        preset: job.settings.preset,
+        smooth: job.settings.simplify,
+        coverage: source?.coverage,
+        partner: source?.partner,
+        originalLabels: source?.labels
+      });
+      fs.writeFileSync(job.svgPath, traced.svg, "utf8");
+      const svg = traced.svg;
       state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svg, "utf8").toString("base64") };
-      message((note ? note + " · " : "ดูตัวอย่างแล้วกดใส่ใน Illustrator · ") + "แผนที่สี " + editor.colorCount() + " · เวกเตอร์ " + countSvgFills(svg) + " สี");
+      message("ดูตัวอย่างแล้วกดใส่ใน Illustrator · แผนที่สี " + editor.colorCount() + " · เวกเตอร์ " + countSvgFills(svg) + " สี · " + traced.pathCount + " เส้น");
       render();
     } catch (error) {
       state = { kind: "editing", selection, job };
@@ -513,21 +481,22 @@ function start(): void {
   ui.cancel.addEventListener("click", () => {
     if (state.kind !== "tracing") return;
     state.job.cancelled = true;
-    state.child?.kill();
     message("กำลังยกเลิก…");
   });
   ui.colors.addEventListener("input", () => { ui.colorsValue.value = ui.colors.value; });
   ui.smooth.addEventListener("input", () => { ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1); });
   ui.preset.addEventListener("change", () => {
-    ui.colors.value = ui.preset.value === "photo" ? "24" : ui.preset.value === "icon" ? "4" : "8";
+    const profile = presetProfile(ui.preset.value);
+    ui.colors.value = String(profile.maxColors);
     ui.colorsValue.value = ui.colors.value;
+    ui.smooth.value = String(Math.round(profile.smooth * 10));
+    ui.smoothValue.value = profile.smooth.toFixed(1);
   });
 
   window.addEventListener("beforeunload", () => {
     if (state.kind === "preview" || state.kind === "editing") cleanJob(state.job);
     if (state.kind === "tracing") {
       state.job.cancelled = true;
-      state.child?.kill();
       cleanJob(state.job);
     }
   });

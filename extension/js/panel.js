@@ -30,14 +30,59 @@
   ));
 
   // src/panel.ts
-  var childProcess = __toESM(__require("child_process"));
   var crypto = __toESM(__require("crypto"));
   var fs = __toESM(__require("fs"));
   var os = __toESM(__require("os"));
   var path = __toESM(__require("path"));
 
+  // src/color/oklab.ts
+  function srgbToLinear(channel) {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  }
+  function linearToSrgb(channel) {
+    const value = channel <= 31308e-7 ? 12.92 * channel : 1.055 * channel ** (1 / 2.4) - 0.055;
+    return Math.round(Math.min(1, Math.max(0, value)) * 255);
+  }
+  function rgbToOklab(r, g, b) {
+    const lr = srgbToLinear(r);
+    const lg = srgbToLinear(g);
+    const lb = srgbToLinear(b);
+    const l = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
+    const m = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
+    const s = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
+    return {
+      l: 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+      a: 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+      b: 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s
+    };
+  }
+  function oklabToRgb(lab) {
+    const l = lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b;
+    const m = lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b;
+    const s = lab.l - 0.0894841775 * lab.a - 1.291485548 * lab.b;
+    const l3 = l * l * l;
+    const m3 = m * m * m;
+    const s3 = s * s * s;
+    return {
+      r: linearToSrgb(4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3),
+      g: linearToSrgb(-1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3),
+      b: linearToSrgb(-0.0041960362 * l3 - 0.7034186147 * m3 + 1.707614701 * s3)
+    };
+  }
+  function oklabDistance(a, b) {
+    const dl = a.l - b.l;
+    const da = a.a - b.a;
+    const db = a.b - b.b;
+    return Math.sqrt(dl * dl + da * da + db * db);
+  }
+  function oklabChroma(lab) {
+    return Math.hypot(lab.a, lab.b);
+  }
+
   // src/color/model.ts
   var TRANSPARENT = 65535;
+  var ZAP_STROKE_CONTRAST = 0.28;
   var defaultZapThresholds = {
     maxSpeckleArea: 48,
     speckleAreaRatio: 4e-4,
@@ -158,10 +203,14 @@
       const fragmentCap = areaCap(this.thresholds.maxFragmentArea, this.thresholds.fragmentAreaRatio, this.labels.length);
       const clickedStats = measure(clicked, this.width, this.height, this.thresholds, areaLimit, fragmentCap);
       if (!clickedStats.zappable) return { ok: false, reason: refusal(clickedStats, this.thresholds, areaLimit) };
+      if (strokeProtected(clicked, label, this.palette, this.width, this.height)) {
+        return { ok: false, reason: "\u0E40\u0E2A\u0E49\u0E19\u0E19\u0E35\u0E49\u0E15\u0E31\u0E14\u0E01\u0E31\u0E1A\u0E2A\u0E35\u0E02\u0E49\u0E32\u0E07\u0E40\u0E04\u0E35\u0E22\u0E07\u0E0A\u0E31\u0E14 Zap \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E25\u0E1A \u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E44\u0E21\u0E48\u0E43\u0E2B\u0E49\u0E15\u0E31\u0E27\u0E2D\u0E31\u0E01\u0E29\u0E23\u0E2B\u0E23\u0E37\u0E2D\u0E08\u0E38\u0E14\u0E17\u0E35\u0E48\u0E04\u0E21\u0E0A\u0E31\u0E14\u0E2B\u0E32\u0E22" };
+      }
       const plan = [];
       for (const component of found.components) {
         const stats = component === clicked ? clickedStats : measure(component, this.width, this.height, this.thresholds, areaLimit, fragmentCap);
         if (!stats.zappable) continue;
+        if (strokeProtected(component, label, this.palette, this.width, this.height)) continue;
         const target = bestNeighbor(component, label, this.palette);
         if (target === null) continue;
         plan.push({ pixels: component.pixels, target });
@@ -392,6 +441,34 @@
       steps++;
     }
     return alive.size > 0 ? limit + 1 : steps;
+  }
+  function strokeProtected(component, ownLabel, palette, width, height) {
+    if (!componentElongated(component, width, height)) return false;
+    const target = bestNeighbor(component, ownLabel, palette);
+    if (target === null) return false;
+    const own = palette[ownLabel];
+    const other = palette[target];
+    if (!own || !other) return false;
+    return oklabDistance(rgbToOklab(own.r, own.g, own.b), rgbToOklab(other.r, other.g, other.b)) >= ZAP_STROKE_CONTRAST;
+  }
+  function componentElongated(component, width, height) {
+    let minX = width;
+    let maxX = 0;
+    let minY = height;
+    let maxY = 0;
+    for (const pixel of component.pixels) {
+      const x = pixel % width;
+      const y = (pixel - x) / width;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const spanX = maxX - minX + 1;
+    const spanY = maxY - minY + 1;
+    const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+    if (aspect >= 2.2) return true;
+    return component.area >= 6 && componentThickness(component.pixels, width, height, 2) <= 2;
   }
   function bestNeighbor(component, ownLabel, palette) {
     const own = palette[ownLabel];
@@ -1109,18 +1186,18 @@
       const start2 = offset + 8;
       const end = start2 + length;
       if (end + 4 > buffer.length) throw new Error("PNG \u0E02\u0E32\u0E14\u0E2A\u0E48\u0E27\u0E19\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25");
-      const chunk2 = buffer.subarray(start2, end);
+      const chunk = buffer.subarray(start2, end);
       if (type === "IHDR") {
-        width = chunk2.readUInt32BE(0);
-        height = chunk2.readUInt32BE(4);
-        bitDepth = chunk2[8] ?? 0;
-        colorType = chunk2[9] ?? -1;
-        const interlace = chunk2[12] ?? 0;
+        width = chunk.readUInt32BE(0);
+        height = chunk.readUInt32BE(4);
+        bitDepth = chunk[8] ?? 0;
+        colorType = chunk[9] ?? -1;
+        const interlace = chunk[12] ?? 0;
         if (bitDepth !== 8 || colorType !== 2 && colorType !== 6) throw new Error("\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A PNG 8-bit RGB \u0E2B\u0E23\u0E37\u0E2D RGBA \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19");
         if (interlace !== 0) throw new Error("\u0E44\u0E21\u0E48\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A PNG \u0E41\u0E1A\u0E1A interlaced");
         if (width < 1 || height < 1 || width > 8e3 || height > 8e3) throw new Error("\u0E02\u0E19\u0E32\u0E14 PNG \u0E44\u0E21\u0E48\u0E40\u0E2B\u0E21\u0E32\u0E30\u0E01\u0E31\u0E1A\u0E07\u0E32\u0E19\u0E41\u0E01\u0E49\u0E2A\u0E35\u0E43\u0E19\u0E1E\u0E32\u0E40\u0E19\u0E25");
       } else if (type === "IDAT") {
-        idat.push(chunk2);
+        idat.push(chunk);
       } else if (type === "IEND") {
         break;
       }
@@ -1150,25 +1227,6 @@
       }
     }
     return { width, height, data };
-  }
-  function encodePng(width, height, rgba) {
-    if (rgba.length < width * height * 4) throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E2A\u0E31\u0E49\u0E19\u0E01\u0E27\u0E48\u0E32\u0E02\u0E19\u0E32\u0E14\u0E17\u0E35\u0E48\u0E23\u0E30\u0E1A\u0E38");
-    const stride = width * 4;
-    const raw = Buffer.alloc(height * (stride + 1));
-    for (let y = 0; y < height; y++) {
-      const row = y * (stride + 1);
-      raw[row] = 0;
-      for (let x = 0; x < stride; x++) raw[row + 1 + x] = rgba[y * stride + x] ?? 0;
-    }
-    const ihdr = Buffer.alloc(13);
-    ihdr.writeUInt32BE(width, 0);
-    ihdr.writeUInt32BE(height, 4);
-    ihdr[8] = 8;
-    ihdr[9] = 6;
-    ihdr[10] = 0;
-    ihdr[11] = 0;
-    ihdr[12] = 0;
-    return Buffer.concat([SIGNATURE, chunk("IHDR", ihdr), chunk("IDAT", (0, import_zlib.deflateSync)(raw)), chunk("IEND", Buffer.alloc(0))]);
   }
   function unfilter(scanlines, width, height, bpp) {
     const stride = width * bpp;
@@ -1205,14 +1263,6 @@
     if (distanceUp <= distanceUpLeft) return up;
     return upLeft;
   }
-  function chunk(type, data) {
-    const head = Buffer.alloc(8);
-    head.writeUInt32BE(data.length, 0);
-    head.write(type, 4, "ascii");
-    const crc = Buffer.alloc(4);
-    crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), data])) >>> 0, 0);
-    return Buffer.concat([head, data, crc]);
-  }
   var CRC_TABLE = (() => {
     const table = new Uint32Array(256);
     for (let index = 0; index < 256; index++) {
@@ -1222,80 +1272,93 @@
     }
     return table;
   })();
-  function crc32(buffer) {
-    let crc = 4294967295;
-    for (let i = 0; i < buffer.length; i++) {
-      const mixed = CRC_TABLE[(crc ^ (buffer[i] ?? 0)) & 255] ?? 0;
-      crc = mixed ^ crc >>> 8;
-    }
-    return (crc ^ 4294967295) >>> 0;
+
+  // src/color/presets.ts
+  var PRESETS = {
+    logo: { maxColors: 8, sensitivity: 0.06, smoothContrast: 0.07, cornerAngle: 0.9, smooth: 1.6 },
+    icon: { maxColors: 6, sensitivity: 0.05, smoothContrast: 0.05, cornerAngle: 0.55, smooth: 0.4 },
+    ui: { maxColors: 12, sensitivity: 0.04, smoothContrast: 0.075, cornerAngle: 0.6, smooth: 0.5 },
+    illustration: { maxColors: 16, sensitivity: 0.05, smoothContrast: 0.055, cornerAngle: 0.75, smooth: 1.2 },
+    photo: { maxColors: 24, sensitivity: 0.03, smoothContrast: 0.04, cornerAngle: 0.85, smooth: 1.4 }
+  };
+  function isPresetName(value) {
+    return value === "logo" || value === "icon" || value === "ui" || value === "illustration" || value === "photo";
+  }
+  function presetProfile(value) {
+    return isPresetName(value) ? PRESETS[value] : PRESETS.logo;
+  }
+  function curveError(smooth) {
+    const t = Math.min(3, Math.max(0, smooth)) / 3;
+    return 0.2 + t * 1.3;
+  }
+  function chooseUpscale(width, height, preset) {
+    const minor = Math.min(width, height);
+    if (preset === "photo") return minor <= 400 ? 2 : 1;
+    if (preset === "icon") return minor <= 700 ? 4 : 2;
+    if (preset === "logo") return minor <= 400 ? 3 : minor <= 900 ? 2 : 1;
+    if (preset === "ui") return minor <= 400 ? 3 : 2;
+    return minor <= 400 ? 3 : minor <= 1200 ? 2 : 1;
   }
 
   // src/color/segment.ts
-  function segmentImage(rgba, width, height, maxColors) {
+  var BIN_SHIFT = 3;
+  var BIN_COUNT = 32 * 32 * 32;
+  function segmentImage(rgba, width, height, maxColors, options = {}) {
     if (rgba.length < width * height * 4) throw new Error("\u0E02\u0E49\u0E2D\u0E21\u0E39\u0E25\u0E20\u0E32\u0E1E\u0E2A\u0E31\u0E49\u0E19\u0E01\u0E27\u0E48\u0E32\u0E02\u0E19\u0E32\u0E14\u0E17\u0E35\u0E48\u0E23\u0E30\u0E1A\u0E38");
     const colors = Math.max(1, Math.floor(maxColors));
-    const labels = new Uint16Array(width * height);
+    const profile = options.preset ? PRESETS[options.preset] : PRESETS.logo;
+    const sensitivity = options.sensitivity ?? profile.sensitivity;
+    const smoothContrast = options.smoothContrast ?? profile.smoothContrast;
+    const pixelCount = width * height;
+    const labels = new Uint16Array(pixelCount);
     labels.fill(TRANSPARENT);
     const histogram = /* @__PURE__ */ new Map();
-    for (let i = 0; i < width * height; i++) {
+    let opaque = 0;
+    for (let i = 0; i < pixelCount; i++) {
       const offset = i * 4;
-      const alpha = rgba[offset + 3] ?? 0;
-      if (alpha < 128) continue;
+      if ((rgba[offset + 3] ?? 0) < 128) continue;
+      opaque++;
       const key = (rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0);
       histogram.set(key, (histogram.get(key) ?? 0) + 1);
     }
-    const unique = [];
-    for (const [key, n] of histogram) {
-      unique.push({ r: key >> 16 & 255, g: key >> 8 & 255, b: key & 255, n });
-    }
-    if (unique.length === 0) return { width, height, labels, palette: [] };
-    const palette = unique.length <= colors ? exactPalette(unique) : medianCutPalette(unique, colors);
-    for (let i = 0; i < width * height; i++) {
-      const offset = i * 4;
-      if ((rgba[offset + 3] ?? 0) < 128) continue;
-      labels[i] = nearest(palette, rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0);
-    }
-    return compactSegmentation({ width, height, labels, palette });
-  }
-  function renderRgba(segmentation) {
-    const rgba = new Uint8Array(segmentation.width * segmentation.height * 4);
-    for (let i = 0; i < segmentation.labels.length; i++) {
-      const label = segmentation.labels[i] ?? TRANSPARENT;
-      if (label === TRANSPARENT) continue;
-      const color = segmentation.palette[label];
-      if (!color) continue;
-      const offset = i * 4;
-      rgba[offset] = color.r;
-      rgba[offset + 1] = color.g;
-      rgba[offset + 2] = color.b;
-      rgba[offset + 3] = 255;
-    }
-    return rgba;
-  }
-  function segmentationToSvg(segmentation) {
-    const groups = /* @__PURE__ */ new Map();
-    for (let y = 0; y < segmentation.height; y++) {
-      let x = 0;
-      while (x < segmentation.width) {
-        const label = segmentation.labels[y * segmentation.width + x] ?? TRANSPARENT;
-        let end = x + 1;
-        while (end < segmentation.width && (segmentation.labels[y * segmentation.width + end] ?? TRANSPARENT) === label) end++;
-        if (label !== TRANSPARENT && segmentation.palette[label]) {
-          const list = groups.get(label) ?? [];
-          list.push('<rect x="' + x + '" y="' + y + '" width="' + (end - x) + '" height="1"/>');
-          groups.set(label, list);
-        }
-        x = end;
+    if (opaque === 0) return { width, height, labels, palette: [] };
+    if (histogram.size <= colors) {
+      const palette = exactPalette(histogram);
+      const lookup = /* @__PURE__ */ new Map();
+      palette.forEach((color, index) => lookup.set(color.r << 16 | color.g << 8 | color.b, index));
+      for (let i = 0; i < pixelCount; i++) {
+        const offset = i * 4;
+        if ((rgba[offset + 3] ?? 0) < 128) continue;
+        const key = (rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0);
+        labels[i] = lookup.get(key) ?? 0;
       }
+      return { width, height, labels, palette };
     }
-    const body = [];
-    for (const [label, rects] of groups) {
-      const color = segmentation.palette[label];
-      if (!color || rects.length === 0) continue;
-      body.push('<g fill="' + rgbHex(color) + '">' + rects.join("") + "</g>");
-    }
-    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + segmentation.width + " " + segmentation.height + '" width="' + segmentation.width + '" height="' + segmentation.height + '" shape-rendering="crispEdges">' + body.join("") + "</svg>";
+    const bins = buildBins(rgba, pixelCount);
+    const seeded = seedCentroids(bins, colors);
+    const centroids = kMeans(bins, seeded.labs);
+    ensureProtected(centroids, seeded.protectedLabs);
+    const paletteLabs = centroids.map((lab) => ({ ...lab }));
+    assignPixels(rgba, labels, pixelCount, paletteLabs);
+    const coverage = new Float32Array(pixelCount);
+    coverage.fill(1);
+    const partner = new Uint16Array(pixelCount);
+    partner.fill(TRANSPARENT);
+    const blend = new Uint8Array(pixelCount);
+    reassignBlends(rgba, labels, width, height, paletteLabs, coverage, partner, blend);
+    writeRobustPalette(rgba, labels, width, height, paletteLabs, blend);
+    mergeClusters(labels, partner, coverage, paletteLabs, sensitivity, smoothContrast, colors);
+    smoothLowContrast(labels, partner, coverage, width, height, paletteLabs, smoothContrast);
+    removeWeakSpeckles(labels, partner, coverage, width, height, paletteLabs);
+    const compacted = compactAll(labels, partner, paletteLabs);
+    return {
+      width,
+      height,
+      labels: compacted.labels,
+      palette: compacted.palette,
+      coverage,
+      partner: compacted.partner
+    };
   }
   function countSvgFills(svg) {
     const found = /* @__PURE__ */ new Set();
@@ -1307,109 +1370,536 @@
     }
     return found.size;
   }
-  function exactPalette(unique) {
-    return [...unique].sort((a, b) => b.n - a.n || a.r - b.r || a.g - b.g || a.b - b.b).map((color) => ({ r: color.r, g: color.g, b: color.b }));
+  function exactPalette(histogram) {
+    const unique = [];
+    for (const [key, n] of histogram) unique.push({ r: key >> 16 & 255, g: key >> 8 & 255, b: key & 255, n });
+    unique.sort((a, b) => b.n - a.n || a.r - b.r || a.g - b.g || a.b - b.b);
+    return unique.map((color) => ({ r: color.r, g: color.g, b: color.b }));
   }
-  function medianCutPalette(unique, maxColors) {
-    let buckets = [unique.slice()];
-    while (buckets.length < maxColors) {
+  function buildBins(rgba, pixelCount) {
+    const count = new Int32Array(BIN_COUNT);
+    const sumR = new Float64Array(BIN_COUNT);
+    const sumG = new Float64Array(BIN_COUNT);
+    const sumB = new Float64Array(BIN_COUNT);
+    for (let i = 0; i < pixelCount; i++) {
+      const offset = i * 4;
+      if ((rgba[offset + 3] ?? 0) < 128) continue;
+      const r = rgba[offset] ?? 0;
+      const g = rgba[offset + 1] ?? 0;
+      const b = rgba[offset + 2] ?? 0;
+      const key = r >> BIN_SHIFT << 10 | g >> BIN_SHIFT << 5 | b >> BIN_SHIFT;
+      count[key] = (count[key] ?? 0) + 1;
+      sumR[key] = (sumR[key] ?? 0) + r;
+      sumG[key] = (sumG[key] ?? 0) + g;
+      sumB[key] = (sumB[key] ?? 0) + b;
+    }
+    const bins = [];
+    for (let key = 0; key < BIN_COUNT; key++) {
+      const n = count[key] ?? 0;
+      if (n === 0) continue;
+      const r = Math.round((sumR[key] ?? 0) / n);
+      const g = Math.round((sumG[key] ?? 0) / n);
+      const b = Math.round((sumB[key] ?? 0) / n);
+      bins.push({ r, g, b, n, lab: rgbToOklab(r, g, b), key });
+    }
+    return bins;
+  }
+  function seedCentroids(bins, maxColors) {
+    const seeds = [];
+    const protectedLabs = [];
+    const remember = (lab, protect) => {
+      if (seeds.length >= maxColors) return;
+      if (seeds.some((seed) => oklabDistance(seed, lab) < 0.045)) return;
+      seeds.push(lab);
+      if (protect) protectedLabs.push(lab);
+    };
+    const chromaBins = bins.filter((bin) => oklabChroma(bin.lab) > 0.08 && bin.n >= 6).sort((a, b) => b.n * oklabChroma(b.lab) - a.n * oklabChroma(a.lab));
+    const chromaBudget = Math.max(1, Math.floor(maxColors / 2));
+    for (const bin of chromaBins) {
+      if (seeds.length >= chromaBudget) break;
+      if (seeds.every((seed) => oklabDistance(seed, bin.lab) > 0.07)) {
+        seeds.push(bin.lab);
+        protectedLabs.push(bin.lab);
+      }
+    }
+    const populous = bins.filter((bin) => bin.n >= 24).sort((a, b) => a.lab.l - b.lab.l);
+    const darkest = populous[0];
+    const lightest = populous[populous.length - 1];
+    if (darkest) remember(darkest.lab, darkest.lab.l < 0.35);
+    if (lightest) remember(lightest.lab, lightest.lab.l > 0.9);
+    const minorities = bins.filter((bin) => bin.n >= 4).sort((a, b) => b.n - a.n);
+    for (const bin of minorities) {
+      if (seeds.length >= maxColors) break;
+      const isolated = seeds.every((seed) => oklabDistance(seed, bin.lab) > 0.12);
+      const vivid = oklabChroma(bin.lab) > 0.08 || bin.lab.l < 0.22 || bin.lab.l > 0.93;
+      if (isolated && vivid) {
+        seeds.push(bin.lab);
+        protectedLabs.push(bin.lab);
+      }
+    }
+    while (seeds.length < maxColors) {
       let best = -1;
-      let bestScore = -1;
-      for (let i = 0; i < buckets.length; i++) {
-        const bucket2 = buckets[i];
-        if (!bucket2 || bucket2.length < 2) continue;
-        const score = bucketScore(bucket2);
+      let bestScore = 0;
+      for (let i = 0; i < bins.length; i++) {
+        const bin = bins[i];
+        if (!bin) continue;
+        let nearest = Infinity;
+        for (const seed of seeds) nearest = Math.min(nearest, oklabDistance(seed, bin.lab));
+        const score = nearest * nearest * bin.n;
         if (score > bestScore) {
           bestScore = score;
           best = i;
         }
       }
-      if (best < 0 || bestScore < 1) break;
-      const bucket = buckets[best];
-      if (!bucket) break;
-      const channel = dominantChannel(bucket);
-      bucket.sort((a, b) => channelValue(a, channel) - channelValue(b, channel));
-      let total = 0;
-      for (const color of bucket) total += color.n;
-      let accumulated = 0;
-      let split = 1;
-      for (let i = 0; i < bucket.length; i++) {
-        accumulated += bucket[i]?.n ?? 0;
-        if (accumulated >= total / 2) {
-          split = Math.min(bucket.length - 1, Math.max(1, i));
-          break;
+      const chosen = bins[best];
+      if (!chosen || bestScore < 1e-8) break;
+      seeds.push(chosen.lab);
+    }
+    if (seeds.length === 0 && bins[0]) seeds.push(bins[0].lab);
+    return { labs: seeds, protectedLabs };
+  }
+  function kMeans(bins, seeds) {
+    const centroids = seeds.map((lab) => ({ l: lab.l, a: lab.a, b: lab.b }));
+    const assign = new Int32Array(bins.length);
+    assign.fill(-1);
+    for (let iter = 0; iter < 8; iter++) {
+      let moved = false;
+      for (let i = 0; i < bins.length; i++) {
+        const bin = bins[i];
+        if (!bin) continue;
+        const next = nearestLab(centroids, bin.lab);
+        if (assign[i] !== next) moved = true;
+        assign[i] = next;
+      }
+      const sumL = new Float64Array(centroids.length);
+      const sumA = new Float64Array(centroids.length);
+      const sumB = new Float64Array(centroids.length);
+      const sumN = new Float64Array(centroids.length);
+      for (let i = 0; i < bins.length; i++) {
+        const bin = bins[i];
+        if (!bin) continue;
+        const group = assign[i] ?? 0;
+        sumL[group] = (sumL[group] ?? 0) + bin.lab.l * bin.n;
+        sumA[group] = (sumA[group] ?? 0) + bin.lab.a * bin.n;
+        sumB[group] = (sumB[group] ?? 0) + bin.lab.b * bin.n;
+        sumN[group] = (sumN[group] ?? 0) + bin.n;
+      }
+      for (let group = 0; group < centroids.length; group++) {
+        const n = sumN[group] ?? 0;
+        if (n <= 0) continue;
+        centroids[group] = {
+          l: (sumL[group] ?? 0) / n,
+          a: (sumA[group] ?? 0) / n,
+          b: (sumB[group] ?? 0) / n
+        };
+      }
+      if (!moved && iter > 0) break;
+    }
+    return centroids;
+  }
+  function ensureProtected(centroids, protectedLabs) {
+    for (const lab of protectedLabs) {
+      if (centroids.some((centroid) => oklabDistance(centroid, lab) < 0.08)) continue;
+      centroids.push(lab);
+    }
+  }
+  function assignPixels(rgba, labels, pixelCount, centroids) {
+    const binLabel = new Int16Array(BIN_COUNT);
+    binLabel.fill(-1);
+    for (let i = 0; i < pixelCount; i++) {
+      const offset = i * 4;
+      if ((rgba[offset + 3] ?? 0) < 128) continue;
+      const r = rgba[offset] ?? 0;
+      const g = rgba[offset + 1] ?? 0;
+      const b = rgba[offset + 2] ?? 0;
+      const key = r >> BIN_SHIFT << 10 | g >> BIN_SHIFT << 5 | b >> BIN_SHIFT;
+      let label = binLabel[key] ?? -1;
+      if (label < 0) {
+        label = nearestLab(centroids, rgbToOklab(r, g, b));
+        binLabel[key] = label;
+      }
+      labels[i] = label;
+    }
+  }
+  function reassignBlends(rgba, labels, width, height, palette, coverage, partner, blend) {
+    const next = labels.slice();
+    const cache = /* @__PURE__ */ new Map();
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT) continue;
+        let bestOther = -1;
+        let bestT = 0;
+        let bestPerp = Infinity;
+        const neighbors = [
+          [x - 1, y],
+          [x + 1, y],
+          [x, y - 1],
+          [x, y + 1]
+        ];
+        for (const [nx, ny] of neighbors) {
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const other = labels[ny * width + nx] ?? TRANSPARENT;
+          if (other === TRANSPARENT || other === label) continue;
+          const color = palette[label];
+          const neighbor = palette[other];
+          if (!color || !neighbor) continue;
+          const lab = cachedLab(cache, rgba, index);
+          const along = project(lab, color, neighbor);
+          if (!along) continue;
+          if (along.t < 0.08 || along.t > 0.92) continue;
+          if (along.perp >= Math.min(0.03, 0.35 * along.length)) continue;
+          if (along.perp < bestPerp) {
+            bestPerp = along.perp;
+            bestT = along.t;
+            bestOther = other;
+          }
+        }
+        if (bestOther < 0) continue;
+        blend[index] = 1;
+        if (bestT < 0.5) {
+          coverage[index] = 1 - bestT;
+          partner[index] = bestOther;
+        } else {
+          next[index] = bestOther;
+          coverage[index] = bestT;
+          partner[index] = label;
         }
       }
-      buckets.splice(best, 1, bucket.slice(0, split), bucket.slice(split));
     }
-    return buckets.map((bucket) => average(bucket));
+    labels.set(next);
   }
-  function bucketScore(bucket) {
-    let total = 0;
-    for (const color of bucket) total += color.n;
-    return channelSpan(bucket) * total;
-  }
-  function channelSpan(bucket) {
-    let best = 0;
-    for (const channel of [0, 1, 2]) {
-      let min = 255;
-      let max = 0;
-      for (const color of bucket) {
-        const value = channelValue(color, channel);
-        if (value < min) min = value;
-        if (value > max) max = value;
-      }
-      if (max - min > best) best = max - min;
-    }
-    return best;
-  }
-  function dominantChannel(bucket) {
-    let best = 0;
-    let bestSpan = -1;
-    for (const channel of [0, 1, 2]) {
-      let min = 255;
-      let max = 0;
-      for (const color of bucket) {
-        const value = channelValue(color, channel);
-        if (value < min) min = value;
-        if (value > max) max = value;
-      }
-      if (max - min > bestSpan) {
-        bestSpan = max - min;
-        best = channel;
+  function writeRobustPalette(rgba, labels, width, height, palette, blend) {
+    const count = palette.length;
+    const interior = new Int32Array(count);
+    const solid = new Int32Array(count);
+    const all = new Int32Array(count);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT || label >= count) continue;
+        all[label] = (all[label] ?? 0) + 1;
+        if ((blend[index] ?? 0) === 1) continue;
+        solid[label] = (solid[label] ?? 0) + 1;
+        if (isInterior(labels, width, height, x, y, label)) interior[label] = (interior[label] ?? 0) + 1;
       }
     }
-    return best;
-  }
-  function channelValue(color, channel) {
-    if (channel === 0) return color.r;
-    if (channel === 1) return color.g;
-    return color.b;
-  }
-  function average(bucket) {
-    let n = 0;
-    let r = 0;
-    let g = 0;
-    let b = 0;
-    for (const color of bucket) {
-      n += color.n;
-      r += color.r * color.n;
-      g += color.g * color.n;
-      b += color.b * color.n;
+    const mode = new Uint8Array(count);
+    for (let label = 0; label < count; label++) {
+      if ((interior[label] ?? 0) >= 12) mode[label] = 2;
+      else if ((solid[label] ?? 0) >= 4) mode[label] = 1;
+      else mode[label] = 0;
     }
-    if (n === 0) return { r: 0, g: 0, b: 0 };
-    return { r: Math.round(r / n), g: Math.round(g / n), b: Math.round(b / n) };
+    const bins = 96;
+    const histL = new Int32Array(count * bins);
+    const histA = new Int32Array(count * bins);
+    const histB = new Int32Array(count * bins);
+    const used = new Int32Array(count);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT || label >= count) continue;
+        const kind = mode[label] ?? 0;
+        if (kind === 2 && (!isInterior(labels, width, height, x, y, label) || (blend[index] ?? 0) === 1)) continue;
+        if (kind === 1 && (blend[index] ?? 0) === 1) continue;
+        const offset = index * 4;
+        const lab = rgbToOklab(rgba[offset] ?? 0, rgba[offset + 1] ?? 0, rgba[offset + 2] ?? 0);
+        const base = label * bins;
+        histL[base + labBin(lab.l, 0, 1, bins)] = (histL[base + labBin(lab.l, 0, 1, bins)] ?? 0) + 1;
+        histA[base + labBin(lab.a, -0.45, 0.45, bins)] = (histA[base + labBin(lab.a, -0.45, 0.45, bins)] ?? 0) + 1;
+        histB[base + labBin(lab.b, -0.45, 0.45, bins)] = (histB[base + labBin(lab.b, -0.45, 0.45, bins)] ?? 0) + 1;
+        used[label] = (used[label] ?? 0) + 1;
+      }
+    }
+    for (let label = 0; label < count; label++) {
+      const total = used[label] ?? 0;
+      if (total === 0) continue;
+      const base = label * bins;
+      palette[label] = {
+        l: histogramMedian(histL, base, bins, total, 0, 1),
+        a: histogramMedian(histA, base, bins, total, -0.45, 0.45),
+        b: histogramMedian(histB, base, bins, total, -0.45, 0.45)
+      };
+    }
   }
-  function nearest(palette, r, g, b) {
-    let best = 0;
-    let bestDistance = Number.POSITIVE_INFINITY;
+  function mergeClusters(labels, partner, coverage, palette, sensitivity, smoothContrast, maxColors) {
+    const counts = countLabels(labels, palette.length);
+    const active = palette.map((_, index) => (counts[index] ?? 0) > 0);
+    const protectedSlot = palette.map((lab) => oklabChroma(lab) > 0.08 || lab.l < 0.2 || lab.l > 0.93);
+    const activeCount = () => active.filter(Boolean).length;
+    for (; ; ) {
+      let bestI = -1;
+      let bestJ = -1;
+      let bestD = Infinity;
+      let bestAllowed = false;
+      for (let i = 0; i < palette.length; i++) {
+        if (!active[i]) continue;
+        const left = palette[i];
+        if (!left) continue;
+        for (let j = i + 1; j < palette.length; j++) {
+          if (!active[j]) continue;
+          const right = palette[j];
+          if (!right) continue;
+          const distance = oklabDistance(left, right);
+          const bothDark = left.l < 0.34 && right.l < 0.34 && oklabChroma(left) < 0.08 && oklabChroma(right) < 0.08;
+          const lowChroma = oklabChroma(left) < 0.05 && oklabChroma(right) < 0.05;
+          const limit = bothDark ? 0.22 : lowChroma ? Math.max(sensitivity, smoothContrast) : sensitivity;
+          const bothProtected = (protectedSlot[i] ?? false) && (protectedSlot[j] ?? false) && !bothDark;
+          const underLimit = distance < limit && !bothProtected;
+          const overBudget = activeCount() > maxColors && !bothProtected;
+          if (!underLimit && !overBudget) continue;
+          const prefer = underLimit && !bestAllowed ? true : underLimit === bestAllowed && distance < bestD;
+          if (bestI < 0 || prefer) {
+            bestI = i;
+            bestJ = j;
+            bestD = distance;
+            bestAllowed = underLimit;
+          }
+        }
+      }
+      if (bestI < 0 || bestJ < 0) break;
+      const leftLab = palette[bestI];
+      const rightLab = palette[bestJ];
+      const darkPair = !!leftLab && !!rightLab && leftLab.l < 0.34 && rightLab.l < 0.34 && oklabChroma(leftLab) < 0.08 && oklabChroma(rightLab) < 0.08;
+      const source = darkPair ? leftLab.l <= rightLab.l ? bestJ : bestI : (counts[bestI] ?? 0) <= (counts[bestJ] ?? 0) ? bestI : bestJ;
+      const target = source === bestI ? bestJ : bestI;
+      relabel(labels, partner, coverage, source, target);
+      counts[target] = (counts[target] ?? 0) + (counts[source] ?? 0);
+      counts[source] = 0;
+      active[source] = false;
+    }
+  }
+  function smoothLowContrast(labels, partner, coverage, width, height, palette, smoothContrast) {
+    const distance = /* @__PURE__ */ new Map();
+    const pair = (a, b) => {
+      const key = a < b ? a * palette.length + b : b * palette.length + a;
+      const cached = distance.get(key);
+      if (cached !== void 0) return cached;
+      const left = palette[a];
+      const right = palette[b];
+      const value = left && right ? oklabDistance(left, right) : Infinity;
+      distance.set(key, value);
+      return value;
+    };
+    const votes = new Int32Array(palette.length);
+    const touched = [];
+    for (let iter = 0; iter < 6; iter++) {
+      const next = labels.slice();
+      let changed = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const index = y * width + x;
+          const label = labels[index] ?? TRANSPARENT;
+          if (label === TRANSPARENT) continue;
+          touched.length = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            const ny = y + dy;
+            if (ny < 0 || ny >= height) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nx = x + dx;
+              if (nx < 0 || nx >= width) continue;
+              const neighbor = labels[ny * width + nx] ?? TRANSPARENT;
+              if (neighbor === TRANSPARENT || neighbor >= votes.length) continue;
+              if ((votes[neighbor] ?? 0) === 0) touched.push(neighbor);
+              votes[neighbor] = (votes[neighbor] ?? 0) + 1;
+            }
+          }
+          let best = label;
+          let bestCount = 0;
+          for (const candidate of touched) {
+            const count = votes[candidate] ?? 0;
+            if (count > bestCount) {
+              best = candidate;
+              bestCount = count;
+            }
+            votes[candidate] = 0;
+          }
+          if (best === label || bestCount < 5) continue;
+          if (pair(label, best) >= smoothContrast) continue;
+          next[index] = best;
+          coverage[index] = 1;
+          partner[index] = TRANSPARENT;
+          changed++;
+        }
+      }
+      labels.set(next);
+      if (changed === 0) break;
+    }
+  }
+  function removeWeakSpeckles(labels, partner, coverage, width, height, palette) {
+    const areaLimit = Math.max(12, Math.round(width * height * 5e-5));
+    const seen = new Uint8Array(labels.length);
+    const stack = [];
+    for (let start2 = 0; start2 < labels.length; start2++) {
+      const label = labels[start2] ?? TRANSPARENT;
+      if (label === TRANSPARENT || seen[start2]) continue;
+      stack.push(start2);
+      seen[start2] = 1;
+      const pixels = [];
+      const adjacency = /* @__PURE__ */ new Map();
+      let minX = width;
+      let maxX = 0;
+      let minY = height;
+      let maxY = 0;
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === void 0) break;
+        pixels.push(current);
+        const x = current % width;
+        const y = (current - x) / width;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const next of neighbors) {
+          const nx = next % width;
+          const ny = (next - nx) / width;
+          if (next < 0 || next >= labels.length) continue;
+          if (next === current - 1 && x === 0 || next === current + 1 && x + 1 === width) continue;
+          if (ny < 0 || ny >= height) continue;
+          const neighbor = labels[next] ?? TRANSPARENT;
+          if (neighbor === label) {
+            if (!seen[next]) {
+              seen[next] = 1;
+              stack.push(next);
+            }
+          } else if (neighbor !== TRANSPARENT) {
+            adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+          }
+        }
+      }
+      if (pixels.length > areaLimit || adjacency.size === 0) continue;
+      const spanX = maxX - minX + 1;
+      const spanY = maxY - minY + 1;
+      const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+      if (aspect >= 2.2) continue;
+      if (pixels.length >= 6 && componentThickness2(pixels, width, height, 2) <= 2) continue;
+      const own = palette[label];
+      if (!own) continue;
+      let target = -1;
+      let bestScore = -1;
+      let contrast = Infinity;
+      for (const [other, touches] of adjacency) {
+        const color = palette[other];
+        if (!color) continue;
+        const distance = oklabDistance(own, color);
+        const score = touches / (1 + distance * 8);
+        if (score > bestScore) {
+          bestScore = score;
+          target = other;
+          contrast = distance;
+        }
+      }
+      if (target < 0) continue;
+      const vivid = oklabChroma(own) > 0.08 || own.l < 0.22 || own.l > 0.92;
+      if (vivid && contrast > 0.05) continue;
+      if (contrast >= 0.1) continue;
+      for (const pixel of pixels) {
+        labels[pixel] = target;
+        coverage[pixel] = 1;
+        partner[pixel] = TRANSPARENT;
+      }
+    }
+  }
+  function compactAll(labels, partner, palette) {
+    const used = new Array(palette.length).fill(false);
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? TRANSPARENT;
+      if (label !== TRANSPARENT && label < used.length) used[label] = true;
+    }
+    const map = new Array(palette.length).fill(TRANSPARENT);
+    const nextPalette = [];
     for (let i = 0; i < palette.length; i++) {
-      const color = palette[i];
-      if (!color) continue;
-      const dr = color.r - r;
-      const dg = color.g - g;
-      const db = color.b - b;
-      const distance = dr * dr + dg * dg + db * db;
+      if (!used[i]) continue;
+      map[i] = nextPalette.length;
+      const lab = palette[i];
+      if (lab) nextPalette.push(oklabToRgb(lab));
+    }
+    const nextLabels = new Uint16Array(labels.length);
+    const nextPartner = new Uint16Array(partner.length);
+    nextPartner.fill(TRANSPARENT);
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? TRANSPARENT;
+      nextLabels[i] = label === TRANSPARENT ? TRANSPARENT : map[label] ?? TRANSPARENT;
+      const other = partner[i] ?? TRANSPARENT;
+      const mapped = other === TRANSPARENT ? TRANSPARENT : map[other] ?? TRANSPARENT;
+      nextPartner[i] = mapped === nextLabels[i] ? TRANSPARENT : mapped;
+    }
+    return { labels: nextLabels, palette: nextPalette, partner: nextPartner };
+  }
+  function cachedLab(cache, rgba, index) {
+    const offset = index * 4;
+    const key = (rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0);
+    const found = cache.get(key);
+    if (found) return found;
+    const lab = rgbToOklab(key >> 16 & 255, key >> 8 & 255, key & 255);
+    cache.set(key, lab);
+    return lab;
+  }
+  function project(point, from, to) {
+    const dl = to.l - from.l;
+    const da = to.a - from.a;
+    const db = to.b - from.b;
+    const length2 = dl * dl + da * da + db * db;
+    if (length2 < 1e-10) return null;
+    const t = ((point.l - from.l) * dl + (point.a - from.a) * da + (point.b - from.b) * db) / length2;
+    const qx = from.l + t * dl;
+    const qy = from.a + t * da;
+    const qz = from.b + t * db;
+    return {
+      t,
+      perp: Math.hypot(point.l - qx, point.a - qy, point.b - qz),
+      length: Math.sqrt(length2)
+    };
+  }
+  function isInterior(labels, width, height, x, y, label) {
+    if (x === 0 || y === 0 || x + 1 === width || y + 1 === height) return false;
+    const index = y * width + x;
+    return labels[index - 1] === label && labels[index + 1] === label && labels[index - width] === label && labels[index + width] === label;
+  }
+  function labBin(value, min, max, bins) {
+    const t = (value - min) / (max - min);
+    return Math.min(bins - 1, Math.max(0, Math.floor(t * bins)));
+  }
+  function histogramMedian(hist, base, bins, total, min, max) {
+    const half = total / 2;
+    let accumulated = 0;
+    for (let i = 0; i < bins; i++) {
+      accumulated += hist[base + i] ?? 0;
+      if (accumulated >= half) return min + (i + 0.5) / bins * (max - min);
+    }
+    return (min + max) / 2;
+  }
+  function countLabels(labels, paletteLength) {
+    const counts = new Int32Array(paletteLength);
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? TRANSPARENT;
+      if (label !== TRANSPARENT && label < paletteLength) counts[label] = (counts[label] ?? 0) + 1;
+    }
+    return counts;
+  }
+  function relabel(labels, partner, coverage, source, target) {
+    for (let i = 0; i < labels.length; i++) {
+      if (labels[i] === source) labels[i] = target;
+      if (partner[i] === source) partner[i] = target;
+      if (partner[i] === labels[i]) {
+        partner[i] = TRANSPARENT;
+        coverage[i] = 1;
+      }
+    }
+  }
+  function nearestLab(centroids, lab) {
+    let best = 0;
+    let bestDistance = Infinity;
+    for (let i = 0; i < centroids.length; i++) {
+      const centroid = centroids[i];
+      if (!centroid) continue;
+      const distance = oklabDistance(centroid, lab);
       if (distance < bestDistance) {
         bestDistance = distance;
         best = i;
@@ -1417,27 +1907,669 @@
     }
     return best;
   }
-  function compactSegmentation(segmentation) {
-    const used = new Array(segmentation.palette.length).fill(false);
-    for (let i = 0; i < segmentation.labels.length; i++) {
-      const label = segmentation.labels[i] ?? TRANSPARENT;
-      if (label !== TRANSPARENT && label < used.length) used[label] = true;
+  function componentThickness2(pixels, width, height, limit) {
+    const alive = new Set(pixels);
+    let steps = 0;
+    while (alive.size > 0 && steps <= limit) {
+      const remove = [];
+      for (const pixel of alive) {
+        const x = pixel % width;
+        const y = (pixel - x) / width;
+        const exposed = x === 0 || y === 0 || x + 1 === width || y + 1 === height || !alive.has(pixel - 1) || !alive.has(pixel + 1) || !alive.has(pixel - width) || !alive.has(pixel + width);
+        if (exposed) remove.push(pixel);
+      }
+      if (remove.length === 0) return steps + 1;
+      for (const pixel of remove) alive.delete(pixel);
+      steps++;
     }
-    if (used.every((value) => value)) return segmentation;
-    const map = new Array(segmentation.palette.length).fill(-1);
-    const palette = [];
-    for (let i = 0; i < segmentation.palette.length; i++) {
-      if (!used[i]) continue;
-      map[i] = palette.length;
-      const color = segmentation.palette[i];
-      if (color) palette.push(color);
+    return alive.size > 0 ? limit + 1 : steps;
+  }
+
+  // src/color/trace.ts
+  function traceSegmentation(segmentation, options = {}) {
+    const preset = options.preset ?? "logo";
+    const profile = presetProfile(preset);
+    const error = curveError(options.smooth ?? profile.smooth);
+    const cornerAngle = options.cornerAngle ?? profile.cornerAngle;
+    const scale = options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
+    const field = resolveField(segmentation, options);
+    const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
+    const shapes = [];
+    const cache = /* @__PURE__ */ new Map();
+    const counts = countLabels2(scaled.labels, segmentation.palette.length);
+    const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
+    order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
+    for (const label of order) {
+      if (options.isCancelled?.()) break;
+      const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
+      const subpaths = [];
+      for (const contour of contours) {
+        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(error * 0.75, 1.15 / scale), cache);
+        if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
+      }
+      const color = segmentation.palette[label];
+      if (!color || subpaths.length === 0) continue;
+      shapes.push({ color, area: counts[label] ?? 0, subpaths });
     }
-    const labels = new Uint16Array(segmentation.labels.length);
-    for (let i = 0; i < segmentation.labels.length; i++) {
-      const label = segmentation.labels[i] ?? TRANSPARENT;
-      labels[i] = label === TRANSPARENT ? TRANSPARENT : map[label] ?? TRANSPARENT;
+    let nodeCount = 0;
+    let subpathCount = 0;
+    for (const shape of shapes) {
+      subpathCount += shape.subpaths.length;
+      for (const subpath of shape.subpaths) nodeCount += subpath.commands.length;
     }
-    return { width: segmentation.width, height: segmentation.height, labels, palette };
+    return {
+      svg: shapesToSvg(shapes, segmentation.width, segmentation.height),
+      pathCount: shapes.length,
+      nodeCount,
+      subpathCount,
+      colorCount: shapes.length,
+      shapes
+    };
+  }
+  function resolveField(segmentation, options) {
+    const count = segmentation.width * segmentation.height;
+    const labels = segmentation.labels;
+    const coverage = new Float32Array(count);
+    coverage.fill(1);
+    const partner = new Uint16Array(count);
+    partner.fill(TRANSPARENT);
+    const sourceCoverage = options.coverage ?? segmentation.coverage;
+    const sourcePartner = options.partner ?? segmentation.partner;
+    if (sourceCoverage && sourceCoverage.length === count) coverage.set(sourceCoverage);
+    if (sourcePartner && sourcePartner.length === count) partner.set(sourcePartner);
+    const original = options.originalLabels;
+    if (original && original.length === count) {
+      for (let i = 0; i < count; i++) {
+        if ((labels[i] ?? TRANSPARENT) !== (original[i] ?? TRANSPARENT)) {
+          coverage[i] = 1;
+          partner[i] = TRANSPARENT;
+        }
+      }
+    }
+    const paletteLength = segmentation.palette.length;
+    for (let i = 0; i < count; i++) {
+      const other = partner[i] ?? TRANSPARENT;
+      const label = labels[i] ?? TRANSPARENT;
+      if (other === TRANSPARENT || other === label || other >= paletteLength) {
+        partner[i] = TRANSPARENT;
+        if (other === label) coverage[i] = 1;
+      }
+    }
+    return { labels, coverage, partner };
+  }
+  function upscaleField(field, width, height, scale) {
+    const scaledWidth = width * scale;
+    const scaledHeight = height * scale;
+    const labels = new Uint16Array(scaledWidth * scaledHeight);
+    labels.fill(TRANSPARENT);
+    const cells = [];
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = y * width + x;
+        const label = field.labels[index] ?? TRANSPARENT;
+        if (label === TRANSPARENT) continue;
+        const other = field.partner[index] ?? TRANSPARENT;
+        const cover = field.coverage[index] ?? 1;
+        const originX = x * scale;
+        const originY = y * scale;
+        if (other === TRANSPARENT || cover >= 0.999) {
+          fillBlock(labels, scaledWidth, originX, originY, scale, label);
+          continue;
+        }
+        let dx = 0;
+        let dy = 0;
+        if (x > 0 && field.labels[index - 1] === other) dx -= 1;
+        if (x + 1 < width && field.labels[index + 1] === other) dx += 1;
+        if (y > 0 && field.labels[index - width] === other) dy -= 1;
+        if (y + 1 < height && field.labels[index + width] === other) dy += 1;
+        if (dx === 0 && dy === 0) dx = 1;
+        cells.length = 0;
+        for (let sy = 0; sy < scale; sy++) {
+          for (let sx = 0; sx < scale; sx++) {
+            const px = sx - (scale - 1) / 2;
+            const py = sy - (scale - 1) / 2;
+            cells.push({ x: sx, y: sy, proj: px * dx + py * dy });
+          }
+        }
+        cells.sort((a, b) => b.proj - a.proj || a.y - b.y || a.x - b.x);
+        const partnerCount = Math.max(0, Math.min(scale * scale, Math.round((1 - cover) * scale * scale)));
+        for (let i = 0; i < cells.length; i++) {
+          const cell = cells[i];
+          if (!cell) continue;
+          labels[(originY + cell.y) * scaledWidth + originX + cell.x] = i < partnerCount ? other : label;
+        }
+      }
+    }
+    return { labels, width: scaledWidth, height: scaledHeight };
+  }
+  function fillBlock(labels, width, originX, originY, scale, label) {
+    for (let sy = 0; sy < scale; sy++) {
+      const row = (originY + sy) * width + originX;
+      labels.fill(label, row, row + scale);
+    }
+  }
+  function traceLabel(labels, width, height, label) {
+    const horizontal = new Uint8Array(width * (height + 1));
+    const vertical = new Uint8Array((width + 1) * height);
+    const contours = [];
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if ((labels[y * width + x] ?? TRANSPARENT) !== label) continue;
+        if (sample(labels, width, height, x, y - 1) === label) continue;
+        if ((horizontal[y * width + x] ?? 0) & 1) continue;
+        const contour = walk(labels, width, height, label, x, y, horizontal, vertical);
+        if (contour && contour.points.length >= 3) contours.push(contour);
+      }
+    }
+    return contours;
+  }
+  function walk(labels, width, height, label, startX, startY, horizontal, vertical) {
+    let x = startX;
+    let y = startY;
+    let dir = 0;
+    const points = [];
+    const outside = [];
+    const limit = (width + 1) * (height + 1) * 2;
+    for (let step = 0; step < limit; step++) {
+      if (step > 0 && x === startX && y === startY && dir === 0) break;
+      if (!markEdge(x, y, dir, width, height, horizontal, vertical)) break;
+      points.push({ x, y });
+      const left = leftOf(x, y, dir);
+      outside.push(sample(labels, width, height, left[0], left[1]));
+      if (dir === 0) x += 1;
+      else if (dir === 1) y += 1;
+      else if (dir === 2) x -= 1;
+      else y -= 1;
+      const turn = [dir + 1 & 3, dir, dir + 3 & 3, dir + 2 & 3];
+      let next = -1;
+      for (const candidate of turn) {
+        const right = rightOf(x, y, candidate);
+        const other = leftOf(x, y, candidate);
+        if (sample(labels, width, height, right[0], right[1]) === label && sample(labels, width, height, other[0], other[1]) !== label) {
+          next = candidate;
+          break;
+        }
+      }
+      if (next < 0) break;
+      dir = next;
+    }
+    if (points.length !== outside.length || points.length < 3) return null;
+    return { points, outside };
+  }
+  function sample(labels, width, height, x, y) {
+    if (x < 0 || y < 0 || x >= width || y >= height) return TRANSPARENT;
+    return labels[y * width + x] ?? TRANSPARENT;
+  }
+  function rightOf(x, y, dir) {
+    if (dir === 0) return [x, y];
+    if (dir === 1) return [x - 1, y];
+    if (dir === 2) return [x - 1, y - 1];
+    return [x, y - 1];
+  }
+  function leftOf(x, y, dir) {
+    if (dir === 0) return [x, y - 1];
+    if (dir === 1) return [x, y];
+    if (dir === 2) return [x - 1, y];
+    return [x - 1, y - 1];
+  }
+  function markEdge(x, y, dir, width, height, horizontal, vertical) {
+    if (dir === 0 || dir === 2) {
+      const edgeX = dir === 0 ? x : x - 1;
+      if (edgeX < 0 || y < 0 || edgeX >= width || y > height) return false;
+      const index2 = y * width + edgeX;
+      const bit2 = dir === 0 ? 1 : 2;
+      if ((horizontal[index2] ?? 0) & bit2) return false;
+      horizontal[index2] = (horizontal[index2] ?? 0) | bit2;
+      return true;
+    }
+    const edgeY = dir === 1 ? y : y - 1;
+    if (x < 0 || edgeY < 0 || x > width || edgeY >= height) return false;
+    const index = edgeY * (width + 1) + x;
+    const bit = dir === 1 ? 1 : 2;
+    if ((vertical[index] ?? 0) & bit) return false;
+    vertical[index] = (vertical[index] ?? 0) | bit;
+    return true;
+  }
+  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache) {
+    const points = contour.points.map((point) => ({ x: point.x / scale, y: point.y / scale }));
+    const chains = splitChains(points, contour.outside);
+    if (chains.length === 0) return null;
+    const only = chains[0];
+    if (chains.length === 1 && only?.closed) {
+      const canonical = canonicalizeClosed(only.points);
+      if (canonical.length < 3) return null;
+      const commands2 = cachedClosed(canonical, error, cornerAngle, simplify, cache);
+      const start3 = canonical[0];
+      if (!start3 || commands2.length === 0) return null;
+      return { start: start3, commands: commands2 };
+    }
+    const start2 = chains[0]?.points[0];
+    if (!start2) return null;
+    const commands = [];
+    for (const chain of chains) {
+      if (chain.closed || chain.points.length < 2) continue;
+      commands.push(...cachedOpen(chain.points, error, cornerAngle, simplify, cache));
+    }
+    if (commands.length === 0) return null;
+    return { start: start2, commands };
+  }
+  function splitChains(points, outside) {
+    const count = points.length;
+    if (count < 3 || outside.length !== count) return [];
+    let junction = -1;
+    for (let i = 0; i < count; i++) {
+      if ((outside[i] ?? TRANSPARENT) !== (outside[(i + count - 1) % count] ?? TRANSPARENT)) {
+        junction = i;
+        break;
+      }
+    }
+    if (junction < 0) return [{ points: points.slice(), closed: true }];
+    const chains = [];
+    let cursor = junction;
+    let walked = 0;
+    while (walked < count) {
+      const outsideLabel = outside[cursor] ?? TRANSPARENT;
+      const chain = [points[cursor]];
+      while (walked < count) {
+        const next = (cursor + 1) % count;
+        chain.push(points[next]);
+        walked++;
+        cursor = next;
+        if (walked >= count || (outside[cursor] ?? TRANSPARENT) !== outsideLabel) break;
+      }
+      chains.push({ points: chain, closed: false });
+    }
+    return chains;
+  }
+  function cachedOpen(points, error, cornerAngle, simplify, cache) {
+    const canonical = canonicalizeOpen(points);
+    const key = "o|" + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(canonical.points);
+    let fitted = cache.get(key);
+    if (!fitted) {
+      fitted = fitOpenChain(canonical.points, error, cornerAngle, simplify);
+      cache.set(key, fitted);
+    }
+    const origin = canonical.points[0];
+    if (!origin) return [];
+    return canonical.reversed ? reverseCommands(fitted, origin) : fitted;
+  }
+  function cachedClosed(points, error, cornerAngle, simplify, cache) {
+    const key = "c|" + error.toFixed(4) + "|" + simplify.toFixed(4) + "|" + cornerAngle.toFixed(3) + "|" + pointKey(points);
+    let fitted = cache.get(key);
+    if (!fitted) {
+      fitted = fitClosedChain(points, error, cornerAngle, simplify);
+      cache.set(key, fitted);
+    }
+    return fitted;
+  }
+  function canonicalizeOpen(points) {
+    const forward = points.slice();
+    const backward = points.slice().reverse();
+    if (comparePoints(forward, backward) <= 0) return { points: forward, reversed: false };
+    return { points: backward, reversed: true };
+  }
+  function canonicalizeClosed(points) {
+    if (points.length === 0) return [];
+    let start2 = 0;
+    for (let i = 1; i < points.length; i++) {
+      if (comparePoint(points[i], points[start2]) < 0) start2 = i;
+    }
+    const forward = rotate(points, start2);
+    const reversed = points.slice().reverse();
+    let reverseStart = 0;
+    for (let i = 0; i < reversed.length; i++) {
+      const point = reversed[i];
+      const origin = points[start2];
+      if (point && origin && point.x === origin.x && point.y === origin.y) {
+        reverseStart = i;
+        break;
+      }
+    }
+    const backward = rotate(reversed, reverseStart);
+    return comparePoints(forward, backward) <= 0 ? forward : backward;
+  }
+  function rotate(points, start2) {
+    const out = [];
+    for (let i = 0; i < points.length; i++) out.push(points[(start2 + i) % points.length]);
+    return out;
+  }
+  function comparePoint(a, b) {
+    if (a.x !== b.x) return a.x - b.x;
+    return a.y - b.y;
+  }
+  function comparePoints(a, b) {
+    const count = Math.min(a.length, b.length);
+    for (let i = 0; i < count; i++) {
+      const delta = comparePoint(a[i], b[i]);
+      if (delta !== 0) return delta;
+    }
+    return a.length - b.length;
+  }
+  function pointKey(points) {
+    let key = "";
+    for (const point of points) key += point.x.toFixed(4) + "," + point.y.toFixed(4) + ";";
+    return key;
+  }
+  function fitOpenChain(points, error, cornerAngle, simplify) {
+    const simplified = douglasPeucker(points, simplify);
+    if (simplified.length < 2) return [];
+    const corners = [0];
+    for (let i = 1; i < simplified.length - 1; i++) {
+      if (Math.abs(turnAngle(simplified[i - 1], simplified[i], simplified[i + 1])) >= cornerAngle) corners.push(i);
+    }
+    corners.push(simplified.length - 1);
+    const commands = [];
+    for (let i = 0; i < corners.length - 1; i++) fitRange(simplified, corners[i], corners[i + 1], error, commands);
+    return commands;
+  }
+  function fitClosedChain(points, error, cornerAngle, simplify) {
+    const simplified = simplifyClosed(points, simplify);
+    if (simplified.length < 3) return [];
+    const corners = [];
+    for (let i = 0; i < simplified.length; i++) {
+      const previous = simplified[(i + simplified.length - 1) % simplified.length];
+      const next = simplified[(i + 1) % simplified.length];
+      if (Math.abs(turnAngle(previous, simplified[i], next)) >= cornerAngle) corners.push(i);
+    }
+    const commands = [];
+    if (corners.length === 0) {
+      const step = Math.max(1, Math.floor(simplified.length / 4));
+      const anchors = [];
+      for (let i = 0; i < simplified.length; i += step) anchors.push(i);
+      if (anchors.length < 3) return fitOpenChain(simplified.concat(simplified[0]), error, Math.PI, simplify);
+      for (let i = 0; i < anchors.length; i++) {
+        const span = sliceCyclic(simplified, anchors[i], anchors[(i + 1) % anchors.length]);
+        fitRange(span, 0, span.length - 1, error, commands);
+      }
+      return commands;
+    }
+    for (let i = 0; i < corners.length; i++) {
+      const span = sliceCyclic(simplified, corners[i], corners[(i + 1) % corners.length]);
+      fitRange(span, 0, span.length - 1, error, commands);
+    }
+    return commands;
+  }
+  function simplifyClosed(points, epsilon) {
+    let first = 0;
+    for (let i = 1; i < points.length; i++) {
+      if (comparePoint(points[i], points[first]) < 0) first = i;
+    }
+    let second = 0;
+    let best = -1;
+    for (let i = 0; i < points.length; i++) {
+      if (i === first) continue;
+      const distance = distance2(points[i], points[first]);
+      if (distance > best) {
+        best = distance;
+        second = i;
+      }
+    }
+    const a = douglasPeucker(sliceCyclic(points, first, second), epsilon);
+    const b = douglasPeucker(sliceCyclic(points, second, first), epsilon);
+    if (a.length === 0) return b;
+    return a.concat(b.slice(1, -1));
+  }
+  function sliceCyclic(points, start2, end) {
+    const out = [points[start2]];
+    if (start2 === end) {
+      for (let i = 1; i <= points.length; i++) out.push(points[(start2 + i) % points.length]);
+      return out;
+    }
+    let cursor = start2;
+    do {
+      cursor = (cursor + 1) % points.length;
+      out.push(points[cursor]);
+    } while (cursor !== end);
+    return out;
+  }
+  function douglasPeucker(points, epsilon) {
+    if (points.length < 3) return points.slice();
+    const keep = new Uint8Array(points.length);
+    keep[0] = 1;
+    keep[points.length - 1] = 1;
+    const stack = [0, points.length - 1];
+    while (stack.length > 0) {
+      const end = stack.pop();
+      const start2 = stack.pop();
+      if (start2 === void 0 || end === void 0) break;
+      let bestIndex = -1;
+      let bestDistance = epsilon;
+      let bestKey = Infinity;
+      for (let i = start2 + 1; i < end; i++) {
+        const point = points[i];
+        const from = points[start2];
+        const to = points[end];
+        if (!point || !from || !to) continue;
+        const distance = pointSegmentDistance(point, from, to);
+        const key = point.x * 1e6 + point.y;
+        if (distance > bestDistance + 1e-8 || Math.abs(distance - bestDistance) <= 1e-8 && key < bestKey) {
+          bestDistance = distance;
+          bestIndex = i;
+          bestKey = key;
+        }
+      }
+      if (bestIndex >= 0) {
+        keep[bestIndex] = 1;
+        stack.push(start2, bestIndex, bestIndex, end);
+      }
+    }
+    const out = [];
+    for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i]);
+    return out;
+  }
+  function fitRange(points, start2, end, error, out) {
+    const from = points[start2];
+    const to = points[end];
+    if (!from || !to || end <= start2) return;
+    if (end === start2 + 1 || maxChordError(points, start2, end) <= error) {
+      out.push({ op: "L", x: to.x, y: to.y });
+      return;
+    }
+    const cubic = fitCubic(points, start2, end);
+    if (cubic && cubic.error <= error) {
+      out.push(cubic.command);
+      return;
+    }
+    let split = start2 + Math.floor((end - start2) / 2);
+    let best = -1;
+    for (let i = start2 + 1; i < end; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const distance = pointSegmentDistance(point, from, to);
+      if (distance > best) {
+        best = distance;
+        split = i;
+      }
+    }
+    if (split <= start2 || split >= end) {
+      out.push({ op: "L", x: to.x, y: to.y });
+      return;
+    }
+    fitRange(points, start2, split, error, out);
+    fitRange(points, split, end, error, out);
+  }
+  function fitCubic(points, start2, end) {
+    const p0 = points[start2];
+    const p3 = points[end];
+    if (!p0 || !p3) return null;
+    const chord = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+    if (chord < 1e-6) return null;
+    const t1 = tangent(points, start2, end, false);
+    const t2 = tangent(points, start2, end, true);
+    if (!t1 || !t2) return null;
+    let length = 0;
+    const parameter = [0];
+    for (let i = start2 + 1; i <= end; i++) {
+      const previous = points[i - 1];
+      const point = points[i];
+      if (!previous || !point) return null;
+      length += Math.hypot(point.x - previous.x, point.y - previous.y);
+      parameter.push(length);
+    }
+    if (length < 1e-6) return null;
+    let c11 = 0;
+    let c12 = 0;
+    let c22 = 0;
+    let x1 = 0;
+    let x2 = 0;
+    const tangentDot = t1.x * t2.x + t1.y * t2.y;
+    for (let i = start2; i <= end; i++) {
+      const point = points[i];
+      if (!point) return null;
+      const t = (parameter[i - start2] ?? 0) / length;
+      const u = 1 - t;
+      const b1 = 3 * u * u * t;
+      const b2 = 3 * u * t * t;
+      const basisX = p0.x * u * u * u + p3.x * t * t * t;
+      const basisY = p0.y * u * u * u + p3.y * t * t * t;
+      const vx = point.x - basisX;
+      const vy = point.y - basisY;
+      c11 += b1 * b1;
+      c22 += b2 * b2;
+      c12 += b1 * b2 * tangentDot;
+      x1 += b1 * (vx * t1.x + vy * t1.y);
+      x2 += b2 * (vx * t2.x + vy * t2.y);
+    }
+    const determinant = c11 * c22 - c12 * c12;
+    if (Math.abs(determinant) < 1e-10) return null;
+    const alpha1 = (c22 * x1 - c12 * x2) / determinant;
+    const alpha2 = (c11 * x2 - c12 * x1) / determinant;
+    if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord || alpha2 > chord) return null;
+    const command = {
+      op: "C",
+      x1: p0.x + t1.x * alpha1,
+      y1: p0.y + t1.y * alpha1,
+      x2: p3.x + t2.x * alpha2,
+      y2: p3.y + t2.y * alpha2,
+      x: p3.x,
+      y: p3.y
+    };
+    let maxError = 0;
+    for (let i = start2; i <= end; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const t = (parameter[i - start2] ?? 0) / length;
+      const at = cubicAt(p0, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, p3, t);
+      maxError = Math.max(maxError, Math.hypot(at.x - point.x, at.y - point.y));
+    }
+    return { command, error: maxError };
+  }
+  function tangent(points, start2, end, atEnd) {
+    const origin = points[atEnd ? end : start2];
+    if (!origin) return null;
+    const reach = Math.min(4, end - start2);
+    let x = 0;
+    let y = 0;
+    for (let step = 1; step <= reach; step++) {
+      const point = points[atEnd ? end - step : start2 + step];
+      if (!point) continue;
+      const weight = 1 / step;
+      x += (point.x - origin.x) * weight;
+      y += (point.y - origin.y) * weight;
+    }
+    const length = Math.hypot(x, y);
+    if (length < 1e-8) return null;
+    return { x: x / length, y: y / length };
+  }
+  function cubicAt(p0, p1, p2, p3, t) {
+    const u = 1 - t;
+    const a = u * u * u;
+    const b = 3 * u * u * t;
+    const c = 3 * u * t * t;
+    const d = t * t * t;
+    return {
+      x: a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+      y: a * p0.y + b * p1.y + c * p2.y + d * p3.y
+    };
+  }
+  function maxChordError(points, start2, end) {
+    const from = points[start2];
+    const to = points[end];
+    if (!from || !to) return 0;
+    let max = 0;
+    for (let i = start2 + 1; i < end; i++) {
+      const point = points[i];
+      if (!point) continue;
+      max = Math.max(max, pointSegmentDistance(point, from, to));
+    }
+    return max;
+  }
+  function pointSegmentDistance(point, from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-8) return Math.hypot(point.x - from.x, point.y - from.y);
+    return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
+  }
+  function turnAngle(a, b, c) {
+    const incoming = Math.atan2(b.y - a.y, b.x - a.x);
+    const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
+    let delta = outgoing - incoming;
+    if (delta > Math.PI) delta -= Math.PI * 2;
+    if (delta < -Math.PI) delta += Math.PI * 2;
+    return delta;
+  }
+  function distance2(a, b) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return dx * dx + dy * dy;
+  }
+  function reverseCommands(commands, start2) {
+    let x = start2.x;
+    let y = start2.y;
+    const segments = [];
+    for (const command of commands) {
+      segments.push({ fromX: x, fromY: y, command });
+      x = command.x;
+      y = command.y;
+    }
+    const reversed = [];
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const segment = segments[i];
+      if (!segment) continue;
+      if (segment.command.op === "L") reversed.push({ op: "L", x: segment.fromX, y: segment.fromY });
+      else {
+        reversed.push({
+          op: "C",
+          x1: segment.command.x2,
+          y1: segment.command.y2,
+          x2: segment.command.x1,
+          y2: segment.command.y1,
+          x: segment.fromX,
+          y: segment.fromY
+        });
+      }
+    }
+    return reversed;
+  }
+  function countLabels2(labels, paletteLength) {
+    const counts = new Int32Array(paletteLength);
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? TRANSPARENT;
+      if (label !== TRANSPARENT && label < paletteLength) counts[label] = (counts[label] ?? 0) + 1;
+    }
+    return counts;
+  }
+  function shapesToSvg(shapes, width, height) {
+    const body = shapes.map((shape) => {
+      const data = shape.subpaths.map((subpath) => {
+        let path2 = "M" + formatNumber(subpath.start.x) + " " + formatNumber(subpath.start.y);
+        for (const command of subpath.commands) {
+          if (command.op === "L") path2 += "L" + formatNumber(command.x) + " " + formatNumber(command.y);
+          else {
+            path2 += "C" + formatNumber(command.x1) + " " + formatNumber(command.y1) + " " + formatNumber(command.x2) + " " + formatNumber(command.y2) + " " + formatNumber(command.x) + " " + formatNumber(command.y);
+          }
+        }
+        return path2 + "Z";
+      }).join("");
+      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.75" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
+    }).join("");
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + body + "</svg>";
+  }
+  function formatNumber(value) {
+    const rounded = Math.round(value * 100) / 100;
+    if (Object.is(rounded, -0) || rounded === 0) return "0";
+    return String(rounded);
   }
 
   // src/panel.ts
@@ -1564,7 +2696,8 @@
       flatPath: path.join(directory, "flat.png"),
       svgPath: path.join(directory, "result.svg"),
       settings,
-      cancelled: false
+      cancelled: false,
+      source: null
     };
   }
   function cleanJob(job) {
@@ -1587,43 +2720,9 @@
     } catch (_) {
     }
   }
-  function vtracerArguments(job, maxColors) {
-    const args = [job.flatPath, job.svgPath];
-    const preset = job.settings.preset;
-    const colors = String(Math.max(2, maxColors));
-    if (preset === "photo") {
-      args.push("--preset", "photo", "--max-colors", colors);
-    } else {
-      args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", colors);
-      if (preset === "icon") args.push("--mode", "polygon");
-    }
-    if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
-    args.push("--optimize", "1");
-    return args;
-  }
-  function runVtracer(binary, job, maxColors, onStart) {
-    return new Promise((resolve, reject) => {
-      const child = childProcess.spawn(binary, vtracerArguments(job, maxColors), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-      onStart(child);
-      let stderr = "";
-      child.stderr?.on("data", (chunk2) => {
-        if (stderr.length < 4e3) stderr += chunk2.toString("utf8").slice(0, 4e3 - stderr.length);
-      });
-      child.once("error", (error) => reject(error));
-      child.once("close", (code) => {
-        if (job.cancelled) {
-          reject(new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27"));
-        } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
-          resolve();
-        } else {
-          reject(new Error("VTracer \u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08" + (stderr ? ": " + stderr.trim() : "")));
-        }
-      });
-    });
-  }
   function readSettings(ui) {
     const preset = ui.preset.value;
-    if (preset !== "logo" && preset !== "icon" && preset !== "photo") throw new Error("Preset \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
+    if (!isPresetName(preset)) throw new Error("Preset \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     const maxColors = Number(ui.colors.value);
     const simplify = Number(ui.smooth.value) / 10;
     if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
@@ -1670,7 +2769,6 @@
   function start() {
     const ui = getUi();
     let state = { kind: "empty" };
-    const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
     const host = typeof CSInterface === "undefined" ? null : new CSInterface();
     const editor = createColorEditor(ui.editorRoot, {
       onVectorPreview: () => {
@@ -1698,7 +2796,7 @@
       ui.trace.disabled = busy || state.kind === "empty";
       ui.trace.textContent = currentSelection(state)?.fromResult ? "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48" : "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07";
       ui.apply.disabled = state.kind !== "preview";
-      ui.cancel.hidden = state.kind !== "tracing";
+      ui.cancel.hidden = true;
       ui.editorRoot.hidden = !editor.hasDocument();
       const count = editor.hasDocument() ? " \xB7 " + editor.colorCount() + " \u0E2A\u0E35" : "";
       const phase = state.kind === "loading" ? "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E" : state.kind === "capturing" ? "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E" : state.kind === "editing" ? "\u0E41\u0E01\u0E49\u0E2A\u0E35" : state.kind === "tracing" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07" : state.kind === "applying" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25" : state.kind === "preview" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : "\u0E1E\u0E23\u0E49\u0E2D\u0E21";
@@ -1715,7 +2813,9 @@
     }
     function openSegmentation(job) {
       const decoded = decodePng(fs.readFileSync(job.pngPath));
-      editor.load(segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors));
+      const segmentation = segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors, { preset: job.settings.preset });
+      job.source = segmentation;
+      editor.load(segmentation);
     }
     async function refresh() {
       if (host === null) {
@@ -1784,24 +2884,23 @@
       try {
         const segmentation = editor.segmentation();
         if (segmentation.palette.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E35\u0E43\u0E2B\u0E49\u0E41\u0E1B\u0E25\u0E07");
-        fs.writeFileSync(job.flatPath, encodePng(segmentation.width, segmentation.height, renderRgba(segmentation)));
-        const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
-        let note = "";
-        if (!fs.existsSync(binary)) {
-          fs.writeFileSync(job.svgPath, segmentationToSvg(segmentation), "utf8");
-          note = "\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer \u0E08\u0E36\u0E07\u0E41\u0E2A\u0E14\u0E07\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E41\u0E01\u0E49\u0E41\u0E1A\u0E1A\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25";
-        } else {
-          message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E08\u0E32\u0E01\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E41\u0E01\u0E49\u2026");
-          state = { kind: "tracing", selection, job, child: null };
-          render();
-          await runVtracer(binary, job, segmentation.palette.length, (child) => {
-            state = { kind: "tracing", selection, job, child };
-            render();
-          });
-        }
-        const svg = fs.readFileSync(job.svgPath, "utf8");
+        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E08\u0E32\u0E01\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E41\u0E01\u0E49\u2026");
+        state = { kind: "tracing", selection, job };
+        render();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
+        const source = job.source;
+        const traced = traceSegmentation(segmentation, {
+          preset: job.settings.preset,
+          smooth: job.settings.simplify,
+          coverage: source?.coverage,
+          partner: source?.partner,
+          originalLabels: source?.labels
+        });
+        fs.writeFileSync(job.svgPath, traced.svg, "utf8");
+        const svg = traced.svg;
         state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svg, "utf8").toString("base64") };
-        message((note ? note + " \xB7 " : "\u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator \xB7 ") + "\u0E41\u0E1C\u0E19\u0E17\u0E35\u0E48\u0E2A\u0E35 " + editor.colorCount() + " \xB7 \u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C " + countSvgFills(svg) + " \u0E2A\u0E35");
+        message("\u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator \xB7 \u0E41\u0E1C\u0E19\u0E17\u0E35\u0E48\u0E2A\u0E35 " + editor.colorCount() + " \xB7 \u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C " + countSvgFills(svg) + " \u0E2A\u0E35 \xB7 " + traced.pathCount + " \u0E40\u0E2A\u0E49\u0E19");
         render();
       } catch (error) {
         state = { kind: "editing", selection, job };
@@ -1862,7 +2961,6 @@
     ui.cancel.addEventListener("click", () => {
       if (state.kind !== "tracing") return;
       state.job.cancelled = true;
-      state.child?.kill();
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
     });
     ui.colors.addEventListener("input", () => {
@@ -1872,14 +2970,16 @@
       ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
     });
     ui.preset.addEventListener("change", () => {
-      ui.colors.value = ui.preset.value === "photo" ? "24" : ui.preset.value === "icon" ? "4" : "8";
+      const profile = presetProfile(ui.preset.value);
+      ui.colors.value = String(profile.maxColors);
       ui.colorsValue.value = ui.colors.value;
+      ui.smooth.value = String(Math.round(profile.smooth * 10));
+      ui.smoothValue.value = profile.smooth.toFixed(1);
     });
     window.addEventListener("beforeunload", () => {
       if (state.kind === "preview" || state.kind === "editing") cleanJob(state.job);
       if (state.kind === "tracing") {
         state.job.cancelled = true;
-        state.child?.kill();
         cleanJob(state.job);
       }
     });

@@ -1,5 +1,10 @@
+import { oklabDistance, rgbToOklab } from "./oklab";
+
 /** Pixel label that is outside the palette (fully transparent). */
 export const TRANSPARENT = 65535;
+
+/** Elongated pieces farther than this from their neighbor are text or icon strokes, not speckles. */
+const ZAP_STROKE_CONTRAST = 0.28;
 
 export type Rgb = { readonly r: number; readonly g: number; readonly b: number };
 
@@ -9,6 +14,10 @@ export type Segmentation = {
   /** Palette index per pixel, or TRANSPARENT. Length is width * height. */
   readonly labels: Uint16Array;
   readonly palette: readonly Rgb[];
+  /** 1 means a solid pixel. Blend pixels are the fraction of `labels[i]`. */
+  readonly coverage?: Float32Array;
+  /** The other palette index mixed into a blend pixel, or TRANSPARENT. */
+  readonly partner?: Uint16Array;
 };
 
 /**
@@ -191,11 +200,15 @@ export class ColorDocument {
     const fragmentCap = areaCap(this.thresholds.maxFragmentArea, this.thresholds.fragmentAreaRatio, this.labels.length);
     const clickedStats = measure(clicked, this.width, this.height, this.thresholds, areaLimit, fragmentCap);
     if (!clickedStats.zappable) return { ok: false, reason: refusal(clickedStats, this.thresholds, areaLimit) };
+    if (strokeProtected(clicked, label, this.palette, this.width, this.height)) {
+      return { ok: false, reason: "เส้นนี้ตัดกับสีข้างเคียงชัด Zap จึงไม่ลบ เพื่อไม่ให้ตัวอักษรหรือจุดที่คมชัดหาย" };
+    }
 
     const plan: { pixels: number[]; target: number }[] = [];
     for (const component of found.components) {
       const stats = component === clicked ? clickedStats : measure(component, this.width, this.height, this.thresholds, areaLimit, fragmentCap);
       if (!stats.zappable) continue;
+      if (strokeProtected(component, label, this.palette, this.width, this.height)) continue;
       const target = bestNeighbor(component, label, this.palette);
       if (target === null) continue;
       plan.push({ pixels: component.pixels, target });
@@ -482,6 +495,36 @@ function componentThickness(pixels: readonly number[], width: number, height: nu
  * Neighbor with the best mix of shared edge count and palette distance.
  * Higher adjacency and a closer color both raise the score.
  */
+function strokeProtected(component: Component, ownLabel: number, palette: readonly Rgb[], width: number, height: number): boolean {
+  if (!componentElongated(component, width, height)) return false;
+  const target = bestNeighbor(component, ownLabel, palette);
+  if (target === null) return false;
+  const own = palette[ownLabel];
+  const other = palette[target];
+  if (!own || !other) return false;
+  return oklabDistance(rgbToOklab(own.r, own.g, own.b), rgbToOklab(other.r, other.g, other.b)) >= ZAP_STROKE_CONTRAST;
+}
+
+function componentElongated(component: Component, width: number, height: number): boolean {
+  let minX = width;
+  let maxX = 0;
+  let minY = height;
+  let maxY = 0;
+  for (const pixel of component.pixels) {
+    const x = pixel % width;
+    const y = (pixel - x) / width;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const spanX = maxX - minX + 1;
+  const spanY = maxY - minY + 1;
+  const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+  if (aspect >= 2.2) return true;
+  return component.area >= 6 && componentThickness(component.pixels, width, height, 2) <= 2;
+}
+
 function bestNeighbor(component: Component, ownLabel: number, palette: readonly Rgb[]): number | null {
   const own = palette[ownLabel];
   if (!own) return null;
