@@ -164,6 +164,12 @@ export function countSvgFills(svg: string): number {
     if (match[1]) found.add(match[1].toLowerCase());
     match = pattern.exec(svg);
   }
+  const gradients = /fill="url\(#([^"]+)\)"/g;
+  let gradient = gradients.exec(svg);
+  while (gradient) {
+    if (gradient[1]) found.add("url(" + gradient[1] + ")");
+    gradient = gradients.exec(svg);
+  }
   return found.size;
 }
 
@@ -360,6 +366,18 @@ function reassignBlends(
       const index = y * width + x;
       const label = labels[index] ?? TRANSPARENT;
       if (label === TRANSPARENT) continue;
+      if (
+        x > 0 &&
+        y > 0 &&
+        x + 1 < width &&
+        y + 1 < height &&
+        labels[index - 1] === label &&
+        labels[index + 1] === label &&
+        labels[index - width] === label &&
+        labels[index + width] === label
+      ) {
+        continue;
+      }
       let bestOther = -1;
       let bestT = 0;
       let bestPerp = Infinity;
@@ -553,6 +571,18 @@ function smoothLowContrast(
         const index = y * width + x;
         const label = labels[index] ?? TRANSPARENT;
         if (label === TRANSPARENT) continue;
+        if (
+          x > 0 &&
+          y > 0 &&
+          x + 1 < width &&
+          y + 1 < height &&
+          labels[index - 1] === label &&
+          labels[index + 1] === label &&
+          labels[index - width] === label &&
+          labels[index + width] === label
+        ) {
+          continue;
+        }
         touched.length = 0;
         for (let dy = -1; dy <= 1; dy++) {
           const ny = y + dy;
@@ -612,16 +642,20 @@ function removeWeakSpeckles(
     let maxX = 0;
     let minY = height;
     let maxY = 0;
+    let oversized = false;
     while (stack.length > 0) {
       const current = stack.pop();
       if (current === undefined) break;
-      pixels.push(current);
       const x = current % width;
       const y = (current - x) / width;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
+      if (!oversized) {
+        pixels.push(current);
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (pixels.length > areaLimit) oversized = true;
+      }
       const neighbors = [current - 1, current + 1, current - width, current + width];
       for (const next of neighbors) {
         const nx = next % width;
@@ -635,12 +669,12 @@ function removeWeakSpeckles(
             seen[next] = 1;
             stack.push(next);
           }
-        } else if (neighbor !== TRANSPARENT) {
+        } else if (!oversized && neighbor !== TRANSPARENT) {
           adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
         }
       }
     }
-    if (pixels.length > areaLimit || adjacency.size === 0) continue;
+    if (oversized || pixels.length > areaLimit || adjacency.size === 0) continue;
     const spanX = maxX - minX + 1;
     const spanY = maxY - minY + 1;
     const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
@@ -767,7 +801,14 @@ type Region = {
   readonly adjacency: Map<number, number>;
 };
 
-function forEachComponent(labels: Uint16Array, width: number, height: number, body: (region: Region) => void): void {
+type ComponentKeep = (info: { count: number; minX: number; maxX: number; minY: number; maxY: number; fat: boolean }) => boolean;
+
+/**
+ * Flood each label component. `keep` may reject a component once its size or a
+ * solid 5×5 block proves the caller would ignore it, so a full-frame background
+ * is only marked seen and not copied into an array.
+ */
+function forEachComponent(labels: Uint16Array, width: number, height: number, body: (region: Region) => void, keep?: ComponentKeep): void {
   const seen = new Uint8Array(labels.length);
   const stack: number[] = [];
   for (let start = 0; start < labels.length; start++) {
@@ -781,36 +822,66 @@ function forEachComponent(labels: Uint16Array, width: number, height: number, bo
     let maxX = 0;
     let minY = height;
     let maxY = 0;
+    let fat = false;
+    let dropped = false;
     while (stack.length > 0) {
       const current = stack.pop();
       if (current === undefined) break;
-      pixels.push(current);
       const x = current % width;
       const y = (current - x) / width;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      const neighbors = [current - 1, current + 1, current - width, current + width];
-      for (const next of neighbors) {
-        if (next < 0 || next >= labels.length) continue;
-        const nx = next % width;
-        const ny = (next - nx) / width;
-        if ((next === current - 1 && x === 0) || (next === current + 1 && x + 1 === width)) continue;
-        if (ny < 0 || ny >= height) continue;
-        const neighbor = labels[next] ?? TRANSPARENT;
-        if (neighbor === label) {
-          if (!seen[next]) {
-            seen[next] = 1;
-            stack.push(next);
-          }
-        } else if (neighbor !== TRANSPARENT) {
-          adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+      if (!dropped) {
+        pixels.push(current);
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        if (keep && !fat && pixels.length > 24 && solidBlock(labels, width, height, x, y, label)) fat = true;
+        if (keep && (fat || pixels.length % 32 === 0) && !keep({ count: pixels.length, minX, maxX, minY, maxY, fat })) {
+          dropped = true;
+          pixels.length = 0;
+          adjacency.clear();
         }
       }
+      if (x > 0) visitComponentNeighbor(labels, seen, stack, adjacency, current - 1, label, dropped);
+      if (x + 1 < width) visitComponentNeighbor(labels, seen, stack, adjacency, current + 1, label, dropped);
+      if (y > 0) visitComponentNeighbor(labels, seen, stack, adjacency, current - width, label, dropped);
+      if (y + 1 < height) visitComponentNeighbor(labels, seen, stack, adjacency, current + width, label, dropped);
     }
-    body({ label, pixels, minX, maxX, minY, maxY, adjacency });
+    if (!dropped) body({ label, pixels, minX, maxX, minY, maxY, adjacency });
   }
+}
+
+function visitComponentNeighbor(
+  labels: Uint16Array,
+  seen: Uint8Array,
+  stack: number[],
+  adjacency: Map<number, number>,
+  next: number,
+  label: number,
+  dropped: boolean
+): void {
+  if (next < 0 || next >= labels.length) return;
+  const neighbor = labels[next] ?? TRANSPARENT;
+  if (neighbor === label) {
+    if (!seen[next]) {
+      seen[next] = 1;
+      stack.push(next);
+    }
+  } else if (!dropped && neighbor !== TRANSPARENT) {
+    adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+  }
+}
+
+/** A 5×5 block of one label is at least three pixels thick, so it is not a sliver. */
+function solidBlock(labels: Uint16Array, width: number, height: number, x: number, y: number, label: number): boolean {
+  if (x < 2 || y < 2 || x + 2 >= width || y + 2 >= height) return false;
+  for (let dy = -2; dy <= 2; dy++) {
+    const row = (y + dy) * width;
+    for (let dx = -2; dx <= 2; dx++) {
+      if ((labels[row + x + dx] ?? TRANSPARENT) !== label) return false;
+    }
+  }
+  return true;
 }
 
 function absorbDarkBlobs(
@@ -826,7 +897,11 @@ function absorbDarkBlobs(
   const counts = countLabels(labels, palette.length);
   const largeArea = width * height * 0.005;
   const mark = new Uint8Array(labels.length);
-  forEachComponent(labels, width, height, (region) => {
+  forEachComponent(
+    labels,
+    width,
+    height,
+    (region) => {
     if (region.pixels.length < 4 || region.pixels.length > areaCap || region.adjacency.size === 0) return;
     const spanX = region.maxX - region.minX + 1;
     const spanY = region.maxY - region.minY + 1;
@@ -853,7 +928,9 @@ function absorbDarkBlobs(
       coverage[pixel] = 1;
       partner[pixel] = TRANSPARENT;
     }
-  });
+  },
+    (info) => info.count <= areaCap
+  );
 }
 
 function dissolveSlivers(
@@ -865,7 +942,11 @@ function dissolveSlivers(
   height: number,
   palette: readonly Lab[]
 ): void {
-  forEachComponent(labels, width, height, (region) => {
+  forEachComponent(
+    labels,
+    width,
+    height,
+    (region) => {
     if (region.pixels.length < 2 || region.adjacency.size === 0) return;
     const spanX = region.maxX - region.minX + 1;
     const spanY = region.maxY - region.minY + 1;
@@ -882,7 +963,14 @@ function dissolveSlivers(
       coverage[pixel] = 1;
       partner[pixel] = TRANSPARENT;
     }
-  });
+  },
+    (info) => {
+      if (!info.fat || info.count <= 80) return true;
+      const spanX = info.maxX - info.minX + 1;
+      const spanY = info.maxY - info.minY + 1;
+      return Math.min(spanX, spanY) <= 2;
+    }
+  );
 }
 
 function peelPaleEdges(
@@ -1181,39 +1269,100 @@ function pinToLocalCores(
   const totals = new Int32Array(colorCount);
   const seen: number[] = [];
   const cache = new Map<number, Lab>();
+  const stride = width + 1;
+  const plane = (height + 1) * stride;
+  const prefix = colorCount > 0 && colorCount <= 24 ? new Uint32Array(colorCount * plane) : null;
+  if (prefix) {
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      const dstRow = (y + 1) * stride;
+      const prevRow = y * stride;
+      for (let x = 0; x < width; x++) {
+        const index = row + x;
+        for (let candidate = 0; candidate < colorCount; candidate++) {
+          const base = candidate * plane;
+          prefix[base + dstRow + x + 1] =
+            (prefix[base + prevRow + x + 1] ?? 0) + (prefix[base + dstRow + x] ?? 0) - (prefix[base + prevRow + x] ?? 0);
+        }
+        if (!flat[index]) continue;
+        const painted = labels[index] ?? TRANSPARENT;
+        if (painted === TRANSPARENT || painted >= colorCount) continue;
+        const slot = painted * plane + dstRow + x + 1;
+        prefix[slot] = (prefix[slot] ?? 0) + 1;
+      }
+    }
+  }
+  const windowCount = (candidate: number, x0: number, y0: number, x1: number, y1: number): number => {
+    if (!prefix) return 0;
+    const base = candidate * plane;
+    const top = y0 * stride;
+    const bottom = (y1 + 1) * stride;
+    return (
+      (prefix[base + bottom + x1 + 1] ?? 0) -
+      (prefix[base + top + x1 + 1] ?? 0) -
+      (prefix[base + bottom + x0] ?? 0) +
+      (prefix[base + top + x0] ?? 0)
+    );
+  };
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const index = y * width + x;
       const label = labels[index] ?? TRANSPARENT;
       if (label === TRANSPARENT || flat[index]) continue;
-      seen.length = 0;
       const y0 = Math.max(0, y - radius);
       const y1 = Math.min(height - 1, y + radius);
       const x0 = Math.max(0, x - radius);
       const x1 = Math.min(width - 1, x + radius);
-      for (let yy = y0; yy <= y1; yy++) {
-        const row = yy * width;
-        for (let xx = x0; xx <= x1; xx++) {
-          const neighborIndex = row + xx;
-          if (!flat[neighborIndex]) continue;
-          const neighbor = labels[neighborIndex] ?? TRANSPARENT;
-          if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
-          if (totals[neighbor] === 0) seen.push(neighbor);
-          totals[neighbor] = (totals[neighbor] ?? 0) + 1;
-        }
-      }
       let first = -1;
       let second = -1;
-      for (const candidate of seen) {
-        if ((totals[candidate] ?? 0) < 3) continue;
-        if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
-          second = first;
-          first = candidate;
-        } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
-          second = candidate;
+      let tied = prefix === null;
+      if (prefix) {
+        let firstN = 0;
+        let secondN = 0;
+        for (let candidate = 0; candidate < colorCount; candidate++) {
+          const count = windowCount(candidate, x0, y0, x1, y1);
+          if (count < 3) continue;
+          if (first < 0 || count > firstN) {
+            second = first;
+            secondN = firstN;
+            first = candidate;
+            firstN = count;
+          } else if (count === firstN) {
+            tied = true;
+          } else if (second < 0 || count > secondN) {
+            second = candidate;
+            secondN = count;
+          } else if (count === secondN) {
+            tied = true;
+          }
         }
       }
-      for (const candidate of seen) totals[candidate] = 0;
+      if (tied) {
+        seen.length = 0;
+        for (let yy = y0; yy <= y1; yy++) {
+          const row = yy * width;
+          for (let xx = x0; xx <= x1; xx++) {
+            const neighborIndex = row + xx;
+            if (!flat[neighborIndex]) continue;
+            const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+            if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
+            if (totals[neighbor] === 0) seen.push(neighbor);
+            totals[neighbor] = (totals[neighbor] ?? 0) + 1;
+          }
+        }
+        first = -1;
+        second = -1;
+        for (const candidate of seen) {
+          if ((totals[candidate] ?? 0) < 3) continue;
+          if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
+            second = first;
+            first = candidate;
+          } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
+            second = candidate;
+          }
+        }
+        for (const candidate of seen) totals[candidate] = 0;
+      }
       if (first < 0 || second < 0) continue;
       const colorA = palette[first];
       const colorB = palette[second];
@@ -1347,6 +1496,12 @@ function dissolveBoundarySlivers(
       const colorB = palette[second[0]];
       if (colorA && colorB && median.l + 0.18 < colorA.l && median.l + 0.18 < colorB.l && oklabChroma(median) < 0.04) return;
       jobs.push({ pixels: region.pixels, first: first[0], second: second[0] });
+    }, (info) => {
+      const spanX = info.maxX - info.minX + 1;
+      const spanY = info.maxY - info.minY + 1;
+      if (spanX >= 6 && spanY >= 6 && info.count >= Math.min(spanX, spanY) * 4) return false;
+      if (info.fat && Math.min(spanX, spanY) > 2) return false;
+      return true;
     });
     if (jobs.length === 0) break;
     for (const job of jobs) {
@@ -1463,27 +1618,32 @@ function clearCheckerboards(
   width: number,
   height: number
 ): void {
-  const votes = new Map<number, number>();
   for (let pass = 0; pass < 8; pass++) {
     let changed = 0;
     for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
       for (let x = 1; x < width - 1; x++) {
-        const index = y * width + x;
+        const index = row + x;
         const label = labels[index] ?? TRANSPARENT;
         if (label === TRANSPARENT) continue;
-        const neighbors = [index - 1, index + 1, index - width, index + width];
-        votes.clear();
+        const north = labels[index - width] ?? TRANSPARENT;
+        const south = labels[index + width] ?? TRANSPARENT;
+        const west = labels[index - 1] ?? TRANSPARENT;
+        const east = labels[index + 1] ?? TRANSPARENT;
         let foreign = 0;
-        for (const neighbor of neighbors) {
-          const other = labels[neighbor] ?? TRANSPARENT;
-          if (other === label || other === TRANSPARENT) continue;
-          foreign++;
-          votes.set(other, (votes.get(other) ?? 0) + 1);
-        }
+        if (north !== label && north !== TRANSPARENT) foreign++;
+        if (south !== label && south !== TRANSPARENT) foreign++;
+        if (west !== label && west !== TRANSPARENT) foreign++;
+        if (east !== label && east !== TRANSPARENT) foreign++;
         if (foreign < 4) continue;
+        const candidates = [west, east, north, south];
         let best = -1;
         let bestCount = 0;
-        for (const [other, count] of votes) {
+        for (let i = 0; i < 4; i++) {
+          const other = candidates[i] ?? TRANSPARENT;
+          if (other === label || other === TRANSPARENT) continue;
+          let count = 1;
+          for (let j = i + 1; j < 4; j++) if (candidates[j] === other) count++;
           if (count > bestCount) {
             best = other;
             bestCount = count;
@@ -1565,7 +1725,7 @@ function absorbInteriorSpecks(
       partner[pixel] = TRANSPARENT;
       coverage[pixel] = 1;
     }
-  });
+  }, (info) => info.count <= 8);
 }
 
 function reconcilePartners(labels: Uint16Array, partner: Uint16Array, coverage: Float32Array): void {

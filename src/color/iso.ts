@@ -3,6 +3,41 @@ import { rgbToOklab, type Lab } from "./oklab";
 
 export type IsoPoint = { x: number; y: number };
 
+/** Reused across chains so coverage lookups stay off the heap. */
+export type IsoCache = {
+  readonly labL: Float64Array;
+  readonly labA: Float64Array;
+  readonly labB: Float64Array;
+  readonly ready: Uint8Array;
+  readonly stamp: Int32Array;
+  readonly stored: Float64Array;
+  generation: number;
+};
+
+export function createIsoCache(pixels: number): IsoCache {
+  return {
+    labL: new Float64Array(pixels),
+    labA: new Float64Array(pixels),
+    labB: new Float64Array(pixels),
+    ready: new Uint8Array(pixels),
+    stamp: new Int32Array(pixels),
+    stored: new Float64Array(pixels),
+    generation: 1
+  };
+}
+
+const BLUR_RADIUS = 2;
+const BLUR_WEIGHTS = (() => {
+  const sigma = 0.7;
+  const weights: number[] = [];
+  for (let dy = -BLUR_RADIUS; dy <= BLUR_RADIUS; dy++) {
+    for (let dx = -BLUR_RADIUS; dx <= BLUR_RADIUS; dx++) {
+      weights.push(Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma)));
+    }
+  }
+  return weights;
+})();
+
 /**
  * Replace one shared edge with the t=0.5 iso-line of the source color between
  * the two palette colors. Each unit edge contributes the bilinear crossing on
@@ -21,7 +56,8 @@ export function refineChain(
   rgba: Uint8Array,
   palette: readonly Rgb[],
   labels: Uint16Array,
-  denoise = true
+  denoise = true,
+  cache?: IsoCache
 ): { points: IsoPoint[]; soft: boolean } {
   const original = points.map((point) => ({ x: point.x, y: point.y }));
   if (outside === TRANSPARENT || inside === TRANSPARENT || points.length < 2) return { points: original, soft: false };
@@ -30,14 +66,28 @@ export function refineChain(
   if (!labA || !labB) return { points: original, soft: false };
   const edgeCount = closed ? points.length : points.length - 1;
   if (edgeCount < 1) return { points: original, soft: false };
-  const coverage = new Map<number, number>();
+  const coverage = cache ? null : new Map<number, number>();
+  if (cache) {
+    cache.generation++;
+    if (cache.generation >= 0x7ffffffe) {
+      cache.stamp.fill(0);
+      cache.generation = 1;
+    }
+  }
   const coverageAt = (x: number, y: number): number => {
     if (x < 0 || y < 0 || x >= width || y >= height) return Number.NaN;
     const index = y * width + x;
-    const hit = coverage.get(index);
+    if (cache) {
+      if (cache.stamp[index] === cache.generation) return cache.stored[index] ?? Number.NaN;
+      const value = sampleT(x, y, 0, width, height, rgba, labels, inside, outside, labA, labB, cache);
+      cache.stamp[index] = cache.generation;
+      cache.stored[index] = value;
+      return value;
+    }
+    const hit = coverage?.get(index);
     if (hit !== undefined) return hit;
     const value = sampleT(x, y, 0, width, height, rgba, labels, inside, outside, labA, labB);
-    coverage.set(index, value);
+    coverage?.set(index, value);
     return value;
   };
   const insideRaw: number[] = [];
@@ -78,7 +128,7 @@ export function refineChain(
   const end = points[points.length - 1];
   if (!start || !end) return { points: original, soft: false };
   const open = dedupe(
-    [sharedJunction(start, width, height, rgba, labels, palette), ...crossings, sharedJunction(end, width, height, rgba, labels, palette)],
+    [sharedJunction(start, width, height, rgba, labels, palette, cache), ...crossings, sharedJunction(end, width, height, rgba, labels, palette, cache)],
     false
   );
   if (open.length < 2) return { points: original, soft: false };
@@ -356,7 +406,8 @@ export function sharedJunction(
   height: number,
   rgba: Uint8Array,
   labels: Uint16Array,
-  palette: readonly Rgb[]
+  palette: readonly Rgb[],
+  cache?: IsoCache
 ): IsoPoint {
   const gx = Math.round(point.x);
   const gy = Math.round(point.y);
@@ -380,8 +431,8 @@ export function sharedJunction(
     const labA = paletteLab(palette, labelA);
     const labB = paletteLab(palette, labelB);
     if (!labA || !labB) continue;
-    const tA = sampleT(ax, ay, 1, width, height, rgba, labels, labelA, labelB, labA, labB);
-    const tB = sampleT(bx, by, 0, width, height, rgba, labels, labelA, labelB, labA, labB);
+    const tA = sampleT(ax, ay, 1, width, height, rgba, labels, labelA, labelB, labA, labB, cache);
+    const tB = sampleT(bx, by, 0, width, height, rgba, labels, labelA, labelB, labA, labB, cache);
     if (tA <= 0.08 && tB >= 0.92) return { x: gx, y: gy };
     crossings.push(dualCrossing(ax, ay, bx, by, tA, tB));
   }
@@ -406,20 +457,19 @@ function edgePixels(ax: number, ay: number, bx: number, by: number): { inside: [
 }
 
 function blurredCoverage(x: number, y: number, width: number, height: number, coverageAt: (px: number, py: number) => number): number {
-  const sigma = 0.7;
-  const radius = 2;
   let sum = 0;
   let wsum = 0;
-  for (let dy = -radius; dy <= radius; dy++) {
-    for (let dx = -radius; dx <= radius; dx++) {
+  let weightIndex = 0;
+  for (let dy = -BLUR_RADIUS; dy <= BLUR_RADIUS; dy++) {
+    for (let dx = -BLUR_RADIUS; dx <= BLUR_RADIUS; dx++) {
+      const weight = BLUR_WEIGHTS[weightIndex++] ?? 0;
       const sx = x + dx;
       const sy = y + dy;
       if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
       const sample = coverageAt(sx, sy);
       if (Number.isNaN(sample)) continue;
-      const w = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma));
-      sum += sample * w;
-      wsum += w;
+      sum += sample * weight;
+      wsum += weight;
     }
   }
   if (wsum <= 0) {
@@ -440,16 +490,31 @@ function sampleT(
   inside: number,
   outside: number,
   labA: Lab,
-  labB: Lab
+  labB: Lab,
+  cache?: IsoCache
 ): number {
   if (x < 0 || y < 0 || x >= width || y >= height) return k <= 0 ? 1 : 0;
   const index = y * width + x;
   if ((rgba[index * 4 + 3] ?? 0) < 128) return 1;
   const label = labels[index] ?? TRANSPARENT;
-  const lab = rgbToOklab(rgba[index * 4] ?? 0, rgba[index * 4 + 1] ?? 0, rgba[index * 4 + 2] ?? 0);
+  const lab = cachedOklab(cache, rgba, index);
   const projected = coverageT(lab, labA, labB);
   if (label !== inside && label !== outside) return projected;
   return projected;
+}
+
+function cachedOklab(cache: IsoCache | undefined, rgba: Uint8Array, index: number): Lab {
+  if (cache && cache.ready[index]) {
+    return { l: cache.labL[index] ?? 0, a: cache.labA[index] ?? 0, b: cache.labB[index] ?? 0 };
+  }
+  const lab = rgbToOklab(rgba[index * 4] ?? 0, rgba[index * 4 + 1] ?? 0, rgba[index * 4 + 2] ?? 0);
+  if (cache) {
+    cache.labL[index] = lab.l;
+    cache.labA[index] = lab.a;
+    cache.labB[index] = lab.b;
+    cache.ready[index] = 1;
+  }
+  return lab;
 }
 
 function coverageT(lab: Lab, from: Lab, to: Lab): number {

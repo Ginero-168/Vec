@@ -6,7 +6,8 @@ import { createColorEditor, type ColorEditor } from "./editor-ui";
 import type { Rgb, Segmentation } from "./color/model";
 import { decodePng } from "./color/png";
 import { countSvgFills, segmentImage } from "./color/segment";
-import { isPresetName, presetProfile, type PresetName } from "./color/presets";
+import { guidedFilter } from "./color/denoise";
+import { isPresetName, prefilterDefault, presetProfile, gradientsDefault, type PresetName } from "./color/presets";
 import { traceSegmentation } from "./color/trace";
 
 interface CepBridge {
@@ -42,6 +43,8 @@ type Settings = {
   readonly simplify: number;
   readonly cleanShapes: number;
   readonly cleanText: boolean;
+  readonly gradients: boolean;
+  readonly prefilter: boolean;
 };
 
 type Job = {
@@ -52,6 +55,8 @@ type Job = {
   readonly svgPath: string;
   settings: Settings;
   cancelled: boolean;
+  /** Pixels that were segmented, after an optional JPEG prefilter. */
+  pixels: Uint8Array | null;
   /** Segmentation before manual edits, including edge coverage for the tracer. */
   source: Segmentation | null;
 };
@@ -85,6 +90,8 @@ type Ui = {
   readonly cleanStrength: HTMLInputElement;
   readonly cleanStrengthValue: HTMLOutputElement;
   readonly cleanText: HTMLInputElement;
+  readonly gradients: HTMLInputElement;
+  readonly prefilter: HTMLInputElement;
   readonly editorRoot: HTMLElement;
 };
 
@@ -136,6 +143,8 @@ function getUi(): Ui {
     cleanStrength: getInput("clean-strength"),
     cleanStrengthValue: getOutput("clean-strength-value"),
     cleanText: getInput("clean-text"),
+    gradients: getInput("gradients"),
+    prefilter: getInput("prefilter"),
     editorRoot: getElement("editor-root")
   };
 }
@@ -222,6 +231,7 @@ function newJob(settings: Settings): Job {
     svgPath: path.join(directory, "result.svg"),
     settings,
     cancelled: false,
+    pixels: null,
     source: null
   };
 }
@@ -259,7 +269,7 @@ function readSettings(ui: Ui): Settings {
   if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("จำนวนสีไม่ถูกต้อง");
   if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
   if (!Number.isFinite(cleanShapes) || cleanShapes < 0 || cleanShapes > 1) throw new Error("ความแรงของรูปทรงไม่ถูกต้อง");
-  return { preset, maxColors, simplify, cleanShapes, cleanText: ui.cleanText.checked };
+  return { preset, maxColors, simplify, cleanShapes, cleanText: ui.cleanText.checked, gradients: ui.gradients.checked, prefilter: ui.prefilter.checked };
 }
 
 function showSelection(ui: Ui, selection: Selection | null): void {
@@ -344,7 +354,9 @@ function start(): void {
 
   function openSegmentation(job: Job): void {
     const decoded = decodePng(fs.readFileSync(job.pngPath));
-    const segmentation = segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors, { preset: job.settings.preset });
+    const pixels = job.settings.prefilter ? guidedFilter(decoded.data, decoded.width, decoded.height) : decoded.data;
+    job.pixels = pixels;
+    const segmentation = segmentImage(pixels, decoded.width, decoded.height, job.settings.maxColors, { preset: job.settings.preset });
     job.source = segmentation;
     editor.load(segmentation);
   }
@@ -420,7 +432,7 @@ function start(): void {
       const segmentation = editor.segmentation();
       if (segmentation.palette.length === 0) throw new Error("ไม่มีสีให้แปลง");
       const live = readSettings(ui);
-      job.settings = { ...job.settings, simplify: live.simplify, cleanShapes: live.cleanShapes, cleanText: live.cleanText };
+      job.settings = { ...job.settings, simplify: live.simplify, cleanShapes: live.cleanShapes, cleanText: live.cleanText, gradients: live.gradients };
       message("กำลังสร้างเส้นจากสีที่แก้…");
       state = { kind: "tracing", selection, job };
       render();
@@ -428,12 +440,13 @@ function start(): void {
       if (job.cancelled) throw new Error("ยกเลิกแล้ว");
       const source = job.source;
       const decoded = decodePng(fs.readFileSync(job.pngPath));
-      const sourcePixels = decoded.width === segmentation.width && decoded.height === segmentation.height ? decoded.data : undefined;
+      const sourcePixels = job.pixels && job.pixels.length === segmentation.width * segmentation.height * 4 ? job.pixels : decoded.width === segmentation.width && decoded.height === segmentation.height ? decoded.data : undefined;
       const traced = traceSegmentation(segmentation, {
         preset: job.settings.preset,
         smooth: job.settings.simplify,
         cleanShapes: job.settings.cleanShapes,
         cleanText: job.settings.cleanText,
+        gradients: job.settings.gradients,
         smoothMask: segmentation.smoothMask,
         coverage: source?.coverage,
         partner: source?.partner,
@@ -477,7 +490,7 @@ function start(): void {
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
-      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";clean=" + job.settings.cleanShapes + ";cleanText=" + (job.settings.cleanText ? 1 : 0) + ";edited=" + editor.colorCount();
+      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";clean=" + job.settings.cleanShapes + ";cleanText=" + (job.settings.cleanText ? 1 : 0) + ";gradients=" + (job.settings.gradients ? 1 : 0) + ";prefilter=" + (job.settings.prefilter ? 1 : 0) + ";edited=" + editor.colorCount();
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่ · สี " + editor.colorCount());
       cleanJob(job);
@@ -520,6 +533,11 @@ function start(): void {
     ui.colorsValue.value = ui.colors.value;
     ui.smooth.value = String(Math.round(profile.smooth * 10));
     ui.smoothValue.value = profile.smooth.toFixed(1);
+    const name = ui.preset.value;
+    if (isPresetName(name)) {
+      ui.gradients.checked = gradientsDefault(name);
+      ui.prefilter.checked = prefilterDefault(name);
+    }
   });
 
   window.addEventListener("beforeunload", () => {

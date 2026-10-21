@@ -1,4 +1,5 @@
 import { createColorEditor } from "./editor-ui";
+import { guidedFilter } from "./color/denoise";
 import { countSvgFills, segmentImage } from "./color/segment";
 import { makeStripeSample } from "./color/sample";
 import { rgbHex } from "./color/model";
@@ -73,6 +74,8 @@ const cleanShapesInput = document.getElementById("clean-shapes");
 const cleanStrengthInput = document.getElementById("clean-strength");
 const cleanStrengthValue = document.getElementById("clean-strength-value");
 const cleanTextInput = document.getElementById("clean-text");
+const gradientsInput = document.getElementById("gradients");
+const prefilterInput = document.getElementById("prefilter");
 
 function cleanOptions(): { strength: number; text: boolean } {
   const enabled = cleanShapesInput instanceof HTMLInputElement && cleanShapesInput.checked;
@@ -101,18 +104,20 @@ if (compareStatus instanceof HTMLElement && compareOriginal instanceof HTMLImage
       if (!decoded) decoded = await loadFixturePixels("../fixtures/user-test-original.png");
       if (token !== compareToken) return;
       const source = decoded;
+      const pixels = prefilterInput instanceof HTMLInputElement && prefilterInput.checked ? guidedFilter(source.rgba, source.width, source.height) : source.rgba;
       const started = performance.now();
-      const segmentation = segmentImage(source.rgba, source.width, source.height, 12, { preset: "ui" });
+      const segmentation = segmentImage(pixels, source.width, source.height, 12, { preset: "ui" });
       const clean = cleanOptions();
       const traced = traceSegmentation(segmentation, {
         preset: "ui",
         smooth: 0.5,
         cleanShapes: clean.strength,
         cleanText: clean.text,
+        gradients: gradientsInput instanceof HTMLInputElement && gradientsInput.checked,
         originalLabels: segmentation.labels,
         coverage: segmentation.coverage,
         partner: segmentation.partner,
-        source: source.rgba
+        source: pixels
       });
       if (token !== compareToken) return;
       const seconds = ((performance.now() - started) / 1000).toFixed(2);
@@ -120,6 +125,8 @@ if (compareStatus instanceof HTMLElement && compareOriginal instanceof HTMLImage
       originalNode.hidden = false;
       resultNode.hidden = false;
       const cleanLabel = clean.strength > 0 ? " · รูปทรงเรียบ " + Math.round(clean.strength * 100) : "";
+      const gradientLabel = gradientsInput instanceof HTMLInputElement && gradientsInput.checked ? " · ไล่สี" : "";
+      const filterLabel = prefilterInput instanceof HTMLInputElement && prefilterInput.checked ? " · เกลี่ย JPEG" : "";
       statusNode.textContent =
         "ข้อความ / หน้าจอ · " +
         segmentation.palette.length +
@@ -130,7 +137,9 @@ if (compareStatus instanceof HTMLElement && compareOriginal instanceof HTMLImage
         " จุด · " +
         seconds +
         " วินาที บนเครื่องนี้" +
-        cleanLabel;
+        cleanLabel +
+        gradientLabel +
+        filterLabel;
     } catch (error) {
       if (token !== compareToken) return;
       statusNode.textContent = error instanceof Error ? error.message : "เทียบภาพไม่สำเร็จ";
@@ -147,6 +156,8 @@ if (compareStatus instanceof HTMLElement && compareOriginal instanceof HTMLImage
   cleanShapesInput?.addEventListener("change", onClean);
   cleanStrengthInput?.addEventListener("input", onClean);
   cleanTextInput?.addEventListener("change", onClean);
+  gradientsInput?.addEventListener("change", onClean);
+  prefilterInput?.addEventListener("change", onClean);
   syncCleanControls();
   void renderCompare();
 }

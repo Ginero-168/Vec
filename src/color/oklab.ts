@@ -3,8 +3,15 @@ import type { Rgb } from "./model";
 export type Lab = { readonly l: number; readonly a: number; readonly b: number };
 
 function srgbToLinear(channel: number): number {
+  if (channel >= 0 && channel <= 255 && channel === (channel | 0)) return SRGB_LINEAR[channel] ?? 0;
   const value = channel / 255;
   return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+}
+
+const SRGB_LINEAR = new Float64Array(256);
+for (let channel = 0; channel < 256; channel++) {
+  const value = channel / 255;
+  SRGB_LINEAR[channel] = value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
 }
 
 function linearToSrgb(channel: number): number {

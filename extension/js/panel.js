@@ -37,8 +37,14 @@
 
   // src/color/oklab.ts
   function srgbToLinear(channel) {
+    if (channel >= 0 && channel <= 255 && channel === (channel | 0)) return SRGB_LINEAR[channel] ?? 0;
     const value = channel / 255;
     return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  }
+  var SRGB_LINEAR = new Float64Array(256);
+  for (let channel = 0; channel < 256; channel++) {
+    const value = channel / 255;
+    SRGB_LINEAR[channel] = value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
   }
   function linearToSrgb(channel) {
     const value = channel <= 31308e-7 ? 12.92 * channel : 1.055 * channel ** (1 / 2.4) - 0.055;
@@ -78,6 +84,31 @@
   }
   function oklabChroma(lab) {
     return Math.hypot(lab.a, lab.b);
+  }
+  var D65_X = 0.95047;
+  var D65_Y = 1;
+  var D65_Z = 1.08883;
+  function cieLabF(t) {
+    const delta = 6 / 29;
+    return t > delta * delta * delta ? Math.cbrt(t) : t / (3 * delta * delta) + 4 / 29;
+  }
+  function rgbToCieLab(r, g, b) {
+    const lr = srgbToLinear(r);
+    const lg = srgbToLinear(g);
+    const lb = srgbToLinear(b);
+    const x = lr * 0.4124564 + lg * 0.3575761 + lb * 0.1804375;
+    const y = lr * 0.2126729 + lg * 0.7151522 + lb * 0.072175;
+    const z = lr * 0.0193339 + lg * 0.119192 + lb * 0.9503041;
+    const fx = cieLabF(x / D65_X);
+    const fy = cieLabF(y / D65_Y);
+    const fz = cieLabF(z / D65_Z);
+    return { l: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+  }
+  function deltaE76(a, b) {
+    const dl = a.l - b.l;
+    const da = a.a - b.a;
+    const db = a.b - b.b;
+    return Math.sqrt(dl * dl + da * da + db * db);
   }
 
   // src/color/model.ts
@@ -1523,6 +1554,12 @@
     if (preset === "ui") return minor <= 400 ? 3 : 2;
     return minor <= 400 ? 3 : minor <= 1200 ? 2 : 1;
   }
+  function gradientsDefault(preset) {
+    return preset === "photo" || preset === "illustration";
+  }
+  function prefilterDefault(preset) {
+    return preset === "photo";
+  }
 
   // src/color/segment.ts
   var BIN_SHIFT = 3;
@@ -1597,6 +1634,12 @@
     while (match) {
       if (match[1]) found.add(match[1].toLowerCase());
       match = pattern.exec(svg);
+    }
+    const gradients = /fill="url\(#([^"]+)\)"/g;
+    let gradient = gradients.exec(svg);
+    while (gradient) {
+      if (gradient[1]) found.add("url(" + gradient[1] + ")");
+      gradient = gradients.exec(svg);
     }
     return found.size;
   }
@@ -1769,6 +1812,9 @@
         const index = y * width + x;
         const label = labels[index] ?? TRANSPARENT;
         if (label === TRANSPARENT) continue;
+        if (x > 0 && y > 0 && x + 1 < width && y + 1 < height && labels[index - 1] === label && labels[index + 1] === label && labels[index - width] === label && labels[index + width] === label) {
+          continue;
+        }
         let bestOther = -1;
         let bestT = 0;
         let bestPerp = Infinity;
@@ -1936,6 +1982,9 @@
           const index = y * width + x;
           const label = labels[index] ?? TRANSPARENT;
           if (label === TRANSPARENT) continue;
+          if (x > 0 && y > 0 && x + 1 < width && y + 1 < height && labels[index - 1] === label && labels[index + 1] === label && labels[index - width] === label && labels[index + width] === label) {
+            continue;
+          }
           touched.length = 0;
           for (let dy = -1; dy <= 1; dy++) {
             const ny = y + dy;
@@ -1987,16 +2036,20 @@
       let maxX = 0;
       let minY = height;
       let maxY = 0;
+      let oversized = false;
       while (stack.length > 0) {
         const current = stack.pop();
         if (current === void 0) break;
-        pixels.push(current);
         const x = current % width;
         const y = (current - x) / width;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
+        if (!oversized) {
+          pixels.push(current);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          if (pixels.length > areaLimit) oversized = true;
+        }
         const neighbors = [current - 1, current + 1, current - width, current + width];
         for (const next of neighbors) {
           const nx = next % width;
@@ -2010,12 +2063,12 @@
               seen[next] = 1;
               stack.push(next);
             }
-          } else if (neighbor !== TRANSPARENT) {
+          } else if (!oversized && neighbor !== TRANSPARENT) {
             adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
           }
         }
       }
-      if (pixels.length > areaLimit || adjacency.size === 0) continue;
+      if (oversized || pixels.length > areaLimit || adjacency.size === 0) continue;
       const spanX = maxX - minX + 1;
       const spanY = maxY - minY + 1;
       const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
@@ -2115,7 +2168,7 @@
     }
     return false;
   }
-  function forEachComponent(labels, width, height, body) {
+  function forEachComponent(labels, width, height, body, keep) {
     const seen = new Uint8Array(labels.length);
     const stack = [];
     for (let start2 = 0; start2 < labels.length; start2++) {
@@ -2129,90 +2182,126 @@
       let maxX = 0;
       let minY = height;
       let maxY = 0;
+      let fat = false;
+      let dropped = false;
       while (stack.length > 0) {
         const current = stack.pop();
         if (current === void 0) break;
-        pixels.push(current);
         const x = current % width;
         const y = (current - x) / width;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        const neighbors = [current - 1, current + 1, current - width, current + width];
-        for (const next of neighbors) {
-          if (next < 0 || next >= labels.length) continue;
-          const nx = next % width;
-          const ny = (next - nx) / width;
-          if (next === current - 1 && x === 0 || next === current + 1 && x + 1 === width) continue;
-          if (ny < 0 || ny >= height) continue;
-          const neighbor = labels[next] ?? TRANSPARENT;
-          if (neighbor === label) {
-            if (!seen[next]) {
-              seen[next] = 1;
-              stack.push(next);
-            }
-          } else if (neighbor !== TRANSPARENT) {
-            adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+        if (!dropped) {
+          pixels.push(current);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          if (keep && !fat && pixels.length > 24 && solidBlock(labels, width, height, x, y, label)) fat = true;
+          if (keep && (fat || pixels.length % 32 === 0) && !keep({ count: pixels.length, minX, maxX, minY, maxY, fat })) {
+            dropped = true;
+            pixels.length = 0;
+            adjacency.clear();
           }
         }
+        if (x > 0) visitComponentNeighbor(labels, seen, stack, adjacency, current - 1, label, dropped);
+        if (x + 1 < width) visitComponentNeighbor(labels, seen, stack, adjacency, current + 1, label, dropped);
+        if (y > 0) visitComponentNeighbor(labels, seen, stack, adjacency, current - width, label, dropped);
+        if (y + 1 < height) visitComponentNeighbor(labels, seen, stack, adjacency, current + width, label, dropped);
       }
-      body({ label, pixels, minX, maxX, minY, maxY, adjacency });
+      if (!dropped) body({ label, pixels, minX, maxX, minY, maxY, adjacency });
     }
+  }
+  function visitComponentNeighbor(labels, seen, stack, adjacency, next, label, dropped) {
+    if (next < 0 || next >= labels.length) return;
+    const neighbor = labels[next] ?? TRANSPARENT;
+    if (neighbor === label) {
+      if (!seen[next]) {
+        seen[next] = 1;
+        stack.push(next);
+      }
+    } else if (!dropped && neighbor !== TRANSPARENT) {
+      adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+    }
+  }
+  function solidBlock(labels, width, height, x, y, label) {
+    if (x < 2 || y < 2 || x + 2 >= width || y + 2 >= height) return false;
+    for (let dy = -2; dy <= 2; dy++) {
+      const row = (y + dy) * width;
+      for (let dx = -2; dx <= 2; dx++) {
+        if ((labels[row + x + dx] ?? TRANSPARENT) !== label) return false;
+      }
+    }
+    return true;
   }
   function absorbDarkBlobs(rgba, labels, partner, coverage, width, height, palette) {
     const areaCap2 = Math.max(160, Math.round(width * height * 4e-3));
     const counts = countLabels(labels, palette.length);
     const largeArea = width * height * 5e-3;
     const mark = new Uint8Array(labels.length);
-    forEachComponent(labels, width, height, (region) => {
-      if (region.pixels.length < 4 || region.pixels.length > areaCap2 || region.adjacency.size === 0) return;
-      const spanX = region.maxX - region.minX + 1;
-      const spanY = region.maxY - region.minY + 1;
-      const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
-      if (aspect >= 2.2) return;
-      if (region.pixels.length >= 6 && componentThickness2(region.pixels, width, height, 3) <= 3) return;
-      const own = medianLab(rgba, region.pixels);
-      const swatch = palette[region.label];
-      const outside = (counts[region.label] ?? 0) - region.pixels.length;
-      if (swatch && outside >= Math.max(largeArea, 400) && oklabDistance(own, swatch) < 0.08) return;
-      if (oklabChroma(own) >= 0.045) return;
-      const ring = ringLabs(rgba, labels, region.pixels, width, height, mark);
-      if (ring.length < 6) return;
-      const surround = medianOf(ring);
-      if (oklabChroma(surround) > 0.05) return;
-      if (spreadL(ring) > 0.055) return;
-      const gap = surround.l - own.l;
-      if (gap <= DARK_SURROUND_L) return;
-      if (own.l < 0.16 && gap > 0.5) return;
-      const target = surroundLabel(region.adjacency, palette, surround);
-      if (target < 0 || target === region.label) return;
-      for (const pixel of region.pixels) {
-        labels[pixel] = target;
-        coverage[pixel] = 1;
-        partner[pixel] = TRANSPARENT;
-      }
-    });
+    forEachComponent(
+      labels,
+      width,
+      height,
+      (region) => {
+        if (region.pixels.length < 4 || region.pixels.length > areaCap2 || region.adjacency.size === 0) return;
+        const spanX = region.maxX - region.minX + 1;
+        const spanY = region.maxY - region.minY + 1;
+        const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+        if (aspect >= 2.2) return;
+        if (region.pixels.length >= 6 && componentThickness2(region.pixels, width, height, 3) <= 3) return;
+        const own = medianLab(rgba, region.pixels);
+        const swatch = palette[region.label];
+        const outside = (counts[region.label] ?? 0) - region.pixels.length;
+        if (swatch && outside >= Math.max(largeArea, 400) && oklabDistance(own, swatch) < 0.08) return;
+        if (oklabChroma(own) >= 0.045) return;
+        const ring = ringLabs(rgba, labels, region.pixels, width, height, mark);
+        if (ring.length < 6) return;
+        const surround = medianOf(ring);
+        if (oklabChroma(surround) > 0.05) return;
+        if (spreadL(ring) > 0.055) return;
+        const gap = surround.l - own.l;
+        if (gap <= DARK_SURROUND_L) return;
+        if (own.l < 0.16 && gap > 0.5) return;
+        const target = surroundLabel(region.adjacency, palette, surround);
+        if (target < 0 || target === region.label) return;
+        for (const pixel of region.pixels) {
+          labels[pixel] = target;
+          coverage[pixel] = 1;
+          partner[pixel] = TRANSPARENT;
+        }
+      },
+      (info) => info.count <= areaCap2
+    );
   }
   function dissolveSlivers(rgba, labels, partner, coverage, width, height, palette) {
-    forEachComponent(labels, width, height, (region) => {
-      if (region.pixels.length < 2 || region.adjacency.size === 0) return;
-      const spanX = region.maxX - region.minX + 1;
-      const spanY = region.maxY - region.minY + 1;
-      const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
-      const narrow = Math.min(spanX, spanY) <= 2 || aspect >= 2.4;
-      if (!narrow && region.pixels.length > 80) return;
-      const thick = componentThickness2(region.pixels, width, height, 3);
-      const thinStrip = Math.min(spanX, spanY) <= 2 || thick <= 1 || thick <= 2 && aspect >= 2.4;
-      if (!thinStrip) return;
-      const target = sliverTarget(rgba, region, palette);
-      if (target < 0 || target === region.label) return;
-      for (const pixel of region.pixels) {
-        labels[pixel] = target;
-        coverage[pixel] = 1;
-        partner[pixel] = TRANSPARENT;
+    forEachComponent(
+      labels,
+      width,
+      height,
+      (region) => {
+        if (region.pixels.length < 2 || region.adjacency.size === 0) return;
+        const spanX = region.maxX - region.minX + 1;
+        const spanY = region.maxY - region.minY + 1;
+        const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+        const narrow = Math.min(spanX, spanY) <= 2 || aspect >= 2.4;
+        if (!narrow && region.pixels.length > 80) return;
+        const thick = componentThickness2(region.pixels, width, height, 3);
+        const thinStrip = Math.min(spanX, spanY) <= 2 || thick <= 1 || thick <= 2 && aspect >= 2.4;
+        if (!thinStrip) return;
+        const target = sliverTarget(rgba, region, palette);
+        if (target < 0 || target === region.label) return;
+        for (const pixel of region.pixels) {
+          labels[pixel] = target;
+          coverage[pixel] = 1;
+          partner[pixel] = TRANSPARENT;
+        }
+      },
+      (info) => {
+        if (!info.fat || info.count <= 80) return true;
+        const spanX = info.maxX - info.minX + 1;
+        const spanY = info.maxY - info.minY + 1;
+        return Math.min(spanX, spanY) <= 2;
       }
-    });
+    );
   }
   function peelPaleEdges(rgba, labels, partner, coverage, width, height, palette) {
     const paleSlot = palette.map((lab) => lab.l > 0.9 && oklabChroma(lab) < 0.04);
@@ -2455,39 +2544,94 @@
     const totals = new Int32Array(colorCount);
     const seen = [];
     const cache = /* @__PURE__ */ new Map();
+    const stride = width + 1;
+    const plane = (height + 1) * stride;
+    const prefix = colorCount > 0 && colorCount <= 24 ? new Uint32Array(colorCount * plane) : null;
+    if (prefix) {
+      for (let y = 0; y < height; y++) {
+        const row = y * width;
+        const dstRow = (y + 1) * stride;
+        const prevRow = y * stride;
+        for (let x = 0; x < width; x++) {
+          const index = row + x;
+          for (let candidate = 0; candidate < colorCount; candidate++) {
+            const base = candidate * plane;
+            prefix[base + dstRow + x + 1] = (prefix[base + prevRow + x + 1] ?? 0) + (prefix[base + dstRow + x] ?? 0) - (prefix[base + prevRow + x] ?? 0);
+          }
+          if (!flat[index]) continue;
+          const painted = labels[index] ?? TRANSPARENT;
+          if (painted === TRANSPARENT || painted >= colorCount) continue;
+          const slot = painted * plane + dstRow + x + 1;
+          prefix[slot] = (prefix[slot] ?? 0) + 1;
+        }
+      }
+    }
+    const windowCount = (candidate, x0, y0, x1, y1) => {
+      if (!prefix) return 0;
+      const base = candidate * plane;
+      const top = y0 * stride;
+      const bottom = (y1 + 1) * stride;
+      return (prefix[base + bottom + x1 + 1] ?? 0) - (prefix[base + top + x1 + 1] ?? 0) - (prefix[base + bottom + x0] ?? 0) + (prefix[base + top + x0] ?? 0);
+    };
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const index = y * width + x;
         const label = labels[index] ?? TRANSPARENT;
         if (label === TRANSPARENT || flat[index]) continue;
-        seen.length = 0;
         const y0 = Math.max(0, y - radius);
         const y1 = Math.min(height - 1, y + radius);
         const x0 = Math.max(0, x - radius);
         const x1 = Math.min(width - 1, x + radius);
-        for (let yy = y0; yy <= y1; yy++) {
-          const row = yy * width;
-          for (let xx = x0; xx <= x1; xx++) {
-            const neighborIndex = row + xx;
-            if (!flat[neighborIndex]) continue;
-            const neighbor = labels[neighborIndex] ?? TRANSPARENT;
-            if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
-            if (totals[neighbor] === 0) seen.push(neighbor);
-            totals[neighbor] = (totals[neighbor] ?? 0) + 1;
-          }
-        }
         let first = -1;
         let second = -1;
-        for (const candidate of seen) {
-          if ((totals[candidate] ?? 0) < 3) continue;
-          if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
-            second = first;
-            first = candidate;
-          } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
-            second = candidate;
+        let tied = prefix === null;
+        if (prefix) {
+          let firstN = 0;
+          let secondN = 0;
+          for (let candidate = 0; candidate < colorCount; candidate++) {
+            const count = windowCount(candidate, x0, y0, x1, y1);
+            if (count < 3) continue;
+            if (first < 0 || count > firstN) {
+              second = first;
+              secondN = firstN;
+              first = candidate;
+              firstN = count;
+            } else if (count === firstN) {
+              tied = true;
+            } else if (second < 0 || count > secondN) {
+              second = candidate;
+              secondN = count;
+            } else if (count === secondN) {
+              tied = true;
+            }
           }
         }
-        for (const candidate of seen) totals[candidate] = 0;
+        if (tied) {
+          seen.length = 0;
+          for (let yy = y0; yy <= y1; yy++) {
+            const row = yy * width;
+            for (let xx = x0; xx <= x1; xx++) {
+              const neighborIndex = row + xx;
+              if (!flat[neighborIndex]) continue;
+              const neighbor = labels[neighborIndex] ?? TRANSPARENT;
+              if (neighbor === TRANSPARENT || neighbor >= colorCount) continue;
+              if (totals[neighbor] === 0) seen.push(neighbor);
+              totals[neighbor] = (totals[neighbor] ?? 0) + 1;
+            }
+          }
+          first = -1;
+          second = -1;
+          for (const candidate of seen) {
+            if ((totals[candidate] ?? 0) < 3) continue;
+            if (first < 0 || (totals[candidate] ?? 0) > (totals[first] ?? 0)) {
+              second = first;
+              first = candidate;
+            } else if (second < 0 || (totals[candidate] ?? 0) > (totals[second] ?? 0)) {
+              second = candidate;
+            }
+          }
+          for (const candidate of seen) totals[candidate] = 0;
+        }
         if (first < 0 || second < 0) continue;
         const colorA = palette[first];
         const colorB = palette[second];
@@ -2601,6 +2745,12 @@
         const colorB = palette[second[0]];
         if (colorA && colorB && median2.l + 0.18 < colorA.l && median2.l + 0.18 < colorB.l && oklabChroma(median2) < 0.04) return;
         jobs.push({ pixels: region.pixels, first: first[0], second: second[0] });
+      }, (info) => {
+        const spanX = info.maxX - info.minX + 1;
+        const spanY = info.maxY - info.minY + 1;
+        if (spanX >= 6 && spanY >= 6 && info.count >= Math.min(spanX, spanY) * 4) return false;
+        if (info.fat && Math.min(spanX, spanY) > 2) return false;
+        return true;
       });
       if (jobs.length === 0) break;
       for (const job of jobs) {
@@ -2700,27 +2850,32 @@
     }
   }
   function clearCheckerboards(labels, partner, coverage, width, height) {
-    const votes = /* @__PURE__ */ new Map();
     for (let pass = 0; pass < 8; pass++) {
       let changed = 0;
       for (let y = 1; y < height - 1; y++) {
+        const row = y * width;
         for (let x = 1; x < width - 1; x++) {
-          const index = y * width + x;
+          const index = row + x;
           const label = labels[index] ?? TRANSPARENT;
           if (label === TRANSPARENT) continue;
-          const neighbors = [index - 1, index + 1, index - width, index + width];
-          votes.clear();
+          const north = labels[index - width] ?? TRANSPARENT;
+          const south = labels[index + width] ?? TRANSPARENT;
+          const west = labels[index - 1] ?? TRANSPARENT;
+          const east = labels[index + 1] ?? TRANSPARENT;
           let foreign = 0;
-          for (const neighbor of neighbors) {
-            const other = labels[neighbor] ?? TRANSPARENT;
-            if (other === label || other === TRANSPARENT) continue;
-            foreign++;
-            votes.set(other, (votes.get(other) ?? 0) + 1);
-          }
+          if (north !== label && north !== TRANSPARENT) foreign++;
+          if (south !== label && south !== TRANSPARENT) foreign++;
+          if (west !== label && west !== TRANSPARENT) foreign++;
+          if (east !== label && east !== TRANSPARENT) foreign++;
           if (foreign < 4) continue;
+          const candidates = [west, east, north, south];
           let best = -1;
           let bestCount = 0;
-          for (const [other, count] of votes) {
+          for (let i = 0; i < 4; i++) {
+            const other = candidates[i] ?? TRANSPARENT;
+            if (other === label || other === TRANSPARENT) continue;
+            let count = 1;
+            for (let j = i + 1; j < 4; j++) if (candidates[j] === other) count++;
             if (count > bestCount) {
               best = other;
               bestCount = count;
@@ -2787,7 +2942,7 @@
         partner[pixel] = TRANSPARENT;
         coverage[pixel] = 1;
       }
-    });
+    }, (info) => info.count <= 8);
   }
   function reconcilePartners(labels, partner, coverage) {
     for (let i = 0; i < labels.length; i++) {
@@ -2977,6 +3132,97 @@
       steps++;
     }
     return alive.size > 0 ? limit + 1 : steps;
+  }
+
+  // src/color/denoise.ts
+  function guidedFilter(rgba, width, height, radius = 3, eps = 140) {
+    const pixels = width * height;
+    const guide = new Float64Array(pixels);
+    const red = new Float64Array(pixels);
+    const green = new Float64Array(pixels);
+    const blue = new Float64Array(pixels);
+    for (let i = 0; i < pixels; i++) {
+      const offset = i * 4;
+      const r = rgba[offset] ?? 0;
+      const g = rgba[offset + 1] ?? 0;
+      const b = rgba[offset + 2] ?? 0;
+      guide[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      red[i] = r;
+      green[i] = g;
+      blue[i] = b;
+    }
+    const meanI = boxMean(guide, width, height, radius);
+    const meanII = boxMean(product(guide, guide), width, height, radius);
+    const meanR = boxMean(red, width, height, radius);
+    const meanG = boxMean(green, width, height, radius);
+    const meanB = boxMean(blue, width, height, radius);
+    const meanIR = boxMean(product(guide, red), width, height, radius);
+    const meanIG = boxMean(product(guide, green), width, height, radius);
+    const meanIB = boxMean(product(guide, blue), width, height, radius);
+    const aR = new Float64Array(pixels);
+    const aG = new Float64Array(pixels);
+    const aB = new Float64Array(pixels);
+    const bR = new Float64Array(pixels);
+    const bG = new Float64Array(pixels);
+    const bB = new Float64Array(pixels);
+    for (let i = 0; i < pixels; i++) {
+      const variance = (meanII[i] ?? 0) - (meanI[i] ?? 0) * (meanI[i] ?? 0);
+      const denom = variance + eps;
+      aR[i] = ((meanIR[i] ?? 0) - (meanI[i] ?? 0) * (meanR[i] ?? 0)) / denom;
+      aG[i] = ((meanIG[i] ?? 0) - (meanI[i] ?? 0) * (meanG[i] ?? 0)) / denom;
+      aB[i] = ((meanIB[i] ?? 0) - (meanI[i] ?? 0) * (meanB[i] ?? 0)) / denom;
+      bR[i] = (meanR[i] ?? 0) - (aR[i] ?? 0) * (meanI[i] ?? 0);
+      bG[i] = (meanG[i] ?? 0) - (aG[i] ?? 0) * (meanI[i] ?? 0);
+      bB[i] = (meanB[i] ?? 0) - (aB[i] ?? 0) * (meanI[i] ?? 0);
+    }
+    const meanAR = boxMean(aR, width, height, radius);
+    const meanAG = boxMean(aG, width, height, radius);
+    const meanAB = boxMean(aB, width, height, radius);
+    const meanBR = boxMean(bR, width, height, radius);
+    const meanBG = boxMean(bG, width, height, radius);
+    const meanBB = boxMean(bB, width, height, radius);
+    const out = new Uint8Array(rgba.length);
+    for (let i = 0; i < pixels; i++) {
+      const offset = i * 4;
+      out[offset] = clampByte((meanAR[i] ?? 0) * (guide[i] ?? 0) + (meanBR[i] ?? 0));
+      out[offset + 1] = clampByte((meanAG[i] ?? 0) * (guide[i] ?? 0) + (meanBG[i] ?? 0));
+      out[offset + 2] = clampByte((meanAB[i] ?? 0) * (guide[i] ?? 0) + (meanBB[i] ?? 0));
+      out[offset + 3] = rgba[offset + 3] ?? 255;
+    }
+    return out;
+  }
+  function product(left, right) {
+    const out = new Float64Array(left.length);
+    for (let i = 0; i < left.length; i++) out[i] = (left[i] ?? 0) * (right[i] ?? 0);
+    return out;
+  }
+  function boxMean(source, width, height, radius) {
+    const integral = new Float64Array((width + 1) * (height + 1));
+    const stride = width + 1;
+    for (let y = 0; y < height; y++) {
+      let row = 0;
+      for (let x = 0; x < width; x++) {
+        row += source[y * width + x] ?? 0;
+        integral[(y + 1) * stride + x + 1] = (integral[y * stride + x + 1] ?? 0) + row;
+      }
+    }
+    const out = new Float64Array(width * height);
+    for (let y = 0; y < height; y++) {
+      const y0 = Math.max(0, y - radius);
+      const y1 = Math.min(height - 1, y + radius);
+      for (let x = 0; x < width; x++) {
+        const x0 = Math.max(0, x - radius);
+        const x1 = Math.min(width - 1, x + radius);
+        const sum = (integral[(y1 + 1) * stride + x1 + 1] ?? 0) - (integral[y0 * stride + x1 + 1] ?? 0) - (integral[(y1 + 1) * stride + x0] ?? 0) + (integral[y0 * stride + x0] ?? 0);
+        out[y * width + x] = sum / ((y1 - y0 + 1) * (x1 - x0 + 1));
+      }
+    }
+    return out;
+  }
+  function clampByte(value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return Math.round(value);
   }
 
   // src/color/clean.ts
@@ -4138,8 +4384,561 @@
     return a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
   }
 
+  // src/color/gradient.ts
+  function detectGradients(rgba, labels, palette, width, height) {
+    const result = palette.map(() => void 0);
+    if (palette.length === 0 || rgba.length < width * height * 4) return result;
+    const populations = new Int32Array(palette.length);
+    const minX = new Int32Array(palette.length);
+    const minY = new Int32Array(palette.length);
+    const maxX = new Int32Array(palette.length);
+    const maxY = new Int32Array(palette.length);
+    minX.fill(width);
+    minY.fill(height);
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels[i] ?? 65535;
+      if (label >= palette.length) continue;
+      populations[label] = (populations[label] ?? 0) + 1;
+      const x = i % width;
+      const y = (i - x) / width;
+      if (x < (minX[label] ?? width)) minX[label] = x;
+      if (y < (minY[label] ?? height)) minY[label] = y;
+      if (x > (maxX[label] ?? 0)) maxX[label] = x;
+      if (y > (maxY[label] ?? 0)) maxY[label] = y;
+    }
+    for (let label = 0; label < palette.length; label++) {
+      const population = populations[label] ?? 0;
+      if (population < 80) continue;
+      const flat = palette[label];
+      if (!flat) continue;
+      const samples = labelSamples(rgba, labels, label, width, population);
+      if (samples.length < 24) continue;
+      const chosen = bestRamp(samples, flat, minX[label] ?? 0, minY[label] ?? 0, maxX[label] ?? 0, maxY[label] ?? 0);
+      if (!chosen) continue;
+      result[label] = chosen;
+    }
+    return result;
+  }
+  function colorAtGradient(gradient, x, y) {
+    let t = 0;
+    if (gradient.kind === "linear") {
+      const dx = gradient.x2 - gradient.x1;
+      const dy = gradient.y2 - gradient.y1;
+      const length2 = dx * dx + dy * dy;
+      t = length2 < 1e-8 ? 0 : ((x - gradient.x1) * dx + (y - gradient.y1) * dy) / length2;
+    } else {
+      t = gradient.r < 1e-6 ? 0 : Math.hypot(x - gradient.cx, y - gradient.cy) / gradient.r;
+    }
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return sampleStops(gradient.stops, t);
+  }
+  function sampleStops(stops, t) {
+    if (stops.length === 0) return { r: 0, g: 0, b: 0 };
+    const first = stops[0];
+    if (!first) return { r: 0, g: 0, b: 0 };
+    if (stops.length === 1) return first.color;
+    let previous = first;
+    for (let i = 1; i < stops.length; i++) {
+      const next = stops[i];
+      if (!next) continue;
+      if (t <= next.offset) {
+        const span = next.offset - previous.offset;
+        const u = span < 1e-6 ? 0 : (t - previous.offset) / span;
+        return {
+          r: Math.round(previous.color.r + (next.color.r - previous.color.r) * u),
+          g: Math.round(previous.color.g + (next.color.g - previous.color.g) * u),
+          b: Math.round(previous.color.b + (next.color.b - previous.color.b) * u)
+        };
+      }
+      previous = next;
+    }
+    return previous.color;
+  }
+  function fitLinear(samples) {
+    let sx = 0;
+    let sy = 0;
+    let sxx = 0;
+    let syy = 0;
+    let sxy = 0;
+    let sr = 0;
+    let sg = 0;
+    let sb = 0;
+    let sxr = 0;
+    let syr = 0;
+    let sxg = 0;
+    let syg = 0;
+    let sxb = 0;
+    let syb = 0;
+    for (const sample2 of samples) {
+      sx += sample2.x;
+      sy += sample2.y;
+      sxx += sample2.x * sample2.x;
+      syy += sample2.y * sample2.y;
+      sxy += sample2.x * sample2.y;
+      sr += sample2.r;
+      sg += sample2.g;
+      sb += sample2.b;
+      sxr += sample2.x * sample2.r;
+      syr += sample2.y * sample2.r;
+      sxg += sample2.x * sample2.g;
+      syg += sample2.y * sample2.g;
+      sxb += sample2.x * sample2.b;
+      syb += sample2.y * sample2.b;
+    }
+    const n = samples.length;
+    const ridge = 1e-3;
+    const matrix = [
+      [sxx + ridge, sxy, sx],
+      [sxy, syy + ridge, sy],
+      [sx, sy, n]
+    ];
+    const red = solve3(matrix, [sxr, syr, sr]);
+    const green = solve3(matrix, [sxg, syg, sg]);
+    const blue = solve3(matrix, [sxb, syb, sb]);
+    if (!red || !green || !blue) return null;
+    const gx = 0.2126 * red[0] + 0.7152 * green[0] + 0.0722 * blue[0];
+    const gy = 0.2126 * red[1] + 0.7152 * green[1] + 0.0722 * blue[1];
+    const length = Math.hypot(gx, gy);
+    if (length < 1e-4) return null;
+    const ux = gx / length;
+    const uy = gy / length;
+    let tMin = Infinity;
+    let tMax = -Infinity;
+    const ts = [];
+    for (const sample2 of samples) {
+      const t = sample2.x * ux + sample2.y * uy;
+      ts.push(t);
+      if (t < tMin) tMin = t;
+      if (t > tMax) tMax = t;
+    }
+    if (tMax - tMin < 6) return null;
+    const predict = (t) => {
+      const x = ux * t;
+      const y = uy * t;
+      return {
+        r: Math.round(Math.min(255, Math.max(0, red[0] * x + red[1] * y + red[2]))),
+        g: Math.round(Math.min(255, Math.max(0, green[0] * x + green[1] * y + green[2]))),
+        b: Math.round(Math.min(255, Math.max(0, blue[0] * x + blue[1] * y + blue[2])))
+      };
+    };
+    const linearStops = [
+      { offset: 0, color: predict(tMin) },
+      { offset: 1, color: predict(tMax) }
+    ];
+    const linearGradient = { kind: "linear", x1: ux * tMin, y1: uy * tMin, x2: ux * tMax, y2: uy * tMax, stops: linearStops };
+    const linearScore = residuals(samples, linearGradient);
+    const sampledStops = stopsAlong(samples, ts, tMin, tMax, 8);
+    const sampledGradient = { ...linearGradient, stops: sampledStops };
+    const sampledScore = residuals(samples, sampledGradient);
+    const chosen = sampledScore.residual + 0.4 < linearScore.residual ? sampledGradient : linearGradient;
+    const score = chosen === linearGradient ? linearScore : sampledScore;
+    return { gradient: chosen, ...score };
+  }
+  function fitRadial(samples) {
+    let cx = 0;
+    let cy = 0;
+    let minL = Infinity;
+    let maxL = -Infinity;
+    let darkX = 0;
+    let darkY = 0;
+    let lightX = 0;
+    let lightY = 0;
+    for (const sample2 of samples) {
+      cx += sample2.x;
+      cy += sample2.y;
+      const luma = 0.2126 * sample2.r + 0.7152 * sample2.g + 0.0722 * sample2.b;
+      if (luma < minL) {
+        minL = luma;
+        darkX = sample2.x;
+        darkY = sample2.y;
+      }
+      if (luma > maxL) {
+        maxL = luma;
+        lightX = sample2.x;
+        lightY = sample2.y;
+      }
+    }
+    cx /= samples.length;
+    cy /= samples.length;
+    let best = null;
+    for (const center of [
+      [cx, cy],
+      [darkX, darkY],
+      [lightX, lightY]
+    ]) {
+      const originX = center[0] ?? cx;
+      const originY = center[1] ?? cy;
+      let maxR = 1;
+      const radii = [];
+      for (const sample2 of samples) {
+        const radius = Math.hypot(sample2.x - originX, sample2.y - originY);
+        radii.push(radius);
+        if (radius > maxR) maxR = radius;
+      }
+      if (maxR < 6) continue;
+      const stops = stopsAlong(samples, radii, 0, maxR);
+      const gradient = { kind: "radial", cx: originX, cy: originY, r: maxR, stops };
+      const scored = { gradient, ...residuals(samples, gradient) };
+      if (!best || scored.residual < best.residual) best = scored;
+    }
+    return best;
+  }
+  function stopsAlong(samples, parameter, min, max, binsCount = 4) {
+    const bins = [];
+    for (let i = 0; i < binsCount; i++) bins.push([]);
+    const span = max - min || 1;
+    for (let i = 0; i < samples.length; i++) {
+      const sample2 = samples[i];
+      const t = parameter[i];
+      if (!sample2 || t === void 0) continue;
+      const bin = Math.min(binsCount - 1, Math.max(0, Math.floor((t - min) / span * binsCount)));
+      bins[bin]?.push(sample2);
+    }
+    const stops = [];
+    for (let bin = 0; bin < binsCount; bin++) {
+      const group = bins[bin] ?? [];
+      if (group.length === 0) continue;
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (const sample2 of group) {
+        r += sample2.r;
+        g += sample2.g;
+        b += sample2.b;
+      }
+      stops.push({
+        offset: binsCount === 1 ? 0 : bin / (binsCount - 1),
+        color: { r: Math.round(r / group.length), g: Math.round(g / group.length), b: Math.round(b / group.length) }
+      });
+    }
+    return stops;
+  }
+  function residuals(samples, gradient) {
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    for (const sample2 of samples) {
+      r += sample2.r;
+      g += sample2.g;
+      b += sample2.b;
+    }
+    const flatColor = { r: r / samples.length, g: g / samples.length, b: b / samples.length };
+    const flatLab = rgbToCieLab(flatColor.r, flatColor.g, flatColor.b);
+    let flatSum = 0;
+    let fitSum = 0;
+    let minE = Infinity;
+    let maxE = 0;
+    const origin = samples[0];
+    const originLab = origin ? rgbToCieLab(origin.r, origin.g, origin.b) : flatLab;
+    for (const sample2 of samples) {
+      const source = rgbToCieLab(sample2.r, sample2.g, sample2.b);
+      flatSum += deltaE76(source, flatLab);
+      const predicted = colorAtGradient(gradient, sample2.x + 0.5, sample2.y + 0.5);
+      fitSum += deltaE76(source, rgbToCieLab(predicted.r, predicted.g, predicted.b));
+      const end = deltaE76(source, originLab);
+      if (end < minE) minE = end;
+      if (end > maxE) maxE = end;
+    }
+    return { residual: fitSum / samples.length, flat: flatSum / samples.length, range: maxE - minE };
+  }
+  function plateauLinear(gradient, palette, minX, minY, maxX, maxY) {
+    if (gradient.kind !== "linear") return gradient;
+    const dx = gradient.x2 - gradient.x1;
+    const dy = gradient.y2 - gradient.y1;
+    const length2 = dx * dx + dy * dy;
+    if (length2 < 1e-6) return gradient;
+    const project2 = (x, y) => ((x - gradient.x1) * dx + (y - gradient.y1) * dy) / length2;
+    const corners = [project2(minX, minY), project2(maxX, minY), project2(minX, maxY), project2(maxX, maxY)];
+    let tMin = corners[0] ?? 0;
+    let tMax = tMin;
+    for (const t of corners) {
+      if (t < tMin) tMin = t;
+      if (t > tMax) tMax = t;
+    }
+    if (tMax - tMin < 1e-4) return gradient;
+    const ramp0 = Math.min(1, Math.max(0, (0 - tMin) / (tMax - tMin)));
+    const ramp1 = Math.min(1, Math.max(0, (1 - tMin) / (tMax - tMin)));
+    if (ramp1 - ramp0 < 0.04) return gradient;
+    const stops = [{ offset: 0, color: palette }];
+    if (ramp0 > 0.02) stops.push({ offset: ramp0, color: palette });
+    for (const stop of gradient.stops) {
+      if (stop.offset <= 0.05) continue;
+      stops.push({ offset: ramp0 + stop.offset * (ramp1 - ramp0), color: stop.color });
+    }
+    const last = stops[stops.length - 1];
+    if (ramp1 < 0.98 && (!last || last.offset < 0.999)) stops.push({ offset: 1, color: palette });
+    return {
+      kind: "linear",
+      x1: gradient.x1 + dx * tMin,
+      y1: gradient.y1 + dy * tMin,
+      x2: gradient.x1 + dx * tMax,
+      y2: gradient.y1 + dy * tMax,
+      stops
+    };
+  }
+  function acceptable(scored) {
+    return scored.range >= 8 && scored.flat >= 3 && scored.residual <= 8 && scored.residual <= scored.flat * 0.65;
+  }
+  function stopsStayInFamily(gradient, palette) {
+    const origin = rgbToCieLab(palette.r, palette.g, palette.b);
+    const originChroma = Math.hypot(origin.a, origin.b);
+    for (const stop of gradient.stops) {
+      const lab = rgbToCieLab(stop.color.r, stop.color.g, stop.color.b);
+      const chroma = Math.hypot(lab.a, lab.b);
+      if (originChroma < 12 && chroma < 12) {
+        if (Math.abs(lab.l - origin.l) > 16) return false;
+        continue;
+      }
+      if (originChroma < 12 || chroma < 12) return false;
+      const hue = Math.atan2(lab.b, lab.a) - Math.atan2(origin.b, origin.a);
+      if (Math.abs(Math.atan2(Math.sin(hue), Math.cos(hue))) > 0.5) return false;
+    }
+    return true;
+  }
+  function bestRamp(samples, palette, minX, minY, maxX, maxY) {
+    const found = [];
+    let bestGain = 0;
+    const consider = (subset, partial) => {
+      if (subset.length < 24) return;
+      const linear = fitLinear(subset);
+      const radial = fitRadial(subset);
+      let fit = linear;
+      if (radial && linear && radial.residual < linear.residual * 0.82 && radial.range > 8) fit = radial;
+      if (!fit) return;
+      if (partial && fit.gradient.kind === "linear") {
+        const plateau = plateauLinear(fit.gradient, palette, minX, minY, maxX, maxY);
+        fit = { gradient: plateau, ...residuals(subset, plateau) };
+      } else if (partial && fit.gradient.kind === "radial") {
+        const radialFit = fit.gradient;
+        const stops = radialFit.stops.map(
+          (stop, index) => index === radialFit.stops.length - 1 ? { offset: stop.offset, color: palette } : stop
+        );
+        const plateau = { kind: "radial", cx: radialFit.cx, cy: radialFit.cy, r: radialFit.r, stops };
+        fit = { gradient: plateau, ...residuals(subset, plateau) };
+      }
+      if (!fit || !acceptable(fit)) return;
+      if (partial && !stopsStayInFamily(fit.gradient, palette)) return;
+      if (fit.gradient.kind === "radial") {
+        const origin = rgbToCieLab(palette.r, palette.g, palette.b);
+        const center = fit.gradient.stops[0];
+        if (center && Math.hypot(origin.a, origin.b) < 12) {
+          const lab = rgbToCieLab(center.color.r, center.color.g, center.color.b);
+          if (lab.l < origin.l - 8) return;
+        }
+      }
+      const gain = (fit.flat - fit.residual) * Math.sqrt(subset.length);
+      if (found.length === 0 || gain > bestGain) {
+        found[0] = fit;
+        bestGain = gain;
+      }
+    };
+    consider(samples, false);
+    let sampleMinY = samples[0]?.y ?? 0;
+    let sampleMaxY = sampleMinY;
+    let sampleMinX = samples[0]?.x ?? 0;
+    let sampleMaxX = sampleMinX;
+    for (const sample2 of samples) {
+      if (sample2.y < sampleMinY) sampleMinY = sample2.y;
+      if (sample2.y > sampleMaxY) sampleMaxY = sample2.y;
+      if (sample2.x < sampleMinX) sampleMinX = sample2.x;
+      if (sample2.x > sampleMaxX) sampleMaxX = sample2.x;
+    }
+    for (const span of [48, 96, 160]) {
+      for (let origin = sampleMinY; origin <= sampleMaxY - span * 0.4; origin += 24) {
+        consider(
+          samples.filter((sample2) => sample2.y >= origin && sample2.y < origin + span),
+          true
+        );
+      }
+      for (let origin = sampleMinX; origin <= sampleMaxX - span * 0.4; origin += 24) {
+        consider(
+          samples.filter((sample2) => sample2.x >= origin && sample2.x < origin + span),
+          true
+        );
+      }
+    }
+    const winner = found[0];
+    return winner ? winner.gradient : null;
+  }
+  function labelSamples(rgba, labels, label, width, population) {
+    const stride = Math.max(1, Math.floor(population / 480));
+    const samples = [];
+    let seen = 0;
+    for (let index = 0; index < labels.length; index++) {
+      if ((labels[index] ?? -1) !== label) continue;
+      seen++;
+      if (seen % stride !== 0) continue;
+      const offset = index * 4;
+      samples.push({
+        x: index % width,
+        y: (index - index % width) / width,
+        r: rgba[offset] ?? 0,
+        g: rgba[offset + 1] ?? 0,
+        b: rgba[offset + 2] ?? 0
+      });
+    }
+    return samples;
+  }
+  function solve3(matrix, rhs) {
+    const a = matrix.map((row, index) => [row[0] ?? 0, row[1] ?? 0, row[2] ?? 0, rhs[index] ?? 0]);
+    for (let col = 0; col < 3; col++) {
+      let pivot = col;
+      let best = Math.abs(a[col]?.[col] ?? 0);
+      for (let row2 = col + 1; row2 < 3; row2++) {
+        const value = Math.abs(a[row2]?.[col] ?? 0);
+        if (value > best) {
+          best = value;
+          pivot = row2;
+        }
+      }
+      if (best < 1e-8) return null;
+      if (pivot !== col) {
+        const swap = a[col];
+        a[col] = a[pivot] ?? [];
+        a[pivot] = swap ?? [];
+      }
+      const row = a[col];
+      if (!row) return null;
+      const diag = row[col] ?? 1;
+      for (let k = col; k < 4; k++) row[k] = (row[k] ?? 0) / diag;
+      for (let other = 0; other < 3; other++) {
+        if (other === col) continue;
+        const target = a[other];
+        if (!target) continue;
+        const factor = target[col] ?? 0;
+        for (let k = col; k < 4; k++) target[k] = (target[k] ?? 0) - factor * (row[k] ?? 0);
+      }
+    }
+    return [a[0]?.[3] ?? 0, a[1]?.[3] ?? 0, a[2]?.[3] ?? 0];
+  }
+  function findRadialDiscs(rgba, labels, palette, width, height) {
+    if (palette.length === 0 || rgba.length < width * height * 4) return [];
+    const populations = new Int32Array(palette.length);
+    const lumaSum = new Float64Array(palette.length);
+    for (let index = 0; index < labels.length; index++) {
+      const label = labels[index] ?? 65535;
+      if (label >= palette.length) continue;
+      populations[label] = (populations[label] ?? 0) + 1;
+      const offset = index * 4;
+      lumaSum[label] = (lumaSum[label] ?? 0) + 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+    }
+    const median2 = new Float64Array(palette.length);
+    for (let label = 0; label < palette.length; label++) {
+      const count = populations[label] ?? 0;
+      median2[label] = count > 0 ? (lumaSum[label] ?? 0) / count : 0;
+    }
+    const bright = new Uint8Array(labels.length);
+    for (let index = 0; index < labels.length; index++) {
+      const label = labels[index] ?? 65535;
+      if (label >= palette.length) continue;
+      const offset = index * 4;
+      const luma = 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+      if (luma > (median2[label] ?? 0) + 16) bright[index] = 1;
+    }
+    const seen = new Uint8Array(labels.length);
+    const stack = [];
+    const discs = [];
+    for (let start2 = 0; start2 < bright.length && discs.length < 3; start2++) {
+      if (!bright[start2] || seen[start2]) continue;
+      const label = labels[start2] ?? 0;
+      stack.push(start2);
+      seen[start2] = 1;
+      const pixels = [];
+      let minX = width;
+      let maxX = 0;
+      let minY = height;
+      let maxY = 0;
+      let brightest = start2;
+      let brightestLuma = -1;
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === void 0) break;
+        pixels.push(current);
+        const x = current % width;
+        const y = (current - x) / width;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        const offset = current * 4;
+        const luma = 0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0);
+        if (luma > brightestLuma) {
+          brightestLuma = luma;
+          brightest = current;
+        }
+        const nexts = [x > 0 ? current - 1 : -1, x + 1 < width ? current + 1 : -1, y > 0 ? current - width : -1, y + 1 < height ? current + width : -1];
+        for (const next of nexts) {
+          if (next < 0 || seen[next] || !bright[next] || (labels[next] ?? -1) !== label) continue;
+          seen[next] = 1;
+          stack.push(next);
+        }
+      }
+      const spanX = maxX - minX + 1;
+      const spanY = maxY - minY + 1;
+      const population = populations[label] ?? 1;
+      if (pixels.length < 180 || pixels.length > population * 0.22) continue;
+      if (spanX < 16 || spanY < 16 || spanX > 160 || spanY > 160) continue;
+      const aspect = Math.max(spanX, spanY) / Math.max(1, Math.min(spanX, spanY));
+      if (aspect > 1.65 || pixels.length / (spanX * spanY) < 0.45) continue;
+      const stride = Math.max(1, Math.floor(pixels.length / 240));
+      const samples = [];
+      for (let i = 0; i < pixels.length; i += stride) {
+        const index = pixels[i];
+        if (index === void 0) continue;
+        const offset = index * 4;
+        samples.push({
+          x: index % width,
+          y: (index - index % width) / width,
+          r: rgba[offset] ?? 0,
+          g: rgba[offset + 1] ?? 0,
+          b: rgba[offset + 2] ?? 0
+        });
+      }
+      const radial = fitRadial(samples);
+      if (!radial || radial.range < 6 || radial.residual > 6 || radial.residual > radial.flat * 0.6) continue;
+      const cx = brightest % width;
+      const cy = (brightest - cx) / width;
+      const radius = 0.5 * Math.max(spanX, spanY);
+      if (radial.gradient.kind !== "radial") continue;
+      const edge = palette[label] ?? { r: 0, g: 0, b: 0 };
+      const fitted = radial.gradient;
+      const stops = fitted.stops.map((stop, index) => index === fitted.stops.length - 1 ? { offset: stop.offset, color: edge } : stop);
+      discs.push({
+        cx,
+        cy,
+        r: radius,
+        color: edge,
+        gradient: { kind: "radial", cx, cy, r: radius, stops }
+      });
+    }
+    return discs;
+  }
+
   // src/color/iso.ts
-  function refineChain(points, closed, inside, outside, width, height, rgba, palette, labels, denoise = true) {
+  function createIsoCache(pixels) {
+    return {
+      labL: new Float64Array(pixels),
+      labA: new Float64Array(pixels),
+      labB: new Float64Array(pixels),
+      ready: new Uint8Array(pixels),
+      stamp: new Int32Array(pixels),
+      stored: new Float64Array(pixels),
+      generation: 1
+    };
+  }
+  var BLUR_RADIUS = 2;
+  var BLUR_WEIGHTS = (() => {
+    const sigma = 0.7;
+    const weights = [];
+    for (let dy = -BLUR_RADIUS; dy <= BLUR_RADIUS; dy++) {
+      for (let dx = -BLUR_RADIUS; dx <= BLUR_RADIUS; dx++) {
+        weights.push(Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma)));
+      }
+    }
+    return weights;
+  })();
+  function refineChain(points, closed, inside, outside, width, height, rgba, palette, labels, denoise = true, cache) {
     const original = points.map((point) => ({ x: point.x, y: point.y }));
     if (outside === TRANSPARENT || inside === TRANSPARENT || points.length < 2) return { points: original, soft: false };
     const labA = paletteLab(palette, inside);
@@ -4147,14 +4946,28 @@
     if (!labA || !labB) return { points: original, soft: false };
     const edgeCount = closed ? points.length : points.length - 1;
     if (edgeCount < 1) return { points: original, soft: false };
-    const coverage = /* @__PURE__ */ new Map();
+    const coverage = cache ? null : /* @__PURE__ */ new Map();
+    if (cache) {
+      cache.generation++;
+      if (cache.generation >= 2147483646) {
+        cache.stamp.fill(0);
+        cache.generation = 1;
+      }
+    }
     const coverageAt = (x, y) => {
       if (x < 0 || y < 0 || x >= width || y >= height) return Number.NaN;
       const index = y * width + x;
-      const hit = coverage.get(index);
+      if (cache) {
+        if (cache.stamp[index] === cache.generation) return cache.stored[index] ?? Number.NaN;
+        const value2 = sampleT(x, y, 0, width, height, rgba, labels, inside, outside, labA, labB, cache);
+        cache.stamp[index] = cache.generation;
+        cache.stored[index] = value2;
+        return value2;
+      }
+      const hit = coverage?.get(index);
       if (hit !== void 0) return hit;
       const value = sampleT(x, y, 0, width, height, rgba, labels, inside, outside, labA, labB);
-      coverage.set(index, value);
+      coverage?.set(index, value);
       return value;
     };
     const insideRaw = [];
@@ -4195,7 +5008,7 @@
     const end = points[points.length - 1];
     if (!start2 || !end) return { points: original, soft: false };
     const open = dedupe(
-      [sharedJunction(start2, width, height, rgba, labels, palette), ...crossings, sharedJunction(end, width, height, rgba, labels, palette)],
+      [sharedJunction(start2, width, height, rgba, labels, palette, cache), ...crossings, sharedJunction(end, width, height, rgba, labels, palette, cache)],
       false
     );
     if (open.length < 2) return { points: original, soft: false };
@@ -4380,7 +5193,7 @@
     const originY = outsideY + 0.5;
     return { x: originX + (insideX + 0.5 - originX) * u, y: originY + (insideY + 0.5 - originY) * u };
   }
-  function sharedJunction(point, width, height, rgba, labels, palette) {
+  function sharedJunction(point, width, height, rgba, labels, palette, cache) {
     const gx = Math.round(point.x);
     const gy = Math.round(point.y);
     if (Math.abs(point.x - gx) > 0.01 || Math.abs(point.y - gy) > 0.01) return { x: point.x, y: point.y };
@@ -4403,8 +5216,8 @@
       const labA = paletteLab(palette, labelA);
       const labB = paletteLab(palette, labelB);
       if (!labA || !labB) continue;
-      const tA = sampleT(ax, ay, 1, width, height, rgba, labels, labelA, labelB, labA, labB);
-      const tB = sampleT(bx, by, 0, width, height, rgba, labels, labelA, labelB, labA, labB);
+      const tA = sampleT(ax, ay, 1, width, height, rgba, labels, labelA, labelB, labA, labB, cache);
+      const tB = sampleT(bx, by, 0, width, height, rgba, labels, labelA, labelB, labA, labB, cache);
       if (tA <= 0.08 && tB >= 0.92) return { x: gx, y: gy };
       crossings.push(dualCrossing(ax, ay, bx, by, tA, tB));
     }
@@ -4427,20 +5240,19 @@
     return null;
   }
   function blurredCoverage(x, y, width, height, coverageAt) {
-    const sigma = 0.7;
-    const radius = 2;
     let sum = 0;
     let wsum = 0;
-    for (let dy = -radius; dy <= radius; dy++) {
-      for (let dx = -radius; dx <= radius; dx++) {
+    let weightIndex = 0;
+    for (let dy = -BLUR_RADIUS; dy <= BLUR_RADIUS; dy++) {
+      for (let dx = -BLUR_RADIUS; dx <= BLUR_RADIUS; dx++) {
+        const weight = BLUR_WEIGHTS[weightIndex++] ?? 0;
         const sx = x + dx;
         const sy = y + dy;
         if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
         const sample2 = coverageAt(sx, sy);
         if (Number.isNaN(sample2)) continue;
-        const w = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma));
-        sum += sample2 * w;
-        wsum += w;
+        sum += sample2 * weight;
+        wsum += weight;
       }
     }
     if (wsum <= 0) {
@@ -4449,15 +5261,28 @@
     }
     return sum / wsum;
   }
-  function sampleT(x, y, k, width, height, rgba, labels, inside, outside, labA, labB) {
+  function sampleT(x, y, k, width, height, rgba, labels, inside, outside, labA, labB, cache) {
     if (x < 0 || y < 0 || x >= width || y >= height) return k <= 0 ? 1 : 0;
     const index = y * width + x;
     if ((rgba[index * 4 + 3] ?? 0) < 128) return 1;
     const label = labels[index] ?? TRANSPARENT;
-    const lab = rgbToOklab(rgba[index * 4] ?? 0, rgba[index * 4 + 1] ?? 0, rgba[index * 4 + 2] ?? 0);
+    const lab = cachedOklab(cache, rgba, index);
     const projected = coverageT(lab, labA, labB);
     if (label !== inside && label !== outside) return projected;
     return projected;
+  }
+  function cachedOklab(cache, rgba, index) {
+    if (cache && cache.ready[index]) {
+      return { l: cache.labL[index] ?? 0, a: cache.labA[index] ?? 0, b: cache.labB[index] ?? 0 };
+    }
+    const lab = rgbToOklab(rgba[index * 4] ?? 0, rgba[index * 4 + 1] ?? 0, rgba[index * 4 + 2] ?? 0);
+    if (cache) {
+      cache.labL[index] = lab.l;
+      cache.labA[index] = lab.a;
+      cache.labB[index] = lab.b;
+      cache.ready[index] = 1;
+    }
+    return lab;
   }
   function coverageT(lab, from, to) {
     const dl = to.l - from.l;
@@ -5262,11 +6087,44 @@
   }
 
   // src/color/trace.ts
+  function discShape(disc) {
+    const cx = disc.cx;
+    const cy = disc.cy;
+    const radius = disc.r;
+    const handle = radius * 0.5522847498307936;
+    const curve = (x1, y1, x2, y2, x, y) => ({
+      op: "C",
+      x1,
+      y1,
+      x2,
+      y2,
+      x,
+      y,
+      primitive: "cubic"
+    });
+    return {
+      color: disc.color,
+      area: Math.PI * radius * radius,
+      gradient: disc.gradient,
+      subpaths: [
+        {
+          start: { x: cx + radius, y: cy },
+          commands: [
+            curve(cx + radius, cy + handle, cx + handle, cy + radius, cx, cy + radius),
+            curve(cx - handle, cy + radius, cx - radius, cy + handle, cx - radius, cy),
+            curve(cx - radius, cy - handle, cx - handle, cy - radius, cx, cy - radius),
+            curve(cx + handle, cy - radius, cx + radius, cy - handle, cx + radius, cy)
+          ]
+        }
+      ]
+    };
+  }
   function traceSegmentation(segmentation, options = {}) {
     const preset = options.preset ?? "logo";
     const profile = presetProfile(preset);
     const error = curveError(options.smooth ?? profile.smooth);
     const cornerAngle = options.cornerAngle ?? profile.cornerAngle;
+    const useGradients = options.gradients ?? gradientsDefault(preset);
     const hasSource = !!options.source && options.source.length >= segmentation.width * segmentation.height * 4;
     const scale = hasSource ? 1 : options.upscale && options.upscale > 1 ? Math.round(options.upscale) : options.upscale === 1 ? 1 : chooseUpscale(segmentation.width, segmentation.height, preset);
     const field = resolveField(segmentation, options);
@@ -5275,13 +6133,15 @@
     const cache = /* @__PURE__ */ new Map();
     const clean = cleanSession(segmentation, options);
     const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
+    const gradientByLabel = useGradients && hasSource && options.source ? detectGradients(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
     const counts = countLabels2(scaled.labels, segmentation.palette.length);
     const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
     order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
+    const isoCache = hasSource ? createIsoCache(segmentation.width * segmentation.height) : null;
     for (const label of order) {
       if (options.isCancelled?.()) break;
       const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
-      const iso = hasSource && options.source ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label } : null;
+      const iso = hasSource && options.source ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label, cache: isoCache } : null;
       const subpaths = [];
       for (const contour of contours) {
         const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean, iso, glyphs);
@@ -5289,7 +6149,11 @@
       }
       const color = segmentation.palette[label];
       if (!color || subpaths.length === 0) continue;
-      shapes.push({ color, area: counts[label] ?? 0, subpaths });
+      shapes.push({ color, area: counts[label] ?? 0, subpaths, gradient: gradientByLabel?.[label] });
+    }
+    if (useGradients && hasSource && options.source && scale <= 1) {
+      const discs = findRadialDiscs(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height);
+      for (const disc of discs) shapes.push(discShape(disc));
     }
     let nodeCount = 0;
     let subpathCount = 0;
@@ -5568,7 +6432,7 @@
       if (replaced) return { points: replaced.points, closed: chain.closed, outside: chain.outside, soft: true, coverage: replaced.coverage };
     }
     if (!iso) return { ...chain, soft: false, coverage: null };
-    const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels);
+    const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels, true, iso.cache ?? void 0);
     return { points: refined.points, closed: chain.closed, outside: chain.outside, soft: refined.soft, coverage: null };
   }
   function cappedTolerance(tolerance, soft) {
@@ -5919,8 +6783,31 @@
   }
   function separation(points, a, b, closed) {
     if (a === b) return 0;
-    if (closed) return Math.min(arcBetween(points, a, b, true), arcBetween(points, b, a, true));
-    return a < b ? arcBetween(points, a, b, false) : arcBetween(points, b, a, false);
+    const lengths = arcLengths(points, closed);
+    if (!closed) {
+      const left = a < b ? a : b;
+      const right = a < b ? b : a;
+      return (lengths[right] ?? 0) - (lengths[left] ?? 0);
+    }
+    const total = lengths[points.length] ?? 0;
+    const forward = a < b ? (lengths[b] ?? 0) - (lengths[a] ?? 0) : total - (lengths[a] ?? 0) + (lengths[b] ?? 0);
+    return Math.min(forward, total - forward);
+  }
+  var arcLengthCache = /* @__PURE__ */ new WeakMap();
+  function arcLengths(points, closed) {
+    const cached = arcLengthCache.get(points);
+    if (cached) return cached;
+    const count = points.length;
+    const lengths = new Float64Array(count + 1);
+    const last = closed ? count : Math.max(0, count - 1);
+    for (let i = 0; i < last; i++) {
+      const start2 = points[i];
+      const end = points[(i + 1) % count];
+      if (!start2 || !end) continue;
+      lengths[i + 1] = (lengths[i] ?? 0) + Math.hypot(end.x - start2.x, end.y - start2.y);
+    }
+    arcLengthCache.set(points, lengths);
+    return lengths;
   }
   function fitSubpixelOpen(points, cornerAngle, tolerance) {
     return polishBites(fitFairOpen(points, cornerAngle, tolerance), points[0] ?? null, false, cornerAngle, tolerance);
@@ -6825,7 +7712,8 @@
     return counts;
   }
   function shapesToSvg(shapes, width, height) {
-    const body = shapes.map((shape) => {
+    const defs = [];
+    const body = shapes.map((shape, index) => {
       const data = shape.subpaths.map((subpath) => {
         let path2 = "M" + formatNumber(subpath.start.x) + " " + formatNumber(subpath.start.y);
         for (const command of subpath.commands) {
@@ -6836,9 +7724,23 @@
         }
         return path2 + "Z";
       }).join("");
-      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.4" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
+      let fill = rgbHex(shape.color);
+      if (shape.gradient) {
+        const id = "vg" + index;
+        defs.push(gradientDef(id, shape.gradient));
+        fill = "url(#" + id + ")";
+      }
+      return '<path fill="' + fill + '" stroke="' + fill + '" stroke-width="0.4" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
     }).join("");
-    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + body + "</svg>";
+    const definitions = defs.length > 0 ? "<defs>" + defs.join("") + "</defs>" : "";
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + definitions + body + "</svg>";
+  }
+  function gradientDef(id, gradient) {
+    const stops = gradient.stops.map((stop) => '<stop offset="' + formatNumber(stop.offset) + '" stop-color="' + rgbHex(stop.color) + '"/>').join("");
+    if (gradient.kind === "linear") {
+      return '<linearGradient id="' + id + '" gradientUnits="userSpaceOnUse" x1="' + formatNumber(gradient.x1) + '" y1="' + formatNumber(gradient.y1) + '" x2="' + formatNumber(gradient.x2) + '" y2="' + formatNumber(gradient.y2) + '">' + stops + "</linearGradient>";
+    }
+    return '<radialGradient id="' + id + '" gradientUnits="userSpaceOnUse" cx="' + formatNumber(gradient.cx) + '" cy="' + formatNumber(gradient.cy) + '" r="' + formatNumber(gradient.r) + '">' + stops + "</radialGradient>";
   }
   function formatNumber(value) {
     const rounded = Math.round(value * 100) / 100;
@@ -6896,6 +7798,8 @@
       cleanStrength: getInput("clean-strength"),
       cleanStrengthValue: getOutput("clean-strength-value"),
       cleanText: getInput("clean-text"),
+      gradients: getInput("gradients"),
+      prefilter: getInput("prefilter"),
       editorRoot: getElement("editor-root")
     };
   }
@@ -6975,6 +7879,7 @@
       svgPath: path.join(directory, "result.svg"),
       settings,
       cancelled: false,
+      pixels: null,
       source: null
     };
   }
@@ -7007,7 +7912,7 @@
     if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E27\u0E32\u0E21\u0E40\u0E23\u0E35\u0E22\u0E1A\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     if (!Number.isFinite(cleanShapes) || cleanShapes < 0 || cleanShapes > 1) throw new Error("\u0E04\u0E27\u0E32\u0E21\u0E41\u0E23\u0E07\u0E02\u0E2D\u0E07\u0E23\u0E39\u0E1B\u0E17\u0E23\u0E07\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    return { preset, maxColors, simplify, cleanShapes, cleanText: ui.cleanText.checked };
+    return { preset, maxColors, simplify, cleanShapes, cleanText: ui.cleanText.checked, gradients: ui.gradients.checked, prefilter: ui.prefilter.checked };
   }
   function showSelection(ui, selection) {
     ui.selection.replaceChildren();
@@ -7093,7 +7998,9 @@
     }
     function openSegmentation(job) {
       const decoded = decodePng(fs.readFileSync(job.pngPath));
-      const segmentation = segmentImage(decoded.data, decoded.width, decoded.height, job.settings.maxColors, { preset: job.settings.preset });
+      const pixels = job.settings.prefilter ? guidedFilter(decoded.data, decoded.width, decoded.height) : decoded.data;
+      job.pixels = pixels;
+      const segmentation = segmentImage(pixels, decoded.width, decoded.height, job.settings.maxColors, { preset: job.settings.preset });
       job.source = segmentation;
       editor.load(segmentation);
     }
@@ -7165,7 +8072,7 @@
         const segmentation = editor.segmentation();
         if (segmentation.palette.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E35\u0E43\u0E2B\u0E49\u0E41\u0E1B\u0E25\u0E07");
         const live = readSettings(ui);
-        job.settings = { ...job.settings, simplify: live.simplify, cleanShapes: live.cleanShapes, cleanText: live.cleanText };
+        job.settings = { ...job.settings, simplify: live.simplify, cleanShapes: live.cleanShapes, cleanText: live.cleanText, gradients: live.gradients };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E08\u0E32\u0E01\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E41\u0E01\u0E49\u2026");
         state = { kind: "tracing", selection, job };
         render();
@@ -7173,12 +8080,13 @@
         if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
         const source = job.source;
         const decoded = decodePng(fs.readFileSync(job.pngPath));
-        const sourcePixels = decoded.width === segmentation.width && decoded.height === segmentation.height ? decoded.data : void 0;
+        const sourcePixels = job.pixels && job.pixels.length === segmentation.width * segmentation.height * 4 ? job.pixels : decoded.width === segmentation.width && decoded.height === segmentation.height ? decoded.data : void 0;
         const traced = traceSegmentation(segmentation, {
           preset: job.settings.preset,
           smooth: job.settings.simplify,
           cleanShapes: job.settings.cleanShapes,
           cleanText: job.settings.cleanText,
+          gradients: job.settings.gradients,
           smoothMask: segmentation.smoothMask,
           coverage: source?.coverage,
           partner: source?.partner,
@@ -7220,7 +8128,7 @@
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
       render();
       try {
-        const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";clean=" + job.settings.cleanShapes + ";cleanText=" + (job.settings.cleanText ? 1 : 0) + ";edited=" + editor.colorCount();
+        const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";clean=" + job.settings.cleanShapes + ";cleanText=" + (job.settings.cleanText ? 1 : 0) + ";gradients=" + (job.settings.gradients ? 1 : 0) + ";prefilter=" + (job.settings.prefilter ? 1 : 0) + ";edited=" + editor.colorCount();
         const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48 \xB7 \u0E2A\u0E35 " + editor.colorCount());
         cleanJob(job);
@@ -7272,6 +8180,11 @@
       ui.colorsValue.value = ui.colors.value;
       ui.smooth.value = String(Math.round(profile.smooth * 10));
       ui.smoothValue.value = profile.smooth.toFixed(1);
+      const name = ui.preset.value;
+      if (isPresetName(name)) {
+        ui.gradients.checked = gradientsDefault(name);
+        ui.prefilter.checked = prefilterDefault(name);
+      }
     });
     window.addEventListener("beforeunload", () => {
       if (state.kind === "preview" || state.kind === "editing") cleanJob(state.job);

@@ -46,3 +46,13 @@ export function chooseUpscale(width: number, height: number, preset: PresetName)
   if (preset === "ui") return minor <= 400 ? 3 : 2;
   return minor <= 400 ? 3 : minor <= 1200 ? 2 : 1;
 }
+
+/** Smooth ramps become gradient fills for photographs and illustrations. Logos stay flat. */
+export function gradientsDefault(preset: PresetName): boolean {
+  return preset === "photo" || preset === "illustration";
+}
+
+/** Edge-preserving smoothing for JPEG blocks. Photographs opt in; flat logos do not. */
+export function prefilterDefault(preset: PresetName): boolean {
+  return preset === "photo";
+}

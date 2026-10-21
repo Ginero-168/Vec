@@ -1,4 +1,5 @@
 import type { Rgb } from "./model";
+import { colorAtGradient, type VecGradient } from "./gradient";
 import type { VecCommand, VecShape } from "./trace";
 
 type Point = { x: number; y: number };
@@ -25,7 +26,7 @@ export function rasterizeShapes(shapes: readonly VecShape[], width: number, heig
       }
       if (polygon.length >= 3) polygons.push(polygon);
     }
-    fillEvenOdd(rgba, width, height, polygons, shape.color, pad);
+    fillEvenOdd(rgba, width, height, polygons, shape.color, shape.gradient, pad);
   }
   return rgba;
 }
@@ -43,6 +44,7 @@ export function rasterizeWindow(
   const placed = shapes.map((shape) => ({
     color: shape.color,
     area: shape.area,
+    gradient: scaleGradient(shape.gradient, originX, originY, zoom),
     subpaths: shape.subpaths.map((subpath) => ({
       start: { x: (subpath.start.x - originX) * zoom, y: (subpath.start.y - originY) * zoom },
       commands: subpath.commands.map((command) => scaleCommand(command, originX, originY, zoom))
@@ -100,7 +102,36 @@ function pointSegmentDistance(point: Point, from: Point, to: Point): number {
   return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
 }
 
-function fillEvenOdd(rgba: Uint8Array, width: number, height: number, polygons: readonly Point[][], color: Rgb, pad: number): void {
+function scaleGradient(gradient: VecGradient | undefined, originX: number, originY: number, zoom: number): VecGradient | undefined {
+  if (!gradient) return undefined;
+  if (gradient.kind === "linear") {
+    return {
+      kind: "linear",
+      x1: (gradient.x1 - originX) * zoom,
+      y1: (gradient.y1 - originY) * zoom,
+      x2: (gradient.x2 - originX) * zoom,
+      y2: (gradient.y2 - originY) * zoom,
+      stops: gradient.stops
+    };
+  }
+  return {
+    kind: "radial",
+    cx: (gradient.cx - originX) * zoom,
+    cy: (gradient.cy - originY) * zoom,
+    r: gradient.r * zoom,
+    stops: gradient.stops
+  };
+}
+
+function fillEvenOdd(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  polygons: readonly Point[][],
+  color: Rgb,
+  gradient: VecGradient | undefined,
+  pad: number
+): void {
   const edges: { x0: number; y0: number; x1: number; y1: number }[] = [];
   for (const polygon of polygons) {
     for (let i = 0; i < polygon.length; i++) {
@@ -129,10 +160,11 @@ function fillEvenOdd(rgba: Uint8Array, width: number, height: number, polygons: 
       const from = Math.max(0, Math.ceil(left - 0.5 - pad));
       const to = Math.min(width - 1, Math.floor(right - 0.5 + pad));
       for (let x = from; x <= to; x++) {
+        const paint = gradient ? colorAtGradient(gradient, x + 0.5, y + 0.5) : color;
         const offset = (y * width + x) * 4;
-        rgba[offset] = color.r;
-        rgba[offset + 1] = color.g;
-        rgba[offset + 2] = color.b;
+        rgba[offset] = paint.r;
+        rgba[offset + 1] = paint.g;
+        rgba[offset + 2] = paint.b;
         rgba[offset + 3] = 255;
       }
     }

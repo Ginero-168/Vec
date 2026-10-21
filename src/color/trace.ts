@@ -1,8 +1,9 @@
 import { boundaryHits, cleanTolerance, fitClosedClean, fitOpenClean, letterMask, strongCleanTolerance } from "./clean";
+import { detectGradients, findRadialDiscs, type RadialDisc, type VecGradient } from "./gradient";
 import { buildGlyphIndex, type GlyphIndex } from "./glyph";
-import { clipContourBites, refineChain } from "./iso";
+import { clipContourBites, createIsoCache, refineChain, type IsoCache } from "./iso";
 import { TRANSPARENT, rgbHex, type Rgb, type Segmentation } from "./model";
-import { chooseUpscale, curveError, presetProfile, type PresetName } from "./presets";
+import { chooseUpscale, curveError, gradientsDefault, presetProfile, type PresetName } from "./presets";
 
 export type TraceOptions = {
   /** Smooth slider, 0 (crisp) through 3 (very smooth). */
@@ -26,6 +27,12 @@ export type TraceOptions = {
   readonly smoothMask?: Uint8Array;
   /** Original pixels. Shared edges then follow the 0.5 color contour instead of the label grid. */
   readonly source?: Uint8Array;
+  /**
+   * Replace a flat swatch with an SVG gradient when the source inside that
+   * shape is a smooth ramp. Unset follows the preset: on for photo and
+   * illustration, off for logo, icon, and ui.
+   */
+  readonly gradients?: boolean;
   readonly isCancelled?: () => boolean;
 };
 
@@ -53,6 +60,7 @@ export type VecShape = {
   readonly color: Rgb;
   readonly area: number;
   readonly subpaths: readonly VecSubpath[];
+  readonly gradient?: VecGradient;
 };
 
 export type TraceResult = {
@@ -66,6 +74,39 @@ export type TraceResult = {
 
 type Point = { x: number; y: number };
 
+function discShape(disc: RadialDisc): VecShape {
+  const cx = disc.cx;
+  const cy = disc.cy;
+  const radius = disc.r;
+  const handle = radius * 0.5522847498307936;
+  const curve = (x1: number, y1: number, x2: number, y2: number, x: number, y: number): VecCommand => ({
+    op: "C",
+    x1,
+    y1,
+    x2,
+    y2,
+    x,
+    y,
+    primitive: "cubic"
+  });
+  return {
+    color: disc.color,
+    area: Math.PI * radius * radius,
+    gradient: disc.gradient,
+    subpaths: [
+      {
+        start: { x: cx + radius, y: cy },
+        commands: [
+          curve(cx + radius, cy + handle, cx + handle, cy + radius, cx, cy + radius),
+          curve(cx - handle, cy + radius, cx - radius, cy + handle, cx - radius, cy),
+          curve(cx - radius, cy - handle, cx - handle, cy - radius, cx, cy - radius),
+          curve(cx + handle, cy - radius, cx + radius, cy - handle, cx + radius, cy)
+        ]
+      }
+    ]
+  };
+}
+
 type FitCommand = VecCommand;
 
 /**
@@ -78,6 +119,7 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
   const profile = presetProfile(preset);
   const error = curveError(options.smooth ?? profile.smooth);
   const cornerAngle = options.cornerAngle ?? profile.cornerAngle;
+  const useGradients = options.gradients ?? gradientsDefault(preset);
   const hasSource = !!options.source && options.source.length >= segmentation.width * segmentation.height * 4;
   const scale = hasSource
     ? 1
@@ -92,16 +134,21 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
   const cache = new Map<string, FitCommand[]>();
   const clean = cleanSession(segmentation, options);
   const glyphs = hasSource && options.source ? buildGlyphIndex(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height) : null;
+  const gradientByLabel =
+    useGradients && hasSource && options.source
+      ? detectGradients(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height)
+      : null;
   const counts = countLabels(scaled.labels, segmentation.palette.length);
   const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
   order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
 
+  const isoCache = hasSource ? createIsoCache(segmentation.width * segmentation.height) : null;
   for (const label of order) {
     if (options.isCancelled?.()) break;
     const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
     const iso =
       hasSource && options.source
-        ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label }
+        ? { rgba: options.source, palette: segmentation.palette, labels: field.labels, width: segmentation.width, height: segmentation.height, inside: label, cache: isoCache }
         : null;
     const subpaths: VecSubpath[] = [];
     for (const contour of contours) {
@@ -110,7 +157,12 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
     }
     const color = segmentation.palette[label];
     if (!color || subpaths.length === 0) continue;
-    shapes.push({ color, area: counts[label] ?? 0, subpaths });
+    shapes.push({ color, area: counts[label] ?? 0, subpaths, gradient: gradientByLabel?.[label] });
+  }
+
+  if (useGradients && hasSource && options.source && scale <= 1) {
+    const discs = findRadialDiscs(options.source, field.labels, segmentation.palette, segmentation.width, segmentation.height);
+    for (const disc of discs) shapes.push(discShape(disc));
   }
 
   let nodeCount = 0;
@@ -247,6 +299,7 @@ export function contourDeviationP95(segmentation: Segmentation, source: Uint8Arr
   const height = segmentation.height;
   const buckets = bucketSamples(sampleShapes(shapes));
   const distances: number[] = [];
+  const isoCache = createIsoCache(width * height);
   const counts = countLabels(segmentation.labels, segmentation.palette.length);
   for (let label = 0; label < segmentation.palette.length; label++) {
     if ((counts[label] ?? 0) === 0) continue;
@@ -254,7 +307,7 @@ export function contourDeviationP95(segmentation: Segmentation, source: Uint8Arr
     for (const contour of contours) {
       const chains = splitChains(contour.points, contour.outside);
       for (const chain of chains) {
-        const refined = refineChain(chain.points, chain.closed, label, chain.outside, width, height, source, segmentation.palette, segmentation.labels, false);
+        const refined = refineChain(chain.points, chain.closed, label, chain.outside, width, height, source, segmentation.palette, segmentation.labels, false, isoCache);
         if (!refined.soft) continue;
         for (const point of refined.points) distances.push(nearestSample(buckets, point.x, point.y));
       }
@@ -536,6 +589,7 @@ type IsoContext = {
   readonly width: number;
   readonly height: number;
   readonly inside: number;
+  readonly cache: IsoCache | null;
 };
 
 type CleanSession = {
@@ -633,7 +687,7 @@ function prepareChain(chain: Chain, iso: IsoContext | null, glyphs: GlyphIndex |
     if (replaced) return { points: replaced.points, closed: chain.closed, outside: chain.outside, soft: true, coverage: replaced.coverage };
   }
   if (!iso) return { ...chain, soft: false, coverage: null };
-  const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels);
+  const refined = refineChain(chain.points, chain.closed, iso.inside, chain.outside, iso.width, iso.height, iso.rgba, iso.palette, iso.labels, true, iso.cache ?? undefined);
   return { points: refined.points, closed: chain.closed, outside: chain.outside, soft: refined.soft, coverage: null };
 }
 
@@ -1023,8 +1077,33 @@ function nearIndex(points: readonly Point[], index: number, others: readonly num
 
 function separation(points: readonly Point[], a: number, b: number, closed: boolean): number {
   if (a === b) return 0;
-  if (closed) return Math.min(arcBetween(points, a, b, true), arcBetween(points, b, a, true));
-  return a < b ? arcBetween(points, a, b, false) : arcBetween(points, b, a, false);
+  const lengths = arcLengths(points, closed);
+  if (!closed) {
+    const left = a < b ? a : b;
+    const right = a < b ? b : a;
+    return (lengths[right] ?? 0) - (lengths[left] ?? 0);
+  }
+  const total = lengths[points.length] ?? 0;
+  const forward = a < b ? (lengths[b] ?? 0) - (lengths[a] ?? 0) : total - (lengths[a] ?? 0) + (lengths[b] ?? 0);
+  return Math.min(forward, total - forward);
+}
+
+const arcLengthCache = new WeakMap<readonly Point[], Float64Array>();
+
+function arcLengths(points: readonly Point[], closed: boolean): Float64Array {
+  const cached = arcLengthCache.get(points);
+  if (cached) return cached;
+  const count = points.length;
+  const lengths = new Float64Array(count + 1);
+  const last = closed ? count : Math.max(0, count - 1);
+  for (let i = 0; i < last; i++) {
+    const start = points[i];
+    const end = points[(i + 1) % count];
+    if (!start || !end) continue;
+    lengths[i + 1] = (lengths[i] ?? 0) + Math.hypot(end.x - start.x, end.y - start.y);
+  }
+  arcLengthCache.set(points, lengths);
+  return lengths;
 }
 
 function fitSubpixelOpen(points: Point[], cornerAngle: number, tolerance: number): FitCommand[] {
@@ -2018,8 +2097,9 @@ function countLabels(labels: Uint16Array, paletteLength: number): Int32Array {
 }
 
 function shapesToSvg(shapes: readonly VecShape[], width: number, height: number): string {
+  const defs: string[] = [];
   const body = shapes
-    .map((shape) => {
+    .map((shape, index) => {
       const data = shape.subpaths
         .map((subpath) => {
           let path = "M" + formatNumber(subpath.start.x) + " " + formatNumber(subpath.start.y);
@@ -2044,10 +2124,53 @@ function shapesToSvg(shapes: readonly VecShape[], width: number, height: number)
           return path + "Z";
         })
         .join("");
-      return '<path fill="' + rgbHex(shape.color) + '" stroke="' + rgbHex(shape.color) + '" stroke-width="0.4" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
+      let fill = rgbHex(shape.color);
+      if (shape.gradient) {
+        const id = "vg" + index;
+        defs.push(gradientDef(id, shape.gradient));
+        fill = "url(#" + id + ")";
+      }
+      return '<path fill="' + fill + '" stroke="' + fill + '" stroke-width="0.4" stroke-linejoin="round" fill-rule="evenodd" d="' + data + '"/>';
     })
     .join("");
-  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + body + "</svg>";
+  const definitions = defs.length > 0 ? "<defs>" + defs.join("") + "</defs>" : "";
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" width="' + width + '" height="' + height + '">' + definitions + body + "</svg>";
+}
+
+function gradientDef(id: string, gradient: VecGradient): string {
+  const stops = gradient.stops
+    .map((stop) => '<stop offset="' + formatNumber(stop.offset) + '" stop-color="' + rgbHex(stop.color) + '"/>')
+    .join("");
+  if (gradient.kind === "linear") {
+    return (
+      '<linearGradient id="' +
+      id +
+      '" gradientUnits="userSpaceOnUse" x1="' +
+      formatNumber(gradient.x1) +
+      '" y1="' +
+      formatNumber(gradient.y1) +
+      '" x2="' +
+      formatNumber(gradient.x2) +
+      '" y2="' +
+      formatNumber(gradient.y2) +
+      '">' +
+      stops +
+      "</linearGradient>"
+    );
+  }
+  return (
+    '<radialGradient id="' +
+    id +
+    '" gradientUnits="userSpaceOnUse" cx="' +
+    formatNumber(gradient.cx) +
+    '" cy="' +
+    formatNumber(gradient.cy) +
+    '" r="' +
+    formatNumber(gradient.r) +
+    '">' +
+    stops +
+    "</radialGradient>"
+  );
 }
 
 function formatNumber(value: number): string {
