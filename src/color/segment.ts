@@ -1152,6 +1152,7 @@ function settleEdges(
   for (let pass = 0; pass < 4; pass++) pinToNearbyCores(rgba, labels, partner, coverage, width, height, palette);
   dissolveBoundarySlivers(rgba, labels, partner, coverage, width, height, palette);
   clearSolidSpecks(labels, partner, coverage, width, height);
+  absorbInteriorSpecks(rgba, labels, partner, coverage, width, height);
   reconcilePartners(labels, partner, coverage);
 }
 
@@ -1526,6 +1527,45 @@ function clearSolidSpecks(
     }
     if (changed === 0) break;
   }
+}
+
+function absorbInteriorSpecks(
+  rgba: Uint8Array,
+  labels: Uint16Array,
+  partner: Uint16Array,
+  coverage: Float32Array,
+  width: number,
+  height: number
+): void {
+  const totals = new Map<number, number>();
+  for (let index = 0; index < labels.length; index++) {
+    const label = labels[index] ?? TRANSPARENT;
+    if (label === TRANSPARENT) continue;
+    totals.set(label, (totals.get(label) ?? 0) + 1);
+  }
+  forEachComponent(labels, width, height, (region) => {
+    if (region.pixels.length < 1 || region.pixels.length > 8 || region.adjacency.size !== 1) return;
+    if ((totals.get(region.label) ?? 0) <= region.pixels.length) return;
+    if (region.minX <= 0 || region.minY <= 0 || region.maxX >= width - 1 || region.maxY >= height - 1) return;
+    const target = region.adjacency.keys().next().value;
+    if (target === undefined || target === region.label) return;
+    let dark = 0;
+    let white = 0;
+    for (const pixel of region.pixels) {
+      const offset = pixel * 4;
+      const r = rgba[offset] ?? 0;
+      const g = rgba[offset + 1] ?? 0;
+      const b = rgba[offset + 2] ?? 0;
+      if (Math.max(r, g, b) < 70) dark++;
+      if (r > 236 && g > 236 && b > 236) white++;
+    }
+    if (dark > 0 || white * 2 >= region.pixels.length) return;
+    for (const pixel of region.pixels) {
+      labels[pixel] = target;
+      partner[pixel] = TRANSPARENT;
+      coverage[pixel] = 1;
+    }
+  });
 }
 
 function reconcilePartners(labels: Uint16Array, partner: Uint16Array, coverage: Float32Array): void {

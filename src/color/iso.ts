@@ -20,7 +20,8 @@ export function refineChain(
   height: number,
   rgba: Uint8Array,
   palette: readonly Rgb[],
-  labels: Uint16Array
+  labels: Uint16Array,
+  denoise = true
 ): { points: IsoPoint[]; soft: boolean } {
   const original = points.map((point) => ({ x: point.x, y: point.y }));
   if (outside === TRANSPARENT || inside === TRANSPARENT || points.length < 2) return { points: original, soft: false };
@@ -29,6 +30,16 @@ export function refineChain(
   if (!labA || !labB) return { points: original, soft: false };
   const edgeCount = closed ? points.length : points.length - 1;
   if (edgeCount < 1) return { points: original, soft: false };
+  const coverage = new Map<number, number>();
+  const coverageAt = (x: number, y: number): number => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return Number.NaN;
+    const index = y * width + x;
+    const hit = coverage.get(index);
+    if (hit !== undefined) return hit;
+    const value = sampleT(x, y, 0, width, height, rgba, labels, inside, outside, labA, labB);
+    coverage.set(index, value);
+    return value;
+  };
   const insideRaw: number[] = [];
   const outsideRaw: number[] = [];
   const pixels: { inside: [number, number]; outside: [number, number] }[] = [];
@@ -39,11 +50,11 @@ export function refineChain(
     const ends = edgePixels(from.x, from.y, to.x, to.y);
     if (!ends) return { points: original, soft: false };
     pixels.push(ends);
-    insideRaw.push(sampleT(ends.inside[0], ends.inside[1], 1, width, height, rgba, labels, inside, outside, labA, labB));
-    outsideRaw.push(sampleT(ends.outside[0], ends.outside[1], 0, width, height, rgba, labels, inside, outside, labA, labB));
+    insideRaw.push(blurredCoverage(ends.inside[0], ends.inside[1], width, height, coverageAt));
+    outsideRaw.push(blurredCoverage(ends.outside[0], ends.outside[1], width, height, coverageAt));
   }
-  const insideT = smoothLine(smoothLine(insideRaw, closed), closed);
-  const outsideT = smoothLine(smoothLine(outsideRaw, closed), closed);
+  const insideT = gaussianSmooth(insideRaw, closed);
+  const outsideT = gaussianSmooth(outsideRaw, closed);
   const crossings: IsoPoint[] = [];
   let soft = 0;
   for (let edge = 0; edge < edgeCount; edge++) {
@@ -56,54 +67,89 @@ export function refineChain(
   }
   if (soft * 5 < edgeCount) return { points: original, soft: false };
   if (closed) {
-    const loop = relaxJogs(dedupe(crossings, true), true);
+    const loop = dedupe(crossings, true);
     if (loop.length < 3) return { points: original, soft: false };
-    return { points: loop, soft: true };
+    if (!denoise) return { points: loop, soft: true };
+    const smoothed = smoothContour(loop, true);
+    if (smoothed.length < 3) return { points: original, soft: false };
+    return { points: smoothed, soft: true };
   }
   const start = points[0];
   const end = points[points.length - 1];
   if (!start || !end) return { points: original, soft: false };
-  const open = relaxJogs(
-    dedupe(
-      [sharedJunction(start, width, height, rgba, labels, palette), ...crossings, sharedJunction(end, width, height, rgba, labels, palette)],
-      false
-    ),
+  const open = dedupe(
+    [sharedJunction(start, width, height, rgba, labels, palette), ...crossings, sharedJunction(end, width, height, rgba, labels, palette)],
     false
   );
   if (open.length < 2) return { points: original, soft: false };
-  return { points: open, soft: true };
+  if (!denoise) return { points: open, soft: true };
+  const smoothed = smoothContour(open, false);
+  if (smoothed.length < 2) return { points: original, soft: false };
+  return { points: smoothed, soft: true };
 }
 
 /**
- * Pull short grid jogs onto the chord of their neighbors. A real corner, with
- * two long arms, stays where the iso-line put it. Straight runs are unchanged.
+ * Flatten marching-squares kinks onto the local chord. A corner that is sharp
+ * at both a short and a long scale stays where the iso-line put it.
  */
-function relaxJogs(points: readonly IsoPoint[], closed: boolean): IsoPoint[] {
-  const count = points.length;
-  if (count < 3) return points.map((point) => ({ x: point.x, y: point.y }));
+function smoothContour(points: readonly IsoPoint[], closed: boolean): IsoPoint[] {
+  if (points.length < 3) return points.map((point) => ({ x: point.x, y: point.y }));
   let current = points.map((point) => ({ x: point.x, y: point.y }));
-  for (let pass = 0; pass < 6; pass++) {
-    const next = current.map((point) => ({ x: point.x, y: point.y }));
-    const first = closed ? 0 : 1;
-    const last = closed ? count : count - 1;
-    for (let i = first; i < last; i++) {
-      const previous = current[(i - 1 + count) % count]!;
-      const point = current[i]!;
-      const following = current[(i + 1) % count]!;
-      const incoming = Math.hypot(point.x - previous.x, point.y - previous.y);
-      const outgoing = Math.hypot(following.x - point.x, following.y - point.y);
-      if (incoming > 2.4 && outgoing > 2.4) continue;
-      const turn = jogTurn(previous, point, following);
-      if (turn < 0.55) continue;
-      const weight = turn > 2.2 ? 0.85 : 0.62;
-      next[i] = {
-        x: point.x * (1 - weight) + ((previous.x + following.x) / 2) * weight,
-        y: point.y * (1 - weight) + ((previous.y + following.y) / 2) * weight
-      };
-    }
-    current = next;
+  for (let pass = 0; pass < 2; pass++) current = flattenStairs(current, closed);
+  return dedupe(current, closed);
+}
+
+/** Pull marching-squares kinks onto the local chord. A real corner, sharp at both scales, stays put. */
+function flattenStairs(points: readonly IsoPoint[], closed: boolean): IsoPoint[] {
+  const count = points.length;
+  const next = points.map((point) => ({ x: point.x, y: point.y }));
+  const window = 6;
+  const first = closed ? 0 : window;
+  const last = closed ? count : count - window;
+  for (let i = first; i < last; i++) {
+    if (stableCorner(points, i, closed)) continue;
+    const near = cornerTurn(points, i, 2, closed);
+    const far = cornerTurn(points, i, window, closed);
+    if (near < 0.35 || far > 0.5) continue;
+    const before = points[(i - window + count) % count];
+    const after = points[(i + window) % count];
+    const point = points[i];
+    if (!before || !after || !point) continue;
+    const dx = after.x - before.x;
+    const dy = after.y - before.y;
+    const length2 = dx * dx + dy * dy;
+    if (length2 < 1e-4) continue;
+    const t = ((point.x - before.x) * dx + (point.y - before.y) * dy) / length2;
+    const clamped = Math.min(1, Math.max(0, t));
+    const targetX = before.x + dx * clamped;
+    const targetY = before.y + dy * clamped;
+    next[i] = { x: point.x * 0.35 + targetX * 0.65, y: point.y * 0.35 + targetY * 0.65 };
   }
-  return current;
+  return next;
+}
+
+/** Along-chain Gaussian, sigma ~0.7 samples. Open ends renormalize so a reversed chain stays the reverse. */
+function gaussianSmooth(values: readonly number[], closed: boolean): number[] {
+  const sigma = 0.7;
+  const radius = 3;
+  const weight: number[] = [];
+  for (let k = -radius; k <= radius; k++) weight.push(Math.exp(-(k * k) / (2 * sigma * sigma)));
+  const count = values.length;
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    let sum = 0;
+    let wsum = 0;
+    for (let k = -radius; k <= radius; k++) {
+      let index = i + k;
+      if (closed) index = (index + count * 4) % count;
+      else if (index < 0 || index >= count) continue;
+      const w = weight[k + radius] ?? 0;
+      sum += (values[index] ?? 0) * w;
+      wsum += w;
+    }
+    out.push(wsum > 0 ? sum / wsum : (values[i] ?? 0));
+  }
+  return out;
 }
 
 function jogTurn(a: IsoPoint, b: IsoPoint, c: IsoPoint): number {
@@ -113,6 +159,23 @@ function jogTurn(a: IsoPoint, b: IsoPoint, c: IsoPoint): number {
   if (delta > Math.PI) delta -= Math.PI * 2;
   if (delta < -Math.PI) delta += Math.PI * 2;
   return Math.abs(delta);
+}
+
+/** A stair kink is sharp up close and straight a few pixels out. A real corner stays sharp. */
+function stableCorner(points: readonly IsoPoint[], index: number, closed: boolean): boolean {
+  const near = cornerTurn(points, index, 3, closed);
+  const far = cornerTurn(points, index, 6, closed);
+  return near >= 1 && far >= 0.65;
+}
+
+function cornerTurn(points: readonly IsoPoint[], index: number, window: number, closed: boolean): number {
+  const count = points.length;
+  if (!closed && (index < window || index + window >= count)) return 0;
+  const previous = points[(index - window + count) % count];
+  const point = points[index];
+  const following = points[(index + window) % count];
+  if (!previous || !point || !following) return 0;
+  return jogTurn(previous, point, following);
 }
 
 /** Crossings of the source 0.5 contour along every label boundary, in source pixels. */
@@ -227,17 +290,6 @@ function sharedJunction(
   return { x: x / crossings.length, y: y / crossings.length };
 }
 
-function smoothLine(values: readonly number[], closed: boolean): number[] {
-  const count = values.length;
-  const out: number[] = [];
-  for (let i = 0; i < count; i++) {
-    const previous = values[closed ? (i - 1 + count) % count : Math.max(0, i - 1)] ?? 0;
-    const next = values[closed ? (i + 1) % count : Math.min(count - 1, i + 1)] ?? 0;
-    out.push(0.25 * previous + 0.5 * (values[i] ?? 0) + 0.25 * next);
-  }
-  return out;
-}
-
 function edgePixels(ax: number, ay: number, bx: number, by: number): { inside: [number, number]; outside: [number, number] } | null {
   const dx = bx - ax;
   const dy = by - ay;
@@ -246,6 +298,30 @@ function edgePixels(ax: number, ay: number, bx: number, by: number): { inside: [
   if (dx === 0 && dy === 1) return { inside: [ax - 1, ay], outside: [ax, ay] };
   if (dx === 0 && dy === -1) return { inside: [ax, ay - 1], outside: [ax - 1, ay - 1] };
   return null;
+}
+
+function blurredCoverage(x: number, y: number, width: number, height: number, coverageAt: (px: number, py: number) => number): number {
+  const sigma = 0.7;
+  const radius = 2;
+  let sum = 0;
+  let wsum = 0;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const sx = x + dx;
+      const sy = y + dy;
+      if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
+      const sample = coverageAt(sx, sy);
+      if (Number.isNaN(sample)) continue;
+      const w = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma));
+      sum += sample * w;
+      wsum += w;
+    }
+  }
+  if (wsum <= 0) {
+    const fallback = coverageAt(x, y);
+    return Number.isNaN(fallback) ? 0.5 : fallback;
+  }
+  return sum / wsum;
 }
 
 function sampleT(

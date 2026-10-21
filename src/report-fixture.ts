@@ -4,7 +4,7 @@ import { encodePng, decodePng } from "./color/png";
 import { rasterizeShapes, rasterizeWindow } from "./color/raster";
 import { DARK_SURROUND_L, renderRgba, segmentImage } from "./color/segment";
 import { legacySegmentImage } from "./color/legacy-segment";
-import { contourDeviationP95, measureSharedEdges, staircaseRatio, traceSegmentation } from "./color/trace";
+import { boundaryWobble, contourDeviationP95, measureSharedEdges, staircaseRatio, traceSegmentation } from "./color/trace";
 import { TRANSPARENT } from "./color/model";
 import { makeStripeSample } from "./color/sample";
 
@@ -401,6 +401,10 @@ console.log(
   staircaseRatio(traced.shapes).toFixed(4),
   "staircaseOn",
   staircaseRatio(cleaned.shapes).toFixed(4),
+  "wobbleOff",
+  boundaryWobble(traced.shapes).toFixed(3),
+  "wobbleOn",
+  boundaryWobble(cleaned.shapes).toFixed(3),
   "deviationOff",
   contourDeviationP95(segmentation, data, traced.shapes).toFixed(3),
   "deviationOn",

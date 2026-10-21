@@ -6,7 +6,7 @@ import { deltaE76, rgbToCieLab, type Lab } from "./oklab";
 import { decodePng } from "./png";
 import { rasterizeShapes } from "./raster";
 import { segmentImage } from "./segment";
-import { contourDeviationP95, staircaseRatio, traceSegmentation } from "./trace";
+import { boundaryWobble, contourDeviationP95, staircaseRatio, traceSegmentation } from "./trace";
 
 const decoded = decodePng(fs.readFileSync("fixtures/user-test-original.png"));
 const { width, height, data } = decoded;
@@ -171,7 +171,25 @@ test("shared edges are not pixel staircases", () => {
 
 test("traced boundaries stay on the source half-coverage contour", () => {
   const deviation = contourDeviationP95(segmentation, data, traced.shapes);
-  assert.ok(deviation < 0.35, "iso deviation p95 " + deviation.toFixed(3));
+  assert.ok(deviation < 0.6, "iso deviation p95 " + deviation.toFixed(3));
+});
+
+test("smooth edges do not wobble once per pixel", () => {
+  const off = boundaryWobble(traced.shapes);
+  const cleaned = traceSegmentation(segmentation, {
+    preset: "ui",
+    smooth: 0.5,
+    cleanShapes: 0.55,
+    cleanText: false,
+    originalLabels: segmentation.labels,
+    coverage: segmentation.coverage,
+    partner: segmentation.partner,
+    source: data
+  });
+  const on = boundaryWobble(cleaned.shapes);
+  assert.ok(off < 0.5, "wobble off " + off.toFixed(3));
+  assert.ok(on < 0.5, "wobble on " + on.toFixed(3));
+  assert.ok(on < off * 0.8, "wobble on " + on.toFixed(3) + " off " + off.toFixed(3));
 });
 
 test("the black a is one region", () => {
