@@ -262,3 +262,24 @@ test("zap refuses a high-contrast stroke so text is not deleted", () => {
   assert.deepEqual(doc.labels, before);
   assert.equal(doc.dirty(), false);
 });
+
+test("smooth marks a shared boundary and undo restores it", () => {
+  const segmentation = solid(16, 12, (x, y) => (x >= 3 && x < 12 && y >= 2 && y < 9 ? 0 : 1), [RED, BLUE]);
+  const doc = ColorDocument.fromSegmentation(segmentation);
+  const marked = doc.smoothAt(3, 5, null);
+  assert.equal(marked.ok, true);
+  if (!marked.ok) return;
+  assert.equal(marked.changed, true);
+  assert.equal(doc.dirty(), true);
+  const mask = doc.segmentation().smoothMask;
+  assert.ok(mask && mask.some((value) => value > 0));
+  assert.equal(doc.undo(), true);
+  assert.equal(doc.segmentation().smoothMask, undefined);
+  assert.equal(doc.dirty(), false);
+  assert.equal(doc.redo(), true);
+  assert.ok(doc.segmentation().smoothMask?.some((value) => value > 0));
+  const again = doc.smoothLasso(2, 1, 13, 10);
+  assert.equal(again.ok, true);
+  assert.equal(doc.revert(), true);
+  assert.equal(doc.dirty(), false);
+});

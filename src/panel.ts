@@ -40,6 +40,8 @@ type Settings = {
   readonly preset: PresetName;
   readonly maxColors: number;
   readonly simplify: number;
+  readonly cleanShapes: number;
+  readonly cleanText: boolean;
 };
 
 type Job = {
@@ -79,6 +81,10 @@ type Ui = {
   readonly colorsValue: HTMLOutputElement;
   readonly smooth: HTMLInputElement;
   readonly smoothValue: HTMLOutputElement;
+  readonly cleanShapes: HTMLInputElement;
+  readonly cleanStrength: HTMLInputElement;
+  readonly cleanStrengthValue: HTMLOutputElement;
+  readonly cleanText: HTMLInputElement;
   readonly editorRoot: HTMLElement;
 };
 
@@ -126,6 +132,10 @@ function getUi(): Ui {
     colorsValue: getOutput("colors-value"),
     smooth: getInput("smooth"),
     smoothValue: getOutput("smooth-value"),
+    cleanShapes: getInput("clean-shapes"),
+    cleanStrength: getInput("clean-strength"),
+    cleanStrengthValue: getOutput("clean-strength-value"),
+    cleanText: getInput("clean-text"),
     editorRoot: getElement("editor-root")
   };
 }
@@ -245,9 +255,11 @@ function readSettings(ui: Ui): Settings {
   if (!isPresetName(preset)) throw new Error("Preset ไม่ถูกต้อง");
   const maxColors = Number(ui.colors.value);
   const simplify = Number(ui.smooth.value) / 10;
+  const cleanShapes = ui.cleanShapes.checked ? Number(ui.cleanStrength.value) / 100 : 0;
   if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("จำนวนสีไม่ถูกต้อง");
   if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
-  return { preset, maxColors, simplify };
+  if (!Number.isFinite(cleanShapes) || cleanShapes < 0 || cleanShapes > 1) throw new Error("ความแรงของรูปทรงไม่ถูกต้อง");
+  return { preset, maxColors, simplify, cleanShapes, cleanText: ui.cleanText.checked };
 }
 
 function showSelection(ui: Ui, selection: Selection | null): void {
@@ -407,6 +419,8 @@ function start(): void {
     try {
       const segmentation = editor.segmentation();
       if (segmentation.palette.length === 0) throw new Error("ไม่มีสีให้แปลง");
+      const live = readSettings(ui);
+      job.settings = { ...job.settings, simplify: live.simplify, cleanShapes: live.cleanShapes, cleanText: live.cleanText };
       message("กำลังสร้างเส้นจากสีที่แก้…");
       state = { kind: "tracing", selection, job };
       render();
@@ -416,6 +430,9 @@ function start(): void {
       const traced = traceSegmentation(segmentation, {
         preset: job.settings.preset,
         smooth: job.settings.simplify,
+        cleanShapes: job.settings.cleanShapes,
+        cleanText: job.settings.cleanText,
+        smoothMask: segmentation.smoothMask,
         coverage: source?.coverage,
         partner: source?.partner,
         originalLabels: source?.labels
@@ -423,7 +440,7 @@ function start(): void {
       fs.writeFileSync(job.svgPath, traced.svg, "utf8");
       const svg = traced.svg;
       state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svg, "utf8").toString("base64") };
-      message("ดูตัวอย่างแล้วกดใส่ใน Illustrator · แผนที่สี " + editor.colorCount() + " · เวกเตอร์ " + countSvgFills(svg) + " สี · " + traced.pathCount + " เส้น");
+      message("ดูตัวอย่างแล้วกดใส่ใน Illustrator · แผนที่สี " + editor.colorCount() + " · เวกเตอร์ " + countSvgFills(svg) + " สี · " + traced.pathCount + " เส้น · " + traced.nodeCount + " จุด");
       render();
     } catch (error) {
       state = { kind: "editing", selection, job };
@@ -457,7 +474,7 @@ function start(): void {
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
-      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";edited=" + editor.colorCount();
+      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";clean=" + job.settings.cleanShapes + ";cleanText=" + (job.settings.cleanText ? 1 : 0) + ";edited=" + editor.colorCount();
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่ · สี " + editor.colorCount());
       cleanJob(job);
@@ -485,6 +502,15 @@ function start(): void {
   });
   ui.colors.addEventListener("input", () => { ui.colorsValue.value = ui.colors.value; });
   ui.smooth.addEventListener("input", () => { ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1); });
+  const syncClean = () => {
+    const on = ui.cleanShapes.checked;
+    ui.cleanStrength.disabled = !on;
+    ui.cleanText.disabled = !on;
+    ui.cleanStrengthValue.value = ui.cleanStrength.value;
+  };
+  ui.cleanShapes.addEventListener("change", syncClean);
+  ui.cleanStrength.addEventListener("input", syncClean);
+  syncClean();
   ui.preset.addEventListener("change", () => {
     const profile = presetProfile(ui.preset.value);
     ui.colors.value = String(profile.maxColors);

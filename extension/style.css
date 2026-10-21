@@ -52,6 +52,12 @@ select { width: 100%; border: 1px solid #55545a; border-radius: 6px; background:
 
 input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 
+input[type="range"]:disabled { opacity: 0.4; }
+
+.check-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: #c6c6ca; font-size: 12px; min-height: 28px; }
+
+.check-row input { width: 16px; height: 16px; margin: 0; accent-color: #c6a6fb; }
+
 .phase { font-size: 11px; color: #a8dcbb; }
 
 .preview-frame { min-height: 175px; max-height: 280px; display: grid; place-items: center; overflow: hidden; background-image: linear-gradient(45deg, #37373c 25%, transparent 25%), linear-gradient(-45deg, #37373c 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #37373c 75%), linear-gradient(-45deg, transparent 75%, #37373c 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0; }
@@ -87,6 +93,8 @@ input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 .count-next { color: #cfb6ff; }
 
 .seg-frame { max-height: 320px; overflow: auto; border: 1px solid #49494e; border-radius: 8px; background-color: #2a2a2e; background-image: linear-gradient(45deg, #3a3a40 25%, transparent 25%), linear-gradient(-45deg, #3a3a40 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #3a3a40 75%), linear-gradient(-45deg, transparent 75%, #3a3a40 75%); background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; touch-action: none; }
+
+.seg-stage { position: relative; display: inline-block; }
 
 .seg-frame canvas { display: block; image-rendering: pixelated; touch-action: none; }
 

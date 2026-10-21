@@ -16,6 +16,7 @@
       .compare figure { margin: 0; }
       .compare figcaption { font-size: 12px; margin-bottom: 6px; color: #d9d3e6; }
       .compare img { width: 100%; height: auto; background: #111; border-radius: 8px; }
+      .compare .clean-controls { max-width: 360px; margin: 8px 0 14px; }
     </style>
   </head>
   <body>
@@ -48,6 +49,21 @@
     </div>
     <section class="compare" aria-labelledby="compare-title">
       <h2 id="compare-title">ภาพจาก Illustrator</h2>
+      <div class="clean-controls">
+        <label class="check-row" for="clean-shapes">
+          <input id="clean-shapes" type="checkbox" />
+          ทำให้เป็นรูปทรงเรียบ
+        </label>
+        <div class="field-row">
+          <label for="clean-strength">ความแรงของรูปทรง</label>
+          <output id="clean-strength-value" for="clean-strength">40</output>
+        </div>
+        <input id="clean-strength" type="range" min="1" max="100" value="40" disabled />
+        <label class="check-row" for="clean-text">
+          <input id="clean-text" type="checkbox" disabled />
+          รวมตัวอักษร
+        </label>
+      </div>
       <p id="compare-status">รอผลแยกสี</p>
       <div class="compare-grid">
         <figure>

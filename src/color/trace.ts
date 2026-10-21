@@ -1,3 +1,4 @@
+import { boundaryHits, cleanTolerance, fitClosedClean, fitOpenClean, letterMask, strongCleanTolerance } from "./clean";
 import { TRANSPARENT, rgbHex, type Rgb, type Segmentation } from "./model";
 import { chooseUpscale, curveError, presetProfile, type PresetName } from "./presets";
 
@@ -12,12 +13,32 @@ export type TraceOptions = {
   readonly partner?: Uint16Array;
   /** Labels from the segmentation before manual edits. Edited pixels are drawn solid. */
   readonly originalLabels?: Uint16Array;
+  /**
+   * Clean-shapes strength, 0 off through 1. Off leaves the existing fitter untouched.
+   * When on, each shared edge is fit to lines, arcs, and fair curves.
+   */
+  readonly cleanShapes?: number;
+  /** Also clean thin high-contrast letters. Off keeps those edges on the existing fitter. */
+  readonly cleanText?: boolean;
+  /** Source pixels whose shared boundary the Smooth tool asked to clean. */
+  readonly smoothMask?: Uint8Array;
   readonly isCancelled?: () => boolean;
 };
 
+export type SnapAxis = "horizontal" | "vertical" | "diagonal";
+
 export type VecCommand =
-  | { readonly op: "L"; readonly x: number; readonly y: number }
-  | { readonly op: "C"; readonly x1: number; readonly y1: number; readonly x2: number; readonly y2: number; readonly x: number; readonly y: number };
+  | { readonly op: "L"; readonly x: number; readonly y: number; readonly primitive?: "line"; readonly snap?: SnapAxis }
+  | {
+      readonly op: "C";
+      readonly x1: number;
+      readonly y1: number;
+      readonly x2: number;
+      readonly y2: number;
+      readonly x: number;
+      readonly y: number;
+      readonly primitive?: "arc" | "cubic";
+    };
 
 export type VecSubpath = {
   readonly start: Point;
@@ -58,6 +79,7 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
   const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
   const shapes: VecShape[] = [];
   const cache = new Map<string, FitCommand[]>();
+  const clean = cleanSession(segmentation, options);
   const counts = countLabels(scaled.labels, segmentation.palette.length);
   const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
   order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
@@ -67,7 +89,7 @@ export function traceSegmentation(segmentation: Segmentation, options: TraceOpti
     const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
     const subpaths: VecSubpath[] = [];
     for (const contour of contours) {
-      const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache);
+      const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean);
       if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
     }
     const color = segmentation.palette[label];
@@ -286,16 +308,62 @@ function markEdge(x: number, y: number, dir: number, width: number, height: numb
 
 type Chain = { readonly points: Point[]; readonly closed: boolean };
 
-function contourToSubpath(contour: Contour, scale: number, error: number, cornerAngle: number, simplify: number, cache: Map<string, FitCommand[]>): VecSubpath | null {
+type CleanSession = {
+  readonly tolerance: number;
+  readonly strong: number;
+  readonly letters: Uint8Array | null;
+  readonly selected: Uint8Array | null;
+  readonly width: number;
+  readonly height: number;
+  readonly cache: Map<string, { start: Point; commands: FitCommand[] }>;
+};
+
+function cleanSession(segmentation: Segmentation, options: TraceOptions): CleanSession | null {
+  const strength = options.cleanShapes ?? 0;
+  const selected = options.smoothMask && options.smoothMask.some((value) => value > 0) ? options.smoothMask : null;
+  if (!(strength > 0) && !selected) return null;
+  return {
+    tolerance: strength > 0 ? cleanTolerance(strength) : 0,
+    strong: strongCleanTolerance(strength),
+    letters: strength > 0 && !options.cleanText ? letterMask(segmentation.labels, segmentation.width, segmentation.height, segmentation.palette) : null,
+    selected,
+    width: segmentation.width,
+    height: segmentation.height,
+    cache: new Map()
+  };
+}
+
+function cleanChainTolerance(points: readonly Point[], session: CleanSession | null): number | null {
+  if (!session) return null;
+  if (session.selected && boundaryHits(session.selected, session.width, session.height, points, 0.08)) return session.strong;
+  if (!(session.tolerance > 0)) return null;
+  if (session.letters && boundaryHits(session.letters, session.width, session.height, points, 0.35)) return null;
+  return session.tolerance;
+}
+
+function contourToSubpath(
+  contour: Contour,
+  scale: number,
+  error: number,
+  cornerAngle: number,
+  simplify: number,
+  cache: Map<string, FitCommand[]>,
+  clean: CleanSession | null
+): VecSubpath | null {
   const points = contour.points.map((point) => ({ x: point.x / scale, y: point.y / scale }));
-  const chains = splitChains(points, contour.outside);
+  const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside);
   if (chains.length === 0) return null;
   const only = chains[0];
   if (chains.length === 1 && only?.closed) {
     const canonical = canonicalizeClosed(only.points);
     if (canonical.length < 3) return null;
+    const tolerance = cleanChainTolerance(canonical, clean);
     const commands = cachedClosed(canonical, error, cornerAngle, simplify, cache);
     const start = canonical[0];
+    if (tolerance !== null && clean) {
+      const fitted = cachedCleanClosed(canonical, tolerance, clean);
+      if (fitted && fitted.commands.length > 0 && fitted.commands.length <= commands.length) return fitted;
+    }
     if (!start || commands.length === 0) return null;
     return { start, commands };
   }
@@ -304,10 +372,74 @@ function contourToSubpath(contour: Contour, scale: number, error: number, corner
   const commands: FitCommand[] = [];
   for (const chain of chains) {
     if (chain.closed || chain.points.length < 2) continue;
-    commands.push(...cachedOpen(chain.points, error, cornerAngle, simplify, cache));
+    const tolerance = cleanChainTolerance(chain.points, clean);
+    const plain = cachedOpen(chain.points, error, cornerAngle, simplify, cache);
+    if (tolerance === null || !clean) commands.push(...plain);
+    else {
+      const fitted = cachedCleanOpen(chain.points, tolerance, clean);
+      commands.push(...(fitted.length > 0 && fitted.length <= plain.length ? fitted : plain));
+    }
   }
   if (commands.length === 0) return null;
   return { start, commands };
+}
+
+function cachedCleanOpen(points: readonly Point[], tolerance: number, session: CleanSession): FitCommand[] {
+  const canonical = canonicalizeOpen(points);
+  const key = "k|" + tolerance.toFixed(3) + "|" + pointKey(canonical.points);
+  let fitted = session.cache.get(key);
+  if (!fitted) {
+    const origin = canonical.points[0];
+    if (!origin) return [];
+    fitted = { start: origin, commands: fitOpenClean(canonical.points, tolerance) };
+    session.cache.set(key, fitted);
+  }
+  if (fitted.commands.length === 0) return [];
+  return canonical.reversed ? reverseCommands(fitted.commands, fitted.start) : fitted.commands;
+}
+
+function cachedCleanClosed(points: Point[], tolerance: number, session: CleanSession): { start: Point; commands: FitCommand[] } | null {
+  const key = "kc|" + tolerance.toFixed(3) + "|" + pointKey(points);
+  let fitted = session.cache.get(key);
+  if (!fitted) {
+    const cleanFit = fitClosedClean(points, tolerance);
+    if (!cleanFit) return null;
+    fitted = { start: cleanFit.start, commands: [...cleanFit.commands] };
+    session.cache.set(key, fitted);
+  }
+  return fitted;
+}
+
+function stabilizeOutside(outside: readonly number[]): number[] {
+  const count = outside.length;
+  if (count < 6) return outside.slice();
+  const copy = outside.slice();
+  const runs: { start: number; length: number; label: number }[] = [];
+  let cursor = 0;
+  while (cursor < count) {
+    const label = copy[cursor] ?? TRANSPARENT;
+    let length = 1;
+    while (cursor + length < count && (copy[cursor + length] ?? TRANSPARENT) === label) length++;
+    runs.push({ start: cursor, length, label });
+    cursor += length;
+  }
+  if (runs.length >= 2) {
+    const first = runs[0];
+    const last = runs[runs.length - 1];
+    if (first && last && first.label === last.label) {
+      last.length += first.length;
+      runs.shift();
+    }
+  }
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i];
+    if (!run || run.length > 3) continue;
+    const previous = runs[(i - 1 + runs.length) % runs.length];
+    const next = runs[(i + 1) % runs.length];
+    if (!previous || !next || previous === next || previous.label !== next.label) continue;
+    for (let step = 0; step < run.length; step++) copy[(run.start + step) % count] = previous.label;
+  }
+  return copy;
 }
 
 function splitChains(points: readonly Point[], outside: readonly number[]): Chain[] {
@@ -716,8 +848,9 @@ function reverseCommands(commands: readonly FitCommand[], start: Point): FitComm
   for (let i = segments.length - 1; i >= 0; i--) {
     const segment = segments[i];
     if (!segment) continue;
-    if (segment.command.op === "L") reversed.push({ op: "L", x: segment.fromX, y: segment.fromY });
-    else {
+    if (segment.command.op === "L") {
+      reversed.push({ op: "L", x: segment.fromX, y: segment.fromY, primitive: segment.command.primitive, snap: segment.command.snap });
+    } else {
       reversed.push({
         op: "C",
         x1: segment.command.x2,
@@ -725,7 +858,8 @@ function reverseCommands(commands: readonly FitCommand[], start: Point): FitComm
         x2: segment.command.x1,
         y2: segment.command.y1,
         x: segment.fromX,
-        y: segment.fromY
+        y: segment.fromY,
+        primitive: segment.command.primitive
       });
     }
   }

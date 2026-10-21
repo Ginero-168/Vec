@@ -26,13 +26,14 @@ export type ColorEditor = {
   destroy(): void;
 };
 
-type Tool = "zap" | "fill" | "pencil" | "dropper";
+type Tool = "zap" | "fill" | "pencil" | "dropper" | "smooth";
 
 const TOOL_HINT: Record<Tool, string> = {
   zap: "Zap · คลิกเศษขอบหรือจุดเล็ก ระบบแยกชิ้นที่ติดกันแล้วรวมเข้าสีข้างเคียง",
   fill: "Fill · คลิกพื้นที่ที่ติดกัน เพื่อเทสีที่เลือกอยู่",
   pencil: "Pencil · ลากเพื่อระบายทีละพิกเซล ด้วยสีที่เลือก",
-  dropper: "Color · คลิกบนภาพเพื่อหยิบสีจากส่วนนั้น"
+  dropper: "Color · คลิกบนภาพเพื่อหยิบสีจากส่วนนั้น",
+  smooth: "Smooth · คลิกช่วงขอบเพื่อเกลาให้เป็นเส้นหรือส่วนโค้ง ลากเพื่อปัด Shift ค้างแล้วลากเพื่อคลุมกรอบ"
 };
 
 const ICONS: Record<string, string> = {
@@ -42,7 +43,8 @@ const ICONS: Record<string, string> = {
   zap: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M9.2 1 3 9h4.2L6.4 15 13 6.6H8.6L9.2 1z"/></svg>',
   fill: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8.2 1.6 3.4 8.2c-.8 1.1-.2 2.8 1.2 2.8h.2l-.6 2.6h8.2l-.7-2.6h.2c1.4 0 2-.1 1.2-2.8L8.2 1.6z"/></svg>',
   pencil: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M11.2 1.8 14.2 4.8 5.6 13.4 2 14l.6-3.6 8.6-8.6z"/></svg>',
-  dropper: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10.2 1.6c.8.1 1.6.5 2.2 1.1l.9.9c.6.6 1 1.4 1.1 2.2l-2.2.6-4.7 4.7-2.6-2.6 4.7-4.7.6-2.2zM3.2 10.2l2.6 2.6-2.2 1.2-1.6-1.6 1.2-2.2z"/></svg>'
+  dropper: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10.2 1.6c.8.1 1.6.5 2.2 1.1l.9.9c.6.6 1 1.4 1.1 2.2l-2.2.6-4.7 4.7-2.6-2.6 4.7-4.7.6-2.2zM3.2 10.2l2.6 2.6-2.2 1.2-1.6-1.6 1.2-2.2z"/></svg>',
+  smooth: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M2 11c2.2-4 3.4-4 5.2-1.2C8.8 12.2 10 12.4 14 5"/></svg>'
 };
 
 export function createColorEditor(container: HTMLElement, hooks: ColorEditorHooks = {}): ColorEditor {
@@ -50,6 +52,13 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
   container.insertAdjacentHTML("beforeend", editorMarkup(hooks));
   const canvas = required(container, "canvas", HTMLCanvasElement);
   const context = canvasContext(canvas);
+  const stage = document.createElement("div");
+  stage.className = "seg-stage";
+  const smoothMarquee = document.createElement("div");
+  smoothMarquee.className = "marquee";
+  smoothMarquee.hidden = true;
+  canvas.replaceWith(stage);
+  stage.append(canvas, smoothMarquee);
   const countNow = required(container, ".count-now", HTMLElement);
   const countNext = required(container, ".count-next", HTMLElement);
   const note = required(container, ".editor-note", HTMLElement);
@@ -82,7 +91,9 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
   type Drag =
     | { kind: "dot"; pointerId: number; index: number; hex: string; sx: number; sy: number; moved: boolean; group: boolean; origins: Map<string, { x: number; y: number }> }
     | { kind: "marquee"; pointerId: number; x0: number; y0: number; x1: number; y1: number; moved: boolean }
-    | { kind: "pencil"; pointerId: number; x: number; y: number };
+    | { kind: "pencil"; pointerId: number; x: number; y: number }
+    | { kind: "smooth"; pointerId: number; x: number; y: number }
+    | { kind: "smooth-lasso"; pointerId: number; x0: number; y0: number; x1: number; y1: number; moved: boolean };
 
   let drag: Drag | null = null;
 
@@ -156,9 +167,10 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
         data[offset + 3] = 0;
         continue;
       }
-      data[offset] = color.r;
-      data[offset + 1] = color.g;
-      data[offset + 2] = color.b;
+      const marked = (doc.smoothMask[i] ?? 0) > 0;
+      data[offset] = marked ? Math.round(color.r * 0.42 + 207 * 0.58) : color.r;
+      data[offset + 1] = marked ? Math.round(color.g * 0.42 + 182 * 0.58) : color.g;
+      data[offset + 2] = marked ? Math.round(color.b * 0.42 + 255 * 0.58) : color.b;
       data[offset + 3] = 255;
     }
     canvas.width = doc.width;
@@ -295,6 +307,44 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
     if (bitmap) context.putImageData(bitmap, 0, 0);
   }
 
+  function paintSmooth(x0: number, y0: number, x1: number, y1: number): void {
+    if (!doc || !stroke) return;
+    const dx = Math.abs(x1 - x0);
+    const dy = Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1;
+    const sy = y0 < y1 ? 1 : -1;
+    let err = dx - dy;
+    let x = x0;
+    let y = y0;
+    let changed = false;
+    while (true) {
+      const result = doc.smoothAt(x, y, stroke);
+      if (result.ok && result.changed) changed = true;
+      if (x === x1 && y === y1) break;
+      const doubled = 2 * err;
+      if (doubled > -dy) {
+        err -= dy;
+        x += sx;
+      }
+      if (doubled < dx) {
+        err += dx;
+        y += sy;
+      }
+    }
+    if (changed) paintBitmap();
+  }
+
+  function placeSmoothMarquee(x0: number, y0: number, x1: number, y1: number): void {
+    const scale = Number(zoom.value) || 1;
+    const left = Math.min(x0, x1) * scale;
+    const top = Math.min(y0, y1) * scale;
+    smoothMarquee.hidden = false;
+    smoothMarquee.style.left = left + "px";
+    smoothMarquee.style.top = top + "px";
+    smoothMarquee.style.width = Math.abs(x1 - x0) * scale + "px";
+    smoothMarquee.style.height = Math.abs(y1 - y0) * scale + "px";
+  }
+
   function localPoint(event: PointerEvent): { x: number; y: number } {
     const rect = diagram.getBoundingClientRect();
     return { x: event.clientX - rect.left + diagram.scrollLeft, y: event.clientY - rect.top + diagram.scrollTop };
@@ -415,6 +465,23 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
       drag.y = pixel.y;
       return;
     }
+    if (drag && event.pointerId === drag.pointerId && drag.kind === "smooth") {
+      const pixel = eventPixel(event);
+      if (!pixel) return;
+      paintSmooth(drag.x, drag.y, pixel.x, pixel.y);
+      drag.x = pixel.x;
+      drag.y = pixel.y;
+      return;
+    }
+    if (drag && event.pointerId === drag.pointerId && drag.kind === "smooth-lasso") {
+      const pixel = eventPixel(event);
+      if (!pixel) return;
+      drag.x1 = pixel.x;
+      drag.y1 = pixel.y;
+      if (Math.abs(pixel.x - drag.x0) + Math.abs(pixel.y - drag.y0) > 2) drag.moved = true;
+      placeSmoothMarquee(drag.x0, drag.y0, pixel.x, pixel.y);
+      return;
+    }
     if (drag && event.pointerId === drag.pointerId && drag.kind === "marquee") {
       const point = localPoint(event);
       drag.x1 = point.x;
@@ -450,6 +517,13 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
     else if (current.kind === "pencil") {
       if (doc && stroke) finish(doc.endPencil(stroke));
       stroke = null;
+    } else if (current.kind === "smooth") {
+      stroke = null;
+      syncChrome();
+    } else if (current.kind === "smooth-lasso") {
+      smoothMarquee.hidden = true;
+      if (doc && current.moved) finish(doc.smoothLasso(current.x0, current.y0, current.x1, current.y1));
+      else if (doc) finish(doc.smoothAt(current.x0, current.y0, null));
     } else if (current.kind === "marquee") {
       if (!current.moved || !doc) {
         selected = new Set();
@@ -486,6 +560,17 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
       paintLine(pixel.x, pixel.y, pixel.x, pixel.y);
       return;
     }
+    if (tool === "smooth") {
+      stroke = { pushed: false };
+      if (event.shiftKey) {
+        drag = { kind: "smooth-lasso", pointerId: event.pointerId, x0: pixel.x, y0: pixel.y, x1: pixel.x, y1: pixel.y, moved: false };
+        placeSmoothMarquee(pixel.x, pixel.y, pixel.x, pixel.y);
+      } else {
+        drag = { kind: "smooth", pointerId: event.pointerId, x: pixel.x, y: pixel.y };
+        finish(doc.smoothAt(pixel.x, pixel.y, stroke));
+      }
+      return;
+    }
     if (tool === "zap") finish(doc.zap(pixel.x, pixel.y));
     else if (tool === "fill") finish(doc.fill(pixel.x, pixel.y));
     else {
@@ -515,7 +600,7 @@ export function createColorEditor(container: HTMLElement, hooks: ColorEditorHook
   container.querySelectorAll<HTMLButtonElement>("[data-tool]").forEach((button) => {
     button.addEventListener("click", () => {
       const next = button.dataset.tool;
-      if (next === "zap" || next === "fill" || next === "pencil" || next === "dropper") {
+      if (next === "zap" || next === "fill" || next === "pencil" || next === "dropper" || next === "smooth") {
         tool = next;
         noteText("");
         syncChrome();
@@ -675,6 +760,7 @@ function editorMarkup(hooks: ColorEditorHooks): string {
         ${toolButton("fill", "data-tool", "Fill", "Fill (F)")}
         ${toolButton("pencil", "data-tool", "Pencil", "Pencil (X)")}
         ${toolButton("dropper", "data-tool", "Color", "Color (C)")}
+        ${toolButton("smooth", "data-tool", "Smooth", "Smooth")}
       </div>
       <p class="tool-hint"></p>
       <p class="editor-note" role="status"></p>

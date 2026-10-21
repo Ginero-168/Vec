@@ -327,10 +327,60 @@ writeZoom(530, 210, 330, 330, "zoom-ai-400.png");
 writeHeatmap("delta-heatmap.png");
 console.log("wrote artifacts");
 
+const cleanStarted = performance.now();
+const cleaned = traceSegmentation(segmentation, {
+  preset: "ui",
+  smooth: 0.5,
+  cleanShapes: 0.55,
+  cleanText: false,
+  originalLabels: segmentation.labels,
+  coverage: segmentation.coverage,
+  partner: segmentation.partner
+});
+const cleanMs = performance.now() - cleanStarted;
+const cleanRaster = rasterizeShapes(cleaned.shapes, width, height);
+const cleanDeltas: number[] = [];
+for (let i = 0; i < width * height; i++) {
+  if ((data[i * 4 + 3] ?? 0) < 128) continue;
+  const origin = originalLabs[i];
+  const alpha = cleanRaster[i * 4 + 3] ?? 0;
+  const sample = rgbToCieLab(
+    alpha ? (cleanRaster[i * 4] ?? 255) : 255,
+    alpha ? (cleanRaster[i * 4 + 1] ?? 255) : 255,
+    alpha ? (cleanRaster[i * 4 + 2] ?? 255) : 255
+  );
+  if (origin) cleanDeltas.push(deltaE76(origin, sample));
+}
+cleanDeltas.sort((a, b) => a - b);
+const cleanMean = cleanDeltas.reduce((sum, value) => sum + value, 0) / Math.max(1, cleanDeltas.length);
+const cleanP95 = cleanDeltas[Math.min(cleanDeltas.length - 1, Math.floor(cleanDeltas.length * 0.95))] ?? 0;
+console.log(
+  "cleanMs",
+  cleanMs.toFixed(0),
+  "nodes",
+  cleaned.nodeCount,
+  "subpaths",
+  cleaned.subpathCount,
+  "fromNodes",
+  traced.nodeCount,
+  "reduction",
+  traced.nodeCount - cleaned.nodeCount,
+  "mean",
+  cleanMean.toFixed(2),
+  "p95",
+  cleanP95.toFixed(2)
+);
+writeCleanZoom(traced.shapes, cleaned.shapes, 132, 220, 110, 110, "zoom-squircle-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 210, 330, 160, 150, "zoom-a-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 640, 290, 180, 160, "zoom-star-clean-400.png");
+writeCleanZoom(traced.shapes, cleaned.shapes, 700, 340, 180, 150, "zoom-ai-letters-clean-400.png");
+console.log("wrote clean zooms");
+
 const balloon = makeStripeSample();
 const balloonStarted = performance.now();
 const balloonSegmentation = segmentImage(balloon.rgba, balloon.width, balloon.height, 8, { preset: "logo" });
 const balloonTraced = traceSegmentation(balloonSegmentation, { preset: "logo", smooth: 1.2, upscale: 2 });
+const balloonClean = traceSegmentation(balloonSegmentation, { preset: "logo", smooth: 1.2, upscale: 2, cleanShapes: 0.55 });
 console.log(
   "balloonMs",
   (performance.now() - balloonStarted).toFixed(0),
@@ -339,7 +389,11 @@ console.log(
   "paths",
   balloonTraced.pathCount,
   "nodes",
-  balloonTraced.nodeCount
+  balloonTraced.nodeCount,
+  "cleanNodes",
+  balloonClean.nodeCount,
+  "cleanPaths",
+  balloonClean.pathCount
 );
 
 function nearWhite(rgba: Uint8Array, index: number): boolean {
@@ -466,6 +520,40 @@ function writeHeatmap(name: string): void {
       .join(" | ")
   );
   fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(width, height, image));
+}
+
+function writeCleanZoom(
+  before: typeof traced.shapes,
+  after: typeof traced.shapes,
+  x0: number,
+  y0: number,
+  cropWidth: number,
+  cropHeight: number,
+  name: string
+): void {
+  const scale = 4;
+  const left = rasterizeWindow(before, x0, y0, cropWidth, cropHeight, scale);
+  const right = rasterizeWindow(after, x0, y0, cropWidth, cropHeight, scale);
+  const zoomedWidth = Math.max(1, Math.round(cropWidth * scale));
+  const zoomedHeight = Math.max(1, Math.round(cropHeight * scale));
+  const image = new Uint8Array(zoomedWidth * 2 * zoomedHeight * 4);
+  for (let y = 0; y < zoomedHeight; y++) {
+    for (let x = 0; x < zoomedWidth; x++) {
+      const fromLeft = (y * zoomedWidth + x) * 4;
+      const fromRight = fromLeft;
+      const toLeft = (y * zoomedWidth * 2 + x) * 4;
+      const toRight = (y * zoomedWidth * 2 + zoomedWidth + x) * 4;
+      image[toLeft] = left[fromLeft] ?? 0;
+      image[toLeft + 1] = left[fromLeft + 1] ?? 0;
+      image[toLeft + 2] = left[fromLeft + 2] ?? 0;
+      image[toLeft + 3] = 255;
+      image[toRight] = right[fromRight] ?? 0;
+      image[toRight + 1] = right[fromRight + 1] ?? 0;
+      image[toRight + 2] = right[fromRight + 2] ?? 0;
+      image[toRight + 3] = 255;
+    }
+  }
+  fs.writeFileSync("/opt/cursor/artifacts/" + name, encodePng(zoomedWidth * 2, zoomedHeight, image));
 }
 
 function writeZoom(x0: number, y0: number, cropWidth: number, cropHeight: number, name: string): void {

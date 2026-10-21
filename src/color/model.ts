@@ -18,6 +18,8 @@ export type Segmentation = {
   readonly coverage?: Float32Array;
   /** The other palette index mixed into a blend pixel, or TRANSPARENT. */
   readonly partner?: Uint16Array;
+  /** 1 marks a boundary the Smooth tool should fit more strongly. */
+  readonly smoothMask?: Uint8Array;
 };
 
 /**
@@ -58,6 +60,7 @@ type Snapshot = {
   readonly labels: Uint16Array;
   readonly palette: readonly Rgb[];
   readonly active: number;
+  readonly smoothMask: Uint8Array;
 };
 
 const HISTORY_LIMIT = 50;
@@ -88,6 +91,7 @@ export class ColorDocument {
   labels: Uint16Array;
   palette: Rgb[];
   active: number;
+  smoothMask: Uint8Array;
   thresholds: ZapThresholds;
   private readonly original: Snapshot;
   private past: Snapshot[] = [];
@@ -98,6 +102,7 @@ export class ColorDocument {
     this.height = segmentation.height;
     this.labels = segmentation.labels.slice();
     this.palette = clonePalette(segmentation.palette);
+    this.smoothMask = new Uint8Array(segmentation.labels.length);
     this.active = this.palette.length > 0 ? largestIndex(this.labels, this.palette.length) : -1;
     this.thresholds = { ...thresholds };
     this.original = this.capture();
@@ -133,6 +138,7 @@ export class ColorDocument {
     }
     for (let i = 0; i < this.labels.length; i++) {
       if (this.labels[i] !== this.original.labels[i]) return true;
+      if ((this.smoothMask[i] ?? 0) !== (this.original.smoothMask[i] ?? 0)) return true;
     }
     return false;
   }
@@ -146,11 +152,19 @@ export class ColorDocument {
   }
 
   segmentation(): Segmentation {
+    let smoothMask: Uint8Array | undefined;
+    for (let i = 0; i < this.smoothMask.length; i++) {
+      if ((this.smoothMask[i] ?? 0) > 0) {
+        smoothMask = this.smoothMask.slice();
+        break;
+      }
+    }
     return {
       width: this.width,
       height: this.height,
       labels: this.labels.slice(),
-      palette: clonePalette(this.palette)
+      palette: clonePalette(this.palette),
+      smoothMask
     };
   }
 
@@ -278,6 +292,47 @@ export class ColorDocument {
     return { ok: true, changed: true, indexMap: null, detail: "" };
   }
 
+  /**
+   * Mark the shared boundary under this pixel for a stronger clean-shape fit.
+   * One gesture is one undo step.
+   */
+  smoothAt(x: number, y: number, stroke: { pushed: boolean } | null = null): EditResult {
+    if (!this.inBounds(x, y)) return { ok: false, reason: "คลิกนอกภาพ" };
+    const segment = boundarySegment(this.labels, this.width, this.height, x, y);
+    if (segment.length === 0) return { ok: false, reason: "คลิกบนรอยต่อของสองสี เพื่อเกลาช่วงนั้น" };
+    const fresh = segment.filter((pixel) => (this.smoothMask[pixel] ?? 0) === 0);
+    if (fresh.length === 0) return { ok: true, changed: false, indexMap: null, detail: "" };
+    if (!stroke?.pushed) this.pushHistory();
+    if (stroke) stroke.pushed = true;
+    for (const pixel of fresh) this.smoothMask[pixel] = 1;
+    return { ok: true, changed: true, indexMap: null, detail: "เกลาขอบ " + segment.length + " พิกเซล" };
+  }
+
+  smoothLasso(x0: number, y0: number, x1: number, y1: number): EditResult {
+    const left = Math.max(0, Math.min(x0, x1));
+    const right = Math.min(this.width - 1, Math.max(x0, x1));
+    const top = Math.max(0, Math.min(y0, y1));
+    const bottom = Math.min(this.height - 1, Math.max(y0, y1));
+    const seen = new Uint8Array(this.labels.length);
+    const fresh: number[] = [];
+    for (let y = top; y <= bottom; y++) {
+      for (let x = left; x <= right; x++) {
+        const index = y * this.width + x;
+        if (seen[index]) continue;
+        if (!isBoundary(this.labels, this.width, this.height, x, y)) continue;
+        const segment = boundarySegment(this.labels, this.width, this.height, x, y);
+        for (const pixel of segment) {
+          seen[pixel] = 1;
+          if ((this.smoothMask[pixel] ?? 0) === 0) fresh.push(pixel);
+        }
+      }
+    }
+    if (fresh.length === 0) return { ok: true, changed: false, indexMap: null, detail: "ในกรอบนี้ไม่มีขอบให้เกลา" };
+    this.pushHistory();
+    for (const pixel of fresh) this.smoothMask[pixel] = 1;
+    return { ok: true, changed: true, indexMap: null, detail: "เกลาขอบในกรอบ " + fresh.length + " พิกเซล" };
+  }
+
   /** Close a pencil stroke and drop a palette entry that no longer has pixels. */
   endPencil(stroke: { pushed: boolean }): EditResult {
     if (!stroke.pushed) return { ok: true, changed: false, indexMap: null, detail: "" };
@@ -322,13 +377,14 @@ export class ColorDocument {
   }
 
   private capture(): Snapshot {
-    return { labels: this.labels.slice(), palette: clonePalette(this.palette), active: this.active };
+    return { labels: this.labels.slice(), palette: clonePalette(this.palette), active: this.active, smoothMask: this.smoothMask.slice() };
   }
 
   private restore(snapshot: Snapshot): void {
     this.labels = snapshot.labels.slice();
     this.palette = clonePalette(snapshot.palette);
     this.active = snapshot.active;
+    this.smoothMask = snapshot.smoothMask.slice();
   }
 
   private pushHistory(): void {
@@ -489,6 +545,103 @@ function componentThickness(pixels: readonly number[], width: number, height: nu
     steps++;
   }
   return alive.size > 0 ? limit + 1 : steps;
+}
+
+function isBoundary(labels: Uint16Array, width: number, height: number, x: number, y: number): boolean {
+  const label = labels[y * width + x] ?? TRANSPARENT;
+  if (label === TRANSPARENT) return false;
+  const neighbors = [
+    [x - 1, y],
+    [x + 1, y],
+    [x, y - 1],
+    [x, y + 1]
+  ] as const;
+  for (const [nx, ny] of neighbors) {
+    if (nx < 0 || ny < 0 || nx >= width || ny >= height) return true;
+    if ((labels[ny * width + nx] ?? TRANSPARENT) !== label) return true;
+  }
+  return false;
+}
+
+function nearestBoundary(labels: Uint16Array, width: number, height: number, x: number, y: number): { x: number; y: number } | null {
+  if (isBoundary(labels, width, height, x, y)) return { x, y };
+  for (let radius = 1; radius <= 6; radius++) {
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        if (isBoundary(labels, width, height, nx, ny)) return { x: nx, y: ny };
+      }
+    }
+  }
+  return null;
+}
+
+/** Pixels of one color that touch a single neighboring color, the shared segment under the click. */
+function boundarySegment(labels: Uint16Array, width: number, height: number, x: number, y: number): number[] {
+  const origin = nearestBoundary(labels, width, height, x, y);
+  if (!origin) return [];
+  const index = origin.y * width + origin.x;
+  const label = labels[index] ?? TRANSPARENT;
+  let other = TRANSPARENT;
+  const around = [
+    [origin.x - 1, origin.y],
+    [origin.x + 1, origin.y],
+    [origin.x, origin.y - 1],
+    [origin.x, origin.y + 1]
+  ] as const;
+  for (const [nx, ny] of around) {
+    if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+      other = TRANSPARENT;
+      break;
+    }
+    const neighbor = labels[ny * width + nx] ?? TRANSPARENT;
+    if (neighbor !== label) {
+      other = neighbor;
+      break;
+    }
+  }
+  const pixels: number[] = [];
+  const seen = new Uint8Array(labels.length);
+  const stack = [index];
+  seen[index] = 1;
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === undefined) break;
+    const cx = current % width;
+    const cy = (current - cx) / width;
+    let touches = false;
+    const nexts = [current - 1, current + 1, current - width, current + width];
+    for (const next of nexts) {
+      if (next < 0 || next >= labels.length) {
+        if (other === TRANSPARENT) touches = true;
+        continue;
+      }
+      const nx = next % width;
+      if (Math.abs(nx - cx) + Math.abs(Math.floor(next / width) - cy) !== 1) {
+        if (other === TRANSPARENT) touches = true;
+        continue;
+      }
+      const neighbor = labels[next] ?? TRANSPARENT;
+      if (neighbor === other) touches = true;
+      else if (neighbor === label && seen[next] === 0 && (labels[next] ?? TRANSPARENT) === label) {
+        // explored below once we know this pixel belongs on the segment
+      }
+    }
+    if (!touches) continue;
+    pixels.push(current);
+    for (const next of nexts) {
+      if (next < 0 || next >= labels.length || seen[next] === 1) continue;
+      const nx = next % width;
+      if (Math.abs(nx - cx) + Math.abs(Math.floor(next / width) - cy) !== 1) continue;
+      if ((labels[next] ?? TRANSPARENT) !== label) continue;
+      seen[next] = 1;
+      stack.push(next);
+    }
+  }
+  return pixels;
 }
 
 /**

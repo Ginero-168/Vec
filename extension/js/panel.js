@@ -116,6 +116,7 @@
       this.height = segmentation.height;
       this.labels = segmentation.labels.slice();
       this.palette = clonePalette(segmentation.palette);
+      this.smoothMask = new Uint8Array(segmentation.labels.length);
       this.active = this.palette.length > 0 ? largestIndex(this.labels, this.palette.length) : -1;
       this.thresholds = { ...thresholds };
       this.original = this.capture();
@@ -147,6 +148,7 @@
       }
       for (let i = 0; i < this.labels.length; i++) {
         if (this.labels[i] !== this.original.labels[i]) return true;
+        if ((this.smoothMask[i] ?? 0) !== (this.original.smoothMask[i] ?? 0)) return true;
       }
       return false;
     }
@@ -157,11 +159,19 @@
       return this.future.length > 0;
     }
     segmentation() {
+      let smoothMask;
+      for (let i = 0; i < this.smoothMask.length; i++) {
+        if ((this.smoothMask[i] ?? 0) > 0) {
+          smoothMask = this.smoothMask.slice();
+          break;
+        }
+      }
       return {
         width: this.width,
         height: this.height,
         labels: this.labels.slice(),
-        palette: clonePalette(this.palette)
+        palette: clonePalette(this.palette),
+        smoothMask
       };
     }
     setThresholds(partial) {
@@ -276,6 +286,45 @@
       this.labels[index] = this.active;
       return { ok: true, changed: true, indexMap: null, detail: "" };
     }
+    /**
+     * Mark the shared boundary under this pixel for a stronger clean-shape fit.
+     * One gesture is one undo step.
+     */
+    smoothAt(x, y, stroke = null) {
+      if (!this.inBounds(x, y)) return { ok: false, reason: "\u0E04\u0E25\u0E34\u0E01\u0E19\u0E2D\u0E01\u0E20\u0E32\u0E1E" };
+      const segment = boundarySegment(this.labels, this.width, this.height, x, y);
+      if (segment.length === 0) return { ok: false, reason: "\u0E04\u0E25\u0E34\u0E01\u0E1A\u0E19\u0E23\u0E2D\u0E22\u0E15\u0E48\u0E2D\u0E02\u0E2D\u0E07\u0E2A\u0E2D\u0E07\u0E2A\u0E35 \u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E40\u0E01\u0E25\u0E32\u0E0A\u0E48\u0E27\u0E07\u0E19\u0E31\u0E49\u0E19" };
+      const fresh = segment.filter((pixel) => (this.smoothMask[pixel] ?? 0) === 0);
+      if (fresh.length === 0) return { ok: true, changed: false, indexMap: null, detail: "" };
+      if (!stroke?.pushed) this.pushHistory();
+      if (stroke) stroke.pushed = true;
+      for (const pixel of fresh) this.smoothMask[pixel] = 1;
+      return { ok: true, changed: true, indexMap: null, detail: "\u0E40\u0E01\u0E25\u0E32\u0E02\u0E2D\u0E1A " + segment.length + " \u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25" };
+    }
+    smoothLasso(x0, y0, x1, y1) {
+      const left = Math.max(0, Math.min(x0, x1));
+      const right = Math.min(this.width - 1, Math.max(x0, x1));
+      const top = Math.max(0, Math.min(y0, y1));
+      const bottom = Math.min(this.height - 1, Math.max(y0, y1));
+      const seen = new Uint8Array(this.labels.length);
+      const fresh = [];
+      for (let y = top; y <= bottom; y++) {
+        for (let x = left; x <= right; x++) {
+          const index = y * this.width + x;
+          if (seen[index]) continue;
+          if (!isBoundary(this.labels, this.width, this.height, x, y)) continue;
+          const segment = boundarySegment(this.labels, this.width, this.height, x, y);
+          for (const pixel of segment) {
+            seen[pixel] = 1;
+            if ((this.smoothMask[pixel] ?? 0) === 0) fresh.push(pixel);
+          }
+        }
+      }
+      if (fresh.length === 0) return { ok: true, changed: false, indexMap: null, detail: "\u0E43\u0E19\u0E01\u0E23\u0E2D\u0E1A\u0E19\u0E35\u0E49\u0E44\u0E21\u0E48\u0E21\u0E35\u0E02\u0E2D\u0E1A\u0E43\u0E2B\u0E49\u0E40\u0E01\u0E25\u0E32" };
+      this.pushHistory();
+      for (const pixel of fresh) this.smoothMask[pixel] = 1;
+      return { ok: true, changed: true, indexMap: null, detail: "\u0E40\u0E01\u0E25\u0E32\u0E02\u0E2D\u0E1A\u0E43\u0E19\u0E01\u0E23\u0E2D\u0E1A " + fresh.length + " \u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25" };
+    }
     /** Close a pencil stroke and drop a palette entry that no longer has pixels. */
     endPencil(stroke) {
       if (!stroke.pushed) return { ok: true, changed: false, indexMap: null, detail: "" };
@@ -316,12 +365,13 @@
       return x >= 0 && y >= 0 && x < this.width && y < this.height;
     }
     capture() {
-      return { labels: this.labels.slice(), palette: clonePalette(this.palette), active: this.active };
+      return { labels: this.labels.slice(), palette: clonePalette(this.palette), active: this.active, smoothMask: this.smoothMask.slice() };
     }
     restore(snapshot) {
       this.labels = snapshot.labels.slice();
       this.palette = clonePalette(snapshot.palette);
       this.active = snapshot.active;
+      this.smoothMask = snapshot.smoothMask.slice();
     }
     pushHistory() {
       this.past.push(this.capture());
@@ -417,12 +467,12 @@
     if (component.area <= areaLimit || ratio >= thresholds.minBoundaryRatio) {
       return { area: component.area, ratio, thickness: component.area <= areaLimit ? 1 : 0, zappable: true };
     }
-    const thickness = componentThickness(component.pixels, width, height, thresholds.maxThinWidth);
+    const thickness2 = componentThickness(component.pixels, width, height, thresholds.maxThinWidth);
     return {
       area: component.area,
       ratio,
-      thickness,
-      zappable: thickness <= thresholds.maxThinWidth
+      thickness: thickness2,
+      zappable: thickness2 <= thresholds.maxThinWidth
     };
   }
   function componentThickness(pixels, width, height, limit) {
@@ -441,6 +491,98 @@
       steps++;
     }
     return alive.size > 0 ? limit + 1 : steps;
+  }
+  function isBoundary(labels, width, height, x, y) {
+    const label = labels[y * width + x] ?? TRANSPARENT;
+    if (label === TRANSPARENT) return false;
+    const neighbors = [
+      [x - 1, y],
+      [x + 1, y],
+      [x, y - 1],
+      [x, y + 1]
+    ];
+    for (const [nx, ny] of neighbors) {
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) return true;
+      if ((labels[ny * width + nx] ?? TRANSPARENT) !== label) return true;
+    }
+    return false;
+  }
+  function nearestBoundary(labels, width, height, x, y) {
+    if (isBoundary(labels, width, height, x, y)) return { x, y };
+    for (let radius = 1; radius <= 6; radius++) {
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          if (isBoundary(labels, width, height, nx, ny)) return { x: nx, y: ny };
+        }
+      }
+    }
+    return null;
+  }
+  function boundarySegment(labels, width, height, x, y) {
+    const origin = nearestBoundary(labels, width, height, x, y);
+    if (!origin) return [];
+    const index = origin.y * width + origin.x;
+    const label = labels[index] ?? TRANSPARENT;
+    let other = TRANSPARENT;
+    const around = [
+      [origin.x - 1, origin.y],
+      [origin.x + 1, origin.y],
+      [origin.x, origin.y - 1],
+      [origin.x, origin.y + 1]
+    ];
+    for (const [nx, ny] of around) {
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+        other = TRANSPARENT;
+        break;
+      }
+      const neighbor = labels[ny * width + nx] ?? TRANSPARENT;
+      if (neighbor !== label) {
+        other = neighbor;
+        break;
+      }
+    }
+    const pixels = [];
+    const seen = new Uint8Array(labels.length);
+    const stack = [index];
+    seen[index] = 1;
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (current === void 0) break;
+      const cx = current % width;
+      const cy = (current - cx) / width;
+      let touches = false;
+      const nexts = [current - 1, current + 1, current - width, current + width];
+      for (const next of nexts) {
+        if (next < 0 || next >= labels.length) {
+          if (other === TRANSPARENT) touches = true;
+          continue;
+        }
+        const nx = next % width;
+        if (Math.abs(nx - cx) + Math.abs(Math.floor(next / width) - cy) !== 1) {
+          if (other === TRANSPARENT) touches = true;
+          continue;
+        }
+        const neighbor = labels[next] ?? TRANSPARENT;
+        if (neighbor === other) touches = true;
+        else if (neighbor === label && seen[next] === 0 && (labels[next] ?? TRANSPARENT) === label) {
+        }
+      }
+      if (!touches) continue;
+      pixels.push(current);
+      for (const next of nexts) {
+        if (next < 0 || next >= labels.length || seen[next] === 1) continue;
+        const nx = next % width;
+        if (Math.abs(nx - cx) + Math.abs(Math.floor(next / width) - cy) !== 1) continue;
+        if ((labels[next] ?? TRANSPARENT) !== label) continue;
+        seen[next] = 1;
+        stack.push(next);
+      }
+    }
+    return pixels;
   }
   function strokeProtected(component, ownLabel, palette, width, height) {
     if (!componentElongated(component, width, height)) return false;
@@ -507,7 +649,8 @@
     zap: "Zap \xB7 \u0E04\u0E25\u0E34\u0E01\u0E40\u0E28\u0E29\u0E02\u0E2D\u0E1A\u0E2B\u0E23\u0E37\u0E2D\u0E08\u0E38\u0E14\u0E40\u0E25\u0E47\u0E01 \u0E23\u0E30\u0E1A\u0E1A\u0E41\u0E22\u0E01\u0E0A\u0E34\u0E49\u0E19\u0E17\u0E35\u0E48\u0E15\u0E34\u0E14\u0E01\u0E31\u0E19\u0E41\u0E25\u0E49\u0E27\u0E23\u0E27\u0E21\u0E40\u0E02\u0E49\u0E32\u0E2A\u0E35\u0E02\u0E49\u0E32\u0E07\u0E40\u0E04\u0E35\u0E22\u0E07",
     fill: "Fill \xB7 \u0E04\u0E25\u0E34\u0E01\u0E1E\u0E37\u0E49\u0E19\u0E17\u0E35\u0E48\u0E17\u0E35\u0E48\u0E15\u0E34\u0E14\u0E01\u0E31\u0E19 \u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E40\u0E17\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E2D\u0E22\u0E39\u0E48",
     pencil: "Pencil \xB7 \u0E25\u0E32\u0E01\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E17\u0E35\u0E25\u0E30\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25 \u0E14\u0E49\u0E27\u0E22\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01",
-    dropper: "Color \xB7 \u0E04\u0E25\u0E34\u0E01\u0E1A\u0E19\u0E20\u0E32\u0E1E\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E2B\u0E22\u0E34\u0E1A\u0E2A\u0E35\u0E08\u0E32\u0E01\u0E2A\u0E48\u0E27\u0E19\u0E19\u0E31\u0E49\u0E19"
+    dropper: "Color \xB7 \u0E04\u0E25\u0E34\u0E01\u0E1A\u0E19\u0E20\u0E32\u0E1E\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E2B\u0E22\u0E34\u0E1A\u0E2A\u0E35\u0E08\u0E32\u0E01\u0E2A\u0E48\u0E27\u0E19\u0E19\u0E31\u0E49\u0E19",
+    smooth: "Smooth \xB7 \u0E04\u0E25\u0E34\u0E01\u0E0A\u0E48\u0E27\u0E07\u0E02\u0E2D\u0E1A\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E40\u0E01\u0E25\u0E32\u0E43\u0E2B\u0E49\u0E40\u0E1B\u0E47\u0E19\u0E40\u0E2A\u0E49\u0E19\u0E2B\u0E23\u0E37\u0E2D\u0E2A\u0E48\u0E27\u0E19\u0E42\u0E04\u0E49\u0E07 \u0E25\u0E32\u0E01\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E1B\u0E31\u0E14 Shift \u0E04\u0E49\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E25\u0E32\u0E01\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E04\u0E25\u0E38\u0E21\u0E01\u0E23\u0E2D\u0E1A"
   };
   var ICONS = {
     undo: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M6.5 3.2 3 6.5l3.5 3.2V7.4c2.7.2 4.4 1.6 5.2 3.6.2-3.4-1.4-6.2-5.2-6.6V3.2z"/></svg>',
@@ -516,13 +659,21 @@
     zap: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M9.2 1 3 9h4.2L6.4 15 13 6.6H8.6L9.2 1z"/></svg>',
     fill: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8.2 1.6 3.4 8.2c-.8 1.1-.2 2.8 1.2 2.8h.2l-.6 2.6h8.2l-.7-2.6h.2c1.4 0 2-.1 1.2-2.8L8.2 1.6z"/></svg>',
     pencil: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M11.2 1.8 14.2 4.8 5.6 13.4 2 14l.6-3.6 8.6-8.6z"/></svg>',
-    dropper: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10.2 1.6c.8.1 1.6.5 2.2 1.1l.9.9c.6.6 1 1.4 1.1 2.2l-2.2.6-4.7 4.7-2.6-2.6 4.7-4.7.6-2.2zM3.2 10.2l2.6 2.6-2.2 1.2-1.6-1.6 1.2-2.2z"/></svg>'
+    dropper: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10.2 1.6c.8.1 1.6.5 2.2 1.1l.9.9c.6.6 1 1.4 1.1 2.2l-2.2.6-4.7 4.7-2.6-2.6 4.7-4.7.6-2.2zM3.2 10.2l2.6 2.6-2.2 1.2-1.6-1.6 1.2-2.2z"/></svg>',
+    smooth: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M2 11c2.2-4 3.4-4 5.2-1.2C8.8 12.2 10 12.4 14 5"/></svg>'
   };
   function createColorEditor(container, hooks = {}) {
     container.replaceChildren();
     container.insertAdjacentHTML("beforeend", editorMarkup(hooks));
     const canvas = required(container, "canvas", HTMLCanvasElement);
     const context = canvasContext(canvas);
+    const stage = document.createElement("div");
+    stage.className = "seg-stage";
+    const smoothMarquee = document.createElement("div");
+    smoothMarquee.className = "marquee";
+    smoothMarquee.hidden = true;
+    canvas.replaceWith(stage);
+    stage.append(canvas, smoothMarquee);
     const countNow = required(container, ".count-now", HTMLElement);
     const countNext = required(container, ".count-next", HTMLElement);
     const note = required(container, ".editor-note", HTMLElement);
@@ -616,9 +767,10 @@
           data[offset + 3] = 0;
           continue;
         }
-        data[offset] = color.r;
-        data[offset + 1] = color.g;
-        data[offset + 2] = color.b;
+        const marked = (doc.smoothMask[i] ?? 0) > 0;
+        data[offset] = marked ? Math.round(color.r * 0.42 + 207 * 0.58) : color.r;
+        data[offset + 1] = marked ? Math.round(color.g * 0.42 + 182 * 0.58) : color.g;
+        data[offset + 2] = marked ? Math.round(color.b * 0.42 + 255 * 0.58) : color.b;
         data[offset + 3] = 255;
       }
       canvas.width = doc.width;
@@ -745,6 +897,42 @@
       }
       if (bitmap) context.putImageData(bitmap, 0, 0);
     }
+    function paintSmooth(x0, y0, x1, y1) {
+      if (!doc || !stroke) return;
+      const dx = Math.abs(x1 - x0);
+      const dy = Math.abs(y1 - y0);
+      const sx = x0 < x1 ? 1 : -1;
+      const sy = y0 < y1 ? 1 : -1;
+      let err = dx - dy;
+      let x = x0;
+      let y = y0;
+      let changed = false;
+      while (true) {
+        const result = doc.smoothAt(x, y, stroke);
+        if (result.ok && result.changed) changed = true;
+        if (x === x1 && y === y1) break;
+        const doubled = 2 * err;
+        if (doubled > -dy) {
+          err -= dy;
+          x += sx;
+        }
+        if (doubled < dx) {
+          err += dx;
+          y += sy;
+        }
+      }
+      if (changed) paintBitmap();
+    }
+    function placeSmoothMarquee(x0, y0, x1, y1) {
+      const scale = Number(zoom.value) || 1;
+      const left = Math.min(x0, x1) * scale;
+      const top = Math.min(y0, y1) * scale;
+      smoothMarquee.hidden = false;
+      smoothMarquee.style.left = left + "px";
+      smoothMarquee.style.top = top + "px";
+      smoothMarquee.style.width = Math.abs(x1 - x0) * scale + "px";
+      smoothMarquee.style.height = Math.abs(y1 - y0) * scale + "px";
+    }
     function localPoint(event) {
       const rect = diagram.getBoundingClientRect();
       return { x: event.clientX - rect.left + diagram.scrollLeft, y: event.clientY - rect.top + diagram.scrollTop };
@@ -862,6 +1050,23 @@
         drag.y = pixel.y;
         return;
       }
+      if (drag && event.pointerId === drag.pointerId && drag.kind === "smooth") {
+        const pixel = eventPixel(event);
+        if (!pixel) return;
+        paintSmooth(drag.x, drag.y, pixel.x, pixel.y);
+        drag.x = pixel.x;
+        drag.y = pixel.y;
+        return;
+      }
+      if (drag && event.pointerId === drag.pointerId && drag.kind === "smooth-lasso") {
+        const pixel = eventPixel(event);
+        if (!pixel) return;
+        drag.x1 = pixel.x;
+        drag.y1 = pixel.y;
+        if (Math.abs(pixel.x - drag.x0) + Math.abs(pixel.y - drag.y0) > 2) drag.moved = true;
+        placeSmoothMarquee(drag.x0, drag.y0, pixel.x, pixel.y);
+        return;
+      }
       if (drag && event.pointerId === drag.pointerId && drag.kind === "marquee") {
         const point = localPoint(event);
         drag.x1 = point.x;
@@ -896,6 +1101,13 @@
       else if (current.kind === "pencil") {
         if (doc && stroke) finish(doc.endPencil(stroke));
         stroke = null;
+      } else if (current.kind === "smooth") {
+        stroke = null;
+        syncChrome();
+      } else if (current.kind === "smooth-lasso") {
+        smoothMarquee.hidden = true;
+        if (doc && current.moved) finish(doc.smoothLasso(current.x0, current.y0, current.x1, current.y1));
+        else if (doc) finish(doc.smoothAt(current.x0, current.y0, null));
       } else if (current.kind === "marquee") {
         if (!current.moved || !doc) {
           selected = /* @__PURE__ */ new Set();
@@ -934,6 +1146,17 @@
         paintLine(pixel.x, pixel.y, pixel.x, pixel.y);
         return;
       }
+      if (tool === "smooth") {
+        stroke = { pushed: false };
+        if (event.shiftKey) {
+          drag = { kind: "smooth-lasso", pointerId: event.pointerId, x0: pixel.x, y0: pixel.y, x1: pixel.x, y1: pixel.y, moved: false };
+          placeSmoothMarquee(pixel.x, pixel.y, pixel.x, pixel.y);
+        } else {
+          drag = { kind: "smooth", pointerId: event.pointerId, x: pixel.x, y: pixel.y };
+          finish(doc.smoothAt(pixel.x, pixel.y, stroke));
+        }
+        return;
+      }
       if (tool === "zap") finish(doc.zap(pixel.x, pixel.y));
       else if (tool === "fill") finish(doc.fill(pixel.x, pixel.y));
       else {
@@ -965,7 +1188,7 @@
     container.querySelectorAll("[data-tool]").forEach((button) => {
       button.addEventListener("click", () => {
         const next = button.dataset.tool;
-        if (next === "zap" || next === "fill" || next === "pencil" || next === "dropper") {
+        if (next === "zap" || next === "fill" || next === "pencil" || next === "dropper" || next === "smooth") {
           tool = next;
           noteText("");
           syncChrome();
@@ -1121,6 +1344,7 @@
         ${toolButton("fill", "data-tool", "Fill", "Fill (F)")}
         ${toolButton("pencil", "data-tool", "Pencil", "Pencil (X)")}
         ${toolButton("dropper", "data-tool", "Color", "Color (C)")}
+        ${toolButton("smooth", "data-tool", "Smooth", "Smooth")}
       </div>
       <p class="tool-hint"></p>
       <p class="editor-note" role="status"></p>
@@ -2317,6 +2541,1165 @@
     return alive.size > 0 ? limit + 1 : steps;
   }
 
+  // src/color/clean.ts
+  var KAPPA = 0.5522847498307936;
+  function cleanTolerance(strength) {
+    const t = Math.min(1, Math.max(0, strength));
+    if (t <= 0) return 0;
+    return 1.15 + t * 2.15;
+  }
+  function strongCleanTolerance(strength) {
+    return Math.max(cleanTolerance(strength), 2.05);
+  }
+  function letterMask(labels, width, height, palette) {
+    const mask = new Uint8Array(labels.length);
+    const owner = new Int32Array(labels.length);
+    owner.fill(-1);
+    const stack = [];
+    const labs = palette.map((color) => rgbToOklab(color.r, color.g, color.b));
+    for (let start2 = 0; start2 < labels.length; start2++) {
+      const label = labels[start2] ?? TRANSPARENT;
+      if (label === TRANSPARENT || owner[start2] !== -1) continue;
+      const pixels = [];
+      const adjacency = /* @__PURE__ */ new Map();
+      stack.push(start2);
+      owner[start2] = 1;
+      let minX = width;
+      let maxX = 0;
+      let minY = height;
+      let maxY = 0;
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (current === void 0) break;
+        pixels.push(current);
+        const x = current % width;
+        const y = (current - x) / width;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        const neighbors = [current - 1, current + 1, current - width, current + width];
+        for (const next of neighbors) {
+          if (next < 0 || next >= labels.length) {
+            adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+            continue;
+          }
+          const nx = next % width;
+          if (Math.abs(nx - x) + Math.abs(Math.floor(next / width) - y) !== 1) {
+            adjacency.set(TRANSPARENT, (adjacency.get(TRANSPARENT) ?? 0) + 1);
+            continue;
+          }
+          const neighbor = labels[next] ?? TRANSPARENT;
+          if (neighbor === label) {
+            if (owner[next] === -1) {
+              owner[next] = 1;
+              stack.push(next);
+            }
+          } else adjacency.set(neighbor, (adjacency.get(neighbor) ?? 0) + 1);
+        }
+      }
+      if (pixels.length < 12 || pixels.length > 8e3) continue;
+      const thick = thickness(pixels, width, height, 5);
+      if (thick > 4) continue;
+      const boxArea = (maxX - minX + 1) * (maxY - minY + 1);
+      if (boxArea > 0 && pixels.length / boxArea > 0.82 && Math.min(maxX - minX, maxY - minY) >= 8) continue;
+      let contrast = 0;
+      let dominant = TRANSPARENT;
+      let dominantCount = 0;
+      for (const [neighbor, count] of adjacency) {
+        if (count > dominantCount) {
+          dominant = neighbor;
+          dominantCount = count;
+        }
+      }
+      const own = labs[label];
+      if (dominant === TRANSPARENT || dominant >= labs.length) contrast = 1;
+      else {
+        const other = labs[dominant];
+        if (own && other) contrast = oklabDistance(own, other);
+      }
+      if (!own || contrast < 0.18) continue;
+      if (rayLike(pixels, width, minX, minY, maxX, maxY)) continue;
+      for (const pixel of pixels) mask[pixel] = 1;
+    }
+    return mask;
+  }
+  function boundaryHits(mask, width, height, points, fraction) {
+    if (points.length === 0) return false;
+    let hits = 0;
+    let samples = 0;
+    const step = Math.max(1, Math.floor(points.length / 48));
+    for (let i = 0; i < points.length; i += step) {
+      const point = points[i];
+      if (!point) continue;
+      samples++;
+      if (nearMask(mask, width, height, point.x, point.y)) hits++;
+    }
+    if (samples === 0) return false;
+    if (fraction <= 0) return hits > 0;
+    return hits / samples >= fraction;
+  }
+  function fitOpenClean(points, tolerance) {
+    if (points.length < 2) return [];
+    const coarse = Math.min(0.9, Math.max(0.4, tolerance * 0.32));
+    const kept = decimateIndexed(points, coarse);
+    const guide = kept.map((index) => points[index]);
+    const cuts = [0];
+    if (guide.length >= 12) {
+      for (const cut of crispCorners(guide, false)) {
+        const index = kept[cut];
+        if (index !== void 0 && index > 0 && index < points.length - 1) cuts.push(index);
+      }
+    }
+    cuts.push(points.length - 1);
+    const commands = [];
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const span = points.slice(cuts[i], cuts[i + 1] + 1);
+      commands.push(...shorterSpan(span, tolerance));
+    }
+    const end = points[points.length - 1];
+    return end ? pinEnd(commands, end) : commands;
+  }
+  function shorterSpan(points, tolerance) {
+    const smooth = flattenPieces(fitSmoothSpan(points, tolerance, 0));
+    const linear = chordFit(points, tolerance);
+    if (smooth.length > 0 && (linear.length === 0 || smooth.length <= linear.length)) return smooth;
+    return linear.length > 0 ? linear : smooth;
+  }
+  function chordFit(points, tolerance) {
+    const guide = decimateOpen(points, tolerance);
+    const commands = [];
+    for (let i = 1; i < guide.length; i++) {
+      const from = guide[i - 1];
+      const to = guide[i];
+      if (!from || !to) continue;
+      const line = tryLine([from, to], tolerance);
+      if (line) commands.push(...line.commands);
+      else commands.push({ op: "L", x: to.x, y: to.y, primitive: "line" });
+    }
+    return commands;
+  }
+  function fitClosedClean(points, tolerance) {
+    if (points.length < 6) return null;
+    const direct = acceptFit(fitClosedPrimitives(points, tolerance), points, tolerance);
+    if (direct) return direct;
+    const guided = fitClosedGuided(points, tolerance);
+    if (guided) return guided;
+    return acceptFit(fitClosedRaw(points, tolerance), points, tolerance) ?? fitClosedRaw(points, tolerance);
+  }
+  function acceptFit(fit, points, tolerance) {
+    if (!fit || fit.commands.length === 0) return null;
+    if (sampleCurveError(fit.start, fit.commands, points) > tolerance) return null;
+    return fit;
+  }
+  function thickness(pixels, width, height, limit) {
+    const alive = new Set(pixels);
+    let steps = 0;
+    while (alive.size > 0 && steps <= limit) {
+      const remove = [];
+      for (const pixel of alive) {
+        const x = pixel % width;
+        const y = (pixel - x) / width;
+        const exposed = x === 0 || y === 0 || x + 1 === width || y + 1 === height || !alive.has(pixel - 1) || !alive.has(pixel + 1) || !alive.has(pixel - width) || !alive.has(pixel + width);
+        if (exposed) remove.push(pixel);
+      }
+      if (remove.length === 0) return steps + 1;
+      for (const pixel of remove) alive.delete(pixel);
+      steps++;
+    }
+    return alive.size > 0 ? limit + 1 : steps;
+  }
+  function rayLike(pixels, width, minX, minY, maxX, maxY) {
+    const dx = maxX - minX;
+    const dy = maxY - minY;
+    const length = Math.hypot(dx, dy);
+    if (length < 10) return false;
+    let maxDistance = 0;
+    for (const pixel of pixels) {
+      const x = pixel % width;
+      const y = (pixel - x) / width;
+      maxDistance = Math.max(maxDistance, pointSegmentDistance({ x, y }, { x: minX, y: minY }, { x: maxX, y: maxY }));
+    }
+    return maxDistance <= 2.4 && length / Math.max(1, maxDistance) >= 8;
+  }
+  function nearMask(mask, width, height, x, y) {
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    for (let dy = -1; dy <= 0; dy++) {
+      for (let dx = -1; dx <= 0; dx++) {
+        const px = x0 + dx;
+        const py = y0 + dy;
+        if (px < 0 || py < 0 || px >= width || py >= height) continue;
+        if ((mask[py * width + px] ?? 0) > 0) return true;
+      }
+    }
+    return false;
+  }
+  function flattenPieces(pieces) {
+    const commands = [];
+    for (const piece of pieces) commands.push(...piece.commands);
+    return commands;
+  }
+  function tryLine(points, tolerance) {
+    const start2 = points[0];
+    const end = points[points.length - 1];
+    if (!start2 || !end) return null;
+    const chord = maxSegmentError(points, start2, end);
+    const angle = Math.atan2(end.y - start2.y, end.x - start2.x);
+    const snap = nearestSnap(angle);
+    if (chord <= tolerance) {
+      return { commands: [{ op: "L", x: end.x, y: end.y, primitive: "line", snap: snap?.name }] };
+    }
+    if (!snap) return null;
+    const snapped = projectSegment(points, snap.axis);
+    if (!snapped || maxSegmentError(points, snapped.start, snapped.end) > tolerance) return null;
+    const move = Math.max(Math.hypot(snapped.start.x - start2.x, snapped.start.y - start2.y), Math.hypot(snapped.end.x - end.x, snapped.end.y - end.y));
+    if (move > 0.05) return null;
+    return { commands: [{ op: "L", x: end.x, y: end.y, primitive: "line", snap: snap.name }] };
+  }
+  function tryArc(points, tolerance) {
+    const start2 = points[0];
+    const end = points[points.length - 1];
+    if (!start2 || !end || points.length < 6) return null;
+    const circle = fitCircle(points);
+    if (!circle) return null;
+    const chord = Math.hypot(end.x - start2.x, end.y - start2.y);
+    if (circle.r > Math.max(48, chord * 6)) return null;
+    let maxError = 0;
+    for (const point of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point.x - circle.cx, point.y - circle.cy) - circle.r));
+    if (maxError > tolerance) return null;
+    const sweep = sweepAbout(points, circle);
+    if (Math.abs(sweep) < 0.4 || Math.abs(sweep) > Math.PI * 1.85) return null;
+    const commands = arcCubics(start2, end, circle, sweep);
+    if (commands.length === 0) return null;
+    if (curveError2(points, start2, commands) > tolerance) return null;
+    return { commands };
+  }
+  function tryFairCubic(points, tolerance) {
+    const start2 = points[0];
+    const end = points[points.length - 1];
+    if (!start2 || !end || points.length < 4) return null;
+    const smoothed = smoothPolyline(points, 2);
+    const incoming = unitToward(smoothed, 0, false);
+    const outgoing = unitToward(smoothed, smoothed.length - 1, true);
+    if (!incoming || !outgoing) return null;
+    const fitted = fitCubic(points, incoming, outgoing);
+    if (!fitted || fitted.error > tolerance) return null;
+    if (extraInflection(points, start2, fitted.command)) return null;
+    return { commands: [{ ...fitted.command, primitive: "cubic" }] };
+  }
+  function tryFullCircle(points, tolerance) {
+    if (points.length < 12 || crispCorners(points, true).length >= 3) return null;
+    const circle = fitCircle(points);
+    if (!circle) return null;
+    const box = bounds(points);
+    if (circle.cx < box.minX - circle.r * 0.25 || circle.cx > box.maxX + circle.r * 0.25) return null;
+    if (circle.cy < box.minY - circle.r * 0.25 || circle.cy > box.maxY + circle.r * 0.25) return null;
+    let maxError = 0;
+    for (const point of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point.x - circle.cx, point.y - circle.cy) - circle.r));
+    if (maxError > tolerance) return null;
+    const sweep = signedArea(points) >= 0 ? Math.PI * 2 : -Math.PI * 2;
+    const startAngle = Math.atan2(points[0].y - circle.cy, points[0].x - circle.cx);
+    const start2 = { x: circle.cx + Math.cos(startAngle) * circle.r, y: circle.cy + Math.sin(startAngle) * circle.r };
+    const commands = fullArcCubics(circle, startAngle, sweep);
+    if (commands.length === 0) return null;
+    if (sampleCurveError(start2, commands, points) > tolerance) return null;
+    return { start: start2, commands };
+  }
+  function tryFullEllipse(points, tolerance) {
+    if (points.length < 16 || crispCorners(points, true).length >= 3) return null;
+    const ellipse = fitEllipse(points);
+    if (!ellipse) return null;
+    if (ellipse.rx < 4 || ellipse.ry < 4) return null;
+    const ratio = ellipse.rx / ellipse.ry;
+    if (ratio < 0.35 || ratio > 2.8) return null;
+    let maxError = 0;
+    for (const point of points) maxError = Math.max(maxError, ellipseRadialError(point, ellipse));
+    if (maxError > tolerance) return null;
+    const sweep = signedArea(points) >= 0 ? Math.PI * 2 : -Math.PI * 2;
+    const start2 = ellipsePoint(ellipse, 0);
+    const commands = ellipseCubics(ellipse, sweep);
+    if (sampleCurveError(start2, commands, points) > tolerance) return null;
+    return { start: start2, commands };
+  }
+  function tryRoundedRect(points, tolerance) {
+    const runs = curvatureRuns(points);
+    if (!runs) return null;
+    const commands = [];
+    let start2 = null;
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
+      const next = runs[(i + 1) % runs.length];
+      if (!run || !next) return null;
+      const from = points[run.indices[0]];
+      const to = points[next.indices[0]];
+      if (!start2) start2 = from;
+      if (!run.curved) {
+        const span2 = run.indices.map((index) => points[index]).concat(to);
+        const line = tryLine(span2, Math.max(tolerance, 0.75));
+        if (!line) return null;
+        const command = line.commands[0];
+        if (!command || command.op !== "L") return null;
+        commands.push({ ...command, x: to.x, y: to.y });
+        continue;
+      }
+      const span = run.indices.map((index) => points[index]).concat(to);
+      const arc = tryArc(span, tolerance);
+      if (!arc) return null;
+      const rebuilt = arc.commands.map(
+        (command, index) => index === arc.commands.length - 1 ? { ...command, x: to.x, y: to.y } : command
+      );
+      commands.push(...rebuilt);
+    }
+    if (!start2 || commands.length === 0) return null;
+    if (sampleCurveError(start2, commands, points) > tolerance * 1.25) return null;
+    return { start: start2, commands };
+  }
+  function trySuperellipse(points, tolerance) {
+    if (points.length < 24) return null;
+    const box = bounds(points);
+    const width = box.maxX - box.minX;
+    const height = box.maxY - box.minY;
+    if (width < 8 || height < 8) return null;
+    const ratio = width / height;
+    if (ratio < 0.55 || ratio > 1.8) return null;
+    if (crispCorners(points, true).length >= 3) return null;
+    let best = null;
+    const cx0 = (box.minX + box.maxX) / 2;
+    const cy0 = (box.minY + box.maxY) / 2;
+    for (const n of [2.6, 3.2, 4, 4.8, 5.5]) {
+      for (const scale of [0.9, 0.96, 1]) {
+        const candidate = { cx: cx0, cy: cy0, a: width / 2 * scale, b: height / 2 * scale, n, error: 0 };
+        let maxError = 0;
+        for (const point of points) {
+          maxError = Math.max(maxError, superellipseError(point, candidate));
+          if (best && maxError >= best.error) break;
+        }
+        candidate.error = maxError;
+        if (maxError <= tolerance && (!best || maxError < best.error)) best = candidate;
+      }
+    }
+    if (!best) return null;
+    const sweep = signedArea(points) >= 0 ? Math.PI * 2 : -Math.PI * 2;
+    const steps = 8;
+    const start2 = superPoint(best, 0);
+    const commands = [];
+    for (let i = 0; i < steps; i++) {
+      const t0 = sweep * i / steps;
+      const t1 = sweep * (i + 1) / steps;
+      const p0 = i === 0 ? start2 : superPoint(best, t0);
+      const p3 = i === steps - 1 ? start2 : superPoint(best, t1);
+      const tan0 = superTangent(best, t0, sweep > 0);
+      const tan1 = superTangent(best, t1, sweep > 0);
+      const chord = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+      const arm = chord * 0.35;
+      commands.push({
+        op: "C",
+        x1: p0.x + tan0.x * arm,
+        y1: p0.y + tan0.y * arm,
+        x2: p3.x - tan1.x * arm,
+        y2: p3.y - tan1.y * arm,
+        x: p3.x,
+        y: p3.y,
+        primitive: "cubic"
+      });
+    }
+    if (sampleCurveError(start2, commands, points) > tolerance) return null;
+    return { start: start2, commands };
+  }
+  function curvatureRuns(points) {
+    const count = points.length;
+    if (count < 20) return null;
+    const turn = new Float64Array(count);
+    for (let i = 0; i < count; i++) turn[i] = turnAngle(points[(i + count - 1) % count], points[i], points[(i + 1) % count]);
+    const smooth = new Float64Array(count);
+    const radius = 3;
+    for (let i = 0; i < count; i++) {
+      let sum = 0;
+      for (let delta = -radius; delta <= radius; delta++) sum += turn[(i + delta + count) % count] ?? 0;
+      smooth[i] = sum / (radius * 2 + 1);
+    }
+    const curved = [];
+    for (let i = 0; i < count; i++) curved.push(Math.abs(smooth[i] ?? 0) > 0.05);
+    let origin = -1;
+    for (let i = 0; i < count; i++) if (!curved[i]) {
+      origin = i;
+      break;
+    }
+    if (origin < 0) return null;
+    const runs = [];
+    let cursor = 0;
+    while (cursor < count) {
+      const index = (origin + cursor) % count;
+      const flag = curved[index] ?? false;
+      const indices = [index];
+      cursor++;
+      while (cursor < count && (curved[(origin + cursor) % count] ?? false) === flag) {
+        indices.push((origin + cursor) % count);
+        cursor++;
+      }
+      runs.push({ curved: flag, indices });
+    }
+    absorb(runs, (run, previous, next) => run.curved && run.indices.length <= 2 && !previous.curved && !next.curved, false);
+    absorb(runs, (run, previous, next) => !run.curved && run.indices.length <= 4 && previous.curved && next.curved, true);
+    const useful = runs.filter((run) => run.indices.length > 0);
+    if (useful.length !== 8) return null;
+    let bends = 0;
+    let sides = 0;
+    for (let i = 0; i < useful.length; i++) {
+      const run = useful[i];
+      const next = useful[(i + 1) % useful.length];
+      if (!run || !next || run.curved === next.curved) return null;
+      if (run.curved) bends++;
+      else sides++;
+      if (run.curved) {
+        let integral = 0;
+        for (const index of run.indices) integral += turn[index] ?? 0;
+        if (Math.abs(integral) < 0.55 || Math.abs(integral) > 2.1) return null;
+      }
+    }
+    if (bends !== 4 || sides !== 4) return null;
+    return useful;
+  }
+  function absorb(runs, take, curved) {
+    for (let i = 0; i < runs.length; ) {
+      const run = runs[i];
+      const previous = runs[(i + runs.length - 1) % runs.length];
+      const next = runs[(i + 1) % runs.length];
+      if (!run || !previous || !next || previous === next || !take(run, previous, next)) {
+        i++;
+        continue;
+      }
+      previous.indices = previous.indices.concat(run.indices, next.indices);
+      previous.curved = curved;
+      const nextIndex = (i + 1) % runs.length;
+      const drop = [i, nextIndex].sort((a, b) => b - a);
+      for (const index of drop) runs.splice(index, 1);
+      i = 0;
+    }
+  }
+  function crispCorners(points, closed) {
+    const count = points.length;
+    if (count < 6) return [];
+    const reach = 3.4;
+    const turns = new Float64Array(count);
+    for (let i = 0; i < count; i++) {
+      const back = walkPoint(points, i, reach, -1, closed);
+      const ahead = walkPoint(points, i, reach, 1, closed);
+      const current = points[i];
+      if (!back || !ahead || !current) continue;
+      const turn = Math.abs(turnAngle(back.point, current, ahead.point));
+      if (turn < 0.9) continue;
+      if (pathDeviation(points, i, back.index, -1, closed) > 0.85 || pathDeviation(points, i, ahead.index, 1, closed) > 0.85) continue;
+      turns[i] = turn;
+    }
+    const cuts = [];
+    for (let i = 0; i < count; i++) {
+      const turn = turns[i] ?? 0;
+      if (turn < 0.9) continue;
+      const left = turns[(i - 1 + count) % count] ?? 0;
+      const right = turns[(i + 1) % count] ?? 0;
+      if (turn + 1e-6 < left || turn < right) continue;
+      const last = cuts[cuts.length - 1];
+      if (last !== void 0 && i - last < 4) continue;
+      cuts.push(i);
+    }
+    if (closed && cuts.length >= 2) {
+      const first = cuts[0];
+      const last = cuts[cuts.length - 1];
+      if (first !== void 0 && last !== void 0 && first + count - last < 4) cuts.pop();
+    }
+    return cuts;
+  }
+  function walkPoint(points, index, distance, sign, closed) {
+    const count = points.length;
+    let remaining = distance;
+    let cursor = index;
+    for (let guard = 0; guard < count; guard++) {
+      const next = cursor + sign;
+      if (!closed && (next < 0 || next >= count)) return null;
+      const wrapped = (next + count) % count;
+      const from = points[(cursor + count) % count];
+      const to = points[wrapped];
+      if (!from || !to) return null;
+      const step = Math.hypot(to.x - from.x, to.y - from.y);
+      if (step < 1e-8) {
+        if (wrapped === index) return null;
+        cursor = wrapped;
+        continue;
+      }
+      if (step + 1e-8 >= remaining) {
+        const t = remaining / step;
+        return { point: { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t }, index: wrapped };
+      }
+      remaining -= step;
+      if (closed && wrapped === index) return null;
+      cursor = wrapped;
+    }
+    return null;
+  }
+  function pathDeviation(points, from, to, sign, closed) {
+    const count = points.length;
+    const start2 = points[from];
+    const end = points[(to + count) % count];
+    if (!start2 || !end) return Infinity;
+    let max = 0;
+    let cursor = from;
+    for (let guard = 0; guard < count; guard++) {
+      const next = cursor + sign;
+      if (!closed && (next < 0 || next >= count)) break;
+      const wrapped = (next + count) % count;
+      const point = points[wrapped];
+      if (point) max = Math.max(max, pointSegmentDistance(point, start2, end));
+      if (wrapped === (to + count) % count) break;
+      cursor = wrapped;
+    }
+    return max;
+  }
+  function fitSmoothSpan(points, tolerance, depth) {
+    const end = points[points.length - 1];
+    const start2 = points[0];
+    if (!start2 || !end) return [];
+    if (points.length < 2) return [];
+    const line = tryLine(points, tolerance);
+    const bow = maxSegmentError(points, start2, end);
+    if (line && bow <= 0.55) return [line];
+    if (points.length >= 6) {
+      const arc = tryArc(points, tolerance);
+      if (arc && arc.commands.length <= 2) return [arc];
+    }
+    if (points.length >= 4) {
+      const cubic = tryFairCubic(points, tolerance);
+      if (cubic) return [cubic];
+    }
+    if (line) return [line];
+    if (depth > 12 || points.length <= 3) return [{ commands: [{ op: "L", x: end.x, y: end.y, primitive: "line" }] }];
+    const split = splitIndex(points);
+    return fairJoin(
+      fitSmoothSpan(points.slice(0, split + 1), tolerance, depth + 1),
+      fitSmoothSpan(points.slice(split), tolerance, depth + 1)
+    );
+  }
+  function fitClosedPrimitives(points, tolerance) {
+    return tryFullCircle(points, tolerance) ?? tryRoundedRect(points, tolerance) ?? trySuperellipse(points, tolerance) ?? tryFullEllipse(points, tolerance);
+  }
+  function fitClosedGuided(points, tolerance) {
+    const epsilon = Math.max(0.5, Math.min(tolerance * 0.78, 1.3));
+    const guide = decimateClosed(points, epsilon);
+    if (guide.length < 6) return null;
+    const primitive = fitClosedPrimitives(guide, Math.max(0.35, tolerance - epsilon * 0.35));
+    if (primitive && sampleCurveError(primitive.start, primitive.commands, points) <= tolerance) return primitive;
+    const fitted = fitClosedRaw(guide, Math.max(0.3, tolerance - epsilon));
+    if (!fitted || sampleCurveError(fitted.start, fitted.commands, points) > tolerance) return null;
+    return fitted;
+  }
+  function fitClosedRaw(points, tolerance) {
+    const cuts = crispCorners(points, true);
+    if (cuts.length >= 3) {
+      const commands2 = [];
+      for (let i = 0; i < cuts.length; i++) {
+        const span = sliceCyclic(points, cuts[i], cuts[(i + 1) % cuts.length]);
+        commands2.push(...fitOpenClean(span, tolerance));
+      }
+      const start3 = points[cuts[0]];
+      if (!start3 || commands2.length === 0) return null;
+      return { start: start3, commands: commands2 };
+    }
+    const loop = points.concat(points[0]);
+    const commands = fitOpenClean(loop, tolerance);
+    const start2 = points[0];
+    if (!start2 || commands.length === 0) return null;
+    return { start: start2, commands };
+  }
+  function pinEnd(commands, end) {
+    const last = commands[commands.length - 1];
+    if (!last || last.x === end.x && last.y === end.y) return commands;
+    return commands.slice(0, -1).concat([{ ...last, x: end.x, y: end.y }]);
+  }
+  function decimateIndexed(points, epsilon) {
+    if (points.length < 3 || epsilon <= 0) return points.map((_, index) => index);
+    const keep = new Uint8Array(points.length);
+    keep[0] = 1;
+    keep[points.length - 1] = 1;
+    const stack = [0, points.length - 1];
+    while (stack.length > 0) {
+      const end = stack.pop();
+      const start2 = stack.pop();
+      if (start2 === void 0 || end === void 0) break;
+      let best = -1;
+      let bestDistance = epsilon;
+      for (let i = start2 + 1; i < end; i++) {
+        const point = points[i];
+        const from = points[start2];
+        const to = points[end];
+        if (!point || !from || !to) continue;
+        const distance = pointSegmentDistance(point, from, to);
+        if (distance > bestDistance) {
+          bestDistance = distance;
+          best = i;
+        }
+      }
+      if (best >= 0) {
+        keep[best] = 1;
+        stack.push(start2, best, best, end);
+      }
+    }
+    const indexes = [];
+    for (let i = 0; i < points.length; i++) if (keep[i]) indexes.push(i);
+    return indexes;
+  }
+  function decimateOpen(points, epsilon) {
+    if (points.length < 3 || epsilon <= 0) return points.slice();
+    const keep = new Uint8Array(points.length);
+    keep[0] = 1;
+    keep[points.length - 1] = 1;
+    const stack = [0, points.length - 1];
+    while (stack.length > 0) {
+      const end = stack.pop();
+      const start2 = stack.pop();
+      if (start2 === void 0 || end === void 0) break;
+      let best = -1;
+      let bestDistance = epsilon;
+      for (let i = start2 + 1; i < end; i++) {
+        const point = points[i];
+        const from = points[start2];
+        const to = points[end];
+        if (!point || !from || !to) continue;
+        const distance = pointSegmentDistance(point, from, to);
+        if (distance > bestDistance) {
+          bestDistance = distance;
+          best = i;
+        }
+      }
+      if (best >= 0) {
+        keep[best] = 1;
+        stack.push(start2, best, best, end);
+      }
+    }
+    const out = [];
+    for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i]);
+    return out;
+  }
+  function decimateClosed(points, epsilon) {
+    if (points.length < 8) return points.slice();
+    let first = 0;
+    for (let i = 1; i < points.length; i++) {
+      const point = points[i];
+      const best = points[first];
+      if (!point || !best) continue;
+      if (point.x < best.x - 1e-9 || Math.abs(point.x - best.x) <= 1e-9 && point.y < best.y) first = i;
+    }
+    const origin = points[first];
+    if (!origin) return points.slice();
+    let second = 0;
+    let far = -1;
+    for (let i = 0; i < points.length; i++) {
+      if (i === first) continue;
+      const point = points[i];
+      if (!point) continue;
+      const distance = (point.x - origin.x) ** 2 + (point.y - origin.y) ** 2;
+      if (distance > far) {
+        far = distance;
+        second = i;
+      }
+    }
+    const a = decimateOpen(sliceCyclic(points, first, second), epsilon);
+    const b = decimateOpen(sliceCyclic(points, second, first), epsilon);
+    if (a.length === 0) return b;
+    return a.concat(b.slice(1, -1));
+  }
+  function fairJoin(left, right) {
+    const previous = left[left.length - 1];
+    const next = right[0];
+    if (!previous || !next) return left.concat(right);
+    const leftCommand = previous.commands[previous.commands.length - 1];
+    const rightCommand = next.commands[0];
+    if (!leftCommand || !rightCommand || leftCommand.op !== "C" || rightCommand.op !== "C") return left.concat(right);
+    const tx = leftCommand.x - leftCommand.x2;
+    const ty = leftCommand.y - leftCommand.y2;
+    const length = Math.hypot(tx, ty);
+    if (length < 1e-6) return left.concat(right);
+    const arm = Math.hypot(rightCommand.x1 - leftCommand.x, rightCommand.y1 - leftCommand.y);
+    const matched = Math.max(length, Math.min(arm, length * 1.35));
+    const joined = {
+      ...rightCommand,
+      x1: leftCommand.x + tx / length * matched,
+      y1: leftCommand.y + ty / length * matched
+    };
+    const rebuilt = { commands: [joined, ...next.commands.slice(1)] };
+    return left.concat([rebuilt], right.slice(1));
+  }
+  function fitCircle(points) {
+    let sumX = 0;
+    let sumY = 0;
+    let sumX2 = 0;
+    let sumY2 = 0;
+    let sumXY = 0;
+    let sumR = 0;
+    let sumRX = 0;
+    let sumRY = 0;
+    const count = points.length;
+    if (count < 6) return null;
+    for (const point of points) {
+      const radius22 = point.x * point.x + point.y * point.y;
+      sumX += point.x;
+      sumY += point.y;
+      sumX2 += point.x * point.x;
+      sumY2 += point.y * point.y;
+      sumXY += point.x * point.y;
+      sumR += radius22;
+      sumRX += radius22 * point.x;
+      sumRY += radius22 * point.y;
+    }
+    const det = determinant(sumX2, sumXY, sumX, sumXY, sumY2, sumY, sumX, sumY, count);
+    if (Math.abs(det) < 1e-8) return null;
+    const d = determinant(-sumRX, sumXY, sumX, -sumRY, sumY2, sumY, -sumR, sumY, count) / det;
+    const e = determinant(sumX2, -sumRX, sumX, sumXY, -sumRY, sumY, sumX, -sumR, count) / det;
+    const f = determinant(sumX2, sumXY, -sumRX, sumXY, sumY2, -sumRY, sumX, sumY, -sumR) / det;
+    const cx = -d / 2;
+    const cy = -e / 2;
+    const radius2 = cx * cx + cy * cy - f;
+    if (!(radius2 > 1)) return null;
+    return { cx, cy, r: Math.sqrt(radius2) };
+  }
+  function fitEllipse(points) {
+    let sx = 0;
+    let sy = 0;
+    for (const point of points) {
+      sx += point.x;
+      sy += point.y;
+    }
+    const cx = sx / points.length;
+    const cy = sy / points.length;
+    let a00 = 0;
+    let a01 = 0;
+    let a11 = 0;
+    let b0 = 0;
+    let b1 = 0;
+    for (const point of points) {
+      const x2 = (point.x - cx) * (point.x - cx);
+      const y2 = (point.y - cy) * (point.y - cy);
+      a00 += x2 * x2;
+      a01 += x2 * y2;
+      a11 += y2 * y2;
+      b0 += x2;
+      b1 += y2;
+    }
+    const det = a00 * a11 - a01 * a01;
+    if (Math.abs(det) < 1e-6) return null;
+    const u = (a11 * b0 - a01 * b1) / det;
+    const v = (a00 * b1 - a01 * b0) / det;
+    if (!(u > 1e-6) || !(v > 1e-6)) return null;
+    return { cx, cy, rx: 1 / Math.sqrt(u), ry: 1 / Math.sqrt(v) };
+  }
+  function ellipseRadialError(point, ellipse) {
+    const dx = (point.x - ellipse.cx) / ellipse.rx;
+    const dy = (point.y - ellipse.cy) / ellipse.ry;
+    const rho = Math.hypot(dx, dy);
+    return Math.abs(rho - 1) * Math.hypot(point.x - ellipse.cx, point.y - ellipse.cy) / Math.max(rho, 0.25);
+  }
+  function superellipseError(point, shape) {
+    const dx = (point.x - shape.cx) / shape.a;
+    const dy = (point.y - shape.cy) / shape.b;
+    const rho = (Math.abs(dx) ** shape.n + Math.abs(dy) ** shape.n) ** (1 / shape.n);
+    return Math.abs(rho - 1) * Math.hypot(point.x - shape.cx, point.y - shape.cy) / Math.max(rho, 0.25);
+  }
+  function fullArcCubics(circle, startAngle, sweep) {
+    const commands = [];
+    const steps = 4;
+    for (let i = 0; i < steps; i++) {
+      const a0 = startAngle + sweep * i / steps;
+      const a1 = startAngle + sweep * (i + 1) / steps;
+      commands.push(arcStep(circle, a0, a1, i === steps - 1 ? startAngle : null));
+    }
+    return commands;
+  }
+  function ellipseCubics(ellipse, sweep) {
+    const commands = [];
+    const steps = 4;
+    for (let i = 0; i < steps; i++) {
+      const a0 = sweep * i / steps;
+      const a1 = sweep * (i + 1) / steps;
+      const p0 = ellipsePoint(ellipse, a0);
+      const p3 = ellipsePoint(ellipse, i === steps - 1 ? 0 : a1);
+      const arm = KAPPA * (Math.abs(sweep) / (Math.PI * 2)) * 4;
+      const t0 = ellipseTangent(ellipse, a0, sweep > 0);
+      const t1 = ellipseTangent(ellipse, a1, sweep > 0);
+      commands.push({
+        op: "C",
+        x1: p0.x + t0.x * ellipseScale(ellipse, arm),
+        y1: p0.y + t0.y * ellipseScale(ellipse, arm),
+        x2: p3.x - t1.x * ellipseScale(ellipse, arm),
+        y2: p3.y - t1.y * ellipseScale(ellipse, arm),
+        x: p3.x,
+        y: p3.y,
+        primitive: "arc"
+      });
+    }
+    return commands;
+  }
+  function ellipseScale(ellipse, arm) {
+    return (ellipse.rx + ellipse.ry) / 2 * arm;
+  }
+  function arcCubics(start2, end, circle, sweep) {
+    const startAngle = Math.atan2(start2.y - circle.cy, start2.x - circle.cx);
+    const steps = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI * 0.62)));
+    const commands = [];
+    for (let i = 0; i < steps; i++) {
+      const a0 = startAngle + sweep * i / steps;
+      const a1 = startAngle + sweep * (i + 1) / steps;
+      const command = arcStep(circle, a0, a1, null);
+      const origin = commandFrom(circle, a0);
+      if (i === 0) {
+        commands.push({ ...command, x1: start2.x + (command.x1 - origin.x), y1: start2.y + (command.y1 - origin.y) });
+      } else commands.push(command);
+    }
+    const last = commands[commands.length - 1];
+    if (last) commands[commands.length - 1] = { ...last, x: end.x, y: end.y };
+    return commands;
+  }
+  function arcStep(circle, a0, a1, closeAt) {
+    const p0 = commandFrom(circle, a0);
+    const p3 = closeAt === null ? commandFrom(circle, a1) : commandFrom(circle, closeAt);
+    const sweep = a1 - a0;
+    const k = 4 / 3 * Math.tan(sweep / 4);
+    const t0 = { x: -Math.sin(a0), y: Math.cos(a0) };
+    const t1 = { x: -Math.sin(a1), y: Math.cos(a1) };
+    return {
+      op: "C",
+      x1: p0.x + t0.x * k * circle.r,
+      y1: p0.y + t0.y * k * circle.r,
+      x2: p3.x - t1.x * k * circle.r,
+      y2: p3.y - t1.y * k * circle.r,
+      x: p3.x,
+      y: p3.y,
+      primitive: "arc"
+    };
+  }
+  function commandFrom(circle, angle) {
+    return { x: circle.cx + Math.cos(angle) * circle.r, y: circle.cy + Math.sin(angle) * circle.r };
+  }
+  function ellipsePoint(ellipse, angle) {
+    return { x: ellipse.cx + Math.cos(angle) * ellipse.rx, y: ellipse.cy + Math.sin(angle) * ellipse.ry };
+  }
+  function ellipseTangent(ellipse, angle, positive) {
+    const tx = -ellipse.rx * Math.sin(angle);
+    const ty = ellipse.ry * Math.cos(angle);
+    const length = Math.hypot(tx, ty) || 1;
+    const sign = positive ? 1 : -1;
+    return { x: tx / length * sign, y: ty / length * sign };
+  }
+  function superPoint(shape, angle) {
+    const c = Math.cos(angle);
+    const s = Math.sin(angle);
+    const power = 2 / shape.n;
+    return {
+      x: shape.cx + Math.sign(c) * shape.a * Math.abs(c) ** power,
+      y: shape.cy + Math.sign(s) * shape.b * Math.abs(s) ** power
+    };
+  }
+  function superTangent(shape, angle, positive) {
+    const ahead = superPoint(shape, angle + 0.02);
+    const behind = superPoint(shape, angle - 0.02);
+    const length = Math.hypot(ahead.x - behind.x, ahead.y - behind.y) || 1;
+    const sign = positive ? 1 : -1;
+    return { x: (ahead.x - behind.x) / length * sign, y: (ahead.y - behind.y) / length * sign };
+  }
+  function sweepAbout(points, circle) {
+    let sweep = 0;
+    for (let i = 1; i < points.length; i++) {
+      const previous = points[i - 1];
+      const point = points[i];
+      if (!previous || !point) continue;
+      const a0 = Math.atan2(previous.y - circle.cy, previous.x - circle.cx);
+      const a1 = Math.atan2(point.y - circle.cy, point.x - circle.cx);
+      let delta = a1 - a0;
+      if (delta > Math.PI) delta -= Math.PI * 2;
+      if (delta < -Math.PI) delta += Math.PI * 2;
+      sweep += delta;
+    }
+    return sweep;
+  }
+  function fitCubic(points, t1, t2) {
+    const p0 = points[0];
+    const p3 = points[points.length - 1];
+    if (!p0 || !p3) return null;
+    const chord = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+    if (chord < 1e-6) return null;
+    let length = 0;
+    const parameter = [0];
+    for (let i = 1; i < points.length; i++) {
+      const previous = points[i - 1];
+      const point = points[i];
+      if (!previous || !point) return null;
+      length += Math.hypot(point.x - previous.x, point.y - previous.y);
+      parameter.push(length);
+    }
+    if (length < 1e-6) return null;
+    let c11 = 0;
+    let c12 = 0;
+    let c22 = 0;
+    let x1 = 0;
+    let x2 = 0;
+    const tangentDot = t1.x * t2.x + t1.y * t2.y;
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i];
+      if (!point) return null;
+      const t = (parameter[i] ?? 0) / length;
+      const u = 1 - t;
+      const b1 = 3 * u * u * t;
+      const b2 = 3 * u * t * t;
+      const basisX = p0.x * u * u * u + p3.x * t * t * t;
+      const basisY = p0.y * u * u * u + p3.y * t * t * t;
+      c11 += b1 * b1;
+      c22 += b2 * b2;
+      c12 += b1 * b2 * tangentDot;
+      x1 += b1 * ((point.x - basisX) * t1.x + (point.y - basisY) * t1.y);
+      x2 += b2 * ((point.x - basisX) * t2.x + (point.y - basisY) * t2.y);
+    }
+    const det = c11 * c22 - c12 * c12;
+    if (Math.abs(det) < 1e-10) return null;
+    const alpha1 = (c22 * x1 - c12 * x2) / det;
+    const alpha2 = (c11 * x2 - c12 * x1) / det;
+    if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord * 1.2 || alpha2 > chord * 1.2) return null;
+    const command = {
+      op: "C",
+      x1: p0.x + t1.x * alpha1,
+      y1: p0.y + t1.y * alpha1,
+      x2: p3.x + t2.x * alpha2,
+      y2: p3.y + t2.y * alpha2,
+      x: p3.x,
+      y: p3.y
+    };
+    let maxError = 0;
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const at = cubicAt(p0, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, p3, (parameter[i] ?? 0) / length);
+      maxError = Math.max(maxError, Math.hypot(at.x - point.x, at.y - point.y));
+    }
+    return { command, error: maxError };
+  }
+  function extraInflection(points, start2, command) {
+    const end = { x: command.x, y: command.y };
+    const source = signChanges(points.map((point) => signedDistance(point, start2, end)));
+    const samples = [];
+    for (let step = 0; step <= 8; step++) {
+      const at = cubicAt(start2, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, end, step / 8);
+      samples.push(signedDistance(at, start2, end));
+    }
+    return signChanges(samples) > source + 1;
+  }
+  function signChanges(values) {
+    let changes = 0;
+    let previous = 0;
+    for (const value of values) {
+      const sign = value > 0.15 ? 1 : value < -0.15 ? -1 : 0;
+      if (sign === 0) continue;
+      if (previous !== 0 && sign !== previous) changes++;
+      previous = sign;
+    }
+    return changes;
+  }
+  function curveError2(points, start2, commands) {
+    return sampleCurveError(start2, commands, points);
+  }
+  function sampleCurveError(start2, commands, points) {
+    const samples = sampleCommands(start2, commands, 10);
+    let maxError = 0;
+    for (const point of points) {
+      let best = Infinity;
+      for (let i = 1; i < samples.length; i++) {
+        const from = samples[i - 1];
+        const to = samples[i];
+        if (!from || !to) continue;
+        best = Math.min(best, pointSegmentDistance(point, from, to));
+      }
+      maxError = Math.max(maxError, best);
+    }
+    return maxError;
+  }
+  function sampleCommands(start2, commands, steps) {
+    const samples = [start2];
+    let x = start2.x;
+    let y = start2.y;
+    for (const command of commands) {
+      if (command.op === "L") {
+        samples.push({ x: command.x, y: command.y });
+        x = command.x;
+        y = command.y;
+        continue;
+      }
+      const from = { x, y };
+      for (let step = 1; step <= steps; step++) {
+        samples.push(cubicAt(from, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, { x: command.x, y: command.y }, step / steps));
+      }
+      x = command.x;
+      y = command.y;
+    }
+    return samples;
+  }
+  function smoothPolyline(points, radius) {
+    return points.map((point, index) => {
+      if (index === 0 || index === points.length - 1) return point;
+      let x = 0;
+      let y = 0;
+      let weight = 0;
+      for (let delta = -radius; delta <= radius; delta++) {
+        const sample2 = points[index + delta];
+        if (!sample2) continue;
+        const w = radius + 1 - Math.abs(delta);
+        x += sample2.x * w;
+        y += sample2.y * w;
+        weight += w;
+      }
+      return weight > 0 ? { x: x / weight, y: y / weight } : point;
+    });
+  }
+  function unitToward(points, index, atEnd) {
+    const origin = points[index];
+    if (!origin) return null;
+    const reach = Math.min(5, atEnd ? index : points.length - 1 - index);
+    let x = 0;
+    let y = 0;
+    for (let step = 1; step <= reach; step++) {
+      const point = points[atEnd ? index - step : index + step];
+      if (!point) continue;
+      x += (point.x - origin.x) / step;
+      y += (point.y - origin.y) / step;
+    }
+    const length = Math.hypot(x, y);
+    if (length < 1e-8) return null;
+    return { x: x / length, y: y / length };
+  }
+  function splitIndex(points) {
+    const start2 = points[0];
+    const end = points[points.length - 1];
+    if (!start2 || !end) return Math.floor(points.length / 2);
+    let best = -1;
+    let index = Math.floor(points.length / 2);
+    for (let i = 1; i < points.length - 1; i++) {
+      const point = points[i];
+      if (!point) continue;
+      const distance = pointSegmentDistance(point, start2, end);
+      if (distance > best) {
+        best = distance;
+        index = i;
+      }
+    }
+    if (index <= 0 || index >= points.length - 1) return Math.floor(points.length / 2);
+    return index;
+  }
+  function projectSegment(points, axis) {
+    const first = points[0];
+    const last = points[points.length - 1];
+    if (!first || !last) return null;
+    const mid = { x: (first.x + last.x) / 2, y: (first.y + last.y) / 2 };
+    const direction = { x: Math.cos(axis), y: Math.sin(axis) };
+    const project2 = (point) => {
+      const t = (point.x - mid.x) * direction.x + (point.y - mid.y) * direction.y;
+      return { x: mid.x + t * direction.x, y: mid.y + t * direction.y };
+    };
+    return { start: project2(first), end: project2(last) };
+  }
+  function nearestSnap(angle) {
+    const axes = [
+      { axis: 0, name: "horizontal" },
+      { axis: Math.PI / 4, name: "diagonal" },
+      { axis: Math.PI / 2, name: "vertical" },
+      { axis: 3 * Math.PI / 4, name: "diagonal" },
+      { axis: Math.PI, name: "horizontal" },
+      { axis: -Math.PI / 4, name: "diagonal" },
+      { axis: -Math.PI / 2, name: "vertical" },
+      { axis: -3 * Math.PI / 4, name: "diagonal" }
+    ];
+    let best = null;
+    let bestDelta = 0.22;
+    for (const candidate of axes) {
+      let delta = Math.abs(angle - candidate.axis);
+      if (delta > Math.PI) delta = Math.PI * 2 - delta;
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        best = candidate;
+      }
+    }
+    return best;
+  }
+  function maxSegmentError(points, start2, end) {
+    let max = 0;
+    for (const point of points) max = Math.max(max, pointSegmentDistance(point, start2, end));
+    return max;
+  }
+  function pointSegmentDistance(point, from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-8) return Math.hypot(point.x - from.x, point.y - from.y);
+    const t = Math.min(1, Math.max(0, ((point.x - from.x) * dx + (point.y - from.y) * dy) / (length * length)));
+    return Math.hypot(point.x - (from.x + t * dx), point.y - (from.y + t * dy));
+  }
+  function signedDistance(point, from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = Math.hypot(dx, dy);
+    if (length < 1e-8) return 0;
+    return ((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
+  }
+  function turnAngle(a, b, c) {
+    const incoming = Math.atan2(b.y - a.y, b.x - a.x);
+    const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
+    let delta = outgoing - incoming;
+    if (delta > Math.PI) delta -= Math.PI * 2;
+    if (delta < -Math.PI) delta += Math.PI * 2;
+    return delta;
+  }
+  function signedArea(points) {
+    let area = 0;
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i];
+      const next = points[(i + 1) % points.length];
+      if (!point || !next) continue;
+      area += point.x * next.y - next.x * point.y;
+    }
+    return area / 2;
+  }
+  function bounds(points) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const point of points) {
+      if (point.x < minX) minX = point.x;
+      if (point.y < minY) minY = point.y;
+      if (point.x > maxX) maxX = point.x;
+      if (point.y > maxY) maxY = point.y;
+    }
+    return { minX, minY, maxX, maxY };
+  }
+  function sliceCyclic(points, start2, end) {
+    const out = [points[start2]];
+    if (start2 === end) {
+      for (let i = 1; i <= points.length; i++) out.push(points[(start2 + i) % points.length]);
+      return out;
+    }
+    let cursor = start2;
+    do {
+      cursor = (cursor + 1) % points.length;
+      out.push(points[cursor]);
+    } while (cursor !== end);
+    return out;
+  }
+  function cubicAt(p0, p1, p2, p3, t) {
+    const u = 1 - t;
+    return {
+      x: u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
+      y: u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * p3.y
+    };
+  }
+  function determinant(a00, a01, a02, a10, a11, a12, a20, a21, a22) {
+    return a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
+  }
+
   // src/color/trace.ts
   function traceSegmentation(segmentation, options = {}) {
     const preset = options.preset ?? "logo";
@@ -2328,6 +3711,7 @@
     const scaled = scale <= 1 ? { labels: field.labels, width: segmentation.width, height: segmentation.height } : upscaleField(field, segmentation.width, segmentation.height, scale);
     const shapes = [];
     const cache = /* @__PURE__ */ new Map();
+    const clean = cleanSession(segmentation, options);
     const counts = countLabels2(scaled.labels, segmentation.palette.length);
     const order = segmentation.palette.map((_, index) => index).filter((index) => (counts[index] ?? 0) > 0);
     order.sort((a, b) => (counts[b] ?? 0) - (counts[a] ?? 0) || a - b);
@@ -2336,7 +3720,7 @@
       const contours = traceLabel(scaled.labels, scaled.width, scaled.height, label);
       const subpaths = [];
       for (const contour of contours) {
-        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache);
+        const subpath = contourToSubpath(contour, scale, error, cornerAngle, Math.max(1.15, error * 0.85), cache, clean);
         if (subpath && subpath.commands.length > 0) subpaths.push(subpath);
       }
       const color = segmentation.palette[label];
@@ -2522,16 +3906,42 @@
     vertical[index] = (vertical[index] ?? 0) | bit;
     return true;
   }
-  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache) {
+  function cleanSession(segmentation, options) {
+    const strength = options.cleanShapes ?? 0;
+    const selected = options.smoothMask && options.smoothMask.some((value) => value > 0) ? options.smoothMask : null;
+    if (!(strength > 0) && !selected) return null;
+    return {
+      tolerance: strength > 0 ? cleanTolerance(strength) : 0,
+      strong: strongCleanTolerance(strength),
+      letters: strength > 0 && !options.cleanText ? letterMask(segmentation.labels, segmentation.width, segmentation.height, segmentation.palette) : null,
+      selected,
+      width: segmentation.width,
+      height: segmentation.height,
+      cache: /* @__PURE__ */ new Map()
+    };
+  }
+  function cleanChainTolerance(points, session) {
+    if (!session) return null;
+    if (session.selected && boundaryHits(session.selected, session.width, session.height, points, 0.08)) return session.strong;
+    if (!(session.tolerance > 0)) return null;
+    if (session.letters && boundaryHits(session.letters, session.width, session.height, points, 0.35)) return null;
+    return session.tolerance;
+  }
+  function contourToSubpath(contour, scale, error, cornerAngle, simplify, cache, clean) {
     const points = contour.points.map((point) => ({ x: point.x / scale, y: point.y / scale }));
-    const chains = splitChains(points, contour.outside);
+    const chains = splitChains(points, clean ? stabilizeOutside(contour.outside) : contour.outside);
     if (chains.length === 0) return null;
     const only = chains[0];
     if (chains.length === 1 && only?.closed) {
       const canonical = canonicalizeClosed(only.points);
       if (canonical.length < 3) return null;
+      const tolerance = cleanChainTolerance(canonical, clean);
       const commands2 = cachedClosed(canonical, error, cornerAngle, simplify, cache);
       const start3 = canonical[0];
+      if (tolerance !== null && clean) {
+        const fitted = cachedCleanClosed(canonical, tolerance, clean);
+        if (fitted && fitted.commands.length > 0 && fitted.commands.length <= commands2.length) return fitted;
+      }
       if (!start3 || commands2.length === 0) return null;
       return { start: start3, commands: commands2 };
     }
@@ -2540,10 +3950,71 @@
     const commands = [];
     for (const chain of chains) {
       if (chain.closed || chain.points.length < 2) continue;
-      commands.push(...cachedOpen(chain.points, error, cornerAngle, simplify, cache));
+      const tolerance = cleanChainTolerance(chain.points, clean);
+      const plain = cachedOpen(chain.points, error, cornerAngle, simplify, cache);
+      if (tolerance === null || !clean) commands.push(...plain);
+      else {
+        const fitted = cachedCleanOpen(chain.points, tolerance, clean);
+        commands.push(...fitted.length > 0 && fitted.length <= plain.length ? fitted : plain);
+      }
     }
     if (commands.length === 0) return null;
     return { start: start2, commands };
+  }
+  function cachedCleanOpen(points, tolerance, session) {
+    const canonical = canonicalizeOpen(points);
+    const key = "k|" + tolerance.toFixed(3) + "|" + pointKey(canonical.points);
+    let fitted = session.cache.get(key);
+    if (!fitted) {
+      const origin = canonical.points[0];
+      if (!origin) return [];
+      fitted = { start: origin, commands: fitOpenClean(canonical.points, tolerance) };
+      session.cache.set(key, fitted);
+    }
+    if (fitted.commands.length === 0) return [];
+    return canonical.reversed ? reverseCommands(fitted.commands, fitted.start) : fitted.commands;
+  }
+  function cachedCleanClosed(points, tolerance, session) {
+    const key = "kc|" + tolerance.toFixed(3) + "|" + pointKey(points);
+    let fitted = session.cache.get(key);
+    if (!fitted) {
+      const cleanFit = fitClosedClean(points, tolerance);
+      if (!cleanFit) return null;
+      fitted = { start: cleanFit.start, commands: [...cleanFit.commands] };
+      session.cache.set(key, fitted);
+    }
+    return fitted;
+  }
+  function stabilizeOutside(outside) {
+    const count = outside.length;
+    if (count < 6) return outside.slice();
+    const copy = outside.slice();
+    const runs = [];
+    let cursor = 0;
+    while (cursor < count) {
+      const label = copy[cursor] ?? TRANSPARENT;
+      let length = 1;
+      while (cursor + length < count && (copy[cursor + length] ?? TRANSPARENT) === label) length++;
+      runs.push({ start: cursor, length, label });
+      cursor += length;
+    }
+    if (runs.length >= 2) {
+      const first = runs[0];
+      const last = runs[runs.length - 1];
+      if (first && last && first.label === last.label) {
+        last.length += first.length;
+        runs.shift();
+      }
+    }
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
+      if (!run || run.length > 3) continue;
+      const previous = runs[(i - 1 + runs.length) % runs.length];
+      const next = runs[(i + 1) % runs.length];
+      if (!previous || !next || previous === next || previous.label !== next.label) continue;
+      for (let step = 0; step < run.length; step++) copy[(run.start + step) % count] = previous.label;
+    }
+    return copy;
   }
   function splitChains(points, outside) {
     const count = points.length;
@@ -2670,13 +4141,13 @@
       for (let i = 0; i < simplified.length; i += step) anchors.push(i);
       if (anchors.length < 3) return fitOpenChain(simplified.concat(simplified[0]), error, Math.PI, simplify);
       for (let i = 0; i < anchors.length; i++) {
-        const span = sliceCyclic(simplified, anchors[i], anchors[(i + 1) % anchors.length]);
+        const span = sliceCyclic2(simplified, anchors[i], anchors[(i + 1) % anchors.length]);
         fitRange(span, 0, span.length - 1, error, commands);
       }
       return commands;
     }
     for (let i = 0; i < corners.length; i++) {
-      const span = sliceCyclic(simplified, corners[i], corners[(i + 1) % corners.length]);
+      const span = sliceCyclic2(simplified, corners[i], corners[(i + 1) % corners.length]);
       fitRange(span, 0, span.length - 1, error, commands);
     }
     return commands;
@@ -2696,12 +4167,12 @@
         second = i;
       }
     }
-    const a = douglasPeucker(sliceCyclic(points, first, second), epsilon);
-    const b = douglasPeucker(sliceCyclic(points, second, first), epsilon);
+    const a = douglasPeucker(sliceCyclic2(points, first, second), epsilon);
+    const b = douglasPeucker(sliceCyclic2(points, second, first), epsilon);
     if (a.length === 0) return b;
     return a.concat(b.slice(1, -1));
   }
-  function sliceCyclic(points, start2, end) {
+  function sliceCyclic2(points, start2, end) {
     const out = [points[start2]];
     if (start2 === end) {
       for (let i = 1; i <= points.length; i++) out.push(points[(start2 + i) % points.length]);
@@ -2732,7 +4203,7 @@
         const from = points[start2];
         const to = points[end];
         if (!point || !from || !to) continue;
-        const distance = pointSegmentDistance(point, from, to);
+        const distance = pointSegmentDistance2(point, from, to);
         const key = point.x * 1e6 + point.y;
         if (distance > bestDistance + 1e-8 || Math.abs(distance - bestDistance) <= 1e-8 && key < bestKey) {
           bestDistance = distance;
@@ -2757,7 +4228,7 @@
       out.push({ op: "L", x: to.x, y: to.y });
       return;
     }
-    const cubic = fitCubic(points, start2, end);
+    const cubic = fitCubic2(points, start2, end);
     if (cubic && cubic.error <= error) {
       out.push(cubic.command);
       return;
@@ -2767,7 +4238,7 @@
     for (let i = start2 + 1; i < end; i++) {
       const point = points[i];
       if (!point) continue;
-      const distance = pointSegmentDistance(point, from, to);
+      const distance = pointSegmentDistance2(point, from, to);
       if (distance > best) {
         best = distance;
         split = i;
@@ -2780,7 +4251,7 @@
     fitRange(points, start2, split, error, out);
     fitRange(points, split, end, error, out);
   }
-  function fitCubic(points, start2, end) {
+  function fitCubic2(points, start2, end) {
     const p0 = points[start2];
     const p3 = points[end];
     if (!p0 || !p3) return null;
@@ -2822,10 +4293,10 @@
       x1 += b1 * (vx * t1.x + vy * t1.y);
       x2 += b2 * (vx * t2.x + vy * t2.y);
     }
-    const determinant = c11 * c22 - c12 * c12;
-    if (Math.abs(determinant) < 1e-10) return null;
-    const alpha1 = (c22 * x1 - c12 * x2) / determinant;
-    const alpha2 = (c11 * x2 - c12 * x1) / determinant;
+    const determinant2 = c11 * c22 - c12 * c12;
+    if (Math.abs(determinant2) < 1e-10) return null;
+    const alpha1 = (c22 * x1 - c12 * x2) / determinant2;
+    const alpha2 = (c11 * x2 - c12 * x1) / determinant2;
     if (!(alpha1 > 0) || !(alpha2 > 0) || alpha1 > chord || alpha2 > chord) return null;
     const command = {
       op: "C",
@@ -2841,7 +4312,7 @@
       const point = points[i];
       if (!point) continue;
       const t = (parameter[i - start2] ?? 0) / length;
-      const at = cubicAt(p0, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, p3, t);
+      const at = cubicAt2(p0, { x: command.x1, y: command.y1 }, { x: command.x2, y: command.y2 }, p3, t);
       maxError = Math.max(maxError, Math.hypot(at.x - point.x, at.y - point.y));
     }
     return { command, error: maxError };
@@ -2863,7 +4334,7 @@
     if (length < 1e-8) return null;
     return { x: x / length, y: y / length };
   }
-  function cubicAt(p0, p1, p2, p3, t) {
+  function cubicAt2(p0, p1, p2, p3, t) {
     const u = 1 - t;
     const a = u * u * u;
     const b = 3 * u * u * t;
@@ -2882,11 +4353,11 @@
     for (let i = start2 + 1; i < end; i++) {
       const point = points[i];
       if (!point) continue;
-      max = Math.max(max, pointSegmentDistance(point, from, to));
+      max = Math.max(max, pointSegmentDistance2(point, from, to));
     }
     return max;
   }
-  function pointSegmentDistance(point, from, to) {
+  function pointSegmentDistance2(point, from, to) {
     const dx = to.x - from.x;
     const dy = to.y - from.y;
     const length = Math.hypot(dx, dy);
@@ -2894,7 +4365,7 @@
     return Math.abs((point.x - from.x) * dy - (point.y - from.y) * dx) / length;
   }
   function keptCorner(previous, current, next, cornerAngle) {
-    const turn = Math.abs(turnAngle(previous, current, next));
+    const turn = Math.abs(turnAngle2(previous, current, next));
     if (turn < cornerAngle) return false;
     const incoming = Math.hypot(current.x - previous.x, current.y - previous.y);
     const outgoing = Math.hypot(next.x - current.x, next.y - current.y);
@@ -2902,7 +4373,7 @@
     if (Math.min(incoming, outgoing) < 0.8 && turn < 1.15) return false;
     return true;
   }
-  function turnAngle(a, b, c) {
+  function turnAngle2(a, b, c) {
     const incoming = Math.atan2(b.y - a.y, b.x - a.x);
     const outgoing = Math.atan2(c.y - b.y, c.x - b.x);
     let delta = outgoing - incoming;
@@ -2928,8 +4399,9 @@
     for (let i = segments.length - 1; i >= 0; i--) {
       const segment = segments[i];
       if (!segment) continue;
-      if (segment.command.op === "L") reversed.push({ op: "L", x: segment.fromX, y: segment.fromY });
-      else {
+      if (segment.command.op === "L") {
+        reversed.push({ op: "L", x: segment.fromX, y: segment.fromY, primitive: segment.command.primitive, snap: segment.command.snap });
+      } else {
         reversed.push({
           op: "C",
           x1: segment.command.x2,
@@ -2937,7 +4409,8 @@
           x2: segment.command.x1,
           y2: segment.command.y1,
           x: segment.fromX,
-          y: segment.fromY
+          y: segment.fromY,
+          primitive: segment.command.primitive
         });
       }
     }
@@ -3019,6 +4492,10 @@
       colorsValue: getOutput("colors-value"),
       smooth: getInput("smooth"),
       smoothValue: getOutput("smooth-value"),
+      cleanShapes: getInput("clean-shapes"),
+      cleanStrength: getInput("clean-strength"),
+      cleanStrengthValue: getOutput("clean-strength-value"),
+      cleanText: getInput("clean-text"),
       editorRoot: getElement("editor-root")
     };
   }
@@ -3126,9 +4603,11 @@
     if (!isPresetName(preset)) throw new Error("Preset \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     const maxColors = Number(ui.colors.value);
     const simplify = Number(ui.smooth.value) / 10;
+    const cleanShapes = ui.cleanShapes.checked ? Number(ui.cleanStrength.value) / 100 : 0;
     if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E27\u0E32\u0E21\u0E40\u0E23\u0E35\u0E22\u0E1A\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    return { preset, maxColors, simplify };
+    if (!Number.isFinite(cleanShapes) || cleanShapes < 0 || cleanShapes > 1) throw new Error("\u0E04\u0E27\u0E32\u0E21\u0E41\u0E23\u0E07\u0E02\u0E2D\u0E07\u0E23\u0E39\u0E1B\u0E17\u0E23\u0E07\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
+    return { preset, maxColors, simplify, cleanShapes, cleanText: ui.cleanText.checked };
   }
   function showSelection(ui, selection) {
     ui.selection.replaceChildren();
@@ -3285,6 +4764,8 @@
       try {
         const segmentation = editor.segmentation();
         if (segmentation.palette.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E21\u0E35\u0E2A\u0E35\u0E43\u0E2B\u0E49\u0E41\u0E1B\u0E25\u0E07");
+        const live = readSettings(ui);
+        job.settings = { ...job.settings, simplify: live.simplify, cleanShapes: live.cleanShapes, cleanText: live.cleanText };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E08\u0E32\u0E01\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E41\u0E01\u0E49\u2026");
         state = { kind: "tracing", selection, job };
         render();
@@ -3294,6 +4775,9 @@
         const traced = traceSegmentation(segmentation, {
           preset: job.settings.preset,
           smooth: job.settings.simplify,
+          cleanShapes: job.settings.cleanShapes,
+          cleanText: job.settings.cleanText,
+          smoothMask: segmentation.smoothMask,
           coverage: source?.coverage,
           partner: source?.partner,
           originalLabels: source?.labels
@@ -3301,7 +4785,7 @@
         fs.writeFileSync(job.svgPath, traced.svg, "utf8");
         const svg = traced.svg;
         state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svg, "utf8").toString("base64") };
-        message("\u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator \xB7 \u0E41\u0E1C\u0E19\u0E17\u0E35\u0E48\u0E2A\u0E35 " + editor.colorCount() + " \xB7 \u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C " + countSvgFills(svg) + " \u0E2A\u0E35 \xB7 " + traced.pathCount + " \u0E40\u0E2A\u0E49\u0E19");
+        message("\u0E14\u0E39\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator \xB7 \u0E41\u0E1C\u0E19\u0E17\u0E35\u0E48\u0E2A\u0E35 " + editor.colorCount() + " \xB7 \u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C " + countSvgFills(svg) + " \u0E2A\u0E35 \xB7 " + traced.pathCount + " \u0E40\u0E2A\u0E49\u0E19 \xB7 " + traced.nodeCount + " \u0E08\u0E38\u0E14");
         render();
       } catch (error) {
         state = { kind: "editing", selection, job };
@@ -3333,7 +4817,7 @@
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
       render();
       try {
-        const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";edited=" + editor.colorCount();
+        const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify + ";clean=" + job.settings.cleanShapes + ";cleanText=" + (job.settings.cleanText ? 1 : 0) + ";edited=" + editor.colorCount();
         const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48 \xB7 \u0E2A\u0E35 " + editor.colorCount());
         cleanJob(job);
@@ -3370,6 +4854,15 @@
     ui.smooth.addEventListener("input", () => {
       ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
     });
+    const syncClean = () => {
+      const on = ui.cleanShapes.checked;
+      ui.cleanStrength.disabled = !on;
+      ui.cleanText.disabled = !on;
+      ui.cleanStrengthValue.value = ui.cleanStrength.value;
+    };
+    ui.cleanShapes.addEventListener("change", syncClean);
+    ui.cleanStrength.addEventListener("input", syncClean);
+    syncClean();
     ui.preset.addEventListener("change", () => {
       const profile = presetProfile(ui.preset.value);
       ui.colors.value = String(profile.maxColors);

@@ -247,6 +247,99 @@ test("thin fringes on a green square are reassigned", () => {
   assert.ok(rgbToOklab(ink.r, ink.g, ink.b).l < 0.25, "the dark mark inside the square stays");
 });
 
+test("a stair-stepped circle fits to a handful of arc anchors", () => {
+  const width = 100;
+  const height = 100;
+  const cx = 50;
+  const cy = 50;
+  const radius = 36;
+  const segmentation = segmentationFrom(width, height, (x, y) => {
+    const dx = x + 0.5 - cx;
+    const dy = y + 0.5 - cy;
+    return dx * dx + dy * dy <= radius * radius ? 0 : TRANSPARENT;
+  }, [{ r: 220, g: 90, b: 40 }]);
+  const traced = traceSegmentation(segmentation, { smooth: 0.5, upscale: 1, cleanShapes: 0.55 });
+  assert.equal(traced.pathCount, 1);
+  assert.ok(traced.nodeCount <= 8, "anchors " + traced.nodeCount);
+  const shape = traced.shapes[0];
+  assert.ok(shape);
+  let samples = 0;
+  let worst = 0;
+  for (const subpath of shape.subpaths) {
+    let x = subpath.start.x;
+    let y = subpath.start.y;
+    const consider = (px: number, py: number) => {
+      samples++;
+      worst = Math.max(worst, Math.abs(Math.hypot(px - cx, py - cy) - radius));
+    };
+    consider(x, y);
+    for (const command of subpath.commands) {
+      assert.equal(command.primitive, "arc");
+      if (command.op === "C") {
+        for (let step = 1; step <= 8; step++) {
+          const t = step / 8;
+          const u = 1 - t;
+          const px = u * u * u * x + 3 * u * u * t * command.x1 + 3 * u * t * t * command.x2 + t * t * t * command.x;
+          const py = u * u * u * y + 3 * u * u * t * command.y1 + 3 * u * t * t * command.y2 + t * t * t * command.y;
+          consider(px, py);
+        }
+      }
+      x = command.x;
+      y = command.y;
+    }
+  }
+  assert.ok(samples > 8);
+  assert.ok(worst <= 0.5, "circle error " + worst.toFixed(3));
+});
+
+test("a stair rounded rect fits to lines and arcs", () => {
+  const width = 90;
+  const height = 70;
+  const segmentation = segmentationFrom(width, height, (x, y) => (insideRoundRect(x + 0.5, y + 0.5, 12, 10, 78, 58, 12) ? 0 : TRANSPARENT), [{ r: 40, g: 150, b: 90 }]);
+  const traced = traceSegmentation(segmentation, { smooth: 0.4, upscale: 1, cleanShapes: 0.7 });
+  const commands = traced.shapes[0]?.subpaths[0]?.commands ?? [];
+  const lines = commands.filter((command) => command.primitive === "line");
+  const arcs = commands.filter((command) => command.primitive === "arc");
+  assert.ok(lines.length >= 4, "lines " + lines.length + " nodes " + traced.nodeCount);
+  assert.ok(arcs.length >= 4, "arcs " + arcs.length);
+  assert.ok(traced.nodeCount <= 16, "anchors " + traced.nodeCount);
+  assert.ok(lines.some((command) => command.op === "L" && (command.snap === "horizontal" || command.snap === "vertical")));
+});
+
+test("clean shapes leave a protected letter unchanged", () => {
+  const width = 120;
+  const height = 80;
+  const segmentation = segmentationFrom(width, height, (x, y) => {
+    const dx = x + 0.5 - 34;
+    const dy = y + 0.5 - 40;
+    if (dx * dx + dy * dy <= 22 * 22) return 0;
+    if (letterPixel(x, y)) return 1;
+    return TRANSPARENT;
+  }, [
+    { r: 230, g: 120, b: 40 },
+    { r: 12, g: 12, b: 12 }
+  ]);
+  const plain = traceSegmentation(segmentation, { smooth: 0, upscale: 1, cornerAngle: 0.9 });
+  const cleaned = traceSegmentation(segmentation, { smooth: 0, upscale: 1, cornerAngle: 0.9, cleanShapes: 0.85 });
+  const plainLetter = plain.shapes.find((shape) => shape.color.r === 12);
+  const cleanLetter = cleaned.shapes.find((shape) => shape.color.r === 12);
+  const plainCircle = plain.shapes.find((shape) => shape.color.r === 230);
+  const cleanCircle = cleaned.shapes.find((shape) => shape.color.r === 230);
+  assert.ok(plainLetter && cleanLetter && plainCircle && cleanCircle);
+  assert.deepEqual(cleanLetter.subpaths, plainLetter.subpaths);
+  const circleNodes = cleanCircle.subpaths.reduce((sum, subpath) => sum + subpath.commands.length, 0);
+  const plainNodes = plainCircle.subpaths.reduce((sum, subpath) => sum + subpath.commands.length, 0);
+  assert.ok(circleNodes <= 8, "circle anchors " + circleNodes);
+  assert.ok(circleNodes < plainNodes, "plain circle anchors " + plainNodes);
+});
+
+test("a crisp rectangle stays four corners when clean shapes is on", () => {
+  const segmentation = segmentationFrom(20, 16, (x, y) => (x >= 3 && x < 16 && y >= 3 && y < 12 ? 0 : TRANSPARENT), [{ r: 20, g: 80, b: 200 }]);
+  const traced = traceSegmentation(segmentation, { smooth: 0.2, upscale: 1, cleanShapes: 0.8 });
+  assert.equal(traced.nodeCount, 4);
+  for (const command of traced.shapes[0]?.subpaths[0]?.commands ?? []) assert.equal(command.primitive, "line");
+});
+
 test("a one-pixel stair on a long edge is smoothed", () => {
   const segmentation = segmentationFrom(20, 30, (x, y) => {
     if (y < 2 || y >= 28 || x >= 16) return TRANSPARENT;
@@ -265,6 +358,29 @@ test("a one-pixel stair on a long edge is smoothed", () => {
   assert.ok(span < 0.45, "left edge still stairs by " + span.toFixed(2));
   assert.ok(traced.nodeCount <= 8, "node count " + traced.nodeCount);
 });
+
+function insideRoundRect(x: number, y: number, left: number, top: number, right: number, bottom: number, radius: number): boolean {
+  if (x < left || y < top || x > right || y > bottom) return false;
+  const innerLeft = left + radius;
+  const innerRight = right - radius;
+  const innerTop = top + radius;
+  const innerBottom = bottom - radius;
+  if (x >= innerLeft && x <= innerRight) return true;
+  if (y >= innerTop && y <= innerBottom) return true;
+  const cx = x < innerLeft ? innerLeft : innerRight;
+  const cy = y < innerTop ? innerTop : innerBottom;
+  const dx = x - cx;
+  const dy = y - cy;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+function letterPixel(x: number, y: number): boolean {
+  if (y < 18 || y > 62) return false;
+  const row = y - 18;
+  const shift = Math.floor(row / 6) % 2 === 0 ? 0 : 6;
+  if (x >= 86 + shift && x <= 88 + shift) return true;
+  return row % 6 === 5 && x >= 86 && x <= 94;
+}
 
 function medianChannel(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
