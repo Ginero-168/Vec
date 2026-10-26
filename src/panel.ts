@@ -3,7 +3,9 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { holeNote, scoreSvg, type TraceFacts } from "./score";
+import { punchTransparency } from "./png-alpha";
+import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, holeNote, scoreSvg, sealGaps, shapeNote, type TraceFacts } from "./score";
+import { vtracerArguments, type Stacking, type TracePreset } from "./trace";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -33,9 +35,11 @@ type Selection = {
 };
 
 type Settings = {
-  readonly preset: "logo" | "icon" | "photo";
+  readonly preset: TracePreset;
   readonly maxColors: number;
-  readonly simplify: number;
+  readonly smoothness: number;
+  readonly removeBackground: boolean;
+  readonly stacking: Stacking;
 };
 
 type Job = {
@@ -53,8 +57,8 @@ type State =
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
   | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: childProcess.ChildProcess }
-  | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string; readonly facts: TraceFacts }
-  | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string; readonly facts: TraceFacts };
+  | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string; readonly pngUrl: string; readonly facts: TraceFacts }
+  | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string; readonly pngUrl: string; readonly facts: TraceFacts };
 
 type Ui = {
   readonly selection: HTMLElement;
@@ -77,6 +81,13 @@ type Ui = {
   readonly factHoles: HTMLElement;
   readonly factColors: HTMLElement;
   readonly factNote: HTMLElement;
+  readonly palette: HTMLElement;
+  readonly backdrop: HTMLInputElement;
+  readonly stacking: HTMLSelectElement;
+  readonly viewPixels: HTMLButtonElement;
+  readonly viewVectors: HTMLButtonElement;
+  readonly zoomIn: HTMLButtonElement;
+  readonly zoomOut: HTMLButtonElement;
 };
 
 function getElement(id: string): HTMLElement {
@@ -106,8 +117,10 @@ function getOutput(id: string): HTMLOutputElement {
 function getUi(): Ui {
   const preview = getElement("preview");
   const preset = getElement("preset");
+  const stacking = getElement("stacking");
   if (!(preview instanceof HTMLImageElement)) throw new Error("Expected preview image");
   if (!(preset instanceof HTMLSelectElement)) throw new Error("Expected preset selector");
+  if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
   return {
     selection: getElement("selection"),
     status: getElement("status"),
@@ -128,7 +141,14 @@ function getUi(): Ui {
     factAnchors: getElement("fact-anchors"),
     factHoles: getElement("fact-holes"),
     factColors: getElement("fact-colors"),
-    factNote: getElement("fact-note")
+    factNote: getElement("fact-note"),
+    palette: getElement("palette"),
+    backdrop: getInput("backdrop"),
+    stacking,
+    viewPixels: getButton("view-pixels"),
+    viewVectors: getButton("view-vectors"),
+    zoomIn: getButton("zoom-in"),
+    zoomOut: getButton("zoom-out")
   };
 }
 
@@ -240,23 +260,9 @@ function cleanStaleJobs(): void {
   }
 }
 
-function vtracerArguments(job: Job): string[] {
-  const args = [job.pngPath, job.svgPath];
-  const preset = job.settings.preset;
-  if (preset === "photo") {
-    args.push("--preset", "photo", "--max-colors", String(job.settings.maxColors));
-  } else {
-    args.push("--preset", "poster", "--hierarchical", "cutout", "--max-colors", String(job.settings.maxColors));
-    if (preset === "icon") args.push("--mode", "polygon");
-  }
-  if (job.settings.simplify > 0) args.push("--simplify", String(job.settings.simplify));
-  args.push("--optimize", "1");
-  return args;
-}
-
-function runVtracer(binary: string, job: Job, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
+function runVtracer(binary: string, job: Job, inputPath: string, onStart: (child: childProcess.ChildProcess) => void): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(binary, vtracerArguments(job), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+    const child = childProcess.spawn(binary, vtracerArguments(inputPath, job.svgPath, job.settings), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
     onStart(child);
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -279,10 +285,15 @@ function readSettings(ui: Ui): Settings {
   const preset = ui.preset.value;
   if (preset !== "logo" && preset !== "icon" && preset !== "photo") throw new Error("Preset ไม่ถูกต้อง");
   const maxColors = Number(ui.colors.value);
-  const simplify = Number(ui.smooth.value) / 10;
-  if (!Number.isInteger(maxColors) || maxColors < 2 || maxColors > 32) throw new Error("จำนวนสีไม่ถูกต้อง");
-  if (!Number.isFinite(simplify) || simplify < 0 || simplify > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
-  return { preset, maxColors, simplify };
+  const smoothness = Number(ui.smooth.value) / 10;
+  const stacking = ui.stacking.value === "stacked" ? "stacked" : "cutout";
+  if (!Number.isInteger(maxColors) || maxColors < 0 || maxColors > 64) throw new Error("จำนวนสีไม่ถูกต้อง");
+  if (!Number.isFinite(smoothness) || smoothness < 0 || smoothness > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
+  return { preset, maxColors, smoothness, removeBackground: ui.backdrop.checked, stacking };
+}
+
+function colorLabel(value: string): string {
+  return value === "0" ? "อัตโนมัติ" : value;
 }
 
 function showFacts(ui: Ui, facts: TraceFacts | null): void {
@@ -290,6 +301,7 @@ function showFacts(ui: Ui, facts: TraceFacts | null): void {
     ui.facts.hidden = true;
     ui.factNote.hidden = true;
     ui.factNote.textContent = "";
+    showPalette(ui, []);
     return;
   }
   ui.factPaths.textContent = String(facts.paths);
@@ -297,9 +309,25 @@ function showFacts(ui: Ui, facts: TraceFacts | null): void {
   ui.factHoles.textContent = String(facts.holes);
   ui.factColors.textContent = String(facts.colors);
   ui.facts.hidden = false;
-  const note = holeNote(facts.holes);
-  ui.factNote.hidden = note === null;
-  ui.factNote.textContent = note ?? "";
+  const note = [holeNote(facts.holes), shapeNote(facts)].filter((item) => item !== null).join(" · ");
+  ui.factNote.hidden = note === "";
+  ui.factNote.textContent = note;
+  showPalette(ui, facts.palette);
+}
+
+function showPalette(ui: Ui, palette: readonly string[]): void {
+  ui.palette.replaceChildren();
+  if (palette.length === 0) {
+    ui.palette.hidden = true;
+    return;
+  }
+  for (const color of palette) {
+    const item = document.createElement("li");
+    if (/^#[0-9a-f]{6}$/.test(color)) item.style.backgroundColor = color;
+    item.title = color;
+    ui.palette.append(item);
+  }
+  ui.palette.hidden = false;
 }
 
 function showSelection(ui: Ui, selection: Selection | null): void {
@@ -335,6 +363,8 @@ function currentSelection(state: State): Selection | null {
 function start(): void {
   const ui = getUi();
   let state: State = { kind: "empty" };
+  let view: "vector" | "pixels" = "vector";
+  let zoom = 1;
   const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
   const host = typeof CSInterface === "undefined" ? null : new CSInterface();
 
@@ -352,8 +382,17 @@ function start(): void {
     ui.apply.disabled = state.kind !== "preview";
     ui.cancel.hidden = state.kind !== "tracing";
     ui.phase.textContent = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
+    const showing = state.kind === "preview" || state.kind === "applying";
+    ui.viewPixels.hidden = !showing;
+    ui.viewVectors.hidden = !showing;
+    ui.zoomIn.hidden = !showing;
+    ui.zoomOut.hidden = !showing;
+    ui.viewPixels.setAttribute("aria-pressed", view === "pixels" ? "true" : "false");
+    ui.viewVectors.setAttribute("aria-pressed", view === "vector" ? "true" : "false");
+    ui.preview.classList.toggle("zoom-2", showing && zoom === 2);
+    ui.preview.classList.toggle("zoom-4", showing && zoom === 4);
     if (state.kind === "preview" || state.kind === "applying") {
-      ui.preview.src = state.dataUrl;
+      ui.preview.src = view === "pixels" ? state.pngUrl : state.dataUrl;
       ui.preview.hidden = false;
       ui.previewEmpty.hidden = true;
       showFacts(ui, state.facts);
@@ -400,16 +439,27 @@ function start(): void {
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
       const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
       if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
+      const sourcePng = fs.readFileSync(job.pngPath);
+      const punched = punchTransparency(sourcePng);
+      const traceInput = path.join(job.directory, "trace.png");
+      fs.writeFileSync(traceInput, punched.png);
       message("กำลังสร้างเส้นเวกเตอร์…");
-      await runVtracer(binary, job, (child) => {
+      await runVtracer(binary, job, traceInput, (child) => {
         if (job === null) return;
         state = { kind: "tracing", selection, job, child };
         render();
       });
-      const svg = fs.readFileSync(job.svgPath);
-      const facts = scoreSvg(svg.toString("utf8"));
-      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64"), facts };
-      message("ดูตัวอย่างแล้วกดใส่ใน Illustrator");
+      let svgText = fs.readFileSync(job.svgPath, "utf8");
+      if (punched.droppedColor !== null) svgText = dropFill(svgText, punched.droppedColor);
+      if (job.settings.removeBackground) svgText = dropCanvasBackground(svgText);
+      svgText = groupPathsByFill(sealGaps(fitShapes(svgText)));
+      fs.writeFileSync(job.svgPath, svgText);
+      const facts = scoreSvg(svgText);
+      view = "vector";
+      zoom = 1;
+      const pngUrl = "data:image/png;base64," + sourcePng.toString("base64");
+      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svgText, "utf8").toString("base64"), pngUrl, facts };
+      message("เทียบพิกเซลกับเวกเตอร์ แล้วกดใส่ใน Illustrator");
       render();
     } catch (error) {
       if (job !== null) cleanJob(job);
@@ -421,12 +471,12 @@ function start(): void {
 
   async function apply(): Promise<void> {
     if (host === null || state.kind !== "preview") return;
-    const { selection, job, dataUrl, facts } = state;
-    state = { kind: "applying", selection, job, dataUrl, facts };
+    const { selection, job, dataUrl, pngUrl, facts } = state;
+    state = { kind: "applying", selection, job, dataUrl, pngUrl, facts };
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
-      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";simplify=" + job.settings.simplify;
+      const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";smooth=" + job.settings.smoothness + ";stacking=" + job.settings.stacking + ";background=" + (job.settings.removeBackground ? "removed" : "kept");
       const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่");
       cleanJob(job);
@@ -437,7 +487,7 @@ function start(): void {
         state = { kind: "selected", selection };
       } else {
         message(errorMessage(error), true);
-        state = { kind: "preview", selection, job, dataUrl, facts };
+        state = { kind: "preview", selection, job, dataUrl, pngUrl, facts };
       }
     }
     render();
@@ -452,11 +502,43 @@ function start(): void {
     state.child.kill();
     message("กำลังยกเลิก…");
   });
-  ui.colors.addEventListener("input", () => { ui.colorsValue.value = ui.colors.value; });
+  ui.colors.addEventListener("input", () => { ui.colorsValue.value = colorLabel(ui.colors.value); });
   ui.smooth.addEventListener("input", () => { ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1); });
   ui.preset.addEventListener("change", () => {
-    ui.colors.value = ui.preset.value === "photo" ? "24" : ui.preset.value === "icon" ? "4" : "8";
-    ui.colorsValue.value = ui.colors.value;
+    if (ui.preset.value === "photo") {
+      ui.colors.value = "36";
+      ui.smooth.value = "16";
+      ui.backdrop.checked = false;
+      ui.stacking.value = "stacked";
+    } else if (ui.preset.value === "icon") {
+      ui.colors.value = "8";
+      ui.smooth.value = "20";
+      ui.backdrop.checked = true;
+      ui.stacking.value = "cutout";
+    } else {
+      ui.colors.value = "0";
+      ui.smooth.value = "24";
+      ui.backdrop.checked = true;
+      ui.stacking.value = "cutout";
+    }
+    ui.colorsValue.value = colorLabel(ui.colors.value);
+    ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
+  });
+  ui.viewPixels.addEventListener("click", () => {
+    view = "pixels";
+    render();
+  });
+  ui.viewVectors.addEventListener("click", () => {
+    view = "vector";
+    render();
+  });
+  ui.zoomIn.addEventListener("click", () => {
+    zoom = zoom === 1 ? 2 : 4;
+    render();
+  });
+  ui.zoomOut.addEventListener("click", () => {
+    zoom = zoom === 4 ? 2 : 1;
+    render();
   });
 
   window.addEventListener("beforeunload", () => {

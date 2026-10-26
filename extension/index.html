@@ -12,7 +12,7 @@
         <div class="mark">V</div>
         <div>
           <h1>Vector Panel</h1>
-          <p>ภาพใน Illustrator เป็น path ที่แก้ได้</p>
+          <p>วงกลม สี่เหลี่ยม และเส้นโค้ง ที่แก้ใน Illustrator ได้</p>
         </div>
       </header>
 
@@ -32,26 +32,42 @@
           <option value="icon">ไอคอน / ขอบคม</option>
           <option value="photo">ภาพหลายสี</option>
         </select>
+        <label for="stacking">การวางรูป</label>
+        <select id="stacking">
+          <option value="cutout">ตัดชน — ชิ้นแยกจากกัน</option>
+          <option value="stacked">ซ้อนชั้น</option>
+        </select>
         <div class="field-row">
           <label for="colors">จำนวนสีสูงสุด</label>
-          <output id="colors-value" for="colors">8</output>
+          <output id="colors-value" for="colors">อัตโนมัติ</output>
         </div>
-        <input id="colors" type="range" min="2" max="32" value="8" />
+        <input id="colors" type="range" min="0" max="64" value="0" />
         <div class="field-row">
           <label for="smooth">ความเรียบของเส้น</label>
-          <output id="smooth-value" for="smooth">1.5</output>
+          <output id="smooth-value" for="smooth">2.4</output>
         </div>
-        <input id="smooth" type="range" min="0" max="30" value="15" />
+        <input id="smooth" type="range" min="0" max="30" value="24" />
+        <p class="hint">เลขสูงขึ้น เส้นโค้งขึ้น</p>
+        <label class="check" for="backdrop">
+          <input id="backdrop" type="checkbox" checked />
+          ลบพื้นหลัง
+        </label>
       </section>
 
       <section class="section" aria-labelledby="preview-title">
         <div class="section-heading">
           <h2 id="preview-title">3 · ตัวอย่าง</h2>
-          <span id="phase" class="phase">พร้อม</span>
+          <div class="preview-tools">
+            <button id="view-pixels" class="text-button" type="button" hidden aria-pressed="false">พิกเซล</button>
+            <button id="view-vectors" class="text-button" type="button" hidden aria-pressed="true">เวกเตอร์</button>
+            <button id="zoom-out" class="text-button" type="button" hidden aria-label="ซูมออก">−</button>
+            <button id="zoom-in" class="text-button" type="button" hidden aria-label="ซูมเข้า">+</button>
+            <span id="phase" class="phase">พร้อม</span>
+          </div>
         </div>
         <div class="preview-frame">
           <img id="preview" alt="ตัวอย่างผลลัพธ์เวกเตอร์" hidden />
-          <p id="preview-empty">ผลลัพธ์จะปรากฏตรงนี้</p>
+          <p id="preview-empty">เทียบพิกเซลกับเวกเตอร์ได้ตรงนี้</p>
         </div>
         <dl id="facts" class="facts" hidden aria-label="ผลที่วัดได้">
           <div>
@@ -72,6 +88,7 @@
           </div>
         </dl>
         <p id="fact-note" class="fact-note" hidden></p>
+        <ul id="palette" class="palette" hidden aria-label="กลุ่มสี"></ul>
         <p id="status" class="status" role="status" aria-live="polite">พร้อมแปลงภาพที่เลือก</p>
       </section>
 

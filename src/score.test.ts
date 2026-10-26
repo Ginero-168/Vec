@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { holeNote, scoreSvg } from "./score.ts";
+import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, holeNote, scoreSvg, sealGaps, shapeNote } from "./score.ts";
 
 const tracedLogo = `<?xml version="1.0" encoding="UTF-8"?>
 <svg version="1.1" xmlns="http://www.w3.org/2000/svg" width="320" height="240">
@@ -12,7 +12,7 @@ const tracedLogo = `<?xml version="1.0" encoding="UTF-8"?>
 
 test("a closed rectangle is four anchors and no hole", () => {
   const facts = scoreSvg('<svg><path d="M0,0 H10 V10 H0 Z" fill="#000"/></svg>');
-  assert.deepEqual(facts, { paths: 1, anchors: 4, holes: 0, colors: 1 });
+  assert.deepEqual(facts, { paths: 1, anchors: 4, holes: 0, colors: 1, palette: ["#000000"], circles: 0, ellipses: 0, rects: 0 });
 });
 
 test("an opposite winding ring inside a shape is one hole", () => {
@@ -33,10 +33,115 @@ test("shorthand fills and style fills count as colors", () => {
   const facts = scoreSvg('<svg><path d="M0,0 H1 V1 Z" fill="#fff"/><path d="M2,2 H3 V3 Z" style="fill:#0F0;stroke:none"/></svg>');
   assert.equal(facts.paths, 2);
   assert.equal(facts.colors, 2);
+  assert.deepEqual(facts.palette, ["#ffffff", "#00ff00"]);
 });
 
 test("the traced logo reports paths, anchors, holes, and colors", () => {
   const facts = scoreSvg(tracedLogo);
-  assert.deepEqual(facts, { paths: 4, anchors: 34, holes: 3, colors: 4 });
+  assert.deepEqual(facts, {
+    paths: 4,
+    anchors: 34,
+    holes: 3,
+    colors: 4,
+    palette: ["#ffffff", "#d6363e", "#2e66d6", "#f2b830"],
+    circles: 0,
+    ellipses: 0,
+    rects: 0
+  });
   assert.equal(holeNote(facts.holes), "มีรู 3 จุด");
+});
+
+test("a full-canvas plate is removed and the mark is grouped by fill", () => {
+  const cleaned = groupPathsByFill(dropCanvasBackground(tracedLogo));
+  const facts = scoreSvg(cleaned);
+  assert.equal(facts.paths, 3);
+  assert.equal(facts.holes, 0);
+  assert.deepEqual(facts.palette, ["#d6363e", "#2e66d6", "#f2b830"]);
+  assert.equal(cleaned.includes("#FFFFFF"), false);
+  assert.equal(cleaned.includes('id="color-d6363e"'), true);
+  assert.equal(cleaned.includes('id="color-2e66d6"'), true);
+  assert.equal(cleaned.includes('id="color-f2b830"'), true);
+});
+
+test("the only path is kept even when it covers the canvas", () => {
+  const svg = '<svg width="10" height="10"><path d="M0,0 H10 V10 H0 Z" fill="#fff"/></svg>';
+  assert.equal(dropCanvasBackground(svg), svg);
+});
+
+test("shapes that do not cover the canvas stay put", () => {
+  const svg = '<svg width="100" height="100"><path d="M0,0 H10 V10 H0 Z" fill="#fff"/><path d="M20,20 H30 V30 H20 Z" fill="#000"/></svg>';
+  assert.equal(dropCanvasBackground(svg), svg);
+});
+
+test("overlapping stacked fills are not regrouped", () => {
+  const svg = '<svg width="10" height="10"><path d="M0,0 H10 V10 H0 Z" fill="#ff0000"/><path d="M2,2 H8 V8 H2 Z" fill="#00ff00"/></svg>';
+  assert.equal(groupPathsByFill(svg), svg);
+});
+
+test("separate shapes of the same fill share one group in paint order", () => {
+  const svg = '<svg width="100" height="20"><path d="M0,0 H10 V10 H0 Z" fill="#ff0000"/><path d="M40,0 H50 V10 H40 Z" fill="#00ff00"/><path d="M12,0 H22 V10 H12 Z" fill="#ff0000"/></svg>';
+  const grouped = groupPathsByFill(svg);
+  assert.equal(grouped.includes("<g"), true);
+  const red = /<g id="color-ff0000">([\s\S]*?)<\/g>/.exec(grouped);
+  assert.equal(red?.[1]?.includes("M0,0"), true);
+  assert.equal(red?.[1]?.includes("M12,0"), true);
+  assert.equal(grouped.indexOf("color-ff0000") < grouped.indexOf("color-00ff00"), true);
+});
+
+function circlePath(cx: number, cy: number, radius: number): string {
+  const handle = radius * 0.5522847498;
+  const n = (value: number): string => String(Math.round(value * 100) / 100);
+  return "M" + n(cx + radius) + "," + n(cy)
+    + "C" + n(cx + radius) + "," + n(cy + handle) + " " + n(cx + handle) + "," + n(cy + radius) + " " + n(cx) + "," + n(cy + radius)
+    + "C" + n(cx - handle) + "," + n(cy + radius) + " " + n(cx - radius) + "," + n(cy + handle) + " " + n(cx - radius) + "," + n(cy)
+    + "C" + n(cx - radius) + "," + n(cy - handle) + " " + n(cx - handle) + "," + n(cy - radius) + " " + n(cx) + "," + n(cy - radius)
+    + "C" + n(cx + handle) + "," + n(cy - radius) + " " + n(cx + radius) + "," + n(cy - handle) + " " + n(cx + radius) + "," + n(cy) + "Z";
+}
+
+test("a traced circle and rectangle become real shapes with fewer anchors", () => {
+  const svg = '<svg width="220" height="120"><path d="' + circlePath(60, 60, 40) + '" fill="#e11d48"/><path d="M120,20 H200 V80 H120 Z" fill="#2563eb"/></svg>';
+  const fitted = fitShapes(svg);
+  assert.match(fitted, /<circle /);
+  assert.match(fitted, /<rect /);
+  const facts = scoreSvg(fitted);
+  assert.equal(facts.circles, 1);
+  assert.equal(facts.rects, 1);
+  assert.equal(facts.paths, 2);
+  assert.equal(facts.anchors, 8);
+  assert.equal(shapeNote(facts), "วงกลม 1 · สี่เหลี่ยม 1");
+  const circle = /<circle\b[^>]*r="([^"]+)"/.exec(fitted);
+  assert.ok(Math.abs(Number(circle?.[1]) - 40) < 0.6);
+});
+
+test("a wide oval becomes an ellipse", () => {
+  const kx = 50 * 0.5522847498;
+  const ky = 24 * 0.5522847498;
+  const n = (value: number): string => String(Math.round(value * 100) / 100);
+  const d = "M" + n(130) + "," + n(40)
+    + "C" + n(130) + "," + n(40 + ky) + " " + n(80 + kx) + "," + n(64) + " " + n(80) + "," + n(64)
+    + "C" + n(80 - kx) + "," + n(64) + " " + n(30) + "," + n(40 + ky) + " " + n(30) + "," + n(40)
+    + "C" + n(30) + "," + n(40 - ky) + " " + n(80 - kx) + "," + n(16) + " " + n(80) + "," + n(16)
+    + "C" + n(80 + kx) + "," + n(16) + " " + n(130) + "," + n(40 - ky) + " " + n(130) + "," + n(40) + "Z";
+  const fitted = fitShapes('<svg width="160" height="80"><path d="' + d + '" fill="#16a34a"/></svg>');
+  assert.match(fitted, /<ellipse /);
+  assert.equal(scoreSvg(fitted).ellipses, 1);
+});
+
+test("an L-shaped path is left as a path", () => {
+  const svg = '<svg width="80" height="80"><path d="M5,5 H40 V20 H20 V50 H5 Z" fill="#111"/></svg>';
+  const fitted = fitShapes(svg);
+  assert.equal(fitted.includes("<path"), true);
+  assert.equal(fitted.includes("<rect"), false);
+  assert.equal(fitted.includes("<ellipse"), false);
+  assert.equal(fitted.includes("<circle"), false);
+});
+
+test("gap strokes use the shape fill and a punched color can be removed", () => {
+  const sealed = sealGaps('<svg><circle cx="1" cy="2" r="3" fill="#abc"/></svg>');
+  assert.match(sealed, /stroke="#abc"/);
+  assert.match(sealed, /stroke-width="0.8"/);
+  const svg = '<svg width="20" height="20"><rect x="0" y="0" width="20" height="20" fill="#ff00ff"/><circle cx="5" cy="5" r="2" fill="#111"/></svg>';
+  const dropped = dropFill(svg, "#ff00ff");
+  assert.equal(dropped.includes("#ff00ff"), false);
+  assert.equal(dropped.includes("<circle"), true);
 });
