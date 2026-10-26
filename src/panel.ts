@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { holeNote, scoreSvg, type TraceFacts } from "./score";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -52,8 +53,8 @@ type State =
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
   | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: childProcess.ChildProcess }
-  | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string }
-  | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string };
+  | { readonly kind: "preview"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string; readonly facts: TraceFacts }
+  | { readonly kind: "applying"; readonly selection: Selection; readonly job: Job; readonly dataUrl: string; readonly facts: TraceFacts };
 
 type Ui = {
   readonly selection: HTMLElement;
@@ -70,6 +71,12 @@ type Ui = {
   readonly colorsValue: HTMLOutputElement;
   readonly smooth: HTMLInputElement;
   readonly smoothValue: HTMLOutputElement;
+  readonly facts: HTMLElement;
+  readonly factPaths: HTMLElement;
+  readonly factAnchors: HTMLElement;
+  readonly factHoles: HTMLElement;
+  readonly factColors: HTMLElement;
+  readonly factNote: HTMLElement;
 };
 
 function getElement(id: string): HTMLElement {
@@ -115,7 +122,13 @@ function getUi(): Ui {
     colors: getInput("colors"),
     colorsValue: getOutput("colors-value"),
     smooth: getInput("smooth"),
-    smoothValue: getOutput("smooth-value")
+    smoothValue: getOutput("smooth-value"),
+    facts: getElement("facts"),
+    factPaths: getElement("fact-paths"),
+    factAnchors: getElement("fact-anchors"),
+    factHoles: getElement("fact-holes"),
+    factColors: getElement("fact-colors"),
+    factNote: getElement("fact-note")
   };
 }
 
@@ -272,6 +285,23 @@ function readSettings(ui: Ui): Settings {
   return { preset, maxColors, simplify };
 }
 
+function showFacts(ui: Ui, facts: TraceFacts | null): void {
+  if (facts === null) {
+    ui.facts.hidden = true;
+    ui.factNote.hidden = true;
+    ui.factNote.textContent = "";
+    return;
+  }
+  ui.factPaths.textContent = String(facts.paths);
+  ui.factAnchors.textContent = String(facts.anchors);
+  ui.factHoles.textContent = String(facts.holes);
+  ui.factColors.textContent = String(facts.colors);
+  ui.facts.hidden = false;
+  const note = holeNote(facts.holes);
+  ui.factNote.hidden = note === null;
+  ui.factNote.textContent = note ?? "";
+}
+
 function showSelection(ui: Ui, selection: Selection | null): void {
   ui.selection.replaceChildren();
   if (selection === null) {
@@ -326,10 +356,12 @@ function start(): void {
       ui.preview.src = state.dataUrl;
       ui.preview.hidden = false;
       ui.previewEmpty.hidden = true;
+      showFacts(ui, state.facts);
     } else {
       ui.preview.removeAttribute("src");
       ui.preview.hidden = true;
       ui.previewEmpty.hidden = false;
+      showFacts(ui, null);
     }
   }
 
@@ -375,7 +407,8 @@ function start(): void {
         render();
       });
       const svg = fs.readFileSync(job.svgPath);
-      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64") };
+      const facts = scoreSvg(svg.toString("utf8"));
+      state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + svg.toString("base64"), facts };
       message("ดูตัวอย่างแล้วกดใส่ใน Illustrator");
       render();
     } catch (error) {
@@ -388,8 +421,8 @@ function start(): void {
 
   async function apply(): Promise<void> {
     if (host === null || state.kind !== "preview") return;
-    const { selection, job, dataUrl } = state;
-    state = { kind: "applying", selection, job, dataUrl };
+    const { selection, job, dataUrl, facts } = state;
+    state = { kind: "applying", selection, job, dataUrl, facts };
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
@@ -404,7 +437,7 @@ function start(): void {
         state = { kind: "selected", selection };
       } else {
         message(errorMessage(error), true);
-        state = { kind: "preview", selection, job, dataUrl };
+        state = { kind: "preview", selection, job, dataUrl, facts };
       }
     }
     render();
