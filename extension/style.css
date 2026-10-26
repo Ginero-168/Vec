@@ -8,7 +8,7 @@
 
 * { box-sizing: border-box; }
 
-body { margin: 0; min-width: 300px; }
+body { margin: 0; min-width: 300px; overflow-y: auto; }
 
 button, select, input { font: inherit; }
 
@@ -60,7 +60,7 @@ input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 
 .palette { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; list-style: none; }
 
-.palette li { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #55545a; }
+.palette li { display: contents; }
 
 .phase { font-size: 11px; color: #a8dcbb; }
 
@@ -75,6 +75,37 @@ input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 .preview-frame img.zoom-2 { max-width: none; max-height: none; width: 200%; }
 
 .preview-frame img.zoom-4 { max-width: none; max-height: none; width: 400%; }
+
+.preview-frame svg { max-width: 100%; max-height: 200px; height: auto; }
+
+.preview-frame svg.zoom-2,
+.brush-canvas.zoom-2 { max-width: none; max-height: none; width: 200%; }
+
+.preview-frame svg.zoom-4,
+.brush-canvas.zoom-4 { max-width: none; max-height: none; width: 400%; }
+
+.anchor-handle {
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.anchor-handle.dragging { cursor: grabbing; }
+
+.anchor-handle:focus { outline: 2px solid #241735; outline-offset: 1px; }
+
+.brush-canvas { touch-action: none; max-width: 100%; max-height: 200px; height: auto; cursor: crosshair; -webkit-user-select: none; user-select: none; }
+
+.edit-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.edit-tools button { min-height: 28px; padding: 4px 8px; border-radius: 6px; border: 1px solid #69656e; background: #38373c; color: #f0f0f2; }
+
+.edit-tools button[aria-pressed="true"] { background: #cfb6ff; color: #241735; border-color: #cfb6ff; }
+
+.palette button { width: 16px; height: 16px; padding: 0; border-radius: 4px; border: 1px solid #55545a; }
+
+.palette button[aria-pressed="true"] { outline: 2px solid #cfb6ff; outline-offset: 1px; }
 
 .preview-frame p { color: #a3a3aa; margin: 0; }
 
@@ -96,7 +127,10 @@ input[type="range"] { width: 100%; accent-color: #c6a6fb; margin: 0; }
 
 .actions button { min-height: 36px; padding: 7px 10px; border-radius: 6px; border: 1px solid #69656e; }
 
-.actions .primary { grid-column: 1 / -1; background: #cfb6ff; color: #211a29; border-color: #cfb6ff; font-weight: 700; }
+.actions .primary,
+.actions .wide { grid-column: 1 / -1; }
+
+.actions .primary { background: #cfb6ff; color: #211a29; border-color: #cfb6ff; font-weight: 700; }
 
 .actions .secondary { background: #38373c; color: #f0f0f2; }
 

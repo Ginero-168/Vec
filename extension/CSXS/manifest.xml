@@ -34,8 +34,8 @@
           <Type>Panel</Type>
           <Menu>Vector Panel</Menu>
           <Geometry>
-            <Size><Width>360</Width><Height>840</Height></Size>
-            <MinSize><Width>300</Width><Height>460</Height></MinSize>
+            <Size><Width>360</Width><Height>1040</Height></Size>
+            <MinSize><Width>300</Width><Height>560</Height></MinSize>
           </Geometry>
         </UI>
       </DispatchInfo>

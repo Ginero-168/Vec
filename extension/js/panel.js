@@ -36,9 +36,594 @@
   var os = __toESM(__require("os"));
   var path = __toESM(__require("path"));
 
+  // src/edit.ts
+  var ARG_COUNT = { m: 2, l: 2, h: 1, v: 1, c: 6, z: 0 };
+  function shapePattern() {
+    return /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
+  }
+  function fairTolerance(smoothness) {
+    const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
+    return Math.round((0.2 + clamped * 0.55) * 100) / 100;
+  }
+  function fairPaths(svg, options) {
+    const tolerance = fairTolerance(options.smoothness);
+    const minTurn = 90 - Math.min(90, Math.max(0, Number.isFinite(options.cornerDegrees) ? options.cornerDegrees : 0));
+    return svg.replace(shapePattern(), (tag) => {
+      if (!/^<path\b/i.test(tag)) return tag;
+      const quoted = readD(tag);
+      if (quoted === null) return tag;
+      const parsed = parsePath(quoted.value);
+      if (parsed === null || parsed.length === 0) return tag;
+      const faired = parsed.map((subpath) => fairSubpath(subpath, tolerance, minTurn));
+      const next = serialize(faired);
+      if (next === quoted.value) return tag;
+      return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+    });
+  }
+  function listAnchors(svg) {
+    const anchors = [];
+    let pathIndex = 0;
+    for (const tag of svg.match(shapePattern()) ?? []) {
+      if (!/^<path\b/i.test(tag)) continue;
+      const data = readD(tag)?.value ?? "";
+      const parsed = parsePath(data);
+      if (parsed === null) {
+        pathIndex += 1;
+        continue;
+      }
+      const locations = anchorLocations(parsed);
+      for (let anchorIndex = 0; anchorIndex < locations.length; anchorIndex += 1) {
+        const point = pointOf(parsed, locations[anchorIndex]);
+        if (point === null) continue;
+        anchors.push({ pathIndex, anchorIndex, x: point.x, y: point.y });
+      }
+      pathIndex += 1;
+    }
+    return anchors;
+  }
+  function moveAnchor(svg, pathIndex, anchorIndex, x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return svg;
+    let seen = 0;
+    return svg.replace(shapePattern(), (tag) => {
+      if (!/^<path\b/i.test(tag)) return tag;
+      const current = seen;
+      seen += 1;
+      if (current !== pathIndex) return tag;
+      const quoted = readD(tag);
+      if (quoted === null) return tag;
+      const parsed = parsePath(quoted.value);
+      if (parsed === null) return tag;
+      const locations = anchorLocations(parsed);
+      const loc = locations[anchorIndex];
+      if (loc === void 0) return tag;
+      const moved = applyMove(parsed, loc, x, y);
+      if (moved === null) return tag;
+      return tag.slice(0, quoted.start) + serialize(moved) + tag.slice(quoted.end);
+    });
+  }
+  function removeShape(svg, index) {
+    const tags = svg.match(shapePattern()) ?? [];
+    if (index < 0 || index >= tags.length || tags.length < 2) return svg;
+    let seen = 0;
+    return svg.replace(shapePattern(), (tag) => {
+      const current = seen;
+      seen += 1;
+      return current === index ? "" : tag;
+    });
+  }
+  function expandPrimitives(svg) {
+    return svg.replace(shapePattern(), (tag) => primitivePath(tag) ?? tag);
+  }
+  function paintDisc(rgba, width, height, x, y, radius, color) {
+    const next = new Uint8Array(rgba);
+    const rgb = parseHex(color);
+    if (rgb === null || !(radius > 0) || width <= 0 || height <= 0) return next;
+    const radiusSquared = radius * radius;
+    const left = Math.max(0, Math.floor(x - radius));
+    const right = Math.min(width - 1, Math.ceil(x + radius));
+    const top = Math.max(0, Math.floor(y - radius));
+    const bottom = Math.min(height - 1, Math.ceil(y + radius));
+    for (let py = top; py <= bottom; py += 1) {
+      for (let px = left; px <= right; px += 1) {
+        const dx = px + 0.5 - x;
+        const dy = py + 0.5 - y;
+        if (dx * dx + dy * dy > radiusSquared) continue;
+        const offset = (py * width + px) * 4;
+        next[offset] = rgb[0];
+        next[offset + 1] = rgb[1];
+        next[offset + 2] = rgb[2];
+        next[offset + 3] = 255;
+      }
+    }
+    return next;
+  }
+  function paletteFromRaster(rgba) {
+    const colors = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (let index = 0; index < rgba.length; index += 4) {
+      if ((rgba[index + 3] ?? 0) < 128) continue;
+      const color = "#" + byte(rgba[index]) + byte(rgba[index + 1]) + byte(rgba[index + 2]);
+      if (seen.has(color)) continue;
+      if (colors.length === 32) return null;
+      seen.add(color);
+      colors.push(color);
+    }
+    return colors;
+  }
+  function parseBatchFields(parts) {
+    if (parts.length < 3) throw new Error("\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
+    const count = Number(parts[2]);
+    if (!Number.isInteger(count) || count < 0 || count > 12) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E20\u0E32\u0E1E\u0E15\u0E48\u0E2D\u0E0A\u0E38\u0E14\u0E15\u0E49\u0E2D\u0E07\u0E44\u0E21\u0E48\u0E40\u0E01\u0E34\u0E19 12");
+    if (parts.length !== 3 + count * 8) throw new Error("\u0E23\u0E32\u0E22\u0E01\u0E32\u0E23\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E04\u0E23\u0E1A");
+    const items = [];
+    for (let index = 0; index < count; index += 1) {
+      const base = 3 + index * 8;
+      const uuid = parts[base] ?? "";
+      const itemType = parts[base + 2];
+      if (!uuid) throw new Error("\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E21\u0E35 UUID");
+      if (itemType !== "PlacedItem" && itemType !== "RasterItem") throw new Error("\u0E23\u0E2D\u0E07\u0E23\u0E31\u0E1A\u0E20\u0E32\u0E1E raster");
+      const left = finite(parts[base + 4], "left");
+      const top = finite(parts[base + 5], "top");
+      const right = finite(parts[base + 6], "right");
+      const bottom = finite(parts[base + 7], "bottom");
+      if (right <= left || top <= bottom) throw new Error("\u0E02\u0E19\u0E32\u0E14\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
+      items.push({
+        uuid,
+        name: parts[base + 1] ?? "",
+        itemType,
+        embedded: parts[base + 3] === "1",
+        bounds: [left, top, right, bottom]
+      });
+    }
+    return { documentName: parts[0] ?? "", documentIdentity: parts[1] ?? "", items };
+  }
+  function finite(raw, label) {
+    const value = Number(raw);
+    if (!Number.isFinite(value)) throw new Error("\u0E04\u0E48\u0E32\u0E08\u0E32\u0E01 Illustrator \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07: " + label);
+    return value;
+  }
+  function byte(value) {
+    return (value ?? 0).toString(16).padStart(2, "0");
+  }
+  function parseHex(color) {
+    const match = /^#([0-9a-f]{6})$/i.exec(color.trim());
+    if (match === null) return null;
+    const hex2 = match[1] ?? "";
+    return [Number.parseInt(hex2.slice(0, 2), 16), Number.parseInt(hex2.slice(2, 4), 16), Number.parseInt(hex2.slice(4, 6), 16)];
+  }
+  function readD(tag) {
+    const match = /\bd\s*=\s*(["'])([\s\S]*?)\1/i.exec(tag);
+    if (match === null || match[1] === void 0 || match.index === void 0) return null;
+    const value = match[2] ?? "";
+    const open = match.index + match[0].indexOf(match[1]);
+    return { value, start: open + 1, end: open + 1 + value.length };
+  }
+  function fairSubpath(subpath, tolerance, minTurn) {
+    if (subpath.cubics.length === 0) return subpath;
+    const starts = protectedStarts(subpath.cubics, subpath.closed, minTurn);
+    const chains = subpath.closed && starts.length < 2 ? quarterChains(subpath.cubics) : openChains(subpath.cubics, starts, subpath.closed);
+    return { cubics: chains.flatMap((chain) => fitChain(chain, tolerance)), closed: subpath.closed };
+  }
+  function protectedStarts(cubics, closed, minTurn) {
+    const starts = [];
+    for (let index = 0; index < cubics.length; index += 1) {
+      const previous = cubics[closed ? (index - 1 + cubics.length) % cubics.length : index - 1];
+      const next = cubics[index];
+      if (previous === void 0 || next === void 0) continue;
+      if (isCorner(previous, next, minTurn)) starts.push(index);
+    }
+    return starts;
+  }
+  function isCorner(previous, next, minTurn) {
+    const longer = Math.max(chord(previous), chord(next));
+    if (!(longer > 3)) return false;
+    return turnDegrees(incoming(previous), outgoing(next)) >= minTurn;
+  }
+  function openChains(cubics, starts, closed) {
+    if (closed) {
+      const chains2 = [];
+      for (let index = 0; index < starts.length; index += 1) {
+        const from = starts[index] ?? 0;
+        const to = starts[(index + 1) % starts.length] ?? from;
+        const chain = sliceWrap(cubics, from, to);
+        if (chain.length > 0) chains2.push(chain);
+      }
+      return chains2.length > 0 ? chains2 : [cubics.slice()];
+    }
+    const cuts = [0, ...starts.filter((start2) => start2 > 0 && start2 < cubics.length), cubics.length];
+    const unique = Array.from(new Set(cuts)).sort((left, right) => left - right);
+    const chains = [];
+    for (let index = 0; index < unique.length - 1; index += 1) {
+      const from = unique[index] ?? 0;
+      const to = unique[index + 1] ?? from;
+      if (to > from) chains.push(cubics.slice(from, to));
+    }
+    return chains.length > 0 ? chains : [cubics.slice()];
+  }
+  function quarterChains(cubics) {
+    const count = cubics.length;
+    if (count < 4) return [cubics.slice()];
+    const cuts = [0, Math.floor(count / 4), Math.floor(count / 2), Math.floor(count * 3 / 4), count];
+    const chains = [];
+    for (let index = 0; index < cuts.length - 1; index += 1) {
+      const from = cuts[index] ?? 0;
+      const to = cuts[index + 1] ?? from;
+      if (to > from) chains.push(cubics.slice(from, to));
+    }
+    return chains;
+  }
+  function sliceWrap(cubics, from, to) {
+    if (to > from) return cubics.slice(from, to);
+    return cubics.slice(from).concat(cubics.slice(0, to));
+  }
+  function fitChain(chain, tolerance) {
+    if (chain.length <= 1) return chain.slice();
+    const samples = sampleChain(chain);
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    if (first === void 0 || last === void 0 || distance(first, last) < 0.05) return chain.slice();
+    const fitted = fitSamples(samples, tolerance, outgoing(chain[0] ?? line(first, last)), incoming(chain[chain.length - 1] ?? line(first, last)), 0);
+    if (fitted === null || fitted.length === 0 || fitted.length >= chain.length) return chain.slice();
+    return fitted;
+  }
+  function fitSamples(samples, tolerance, tanStart, tanEnd, depth) {
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    if (first === void 0 || last === void 0) return null;
+    if (distance(first, last) < 0.05) return [];
+    if (maxSegmentDistance(samples, first, last) <= tolerance) return [straightCubic(first, last)];
+    const cubic = cubicFromTangents(first, last, tanStart, tanEnd);
+    const worst = farthest(samples, cubic);
+    if (worst.distance <= tolerance) return [cubic];
+    if (depth >= 12 || worst.index <= 0 || worst.index >= samples.length - 1) return null;
+    const tangent = tangentAt(samples, worst.index);
+    const left = fitSamples(samples.slice(0, worst.index + 1), tolerance, tanStart, tangent, depth + 1);
+    const right = fitSamples(samples.slice(worst.index), tolerance, tangent, tanEnd, depth + 1);
+    if (left === null || right === null) return null;
+    return [...left, ...right];
+  }
+  function sampleChain(chain) {
+    const samples = [];
+    chain.forEach((cubic, index) => {
+      if (index === 0) samples.push(cubic.p0);
+      for (const t of [0.25, 0.5, 0.75, 1]) samples.push(bezier(cubic, t));
+    });
+    return samples;
+  }
+  function farthest(samples, cubic) {
+    let distanceWorst = 0;
+    let index = 0;
+    for (let sampleIndex = 1; sampleIndex < samples.length - 1; sampleIndex += 1) {
+      const point = samples[sampleIndex];
+      if (point === void 0) continue;
+      const error = distanceToCubic(point, cubic);
+      if (error > distanceWorst) {
+        distanceWorst = error;
+        index = sampleIndex;
+      }
+    }
+    return { distance: distanceWorst, index };
+  }
+  function maxSegmentDistance(samples, start2, end) {
+    let worst = 0;
+    for (const point of samples) worst = Math.max(worst, distanceToSegment(point, start2, end));
+    return worst;
+  }
+  function distanceToSegment(point, start2, end) {
+    const dx = end.x - start2.x;
+    const dy = end.y - start2.y;
+    const lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared < 1e-8) return distance(point, start2);
+    const t = Math.min(1, Math.max(0, ((point.x - start2.x) * dx + (point.y - start2.y) * dy) / lengthSquared));
+    return distance(point, { x: start2.x + dx * t, y: start2.y + dy * t });
+  }
+  function distanceToCubic(point, cubic) {
+    let best = Infinity;
+    for (let step = 0; step <= 24; step += 1) {
+      best = Math.min(best, distance(point, bezier(cubic, step / 24)));
+    }
+    return best;
+  }
+  function tangentAt(samples, index) {
+    const previous = samples[Math.max(0, index - 1)] ?? { x: 0, y: 0 };
+    const next = samples[Math.min(samples.length - 1, index + 1)] ?? previous;
+    return { x: next.x - previous.x, y: next.y - previous.y };
+  }
+  function straightCubic(start2, end) {
+    return {
+      p0: start2,
+      p1: { x: start2.x + (end.x - start2.x) / 3, y: start2.y + (end.y - start2.y) / 3 },
+      p2: { x: start2.x + 2 * (end.x - start2.x) / 3, y: start2.y + 2 * (end.y - start2.y) / 3 },
+      p3: end
+    };
+  }
+  function cubicFromTangents(start2, end, tanStart, tanEnd) {
+    const handle = distance(start2, end) / 3;
+    const startDir = unit(tanStart) ?? unit({ x: end.x - start2.x, y: end.y - start2.y }) ?? { x: 1, y: 0 };
+    const endDir = unit(tanEnd) ?? startDir;
+    return {
+      p0: start2,
+      p1: { x: start2.x + startDir.x * handle, y: start2.y + startDir.y * handle },
+      p2: { x: end.x - endDir.x * handle, y: end.y - endDir.y * handle },
+      p3: end
+    };
+  }
+  function bezier(cubic, t) {
+    const u = 1 - t;
+    return {
+      x: u * u * u * cubic.p0.x + 3 * u * u * t * cubic.p1.x + 3 * u * t * t * cubic.p2.x + t * t * t * cubic.p3.x,
+      y: u * u * u * cubic.p0.y + 3 * u * u * t * cubic.p1.y + 3 * u * t * t * cubic.p2.y + t * t * t * cubic.p3.y
+    };
+  }
+  function outgoing(cubic) {
+    const handle = { x: cubic.p1.x - cubic.p0.x, y: cubic.p1.y - cubic.p0.y };
+    return lengthOf(handle) > 1e-6 ? handle : { x: cubic.p3.x - cubic.p0.x, y: cubic.p3.y - cubic.p0.y };
+  }
+  function incoming(cubic) {
+    const handle = { x: cubic.p3.x - cubic.p2.x, y: cubic.p3.y - cubic.p2.y };
+    return lengthOf(handle) > 1e-6 ? handle : { x: cubic.p3.x - cubic.p0.x, y: cubic.p3.y - cubic.p0.y };
+  }
+  function chord(cubic) {
+    return distance(cubic.p0, cubic.p3);
+  }
+  function turnDegrees(incomingDir, outgoingDir) {
+    const a = unit(incomingDir);
+    const b = unit(outgoingDir);
+    if (a === null || b === null) return 0;
+    const dot = Math.min(1, Math.max(-1, a.x * b.x + a.y * b.y));
+    return Math.acos(dot) * 180 / Math.PI;
+  }
+  function unit(point) {
+    const length = lengthOf(point);
+    if (length < 1e-6) return null;
+    return { x: point.x / length, y: point.y / length };
+  }
+  function lengthOf(point) {
+    return Math.hypot(point.x, point.y);
+  }
+  function distance(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+  function line(start2, end) {
+    return straightCubic(start2, end);
+  }
+  function anchorLocations(subpaths) {
+    const locations = [];
+    subpaths.forEach((subpath, subIndex) => {
+      if (subpath.cubics.length === 0) return;
+      locations.push({ subIndex, kind: "start", cubicIndex: 0 });
+      subpath.cubics.forEach((cubic, cubicIndex) => {
+        const start2 = subpath.cubics[0]?.p0;
+        const closing = subpath.closed && start2 !== void 0 && cubicIndex === subpath.cubics.length - 1 && distance(cubic.p3, start2) < 0.05;
+        if (!closing) locations.push({ subIndex, kind: "end", cubicIndex });
+      });
+    });
+    return locations;
+  }
+  function pointOf(subpaths, loc) {
+    if (loc === void 0) return null;
+    const subpath = subpaths[loc.subIndex];
+    const cubic = subpath?.cubics[loc.cubicIndex];
+    if (subpath === void 0 || cubic === void 0) return null;
+    return loc.kind === "start" ? cubic.p0 : cubic.p3;
+  }
+  function applyMove(subpaths, loc, x, y) {
+    const current = pointOf(subpaths, loc);
+    if (current === null) return null;
+    const dx = x - current.x;
+    const dy = y - current.y;
+    return subpaths.map((subpath, subIndex) => {
+      if (subIndex !== loc.subIndex) return subpath;
+      const cubics = subpath.cubics.map((cubic) => ({
+        p0: { ...cubic.p0 },
+        p1: { ...cubic.p1 },
+        p2: { ...cubic.p2 },
+        p3: { ...cubic.p3 }
+      }));
+      if (loc.kind === "start") {
+        const first = cubics[0];
+        if (first === void 0) return subpath;
+        first.p0 = shift(first.p0, dx, dy);
+        first.p1 = shift(first.p1, dx, dy);
+        const last = cubics[cubics.length - 1];
+        if (subpath.closed && last !== void 0 && distance(last.p3, current) < 0.05) {
+          last.p2 = shift(last.p2, dx, dy);
+          last.p3 = shift(last.p3, dx, dy);
+        }
+      } else {
+        const cubic = cubics[loc.cubicIndex];
+        if (cubic === void 0) return subpath;
+        cubic.p2 = shift(cubic.p2, dx, dy);
+        cubic.p3 = shift(cubic.p3, dx, dy);
+        const next = cubics[loc.cubicIndex + 1];
+        if (next !== void 0) {
+          next.p0 = shift(next.p0, dx, dy);
+          next.p1 = shift(next.p1, dx, dy);
+        }
+      }
+      return { cubics, closed: subpath.closed };
+    });
+  }
+  function shift(point, dx, dy) {
+    return { x: point.x + dx, y: point.y + dy };
+  }
+  function serialize(subpaths) {
+    return subpaths.map((subpath) => {
+      if (subpath.cubics.length === 0) return "";
+      const commands = ["M" + pair(subpath.cubics[0]?.p0 ?? { x: 0, y: 0 })];
+      for (const cubic of subpath.cubics) commands.push("C" + pair(cubic.p1) + " " + pair(cubic.p2) + " " + pair(cubic.p3));
+      if (subpath.closed) commands.push("Z");
+      return commands.join("");
+    }).join("");
+  }
+  function pair(point) {
+    return fmt(point.x) + "," + fmt(point.y);
+  }
+  function fmt(value) {
+    const rounded = Math.round(value * 100) / 100;
+    return Object.is(rounded, -0) ? "0" : String(rounded);
+  }
+  function parsePath(data) {
+    const tokens = tokenize(data);
+    if (tokens === null) return null;
+    const subpaths = [];
+    let current = [];
+    let closed = false;
+    let cx = 0;
+    let cy = 0;
+    let sx = 0;
+    let sy = 0;
+    let drawing = false;
+    const commit = () => {
+      if (!drawing) return;
+      subpaths.push({ cubics: current, closed });
+      current = [];
+      closed = false;
+      drawing = false;
+    };
+    for (const token of tokens) {
+      const op = token.cmd.toLowerCase();
+      const relative = token.cmd === op;
+      const at = (index) => token.args[index] ?? 0;
+      if (op === "m") {
+        commit();
+        cx = relative ? cx + at(0) : at(0);
+        cy = relative ? cy + at(1) : at(1);
+        sx = cx;
+        sy = cy;
+        drawing = true;
+      } else if (op === "l") {
+        const x = relative ? cx + at(0) : at(0);
+        const y = relative ? cy + at(1) : at(1);
+        current.push(straightCubic({ x: cx, y: cy }, { x, y }));
+        cx = x;
+        cy = y;
+      } else if (op === "h") {
+        const x = relative ? cx + at(0) : at(0);
+        current.push(straightCubic({ x: cx, y: cy }, { x, y: cy }));
+        cx = x;
+      } else if (op === "v") {
+        const y = relative ? cy + at(0) : at(0);
+        current.push(straightCubic({ x: cx, y: cy }, { x: cx, y }));
+        cy = y;
+      } else if (op === "c") {
+        const p1 = relative ? { x: cx + at(0), y: cy + at(1) } : { x: at(0), y: at(1) };
+        const p2 = relative ? { x: cx + at(2), y: cy + at(3) } : { x: at(2), y: at(3) };
+        const p3 = relative ? { x: cx + at(4), y: cy + at(5) } : { x: at(4), y: at(5) };
+        current.push({ p0: { x: cx, y: cy }, p1, p2, p3 });
+        cx = p3.x;
+        cy = p3.y;
+      } else if (op === "z") {
+        if (Math.hypot(cx - sx, cy - sy) >= 0.05) current.push(straightCubic({ x: cx, y: cy }, { x: sx, y: sy }));
+        cx = sx;
+        cy = sy;
+        closed = true;
+        commit();
+      }
+    }
+    commit();
+    return subpaths;
+  }
+  function tokenize(data) {
+    const tokens = [];
+    let index = 0;
+    let cmd = "";
+    let args = [];
+    while (index < data.length) {
+      const char = data[index] ?? "";
+      if (/[A-Za-z]/.test(char)) {
+        if (!/[MmLlHhVvCcZz]/.test(char)) return null;
+        if (args.length > 0) return null;
+        cmd = char;
+        args = [];
+        index += 1;
+        if (char === "Z" || char === "z") {
+          tokens.push({ cmd: char, args: [] });
+          cmd = "";
+        }
+        continue;
+      }
+      if (char === "," || /\s/.test(char)) {
+        index += 1;
+        continue;
+      }
+      if (cmd === "") return null;
+      const number = readNumber(data, index);
+      if (number === null) return null;
+      args.push(number.value);
+      index = number.next;
+      const count = ARG_COUNT[cmd.toLowerCase()];
+      if (count === void 0) return null;
+      if (args.length === count) {
+        tokens.push({ cmd, args });
+        args = [];
+        if (cmd === "M") cmd = "L";
+        else if (cmd === "m") cmd = "l";
+      }
+    }
+    return args.length === 0 ? tokens : null;
+  }
+  function readNumber(data, index) {
+    const match = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/.exec(data.slice(index));
+    if (match === null) return null;
+    const raw = match[0];
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return null;
+    return { value, next: index + raw.length };
+  }
+  function primitivePath(tag) {
+    const name = (/^<([a-z]+)/i.exec(tag)?.[1] ?? "").toLowerCase();
+    if (name !== "circle" && name !== "ellipse" && name !== "rect") return null;
+    const attrs = /^<(?:circle|ellipse|rect)\b([^>]*)\/?>/i.exec(tag)?.[1] ?? "";
+    const numberAttr = (key) => {
+      const raw = readAttr(attrs, key);
+      if (raw === null) return null;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : null;
+    };
+    let data = "";
+    if (name === "rect") {
+      const width = numberAttr("width");
+      const height = numberAttr("height");
+      if (width === null || height === null || !(width > 0) || !(height > 0)) return null;
+      const x = numberAttr("x") ?? 0;
+      const y = numberAttr("y") ?? 0;
+      data = "M" + fmt(x) + "," + fmt(y) + "H" + fmt(x + width) + "V" + fmt(y + height) + "H" + fmt(x) + "Z";
+    } else {
+      const rx = name === "circle" ? numberAttr("r") : numberAttr("rx");
+      const ry = name === "circle" ? rx : numberAttr("ry");
+      if (rx === null || ry === null || !(rx > 0) || !(ry > 0)) return null;
+      const cx = numberAttr("cx") ?? 0;
+      const cy = numberAttr("cy") ?? 0;
+      data = ellipsePath(cx, cy, rx, ry);
+    }
+    const kept = ["fill", "stroke", "stroke-width", "stroke-linejoin", "opacity", "transform", "fill-rule", "id"].map((key) => {
+      const value = readAttr(attrs, key);
+      return value === null ? "" : " " + key + '="' + value.replace(/"/g, "") + '"';
+    }).join("");
+    return '<path d="' + data + '"' + kept + "/>";
+  }
+  function ellipsePath(cx, cy, rx, ry) {
+    const k = 0.5522847498;
+    const curves = [
+      [cx + rx, cy + k * ry, cx + k * rx, cy + ry, cx, cy + ry],
+      [cx - k * rx, cy + ry, cx - rx, cy + k * ry, cx - rx, cy],
+      [cx - rx, cy - k * ry, cx - k * rx, cy - ry, cx, cy - ry],
+      [cx + k * rx, cy - ry, cx + rx, cy - k * ry, cx + rx, cy]
+    ];
+    return "M" + fmt(cx + rx) + "," + fmt(cy) + curves.map((row) => "C" + row.map((value) => fmt(value)).join(",")).join("") + "Z";
+  }
+  function readAttr(attrs, name) {
+    const match = new RegExp("\\b" + name + `\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i").exec(attrs);
+    if (match === null) return null;
+    return match[1] ?? match[2] ?? "";
+  }
+
   // src/png-alpha.ts
   var zlib = __toESM(__require("zlib"));
-  var PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  function pngSignature() {
+    return Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  }
   var CRC_TABLE = new Uint32Array(256);
   for (let index = 0; index < 256; index += 1) {
     let value = index;
@@ -89,14 +674,14 @@
     header[8] = 8;
     header[9] = 6;
     return Buffer.concat([
-      PNG_SIGNATURE,
+      pngSignature(),
       chunk("IHDR", header),
       chunk("IDAT", zlib.deflateSync(raw)),
       chunk("IEND", Buffer.alloc(0))
     ]);
   }
   function readRgbaPng(png) {
-    if (png.length < 8 || !png.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
+    if (png.length < 8 || !png.subarray(0, 8).equals(pngSignature())) return null;
     let width = 0;
     let height = 0;
     let bitDepth = 0;
@@ -227,7 +812,7 @@
   }
   function crc32(data) {
     let crc = 4294967295;
-    for (const byte of data) crc = (CRC_TABLE[(crc ^ byte) & 255] ?? 0) ^ crc >>> 8;
+    for (const byte2 of data) crc = (CRC_TABLE[(crc ^ byte2) & 255] ?? 0) ^ crc >>> 8;
     return (crc ^ 4294967295) >>> 0;
   }
   function chunk(type, data) {
@@ -240,7 +825,7 @@
   }
 
   // src/score.ts
-  var ARG_COUNT = {
+  var ARG_COUNT2 = {
     m: 2,
     l: 2,
     h: 1,
@@ -277,7 +862,7 @@
       const attrs = tagAttrs(tag.source);
       const fill = normalizeFill(fillOf(attrs));
       if (name === "path") {
-        const data = readAttr(attrs, "d");
+        const data = readAttr2(attrs, "d");
         if (data === null || data.trim() === "") continue;
         paths += 1;
         rememberFill(fill, seen, palette);
@@ -357,18 +942,18 @@
   function fittedMarkup(tag) {
     if (elementName(tag.source) !== "path") return null;
     const attrs = tagAttrs(tag.source);
-    const data = readAttr(attrs, "d");
+    const data = readAttr2(attrs, "d");
     if (data === null) return null;
     const measured = measurePath(data);
     if (measured.loops !== 1 || measured.samples.length < 4) return null;
     const fill = fillOf(attrs);
     const fillAttr = fill === null ? "" : ' fill="' + fill.replace(/"/g, "") + '"';
     const rect = fitRect(measured);
-    if (rect !== null) return '<rect x="' + fmt(rect.x) + '" y="' + fmt(rect.y) + '" width="' + fmt(rect.width) + '" height="' + fmt(rect.height) + '"' + fillAttr + "/>";
+    if (rect !== null) return '<rect x="' + fmt2(rect.x) + '" y="' + fmt2(rect.y) + '" width="' + fmt2(rect.width) + '" height="' + fmt2(rect.height) + '"' + fillAttr + "/>";
     const circle = fitCircle(measured);
-    if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
+    if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
-    if (ellipse !== null) return '<ellipse cx="' + fmt(ellipse.cx) + '" cy="' + fmt(ellipse.cy) + '" rx="' + fmt(ellipse.rx) + '" ry="' + fmt(ellipse.ry) + '"' + fillAttr + "/>";
+    if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
     return null;
   }
   function fitRect(measured) {
@@ -460,7 +1045,7 @@
     if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.12) return null;
     return { cx, cy, rx, ry };
   }
-  function fmt(value) {
+  function fmt2(value) {
     return String(Math.round(value * 100) / 100);
   }
   function groupPathsByFill(svg) {
@@ -523,10 +1108,10 @@
     const tag = /<svg\b([^>]*)>/i.exec(svg);
     if (tag === null) return null;
     const attrs = tag[1] ?? "";
-    const width = lengthOf(readAttr(attrs, "width"));
-    const height = lengthOf(readAttr(attrs, "height"));
+    const width = lengthOf2(readAttr2(attrs, "width"));
+    const height = lengthOf2(readAttr2(attrs, "height"));
     if (width !== null && height !== null) return { width, height };
-    const viewBox = readAttr(attrs, "viewBox");
+    const viewBox = readAttr2(attrs, "viewBox");
     if (viewBox === null) return null;
     const parts = viewBox.trim().split(/[\s,]+/).map(Number);
     const boxWidth = parts[2];
@@ -534,7 +1119,7 @@
     if (boxWidth === void 0 || boxHeight === void 0 || !(boxWidth > 0) || !(boxHeight > 0)) return null;
     return { width: boxWidth, height: boxHeight };
   }
-  function lengthOf(value) {
+  function lengthOf2(value) {
     if (value === null) return null;
     const match = /^([0-9]*\.?[0-9]+)/.exec(value.trim());
     if (match === null) return null;
@@ -545,13 +1130,13 @@
     const name = elementName(tag.source);
     const attrs = tagAttrs(tag.source);
     if (name !== "path") return measurePrimitive(name, attrs);
-    const data = readAttr(attrs, "d");
+    const data = readAttr2(attrs, "d");
     if (data === null || data.trim() === "") return null;
     return measurePath(data);
   }
   function measurePrimitive(name, attrs) {
     const numberAttr = (key) => {
-      const raw = readAttr(attrs, key);
+      const raw = readAttr2(attrs, key);
       if (raw === null) return null;
       const value = Number(raw);
       return Number.isFinite(value) ? value : null;
@@ -608,16 +1193,16 @@
     const smaller = Math.min(areaA, areaB);
     return smaller > 0 && width * height / smaller > 0.15;
   }
-  function readAttr(attrs, name) {
+  function readAttr2(attrs, name) {
     const pattern = new RegExp("\\b" + name + `\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i");
     const match = pattern.exec(attrs);
     if (match === null) return null;
     return match[1] ?? match[2] ?? "";
   }
   function fillOf(attrs) {
-    const direct = readAttr(attrs, "fill");
+    const direct = readAttr2(attrs, "fill");
     if (direct !== null) return direct;
-    const style = readAttr(attrs, "style");
+    const style = readAttr2(attrs, "style");
     if (style === null) return null;
     const match = /(?:^|;)\s*fill\s*:\s*([^;]+)/i.exec(style);
     const paint = match?.[1];
@@ -635,7 +1220,7 @@
     return value;
   }
   function measurePath(data) {
-    const commands = tokenize(data);
+    const commands = tokenize2(data);
     let cx = 0;
     let cy = 0;
     let sx = 0;
@@ -692,7 +1277,7 @@
         const start2 = { x: cx, y: cy };
         const cubic = curveControls(op, relative, args, start2, prevControl);
         for (const t of [0.25, 0.5, 0.75, 1]) {
-          const point = bezier(start2, cubic.p1, cubic.p2, cubic.p3, t);
+          const point = bezier2(start2, cubic.p1, cubic.p2, cubic.p3, t);
           open.push(point);
           track(point);
         }
@@ -761,7 +1346,7 @@
     const y = args[6] ?? 0;
     return { x: relative ? cx + x : x, y: relative ? cy + y : y };
   }
-  function bezier(p0, p1, p2, p3, t) {
+  function bezier2(p0, p1, p2, p3, t) {
     const u = 1 - t;
     return {
       x: u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
@@ -816,7 +1401,7 @@
     }
     return inside;
   }
-  function tokenize(data) {
+  function tokenize2(data) {
     const commands = [];
     let index = 0;
     let cmd = "";
@@ -833,12 +1418,12 @@
         }
       }
       if (cmd === "") break;
-      const count = ARG_COUNT[cmd.toLowerCase()] ?? 0;
+      const count = ARG_COUNT2[cmd.toLowerCase()] ?? 0;
       if (count === 0) break;
       const args = [];
       let cursor = index;
       for (let slot = 0; slot < count; slot += 1) {
-        const number = readNumber(data, cursor);
+        const number = readNumber2(data, cursor);
         if (number === null) break;
         args.push(number.value);
         cursor = number.index;
@@ -860,7 +1445,7 @@
     }
     return cursor;
   }
-  function readNumber(data, index) {
+  function readNumber2(data, index) {
     let cursor = index;
     while (cursor < data.length) {
       const char = data[cursor] ?? "";
@@ -874,6 +1459,11 @@
   }
 
   // src/trace.ts
+  function presetDefaults(preset) {
+    if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
+    if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
+    return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
+  }
   function simplifyTolerance(smoothness) {
     const clamped = Math.min(3, Math.max(0, smoothness));
     const tolerance = 2.2 - clamped * 0.75;
@@ -893,8 +1483,11 @@
       simplifyTolerance(request.smoothness).toFixed(2)
     ];
     if (request.maxColors > 0) args.push("--max-colors", String(request.maxColors));
+    if (request.palette !== void 0 && request.palette.length > 0 && request.palette.length <= 32) {
+      args.push("--palette", request.palette.join(","));
+    }
     if (request.preset === "photo") {
-      args.push("--preset", "photo", "--color-precision", "6");
+      args.push("--preset", "photo", "--color-precision", "8", "--filter-speckle", "1");
     } else if (request.preset === "icon") {
       args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "2");
     } else {
@@ -909,6 +1502,8 @@
       super("Illustrator \u0E44\u0E21\u0E48\u0E15\u0E2D\u0E1A\u0E01\u0E25\u0E31\u0E1A\u0E20\u0E32\u0E22\u0E43\u0E19\u0E40\u0E27\u0E25\u0E32\u0E17\u0E35\u0E48\u0E01\u0E33\u0E2B\u0E19\u0E14");
     }
   };
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  var SAFE_ATTRS = ["viewBox", "width", "height", "fill", "stroke", "stroke-width", "stroke-linejoin", "d", "cx", "cy", "r", "rx", "ry", "x", "y", "transform", "opacity", "fill-rule", "id"];
   function getElement(id) {
     const value = document.getElementById(id);
     if (value === null) throw new Error("Missing panel element: " + id);
@@ -933,24 +1528,31 @@
     const preview = getElement("preview");
     const preset = getElement("preset");
     const stacking = getElement("stacking");
+    const brushCanvas = getElement("brush-canvas");
     if (!(preview instanceof HTMLImageElement)) throw new Error("Expected preview image");
     if (!(preset instanceof HTMLSelectElement)) throw new Error("Expected preset selector");
     if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
+    if (!(brushCanvas instanceof HTMLCanvasElement)) throw new Error("Expected brush canvas");
     return {
       selection: getElement("selection"),
       status: getElement("status"),
       phase: getElement("phase"),
       preview,
       previewEmpty: getElement("preview-empty"),
+      stage: getElement("vector-stage"),
+      brushCanvas,
       refresh: getButton("refresh"),
       trace: getButton("trace"),
       cancel: getButton("cancel"),
       apply: getButton("apply"),
+      batch: getButton("batch"),
       preset,
       colors: getInput("colors"),
       colorsValue: getOutput("colors-value"),
       smooth: getInput("smooth"),
       smoothValue: getOutput("smooth-value"),
+      corner: getInput("corner"),
+      cornerValue: getOutput("corner-value"),
       facts: getElement("facts"),
       factPaths: getElement("fact-paths"),
       factAnchors: getElement("fact-anchors"),
@@ -963,8 +1565,18 @@
       viewPixels: getButton("view-pixels"),
       viewVectors: getButton("view-vectors"),
       zoomIn: getButton("zoom-in"),
-      zoomOut: getButton("zoom-out")
+      zoomOut: getButton("zoom-out"),
+      editTools: getElement("edit-tools"),
+      toolDrag: getButton("tool-drag"),
+      toolErase: getButton("tool-erase"),
+      toolBrush: getButton("tool-brush"),
+      brushTrace: getButton("brush-trace")
     };
+  }
+  function illustratorHost() {
+    const cep = window.__adobe_cep__;
+    if (cep === void 0 || typeof CSInterface === "undefined") return null;
+    return new CSInterface();
   }
   function parseHostResult(raw) {
     if (raw === "EvalScript error.") throw new Error("Illustrator \u0E40\u0E23\u0E35\u0E22\u0E01\u0E2A\u0E04\u0E23\u0E34\u0E1B\u0E15\u0E4C\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08");
@@ -1063,9 +1675,19 @@
     } catch (_) {
     }
   }
-  function runVtracer(binary, job, inputPath, onStart) {
+  function fittedSource(svg, droppedColor, settings) {
+    let next = svg;
+    if (droppedColor !== null) next = dropFill(next, droppedColor);
+    if (settings.removeBackground) next = dropCanvasBackground(next);
+    return fitShapes(next);
+  }
+  function styledSvg(fitted, settings) {
+    return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner })));
+  }
+  function runVtracer(binary, job, inputPath, palette, onStart) {
+    const request = palette === void 0 ? job.settings : { ...job.settings, palette };
     return new Promise((resolve, reject) => {
-      const child = childProcess.spawn(binary, vtracerArguments(inputPath, job.svgPath, job.settings), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+      const child = childProcess.spawn(binary, vtracerArguments(inputPath, job.svgPath, request), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
       onStart(child);
       let stderr = "";
       child.stderr?.on("data", (chunk2) => {
@@ -1088,20 +1710,33 @@
     if (preset !== "logo" && preset !== "icon" && preset !== "photo") throw new Error("Preset \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     const maxColors = Number(ui.colors.value);
     const smoothness = Number(ui.smooth.value) / 10;
+    const corner = Number(ui.corner.value);
     const stacking = ui.stacking.value === "stacked" ? "stacked" : "cutout";
     if (!Number.isInteger(maxColors) || maxColors < 0 || maxColors > 64) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
     if (!Number.isFinite(smoothness) || smoothness < 0 || smoothness > 3) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E27\u0E32\u0E21\u0E40\u0E23\u0E35\u0E22\u0E1A\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    return { preset, maxColors, smoothness, removeBackground: ui.backdrop.checked, stacking };
+    if (!Number.isInteger(corner) || corner < 0 || corner > 90) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E21\u0E02\u0E2D\u0E07\u0E21\u0E38\u0E21\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
+    return { preset, maxColors, smoothness, corner, removeBackground: ui.backdrop.checked, stacking };
   }
   function colorLabel(value) {
     return value === "0" ? "\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34" : value;
+  }
+  function svgDataUrl(svg) {
+    return "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)));
+  }
+  function pngDataUrl(bytes) {
+    if (typeof Buffer !== "undefined") return "data:image/png;base64," + Buffer.from(bytes).toString("base64");
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index] ?? 0);
+    return "data:image/png;base64," + btoa(binary);
+  }
+  function settingsNote(settings) {
+    return "preset=" + settings.preset + ";colors=" + settings.maxColors + ";smooth=" + settings.smoothness + ";corner=" + settings.corner + ";stacking=" + settings.stacking + ";background=" + (settings.removeBackground ? "removed" : "kept");
   }
   function showFacts(ui, facts) {
     if (facts === null) {
       ui.facts.hidden = true;
       ui.factNote.hidden = true;
       ui.factNote.textContent = "";
-      showPalette(ui, []);
       return;
     }
     ui.factPaths.textContent = String(facts.paths);
@@ -1112,21 +1747,6 @@
     const note = [holeNote(facts.holes), shapeNote(facts)].filter((item) => item !== null).join(" \xB7 ");
     ui.factNote.hidden = note === "";
     ui.factNote.textContent = note;
-    showPalette(ui, facts.palette);
-  }
-  function showPalette(ui, palette) {
-    ui.palette.replaceChildren();
-    if (palette.length === 0) {
-      ui.palette.hidden = true;
-      return;
-    }
-    for (const color of palette) {
-      const item = document.createElement("li");
-      if (/^#[0-9a-f]{6}$/.test(color)) item.style.backgroundColor = color;
-      item.title = color;
-      ui.palette.append(item);
-    }
-    ui.palette.hidden = false;
   }
   function showSelection(ui, selection) {
     ui.selection.replaceChildren();
@@ -1159,54 +1779,328 @@
       }
     }
   }
+  function previewOf(state) {
+    if (state.kind === "preview" || state.kind === "applying") return state;
+    return null;
+  }
+  function copySvgElement(node) {
+    const name = node.localName;
+    if (name !== "svg" && name !== "g" && name !== "path" && name !== "circle" && name !== "ellipse" && name !== "rect") return null;
+    const next = document.createElementNS(SVG_NS, name);
+    for (const attr of SAFE_ATTRS) {
+      const value = node.getAttribute(attr);
+      if (value !== null && !/^\s*javascript:/i.test(value)) next.setAttribute(attr, value);
+    }
+    for (const child of Array.from(node.children)) {
+      const copied = copySvgElement(child);
+      if (copied !== null) next.append(copied);
+    }
+    return next;
+  }
+  function adoptSvg(svgText) {
+    const parsed = new DOMParser().parseFromString(svgText, "image/svg+xml");
+    if (parsed.querySelector("parsererror") !== null) return null;
+    const root = parsed.documentElement;
+    if (root.localName !== "svg") return null;
+    const copy = copySvgElement(root);
+    return copy instanceof SVGSVGElement ? copy : null;
+  }
+  function pathDataAt(svg, pathIndex) {
+    const tags = svg.match(/<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>/gi) ?? [];
+    const tag = tags[pathIndex];
+    if (tag === void 0) return null;
+    const match = /\bd\s*=\s*"([^"]*)"|\bd\s*=\s*'([^']*)'/i.exec(tag);
+    return match?.[1] ?? match?.[2] ?? null;
+  }
+  function svgPoint(svg, event) {
+    const matrix = svg.getScreenCTM();
+    if (matrix === null) return null;
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const local = point.matrixTransform(matrix.inverse());
+    return { x: local.x, y: local.y };
+  }
   function start() {
     const ui = getUi();
     let state = { kind: "empty" };
     let view = "vector";
     let zoom = 1;
-    const extensionPath = typeof CSInterface === "undefined" ? "" : new CSInterface().getSystemPath(SystemPath.EXTENSION);
-    const host = typeof CSInterface === "undefined" ? null : new CSInterface();
+    let tool = "none";
+    let brushColor = null;
+    let brushPixels = null;
+    let batching = false;
+    let stopBatch = false;
+    let pendingFocus = null;
+    let fittedSvg = null;
+    let edited = false;
+    const host = illustratorHost();
+    const extensionPath = host === null ? "" : host.getSystemPath(SystemPath.EXTENSION);
     function message(value, isError = false) {
       ui.status.textContent = value;
       ui.status.classList.toggle("error", isError);
     }
+    function syncOutputs() {
+      ui.colorsValue.value = colorLabel(ui.colors.value);
+      ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
+      ui.cornerValue.value = ui.corner.value + "\xB0";
+    }
+    function commitSvg(svgText, focus = null) {
+      if (state.kind !== "preview") return;
+      pendingFocus = focus;
+      if (state.job !== null) fs.writeFileSync(state.job.svgPath, svgText);
+      state = { ...state, svgText, facts: scoreSvg(svgText), dataUrl: svgDataUrl(svgText) };
+      render();
+    }
+    function showPalette() {
+      const preview = previewOf(state);
+      const palette = preview?.facts.palette ?? [];
+      ui.palette.replaceChildren();
+      if (palette.length === 0) {
+        ui.palette.hidden = true;
+        return;
+      }
+      for (const color of palette) {
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.title = color;
+        button.setAttribute("aria-label", color);
+        button.setAttribute("aria-pressed", color === brushColor ? "true" : "false");
+        if (/^#[0-9a-f]{6}$/i.test(color)) button.style.backgroundColor = color;
+        button.addEventListener("click", () => {
+          brushColor = color;
+          tool = "brush";
+          view = "pixels";
+          message("\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E1A\u0E19\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25 \u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E41\u0E1B\u0E25\u0E07\u0E08\u0E32\u0E01\u0E41\u0E1B\u0E23\u0E07");
+          render();
+        });
+        item.append(button);
+        ui.palette.append(item);
+      }
+      ui.palette.hidden = false;
+    }
+    function mountStage(svgText) {
+      ui.stage.replaceChildren();
+      const svg = adoptSvg(svgText);
+      if (svg === null) return;
+      const viewBox = svg.getAttribute("viewBox")?.trim().split(/[\s,]+/) ?? [];
+      const boxWidth = Number(viewBox[2] ?? svg.getAttribute("width") ?? 100);
+      const radius = Math.max(2.5, (Number.isFinite(boxWidth) ? boxWidth : 100) / 48);
+      svg.classList.toggle("zoom-2", zoom === 2);
+      svg.classList.toggle("zoom-4", zoom === 4);
+      let shapeIndex = 0;
+      let pathIndex = 0;
+      const shapes = svg.querySelectorAll("path, circle, ellipse, rect");
+      shapes.forEach((shape) => {
+        const currentShape = shapeIndex;
+        shapeIndex += 1;
+        shape.setAttribute("data-shape-index", String(currentShape));
+        if (tool === "erase") {
+          shape.addEventListener("pointerdown", (event) => {
+            if (!(event instanceof PointerEvent) || event.button !== 0) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (state.kind !== "preview") return;
+            const next = removeShape(state.svgText, currentShape);
+            if (next === state.svgText) {
+              message("\u0E40\u0E2B\u0E25\u0E37\u0E2D\u0E0A\u0E34\u0E49\u0E19\u0E2A\u0E38\u0E14\u0E17\u0E49\u0E32\u0E22\u0E41\u0E25\u0E49\u0E27", true);
+              return;
+            }
+            edited = true;
+            message("\u0E25\u0E1A\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27");
+            commitSvg(next);
+          });
+        }
+        if (shape.localName !== "path" || tool !== "drag") return;
+        const currentPath = pathIndex;
+        pathIndex += 1;
+        shape.setAttribute("data-path-index", String(currentPath));
+        const parent = shape.parentElement ?? svg;
+        for (const anchor of listAnchors(svgText).filter((item) => item.pathIndex === currentPath)) {
+          const handle = document.createElementNS(SVG_NS, "circle");
+          handle.setAttribute("class", "anchor-handle");
+          handle.setAttribute("cx", String(anchor.x));
+          handle.setAttribute("cy", String(anchor.y));
+          handle.setAttribute("r", String(radius));
+          handle.setAttribute("fill", "#cfb6ff");
+          handle.setAttribute("stroke", "#241735");
+          handle.setAttribute("stroke-width", String(Math.max(0.4, radius / 5)));
+          handle.setAttribute("tabindex", "0");
+          handle.setAttribute("role", "button");
+          handle.setAttribute("aria-label", "\u0E08\u0E38\u0E14\u0E22\u0E36\u0E14 " + String(anchor.anchorIndex + 1));
+          parent.append(handle);
+          let live = svgText;
+          const follow = (next) => {
+            live = next;
+            const data = pathDataAt(next, currentPath);
+            if (data !== null) shape.setAttribute("d", data);
+            const points = listAnchors(next);
+            svg.querySelectorAll(".anchor-handle").forEach((node, index) => {
+              const point = points[index];
+              if (point === void 0) return;
+              node.setAttribute("cx", String(point.x));
+              node.setAttribute("cy", String(point.y));
+            });
+          };
+          handle.addEventListener("pointerdown", (event) => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            handle.classList.add("dragging");
+            handle.setPointerCapture(event.pointerId);
+          });
+          handle.addEventListener("pointermove", (event) => {
+            if (!handle.hasPointerCapture(event.pointerId)) return;
+            const point = svgPoint(svg, event);
+            if (point === null) return;
+            follow(moveAnchor(live, currentPath, anchor.anchorIndex, point.x, point.y));
+          });
+          handle.addEventListener("lostpointercapture", () => {
+            handle.classList.remove("dragging");
+            if (live === svgText) return;
+            edited = true;
+            commitSvg(live, { pathIndex: currentPath, anchorIndex: anchor.anchorIndex });
+          });
+          handle.addEventListener("keydown", (event) => {
+            const step = event.shiftKey ? 8 : 1;
+            const dx = event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0;
+            const dy = event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0;
+            if (dx === 0 && dy === 0) return;
+            event.preventDefault();
+            const current = listAnchors(live).find((item) => item.pathIndex === currentPath && item.anchorIndex === anchor.anchorIndex);
+            if (current === void 0) return;
+            edited = true;
+            commitSvg(moveAnchor(live, currentPath, anchor.anchorIndex, current.x + dx, current.y + dy), { pathIndex: currentPath, anchorIndex: anchor.anchorIndex });
+          });
+        }
+      });
+      ui.stage.append(svg);
+      if (pendingFocus !== null) {
+        const target = pendingFocus;
+        pendingFocus = null;
+        const handles = svg.querySelectorAll(".anchor-handle");
+        const index = listAnchors(svgText).findIndex((item) => item.pathIndex === target.pathIndex && item.anchorIndex === target.anchorIndex);
+        const handle = handles[index];
+        if (handle instanceof SVGElement) handle.focus();
+      }
+    }
+    function drawBrush() {
+      const preview = previewOf(state);
+      if (preview?.raster == null) return;
+      const pixels = brushPixels ?? preview.raster.rgba;
+      if (ui.brushCanvas.width !== preview.raster.width) ui.brushCanvas.width = preview.raster.width;
+      if (ui.brushCanvas.height !== preview.raster.height) ui.brushCanvas.height = preview.raster.height;
+      const context = ui.brushCanvas.getContext("2d");
+      if (context === null) return;
+      const image = context.createImageData(preview.raster.width, preview.raster.height);
+      image.data.set(pixels);
+      context.putImageData(image, 0, 0);
+    }
     function render() {
       showSelection(ui, currentSelection(state));
-      const busy = state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying";
+      const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying";
       ui.refresh.disabled = busy;
       ui.trace.disabled = busy || state.kind === "empty";
+      ui.batch.disabled = busy;
       ui.trace.textContent = currentSelection(state)?.fromResult ? "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48" : "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07";
-      ui.apply.disabled = state.kind !== "preview";
-      ui.cancel.hidden = state.kind !== "tracing";
-      ui.phase.textContent = state.kind === "loading" ? "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E" : state.kind === "capturing" ? "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E" : state.kind === "tracing" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07" : state.kind === "applying" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25" : state.kind === "preview" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : "\u0E1E\u0E23\u0E49\u0E2D\u0E21";
+      ui.apply.disabled = state.kind !== "preview" || state.job === null;
+      ui.cancel.hidden = state.kind !== "tracing" && !batching;
+      ui.phase.textContent = state.kind === "loading" ? "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E" : state.kind === "capturing" ? "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E" : state.kind === "tracing" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07" : state.kind === "applying" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25" : batching ? "\u0E41\u0E1B\u0E25\u0E07\u0E2B\u0E25\u0E32\u0E22\u0E20\u0E32\u0E1E" : state.kind === "preview" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : "\u0E1E\u0E23\u0E49\u0E2D\u0E21";
       const showing = state.kind === "preview" || state.kind === "applying";
       ui.viewPixels.hidden = !showing;
       ui.viewVectors.hidden = !showing;
       ui.zoomIn.hidden = !showing;
       ui.zoomOut.hidden = !showing;
+      ui.editTools.hidden = !showing;
       ui.viewPixels.setAttribute("aria-pressed", view === "pixels" ? "true" : "false");
       ui.viewVectors.setAttribute("aria-pressed", view === "vector" ? "true" : "false");
+      ui.toolDrag.setAttribute("aria-pressed", tool === "drag" ? "true" : "false");
+      ui.toolErase.setAttribute("aria-pressed", tool === "erase" ? "true" : "false");
+      ui.toolBrush.setAttribute("aria-pressed", tool === "brush" ? "true" : "false");
+      ui.brushTrace.disabled = !showing || brushPixels === null || previewOf(state)?.job == null;
       ui.preview.classList.toggle("zoom-2", showing && zoom === 2);
       ui.preview.classList.toggle("zoom-4", showing && zoom === 4);
+      ui.brushCanvas.classList.toggle("zoom-2", showing && zoom === 2);
+      ui.brushCanvas.classList.toggle("zoom-4", showing && zoom === 4);
+      const editingVectors = showing && view === "vector" && (tool === "drag" || tool === "erase");
+      const brushing = showing && tool === "brush";
       if (state.kind === "preview" || state.kind === "applying") {
-        ui.preview.src = view === "pixels" ? state.pngUrl : state.dataUrl;
-        ui.preview.hidden = false;
         ui.previewEmpty.hidden = true;
         showFacts(ui, state.facts);
+        showPalette();
+        if (brushing) {
+          ui.preview.hidden = true;
+          ui.stage.hidden = true;
+          ui.brushCanvas.hidden = false;
+          drawBrush();
+        } else if (editingVectors) {
+          ui.preview.hidden = true;
+          ui.brushCanvas.hidden = true;
+          ui.stage.hidden = false;
+          const editable = tool === "drag" ? expandPrimitives(state.svgText) : state.svgText;
+          if (tool === "drag" && editable !== state.svgText && state.kind === "preview") {
+            commitSvg(editable);
+            return;
+          }
+          mountStage(editable);
+        } else {
+          ui.stage.hidden = true;
+          ui.brushCanvas.hidden = true;
+          ui.preview.hidden = false;
+          ui.preview.src = view === "pixels" ? state.pngUrl : state.dataUrl;
+        }
       } else {
         ui.preview.removeAttribute("src");
         ui.preview.hidden = true;
+        ui.stage.hidden = true;
+        ui.brushCanvas.hidden = true;
         ui.previewEmpty.hidden = false;
         showFacts(ui, null);
+        showPalette();
       }
+    }
+    async function vectorize(selection, job, palette) {
+      if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
+      const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
+      if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
+      const sourcePng = fs.readFileSync(job.pngPath);
+      const punched = punchTransparency(sourcePng);
+      const traceInput = path.join(job.directory, "trace.png");
+      fs.writeFileSync(traceInput, punched.png);
+      message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");
+      await runVtracer(binary, job, traceInput, palette, (child) => {
+        state = { kind: "tracing", selection, job, child };
+        render();
+      });
+      fittedSvg = fittedSource(fs.readFileSync(job.svgPath, "utf8"), punched.droppedColor, job.settings);
+      edited = false;
+      const svgText = styledSvg(fittedSvg, job.settings);
+      fs.writeFileSync(job.svgPath, svgText);
+      const decoded = readRgbaPng(sourcePng);
+      brushPixels = null;
+      tool = "none";
+      view = "vector";
+      zoom = 1;
+      state = {
+        kind: "preview",
+        selection,
+        job,
+        dataUrl: svgDataUrl(svgText),
+        pngUrl: pngDataUrl(sourcePng),
+        svgText,
+        raster: decoded === null ? null : { width: decoded.width, height: decoded.height, rgba: decoded.rgba },
+        facts: scoreSvg(svgText)
+      };
+      message("\u0E40\u0E17\u0E35\u0E22\u0E1A\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25\u0E01\u0E31\u0E1A\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C \u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator");
+      render();
     }
     async function refresh() {
       if (host === null) {
         message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
         return;
       }
-      if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
-      if (state.kind === "preview") cleanJob(state.job);
+      if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying" || batching) return;
+      if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
       state = { kind: "loading" };
       render();
       try {
@@ -1220,70 +2114,207 @@
       render();
     }
     async function trace() {
-      if (host === null) return;
+      if (host === null) {
+        message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
+        return;
+      }
       if (state.kind !== "selected" && state.kind !== "preview") return;
       const selection = state.selection;
-      if (state.kind === "preview") cleanJob(state.job);
-      let job = null;
+      if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+      const job = newJob(readSettings(ui));
       try {
-        job = newJob(readSettings(ui));
         state = { kind: "capturing", selection, job };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator\u2026");
         render();
         await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
-        if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
-        const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
-        if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
-        const sourcePng = fs.readFileSync(job.pngPath);
-        const punched = punchTransparency(sourcePng);
-        const traceInput = path.join(job.directory, "trace.png");
-        fs.writeFileSync(traceInput, punched.png);
-        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");
-        await runVtracer(binary, job, traceInput, (child) => {
-          if (job === null) return;
-          state = { kind: "tracing", selection, job, child };
-          render();
-        });
-        let svgText = fs.readFileSync(job.svgPath, "utf8");
-        if (punched.droppedColor !== null) svgText = dropFill(svgText, punched.droppedColor);
-        if (job.settings.removeBackground) svgText = dropCanvasBackground(svgText);
-        svgText = groupPathsByFill(sealGaps(fitShapes(svgText)));
-        fs.writeFileSync(job.svgPath, svgText);
-        const facts = scoreSvg(svgText);
-        view = "vector";
-        zoom = 1;
-        const pngUrl = "data:image/png;base64," + sourcePng.toString("base64");
-        state = { kind: "preview", selection, job, dataUrl: "data:image/svg+xml;base64," + Buffer.from(svgText, "utf8").toString("base64"), pngUrl, facts };
-        message("\u0E40\u0E17\u0E35\u0E22\u0E1A\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25\u0E01\u0E31\u0E1A\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C \u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator");
-        render();
+        await vectorize(selection, job);
       } catch (error) {
-        if (job !== null) cleanJob(job);
+        cleanJob(job);
         state = { kind: "selected", selection };
         message(errorMessage(error), true);
         render();
       }
     }
     async function apply() {
-      if (host === null || state.kind !== "preview") return;
-      const { selection, job, dataUrl, pngUrl, facts } = state;
-      state = { kind: "applying", selection, job, dataUrl, pngUrl, facts };
+      if (host === null || state.kind !== "preview" || state.job === null) return false;
+      const preview = state;
+      const job = state.job;
+      state = { ...preview, kind: "applying" };
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
       render();
       try {
-        const settings = "preset=" + job.settings.preset + ";colors=" + job.settings.maxColors + ";smooth=" + job.settings.smoothness + ";stacking=" + job.settings.stacking + ";background=" + (job.settings.removeBackground ? "removed" : "kept");
-        const result = await callHost(host, "VP_commit", [selection.uuid, job.svgPath, job.id, settings, selection.bounds.join(","), selection.documentIdentity]);
+        const result = await callHost(host, "VP_commit", [preview.selection.uuid, job.svgPath, job.id, settingsNote(job.settings), preview.selection.bounds.join(","), preview.selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48");
         cleanJob(job);
-        state = { kind: "selected", selection };
+        state = { kind: "selected", selection: preview.selection };
+        render();
+        return true;
       } catch (error) {
         if (error instanceof HostTimeoutError) {
           message("Illustrator \u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E15\u0E2D\u0E1A\u0E01\u0E25\u0E31\u0E1A \u0E15\u0E23\u0E27\u0E08 Layers \u0E01\u0E48\u0E2D\u0E19\u0E40\u0E23\u0E34\u0E48\u0E21\u0E07\u0E32\u0E19\u0E43\u0E2B\u0E21\u0E48 \u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E44\u0E21\u0E48\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E1C\u0E25\u0E0B\u0E49\u0E33", true);
-          state = { kind: "selected", selection };
+          state = { kind: "selected", selection: preview.selection };
         } else {
           message(errorMessage(error), true);
-          state = { kind: "preview", selection, job, dataUrl, pngUrl, facts };
+          state = preview;
+        }
+        render();
+        return false;
+      }
+    }
+    async function batch() {
+      if (host === null) {
+        message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
+        return;
+      }
+      if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
+      if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+      batching = true;
+      stopBatch = false;
+      render();
+      let finished = 0;
+      try {
+        const list = parseBatchFields(await callHost(host, "VP_list"));
+        if (list.items.length === 0) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A\u0E20\u0E32\u0E1E raster \u0E43\u0E19\u0E40\u0E2D\u0E01\u0E2A\u0E32\u0E23");
+        for (const item of list.items) {
+          if (stopBatch) break;
+          const selection = {
+            documentName: list.documentName,
+            documentIdentity: list.documentIdentity,
+            itemName: item.name || "\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01",
+            itemType: item.itemType,
+            uuid: item.uuid,
+            bounds: item.bounds,
+            widthPt: item.bounds[2] - item.bounds[0],
+            heightPt: item.bounds[1] - item.bounds[3],
+            embedded: item.embedded,
+            fromResult: false
+          };
+          const job = newJob(readSettings(ui));
+          message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E " + String(finished + 1) + "/" + String(list.items.length) + " \xB7 " + selection.itemName);
+          state = { kind: "capturing", selection, job };
+          render();
+          try {
+            await callHost(host, "VP_capture", [item.uuid, job.pngPath, list.documentIdentity, "1"]);
+            await vectorize(selection, job);
+            const placed = await apply();
+            if (!placed) return;
+            finished += 1;
+          } catch (error) {
+            cleanJob(job);
+            throw error;
+          }
+        }
+        message(stopBatch ? "\u0E2B\u0E22\u0E38\u0E14\u0E17\u0E35\u0E48\u0E20\u0E32\u0E1E " + String(finished) : "\u0E41\u0E1B\u0E25\u0E07\u0E04\u0E23\u0E1A " + String(finished) + " \u0E20\u0E32\u0E1E");
+      } catch (error) {
+        message(errorMessage(error), true);
+      } finally {
+        batching = false;
+        stopBatch = false;
+        render();
+      }
+    }
+    async function retraceBrush() {
+      if (state.kind !== "preview" || state.job === null || state.raster === null || brushPixels === null) {
+        message("\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E2A\u0E35\u0E01\u0E48\u0E2D\u0E19\u0E41\u0E1B\u0E25\u0E07\u0E08\u0E32\u0E01\u0E41\u0E1B\u0E23\u0E07", true);
+        return;
+      }
+      const palette = paletteFromRaster(brushPixels);
+      const selection = state.selection;
+      const job = state.job;
+      try {
+        fs.writeFileSync(job.pngPath, encodeRgbaPng(state.raster.width, state.raster.height, brushPixels));
+        message(palette === null ? "\u0E2A\u0E35\u0E21\u0E32\u0E01\u0E01\u0E27\u0E48\u0E32 32 \u0E2A\u0E35 \u0E08\u0E36\u0E07\u0E43\u0E2B\u0E49 VTracer \u0E08\u0E31\u0E14\u0E01\u0E25\u0E38\u0E48\u0E21\u0E2A\u0E35\u0E40\u0E2D\u0E07" : "\u0E43\u0E0A\u0E49\u0E2A\u0E35\u0E08\u0E32\u0E01\u0E41\u0E1B\u0E23\u0E07 " + String(palette.length) + " \u0E2A\u0E35");
+        await vectorize(selection, job, palette ?? void 0);
+      } catch (error) {
+        message(errorMessage(error), true);
+        render();
+      }
+    }
+    function paintEvent(event) {
+      const preview = previewOf(state);
+      if (preview?.raster == null || brushColor === null || tool !== "brush") return;
+      const rect = ui.brushCanvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const x = (event.clientX - rect.left) * preview.raster.width / rect.width;
+      const y = (event.clientY - rect.top) * preview.raster.height / rect.height;
+      const radius = Math.max(2, preview.raster.width / 28);
+      brushPixels = paintDisc(brushPixels ?? preview.raster.rgba, preview.raster.width, preview.raster.height, x, y, radius, brushColor);
+      drawBrush();
+      ui.brushTrace.disabled = preview.job === null;
+    }
+    function chooseTool(next, note) {
+      tool = tool === next ? "none" : next;
+      if (tool === "brush") view = "pixels";
+      if (tool === "drag" || tool === "erase") view = "vector";
+      message(tool === "none" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : note);
+      render();
+    }
+    function refair() {
+      if (state.kind !== "preview" || fittedSvg === null) return;
+      if (edited) {
+        message("\u0E41\u0E01\u0E49\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E1B\u0E23\u0E31\u0E1A\u0E21\u0E38\u0E21\u0E17\u0E31\u0E1A \u0E08\u0E19\u0E01\u0E27\u0E48\u0E32\u0E08\u0E30\u0E41\u0E1B\u0E25\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
+        return;
+      }
+      const settings = readSettings(ui);
+      const next = styledSvg(fittedSvg, settings);
+      if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
+      commitSvg(next);
+    }
+    function loadFixture() {
+      const radians = 15 * Math.PI / 180;
+      let stair = "M88,18";
+      for (let step = 0; step < 14; step += 1) stair += " h1 v1";
+      const kink = "M88,78 L98,78 L" + (98 + 10 * Math.cos(radians)).toFixed(2) + "," + (78 - 10 * Math.sin(radians)).toFixed(2);
+      const svgText = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="100" viewBox="0 0 160 100"><path fill="#d6363e" d="M8,8 H58 V58 H8 Z"/><path fill="#2e66d6" d="' + stair + '"/><path fill="#f2b830" d="' + kink + '"/></svg>';
+      fittedSvg = svgText;
+      edited = false;
+      const width = 80;
+      const height = 48;
+      const rgba = new Uint8Array(width * height * 4);
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const color = x < 27 ? [214, 54, 62] : x < 54 ? [46, 102, 214] : [242, 184, 48];
+          const offset = (y * width + x) * 4;
+          rgba[offset] = color[0] ?? 0;
+          rgba[offset + 1] = color[1] ?? 0;
+          rgba[offset + 2] = color[2] ?? 0;
+          rgba[offset + 3] = 255;
         }
       }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      let pngUrl = "";
+      if (context !== null) {
+        const image = context.createImageData(width, height);
+        image.data.set(rgba);
+        context.putImageData(image, 0, 0);
+        pngUrl = canvas.toDataURL("image/png");
+      }
+      const shown = styledSvg(svgText, readSettings(ui));
+      state = {
+        kind: "preview",
+        selection: {
+          documentName: "\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07",
+          documentIdentity: "fixture",
+          itemName: "\u0E20\u0E32\u0E1E\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07",
+          itemType: "RasterItem",
+          uuid: "fixture",
+          bounds: [0, 100, 160, 0],
+          widthPt: 160,
+          heightPt: 100,
+          embedded: true,
+          fromResult: false
+        },
+        job: null,
+        dataUrl: svgDataUrl(shown),
+        pngUrl,
+        svgText: shown,
+        raster: { width, height, rgba },
+        facts: scoreSvg(shown)
+      };
+      message("\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E43\u0E19\u0E40\u0E1A\u0E23\u0E32\u0E27\u0E4C\u0E40\u0E0B\u0E2D\u0E23\u0E4C: \u0E25\u0E32\u0E01\u0E08\u0E38\u0E14 \u0E25\u0E1A\u0E0A\u0E34\u0E49\u0E19 \u0E2B\u0E23\u0E37\u0E2D\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E2A\u0E35\u0E44\u0E14\u0E49");
       render();
     }
     ui.refresh.addEventListener("click", () => {
@@ -1295,44 +2326,48 @@
     ui.apply.addEventListener("click", () => {
       void apply();
     });
+    ui.batch.addEventListener("click", () => {
+      void batch();
+    });
+    ui.brushTrace.addEventListener("click", () => {
+      void retraceBrush();
+    });
     ui.cancel.addEventListener("click", () => {
+      stopBatch = true;
       if (state.kind !== "tracing") return;
       state.job.cancelled = true;
       state.child.kill();
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
     });
-    ui.colors.addEventListener("input", () => {
-      ui.colorsValue.value = colorLabel(ui.colors.value);
-    });
+    ui.colors.addEventListener("input", syncOutputs);
     ui.smooth.addEventListener("input", () => {
-      ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
+      syncOutputs();
+      refair();
+    });
+    ui.corner.addEventListener("input", () => {
+      syncOutputs();
+      refair();
     });
     ui.preset.addEventListener("change", () => {
-      if (ui.preset.value === "photo") {
-        ui.colors.value = "36";
-        ui.smooth.value = "16";
-        ui.backdrop.checked = false;
-        ui.stacking.value = "stacked";
-      } else if (ui.preset.value === "icon") {
-        ui.colors.value = "8";
-        ui.smooth.value = "20";
-        ui.backdrop.checked = true;
-        ui.stacking.value = "cutout";
-      } else {
-        ui.colors.value = "0";
-        ui.smooth.value = "24";
-        ui.backdrop.checked = true;
-        ui.stacking.value = "cutout";
-      }
-      ui.colorsValue.value = colorLabel(ui.colors.value);
-      ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
+      const preset = ui.preset.value;
+      if (preset !== "logo" && preset !== "icon" && preset !== "photo") return;
+      const defaults = presetDefaults(preset);
+      ui.colors.value = String(defaults.maxColors);
+      ui.smooth.value = String(Math.round(defaults.smoothness * 10));
+      ui.corner.value = String(defaults.corner);
+      ui.backdrop.checked = defaults.removeBackground;
+      ui.stacking.value = defaults.stacking;
+      syncOutputs();
+      refair();
     });
     ui.viewPixels.addEventListener("click", () => {
       view = "pixels";
+      if (tool === "drag" || tool === "erase") tool = "none";
       render();
     });
     ui.viewVectors.addEventListener("click", () => {
       view = "vector";
+      if (tool === "brush") tool = "none";
       render();
     });
     ui.zoomIn.addEventListener("click", () => {
@@ -1343,17 +2378,43 @@
       zoom = zoom === 4 ? 2 : 1;
       render();
     });
+    ui.toolDrag.addEventListener("click", () => {
+      chooseTool("drag", "\u0E25\u0E32\u0E01\u0E08\u0E38\u0E14 \u0E2B\u0E23\u0E37\u0E2D\u0E43\u0E0A\u0E49\u0E1B\u0E38\u0E48\u0E21\u0E25\u0E39\u0E01\u0E28\u0E23\u0E40\u0E21\u0E37\u0E48\u0E2D\u0E08\u0E38\u0E14\u0E16\u0E39\u0E01\u0E40\u0E25\u0E37\u0E2D\u0E01");
+    });
+    ui.toolErase.addEventListener("click", () => {
+      chooseTool("erase", "\u0E41\u0E15\u0E30\u0E0A\u0E34\u0E49\u0E19\u0E17\u0E35\u0E48\u0E15\u0E49\u0E2D\u0E07\u0E01\u0E32\u0E23\u0E25\u0E1A");
+    });
+    ui.toolBrush.addEventListener("click", () => {
+      chooseTool("brush", "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E2A\u0E35\u0E08\u0E32\u0E01\u0E41\u0E16\u0E1A \u0E41\u0E25\u0E49\u0E27\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E1A\u0E19\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25");
+    });
+    ui.brushCanvas.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || brushColor === null) return;
+      ui.brushCanvas.setPointerCapture(event.pointerId);
+      paintEvent(event);
+    });
+    ui.brushCanvas.addEventListener("pointermove", (event) => {
+      if (!ui.brushCanvas.hasPointerCapture(event.pointerId)) return;
+      paintEvent(event);
+    });
     window.addEventListener("beforeunload", () => {
-      if (state.kind === "preview") cleanJob(state.job);
+      if ((state.kind === "preview" || state.kind === "applying") && state.job !== null) cleanJob(state.job);
       if (state.kind === "tracing") {
         state.job.cancelled = true;
         state.child.kill();
         cleanJob(state.job);
       }
     });
-    cleanStaleJobs();
-    render();
-    void refresh();
+    syncOutputs();
+    if (host !== null) {
+      cleanStaleJobs();
+      render();
+      void refresh();
+    } else if (new URLSearchParams(window.location.search).get("fixture") === "1") {
+      loadFixture();
+    } else {
+      render();
+      message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
+    }
   }
   start();
 })();

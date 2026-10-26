@@ -7,7 +7,20 @@ export type TraceRequest = {
   readonly smoothness: number;
   readonly removeBackground: boolean;
   readonly stacking: Stacking;
+  readonly palette?: readonly string[];
 };
+
+export function presetDefaults(preset: TracePreset): {
+  readonly maxColors: number;
+  readonly smoothness: number;
+  readonly corner: number;
+  readonly removeBackground: boolean;
+  readonly stacking: Stacking;
+} {
+  if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
+  if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
+  return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
+}
 
 export function simplifyTolerance(smoothness: number): number {
   const clamped = Math.min(3, Math.max(0, smoothness));
@@ -29,8 +42,11 @@ export function vtracerArguments(input: string, output: string, request: TraceRe
     simplifyTolerance(request.smoothness).toFixed(2)
   ];
   if (request.maxColors > 0) args.push("--max-colors", String(request.maxColors));
+  if (request.palette !== undefined && request.palette.length > 0 && request.palette.length <= 32) {
+    args.push("--palette", request.palette.join(","));
+  }
   if (request.preset === "photo") {
-    args.push("--preset", "photo", "--color-precision", "6");
+    args.push("--preset", "photo", "--color-precision", "8", "--filter-speckle", "1");
   } else if (request.preset === "icon") {
     args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "2");
   } else {

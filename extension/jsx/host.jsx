@@ -54,6 +54,42 @@ function VP_documentIdentity(documentRef) {
   return "unsaved:" + documentRef.name;
 }
 
+function VP_hiddenOrLocked(item) {
+  var node = item;
+  var guard = 0;
+  while (node && guard < 30) {
+    guard++;
+    if (node.typename === "Document" || node.typename === "Application") break;
+    try {
+      if (node.hidden === true || node.locked === true) return true;
+    } catch (ignored) {}
+    try { node = node.parent; } catch (ignoredParent) { break; }
+  }
+  return false;
+}
+
+function VP_list() {
+  try {
+    if (app.documents.length === 0) throw new Error("เปิดเอกสาร Illustrator ก่อน");
+    var doc = app.activeDocument;
+    var values = [doc.name, VP_documentIdentity(doc), "0"];
+    var found = 0;
+    for (var i = 0; i < doc.pageItems.length && found < 12; i++) {
+      var item = doc.pageItems[i];
+      if (!item || (item.typename !== "PlacedItem" && item.typename !== "RasterItem")) continue;
+      if (VP_hiddenOrLocked(item)) continue;
+      var b = item.geometricBounds;
+      if (Number(b[2]) <= Number(b[0]) || Number(b[1]) <= Number(b[3])) continue;
+      values.push(item.uuid, item.name || "ภาพที่เลือก", item.typename, item.typename === "RasterItem" && item.embedded ? "1" : "0", b[0], b[1], b[2], b[3]);
+      found++;
+    }
+    values[2] = String(found);
+    return VP_ok(values);
+  } catch (error) {
+    return VP_error(error);
+  }
+}
+
 function VP_snapshot() {
   try {
     if (app.documents.length === 0) throw new Error("เปิดเอกสาร Illustrator ก่อน");
@@ -68,26 +104,33 @@ function VP_snapshot() {
   }
 }
 
-function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity) {
+function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity, encodedBatch) {
   var temporary = null;
   var sourceDocument = null;
+  var source = null;
+  var selectedBeforeCopy = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
     var outputPath = decodeURIComponent(encodedPath);
     var documentIdentity = decodeURIComponent(encodedDocumentIdentity);
+    var batch = typeof encodedBatch === "string" && decodeURIComponent(encodedBatch) === "1";
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
     sourceDocument = app.activeDocument;
     if (VP_documentIdentity(sourceDocument) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
-    var resolved = VP_selectionSource(sourceDocument);
-    if (resolved.source.uuid !== uuid) throw new Error("ภาพที่เลือกเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
-    var source = resolved.source;
+    if (batch) {
+      source = VP_image(sourceDocument, uuid);
+    } else {
+      var resolved = VP_selectionSource(sourceDocument);
+      if (resolved.source.uuid !== uuid) throw new Error("ภาพที่เลือกเปลี่ยนไป กรุณากดตรวจภาพอีกครั้ง");
+      source = resolved.source;
+    }
     var bounds = source.geometricBounds;
     var width = Number(bounds[2]) - Number(bounds[0]);
     var height = Number(bounds[1]) - Number(bounds[3]);
     if (width <= 0 || height <= 0) throw new Error("ขนาดภาพไม่ถูกต้อง");
 
-    var selectedBeforeCopy = sourceDocument.selection[0];
-    selectedBeforeCopy.selected = false;
+    try { selectedBeforeCopy = sourceDocument.selection[0]; } catch (ignoredSelection) {}
+    if (selectedBeforeCopy) selectedBeforeCopy.selected = false;
     source.selected = true;
     app.copy();
     temporary = app.documents.add(sourceDocument.documentColorSpace, Math.max(10, width), Math.max(10, height));

@@ -1,6 +1,8 @@
 import * as zlib from "zlib";
 
-const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+function pngSignature(): Buffer {
+  return Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+}
 
 const CRC_TABLE = new Uint32Array(256);
 for (let index = 0; index < 256; index += 1) {
@@ -59,7 +61,7 @@ export function encodeRgbaPng(width: number, height: number, rgba: Uint8Array): 
   header[8] = 8;
   header[9] = 6;
   return Buffer.concat([
-    PNG_SIGNATURE,
+    pngSignature(),
     chunk("IHDR", header),
     chunk("IDAT", zlib.deflateSync(raw)),
     chunk("IEND", Buffer.alloc(0))
@@ -67,7 +69,7 @@ export function encodeRgbaPng(width: number, height: number, rgba: Uint8Array): 
 }
 
 export function readRgbaPng(png: Buffer): { readonly width: number; readonly height: number; readonly rgba: Uint8Array } | null {
-  if (png.length < 8 || !png.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
+  if (png.length < 8 || !png.subarray(0, 8).equals(pngSignature())) return null;
   let width = 0;
   let height = 0;
   let bitDepth = 0;

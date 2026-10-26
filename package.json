@@ -5,7 +5,7 @@
   "description": "CEP vector tracing panel for Adobe Illustrator",
   "scripts": {
     "build": "tsc -p tsconfig.json && esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js",
-    "test": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test src/score.test.ts src/trace.test.ts src/png-alpha.test.ts",
+    "test": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test src/score.test.ts src/trace.test.ts src/png-alpha.test.ts src/edit.test.ts",
     "watch": "esbuild src/panel.ts --bundle --platform=node --format=iife --target=chrome99 --outfile=extension/js/panel.js --watch"
   },
   "devDependencies": {
