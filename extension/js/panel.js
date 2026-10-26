@@ -43,7 +43,7 @@
   }
   function fairTolerance(smoothness) {
     const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
-    return Math.round((0.2 + clamped * 0.55) * 100) / 100;
+    return Math.round((0.4 + clamped * 2.2) * 100) / 100;
   }
   function fairPaths(svg, options) {
     const tolerance = fairTolerance(options.smoothness);
@@ -199,10 +199,126 @@
     return { value, start: open + 1, end: open + 1 + value.length };
   }
   function fairSubpath(subpath, tolerance, minTurn) {
-    if (subpath.cubics.length === 0) return subpath;
-    const starts = protectedStarts(subpath.cubics, subpath.closed, minTurn);
-    const chains = subpath.closed && starts.length < 2 ? quarterChains(subpath.cubics) : openChains(subpath.cubics, starts, subpath.closed);
-    return { cubics: chains.flatMap((chain) => fitChain(chain, tolerance)), closed: subpath.closed };
+    if (subpath.cubics.length < 2) return subpath;
+    const points = outlinePoints(subpath);
+    const locked = new Set(protectedStarts(subpath.cubics, subpath.closed, minTurn));
+    if (!subpath.closed) {
+      locked.add(0);
+      locked.add(points.length - 1);
+    }
+    const kept = subpath.closed ? simplifyClosed(points, tolerance, locked) : simplifyOpen(points, tolerance, locked);
+    const cubics = [];
+    for (let index = 0; index < kept.length; index += 1) {
+      const from = kept[index] ?? 0;
+      const to = kept[subpath.closed ? (index + 1) % kept.length : index + 1];
+      if (to === void 0) continue;
+      const chain = cubicsBetween(subpath.cubics, from, to, subpath.closed);
+      const start2 = points[from];
+      const end = points[to];
+      if (chain.length > 1 && start2 !== void 0 && end !== void 0) cubics.push(straightCubic(start2, end));
+      else cubics.push(...fitChain(chain, tolerance));
+    }
+    return { cubics: cubics.length > 0 ? cubics : subpath.cubics, closed: subpath.closed };
+  }
+  function outlinePoints(subpath) {
+    const points = subpath.cubics.map((cubic) => cubic.p0);
+    const last = subpath.cubics[subpath.cubics.length - 1]?.p3;
+    const first = points[0];
+    if (last !== void 0 && (first === void 0 || !subpath.closed || distance(first, last) >= 0.05)) points.push(last);
+    return points;
+  }
+  function simplifyOpen(points, epsilon, locked) {
+    const seeds = uniqueSorted([0, points.length - 1, ...locked]);
+    const keep = new Set(seeds);
+    for (let index = 0; index < seeds.length - 1; index += 1) keepFar(points, seeds[index] ?? 0, seeds[index + 1] ?? 0, epsilon, keep);
+    return uniqueSorted(keep);
+  }
+  function simplifyClosed(points, epsilon, locked) {
+    let seeds = uniqueSorted(locked);
+    if (seeds.length === 0) seeds = diameterIndices(points);
+    else if (seeds.length === 1) seeds = uniqueSorted([seeds[0] ?? 0, farthestIndex(points, seeds[0] ?? 0)]);
+    const keep = new Set(seeds);
+    for (let index = 0; index < seeds.length; index += 1) {
+      keepFar(points, seeds[index] ?? 0, seeds[(index + 1) % seeds.length] ?? 0, epsilon, keep);
+    }
+    return uniqueSorted(keep);
+  }
+  function keepFar(points, from, to, epsilon, keep) {
+    const chain = indexSpan(from, to, points.length);
+    if (chain.length < 3) return;
+    const start2 = points[from];
+    const end = points[to];
+    if (start2 === void 0 || end === void 0) return;
+    let worst = 0;
+    let at = -1;
+    for (let index = 1; index < chain.length - 1; index += 1) {
+      const pointIndex = chain[index] ?? 0;
+      const point = points[pointIndex];
+      if (point === void 0) continue;
+      const gap = distanceToSegment(point, start2, end);
+      if (gap > worst) {
+        worst = gap;
+        at = pointIndex;
+      }
+    }
+    if (at < 0 || worst <= epsilon) return;
+    keep.add(at);
+    keepFar(points, from, at, epsilon, keep);
+    keepFar(points, at, to, epsilon, keep);
+  }
+  function indexSpan(from, to, count) {
+    const span = [from];
+    if (count <= 0) return span;
+    let cursor = from;
+    while (cursor !== to && span.length <= count) {
+      cursor = (cursor + 1) % count;
+      span.push(cursor);
+    }
+    return span;
+  }
+  function diameterIndices(points) {
+    let best = 0;
+    let left = 0;
+    let right = points.length > 1 ? 1 : 0;
+    for (let start2 = 0; start2 < points.length; start2 += 1) {
+      const origin = points[start2];
+      if (origin === void 0) continue;
+      for (let index = start2 + 1; index < points.length; index += 1) {
+        const point = points[index];
+        if (point === void 0) continue;
+        const gap = distance(origin, point);
+        if (gap > best) {
+          best = gap;
+          left = start2;
+          right = index;
+        }
+      }
+    }
+    return uniqueSorted([left, right]);
+  }
+  function farthestIndex(points, origin) {
+    const start2 = points[origin];
+    if (start2 === void 0) return origin;
+    let best = 0;
+    let at = origin;
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      if (point === void 0) continue;
+      const gap = distance(start2, point);
+      if (gap > best) {
+        best = gap;
+        at = index;
+      }
+    }
+    return at;
+  }
+  function uniqueSorted(values) {
+    return Array.from(new Set(values)).filter((value) => Number.isInteger(value) && value >= 0).sort((left, right) => left - right);
+  }
+  function cubicsBetween(cubics, from, to, closed) {
+    if (!closed) return cubics.slice(from, to);
+    if (to > from) return cubics.slice(from, to);
+    return cubics.slice(from).concat(cubics.slice(0, to));
   }
   function protectedStarts(cubics, closed, minTurn) {
     const stairs = stairRunIndices(cubics.map((_, index) => {
@@ -264,7 +380,7 @@
     return skip;
   }
   function isStairJoint(previous, next) {
-    if (chord(previous) > 8 || chord(next) > 8) return false;
+    if (chord(previous) > 24 || chord(next) > 24) return false;
     const turn = turnDegrees(incoming(previous), outgoing(next));
     return turn >= 60 && turn <= 120;
   }
@@ -281,43 +397,6 @@
     const longer = Math.max(chord(previous), chord(next));
     if (!(longer > 3)) return false;
     return turnDegrees(incoming(previous), outgoing(next)) >= minTurn;
-  }
-  function openChains(cubics, starts, closed) {
-    if (closed) {
-      const chains2 = [];
-      for (let index = 0; index < starts.length; index += 1) {
-        const from = starts[index] ?? 0;
-        const to = starts[(index + 1) % starts.length] ?? from;
-        const chain = sliceWrap(cubics, from, to);
-        if (chain.length > 0) chains2.push(chain);
-      }
-      return chains2.length > 0 ? chains2 : [cubics.slice()];
-    }
-    const cuts = [0, ...starts.filter((start2) => start2 > 0 && start2 < cubics.length), cubics.length];
-    const unique = Array.from(new Set(cuts)).sort((left, right) => left - right);
-    const chains = [];
-    for (let index = 0; index < unique.length - 1; index += 1) {
-      const from = unique[index] ?? 0;
-      const to = unique[index + 1] ?? from;
-      if (to > from) chains.push(cubics.slice(from, to));
-    }
-    return chains.length > 0 ? chains : [cubics.slice()];
-  }
-  function quarterChains(cubics) {
-    const count = cubics.length;
-    if (count < 4) return [cubics.slice()];
-    const cuts = [0, Math.floor(count / 4), Math.floor(count / 2), Math.floor(count * 3 / 4), count];
-    const chains = [];
-    for (let index = 0; index < cuts.length - 1; index += 1) {
-      const from = cuts[index] ?? 0;
-      const to = cuts[index + 1] ?? from;
-      if (to > from) chains.push(cubics.slice(from, to));
-    }
-    return chains;
-  }
-  function sliceWrap(cubics, from, to) {
-    if (to > from) return cubics.slice(from, to);
-    return cubics.slice(from).concat(cubics.slice(0, to));
   }
   function fitChain(chain, tolerance) {
     if (chain.length <= 1) return chain.slice();
@@ -2848,16 +2927,64 @@
       message(tool === "none" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : note);
       render();
     }
+    let fairTimer = 0;
+    let retraceTimer = 0;
+    let retraceQueued = false;
+    function scheduleFair() {
+      window.clearTimeout(fairTimer);
+      fairTimer = window.setTimeout(() => refair(), 40);
+    }
+    function scheduleRetrace() {
+      window.clearTimeout(retraceTimer);
+      retraceTimer = window.setTimeout(() => {
+        void retraceFromCapture();
+      }, 400);
+    }
     function refair() {
       if (state.kind !== "preview" || fittedSvg === null) return;
       if (edited) {
         message("\u0E41\u0E01\u0E49\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E1B\u0E23\u0E31\u0E1A\u0E21\u0E38\u0E21\u0E17\u0E31\u0E1A \u0E08\u0E19\u0E01\u0E27\u0E48\u0E32\u0E08\u0E30\u0E41\u0E1B\u0E25\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
         return;
       }
+      const before = state.facts.anchors;
       const settings = readSettings(ui);
       const next = styledSvg(fittedSvg, settings);
       if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
       commitSvg(next);
+      if (state.kind === "preview" && state.facts.anchors !== before) {
+        message("\u0E1B\u0E23\u0E31\u0E1A\u0E40\u0E2A\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E08\u0E38\u0E14 " + String(before) + " \u2192 " + String(state.facts.anchors));
+      }
+    }
+    async function retraceFromCapture() {
+      if (state.kind === "tracing" || state.kind === "capturing" || state.kind === "applying" || batching) {
+        retraceQueued = true;
+        return;
+      }
+      if (state.kind !== "preview" || state.job === null || !fs.existsSync(state.job.pngPath)) return;
+      retraceQueued = false;
+      const previous = state;
+      const current = previous.job;
+      if (current === null) return;
+      const job = {
+        id: current.id,
+        directory: current.directory,
+        pngPath: current.pngPath,
+        svgPath: current.svgPath,
+        settings: readSettings(ui),
+        cancelled: false
+      };
+      try {
+        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E43\u0E2B\u0E21\u0E48\u0E15\u0E32\u0E21\u0E41\u0E16\u0E1A\u2026");
+        await vectorize(previous.selection, job);
+      } catch (error) {
+        state = previous;
+        message(errorMessage(error), true);
+        render();
+      }
+      if (retraceQueued) {
+        retraceQueued = false;
+        void retraceFromCapture();
+      }
     }
     function loadFixture() {
       const radians = 15 * Math.PI / 180;
@@ -2938,14 +3065,20 @@
       state.child.kill();
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
     });
-    ui.colors.addEventListener("input", syncOutputs);
+    ui.colors.addEventListener("input", () => {
+      syncOutputs();
+      scheduleRetrace();
+    });
+    ui.backdrop.addEventListener("change", () => {
+      scheduleRetrace();
+    });
     ui.smooth.addEventListener("input", () => {
       syncOutputs();
-      refair();
+      scheduleFair();
     });
     ui.corner.addEventListener("input", () => {
       syncOutputs();
-      refair();
+      scheduleFair();
     });
     ui.preset.addEventListener("change", () => {
       const preset = ui.preset.value;

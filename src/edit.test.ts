@@ -12,9 +12,9 @@ function cubicCount(svg: string): number {
 }
 
 test("fairing tolerance grows as the curve slider asks for smoother lines", () => {
-  assert.equal(fairTolerance(0), 0.2);
-  assert.equal(fairTolerance(2.4), 1.52);
-  assert.equal(fairTolerance(3), 1.85);
+  assert.equal(fairTolerance(0), 0.4);
+  assert.equal(fairTolerance(2.4), 5.68);
+  assert.equal(fairTolerance(3), 7);
 });
 
 test("pixel stairs collapse and a long square keeps its corners", () => {
@@ -60,6 +60,13 @@ test("pixel stairs collapse and a long square keeps its corners", () => {
 
   const rough = fairPaths('<svg><path d="' + brief + '"/></svg>', { smoothness: 0, cornerDegrees: 35 });
   assert.ok(cubicCount(rough) >= 6);
+
+  let wide = "M0,0";
+  for (let step = 0; step < 40; step += 1) wide += " H" + String(step + 1) + " V" + String(step % 2 === 0 ? 1 : 0);
+  const jagged = listAnchors(fairPaths('<svg><path d="' + wide + '"/></svg>', { smoothness: 0, cornerDegrees: 90 }));
+  const smoothed = listAnchors(fairPaths('<svg><path d="' + wide + '"/></svg>', { smoothness: 2.4, cornerDegrees: 90 }));
+  assert.ok(jagged.length > 30);
+  assert.ok(smoothed.length <= 4);
 });
 
 test("a shallow kink is kept only when the corner slider is high", () => {
@@ -80,11 +87,9 @@ test("a wide curve stays curved and unsupported commands stay untouched", () => 
     steps.push("L" + (40 * Math.cos(angle)).toFixed(3) + "," + (40 * Math.sin(angle)).toFixed(3));
   }
   const faired = fairPaths('<svg><path d="' + steps.join(" ") + '"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
-  assert.ok(cubicCount(faired) >= 2);
-  assert.ok(cubicCount(faired) <= 6);
-  const arcAnchors = listAnchors(faired);
-  const mid = arcAnchors[Math.floor(arcAnchors.length / 2)];
-  assert.ok(mid !== undefined && mid.y > 20);
+  assert.ok(cubicCount(faired) >= 1);
+  assert.ok(cubicCount(faired) <= 8);
+  assert.ok(listAnchors(faired).some((anchor) => anchor.y > 30));
   const arc = '<svg><path d="M0,0 A10,10 0 0 1 10,10"/></svg>';
   assert.equal(fairPaths(arc, { smoothness: 3, cornerDegrees: 0 }), arc);
   const circle = '<svg><circle cx="4" cy="4" r="3"/></svg>';

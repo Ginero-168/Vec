@@ -33,7 +33,7 @@ function shapePattern(): RegExp {
 
 export function fairTolerance(smoothness: number): number {
   const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
-  return Math.round((0.2 + clamped * 0.55) * 100) / 100;
+  return Math.round((0.4 + clamped * 2.2) * 100) / 100;
 }
 
 export function fairPaths(svg: string, options: { readonly smoothness: number; readonly cornerDegrees: number }): string {
@@ -202,10 +202,135 @@ function readD(tag: string): { readonly value: string; readonly start: number; r
 }
 
 function fairSubpath(subpath: Subpath, tolerance: number, minTurn: number): Subpath {
-  if (subpath.cubics.length === 0) return subpath;
-  const starts = protectedStarts(subpath.cubics, subpath.closed, minTurn);
-  const chains = subpath.closed && starts.length < 2 ? quarterChains(subpath.cubics) : openChains(subpath.cubics, starts, subpath.closed);
-  return { cubics: chains.flatMap((chain) => fitChain(chain, tolerance)), closed: subpath.closed };
+  if (subpath.cubics.length < 2) return subpath;
+  const points = outlinePoints(subpath);
+  const locked = new Set(protectedStarts(subpath.cubics, subpath.closed, minTurn));
+  if (!subpath.closed) {
+    locked.add(0);
+    locked.add(points.length - 1);
+  }
+  const kept = subpath.closed ? simplifyClosed(points, tolerance, locked) : simplifyOpen(points, tolerance, locked);
+  const cubics: Cubic[] = [];
+  for (let index = 0; index < kept.length; index += 1) {
+    const from = kept[index] ?? 0;
+    const to = kept[subpath.closed ? (index + 1) % kept.length : index + 1];
+    if (to === undefined) continue;
+    const chain = cubicsBetween(subpath.cubics, from, to, subpath.closed);
+    const start = points[from];
+    const end = points[to];
+    if (chain.length > 1 && start !== undefined && end !== undefined) cubics.push(straightCubic(start, end));
+    else cubics.push(...fitChain(chain, tolerance));
+  }
+  return { cubics: cubics.length > 0 ? cubics : subpath.cubics, closed: subpath.closed };
+}
+
+function outlinePoints(subpath: Subpath): Point[] {
+  const points = subpath.cubics.map((cubic) => cubic.p0);
+  const last = subpath.cubics[subpath.cubics.length - 1]?.p3;
+  const first = points[0];
+  if (last !== undefined && (first === undefined || !subpath.closed || distance(first, last) >= 0.05)) points.push(last);
+  return points;
+}
+
+function simplifyOpen(points: readonly Point[], epsilon: number, locked: ReadonlySet<number>): number[] {
+  const seeds = uniqueSorted([0, points.length - 1, ...locked]);
+  const keep = new Set<number>(seeds);
+  for (let index = 0; index < seeds.length - 1; index += 1) keepFar(points, seeds[index] ?? 0, seeds[index + 1] ?? 0, epsilon, keep);
+  return uniqueSorted(keep);
+}
+
+function simplifyClosed(points: readonly Point[], epsilon: number, locked: ReadonlySet<number>): number[] {
+  let seeds = uniqueSorted(locked);
+  if (seeds.length === 0) seeds = diameterIndices(points);
+  else if (seeds.length === 1) seeds = uniqueSorted([seeds[0] ?? 0, farthestIndex(points, seeds[0] ?? 0)]);
+  const keep = new Set<number>(seeds);
+  for (let index = 0; index < seeds.length; index += 1) {
+    keepFar(points, seeds[index] ?? 0, seeds[(index + 1) % seeds.length] ?? 0, epsilon, keep);
+  }
+  return uniqueSorted(keep);
+}
+
+function keepFar(points: readonly Point[], from: number, to: number, epsilon: number, keep: Set<number>): void {
+  const chain = indexSpan(from, to, points.length);
+  if (chain.length < 3) return;
+  const start = points[from];
+  const end = points[to];
+  if (start === undefined || end === undefined) return;
+  let worst = 0;
+  let at = -1;
+  for (let index = 1; index < chain.length - 1; index += 1) {
+    const pointIndex = chain[index] ?? 0;
+    const point = points[pointIndex];
+    if (point === undefined) continue;
+    const gap = distanceToSegment(point, start, end);
+    if (gap > worst) {
+      worst = gap;
+      at = pointIndex;
+    }
+  }
+  if (at < 0 || worst <= epsilon) return;
+  keep.add(at);
+  keepFar(points, from, at, epsilon, keep);
+  keepFar(points, at, to, epsilon, keep);
+}
+
+function indexSpan(from: number, to: number, count: number): number[] {
+  const span = [from];
+  if (count <= 0) return span;
+  let cursor = from;
+  while (cursor !== to && span.length <= count) {
+    cursor = (cursor + 1) % count;
+    span.push(cursor);
+  }
+  return span;
+}
+
+function diameterIndices(points: readonly Point[]): number[] {
+  let best = 0;
+  let left = 0;
+  let right = points.length > 1 ? 1 : 0;
+  for (let start = 0; start < points.length; start += 1) {
+    const origin = points[start];
+    if (origin === undefined) continue;
+    for (let index = start + 1; index < points.length; index += 1) {
+      const point = points[index];
+      if (point === undefined) continue;
+      const gap = distance(origin, point);
+      if (gap > best) {
+        best = gap;
+        left = start;
+        right = index;
+      }
+    }
+  }
+  return uniqueSorted([left, right]);
+}
+
+function farthestIndex(points: readonly Point[], origin: number): number {
+  const start = points[origin];
+  if (start === undefined) return origin;
+  let best = 0;
+  let at = origin;
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    if (point === undefined) continue;
+    const gap = distance(start, point);
+    if (gap > best) {
+      best = gap;
+      at = index;
+    }
+  }
+  return at;
+}
+
+function uniqueSorted(values: Iterable<number>): number[] {
+  return Array.from(new Set(values)).filter((value) => Number.isInteger(value) && value >= 0).sort((left, right) => left - right);
+}
+
+function cubicsBetween(cubics: readonly Cubic[], from: number, to: number, closed: boolean): Cubic[] {
+  if (!closed) return cubics.slice(from, to);
+  if (to > from) return cubics.slice(from, to);
+  return cubics.slice(from).concat(cubics.slice(0, to));
 }
 
 function protectedStarts(cubics: readonly Cubic[], closed: boolean, minTurn: number): number[] {
@@ -270,7 +395,7 @@ function stairRunIndices(flags: readonly boolean[], closed: boolean): Set<number
 }
 
 function isStairJoint(previous: Cubic, next: Cubic): boolean {
-  if (chord(previous) > 8 || chord(next) > 8) return false;
+  if (chord(previous) > 24 || chord(next) > 24) return false;
   const turn = turnDegrees(incoming(previous), outgoing(next));
   return turn >= 60 && turn <= 120;
 }
@@ -289,46 +414,6 @@ function isCorner(previous: Cubic, next: Cubic, minTurn: number): boolean {
   const longer = Math.max(chord(previous), chord(next));
   if (!(longer > 3)) return false;
   return turnDegrees(incoming(previous), outgoing(next)) >= minTurn;
-}
-
-function openChains(cubics: readonly Cubic[], starts: readonly number[], closed: boolean): Cubic[][] {
-  if (closed) {
-    const chains: Cubic[][] = [];
-    for (let index = 0; index < starts.length; index += 1) {
-      const from = starts[index] ?? 0;
-      const to = starts[(index + 1) % starts.length] ?? from;
-      const chain = sliceWrap(cubics, from, to);
-      if (chain.length > 0) chains.push(chain);
-    }
-    return chains.length > 0 ? chains : [cubics.slice()];
-  }
-  const cuts = [0, ...starts.filter((start) => start > 0 && start < cubics.length), cubics.length];
-  const unique = Array.from(new Set(cuts)).sort((left, right) => left - right);
-  const chains: Cubic[][] = [];
-  for (let index = 0; index < unique.length - 1; index += 1) {
-    const from = unique[index] ?? 0;
-    const to = unique[index + 1] ?? from;
-    if (to > from) chains.push(cubics.slice(from, to));
-  }
-  return chains.length > 0 ? chains : [cubics.slice()];
-}
-
-function quarterChains(cubics: readonly Cubic[]): Cubic[][] {
-  const count = cubics.length;
-  if (count < 4) return [cubics.slice()];
-  const cuts = [0, Math.floor(count / 4), Math.floor(count / 2), Math.floor((count * 3) / 4), count];
-  const chains: Cubic[][] = [];
-  for (let index = 0; index < cuts.length - 1; index += 1) {
-    const from = cuts[index] ?? 0;
-    const to = cuts[index + 1] ?? from;
-    if (to > from) chains.push(cubics.slice(from, to));
-  }
-  return chains;
-}
-
-function sliceWrap(cubics: readonly Cubic[], from: number, to: number): Cubic[] {
-  if (to > from) return cubics.slice(from, to);
-  return cubics.slice(from).concat(cubics.slice(0, to));
 }
 
 function fitChain(chain: readonly Cubic[], tolerance: number): Cubic[] {

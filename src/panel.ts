@@ -920,16 +920,66 @@ function start(): void {
     render();
   }
 
+  let fairTimer = 0;
+  let retraceTimer = 0;
+  let retraceQueued = false;
+
+  function scheduleFair(): void {
+    window.clearTimeout(fairTimer);
+    fairTimer = window.setTimeout(() => refair(), 40);
+  }
+
+  function scheduleRetrace(): void {
+    window.clearTimeout(retraceTimer);
+    retraceTimer = window.setTimeout(() => { void retraceFromCapture(); }, 400);
+  }
+
   function refair(): void {
     if (state.kind !== "preview" || fittedSvg === null) return;
     if (edited) {
       message("แก้ชิ้นแล้ว จึงไม่ปรับมุมทับ จนกว่าจะแปลงใหม่", true);
       return;
     }
+    const before = state.facts.anchors;
     const settings = readSettings(ui);
     const next = styledSvg(fittedSvg, settings);
     if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
     commitSvg(next);
+    if (state.kind === "preview" && state.facts.anchors !== before) {
+      message("ปรับเส้นแล้ว · จุด " + String(before) + " → " + String(state.facts.anchors));
+    }
+  }
+
+  async function retraceFromCapture(): Promise<void> {
+    if (state.kind === "tracing" || state.kind === "capturing" || state.kind === "applying" || batching) {
+      retraceQueued = true;
+      return;
+    }
+    if (state.kind !== "preview" || state.job === null || !fs.existsSync(state.job.pngPath)) return;
+    retraceQueued = false;
+    const previous = state;
+    const current = previous.job;
+    if (current === null) return;
+    const job: Job = {
+      id: current.id,
+      directory: current.directory,
+      pngPath: current.pngPath,
+      svgPath: current.svgPath,
+      settings: readSettings(ui),
+      cancelled: false
+    };
+    try {
+      message("กำลังจัดสีใหม่ตามแถบ…");
+      await vectorize(previous.selection, job);
+    } catch (error) {
+      state = previous;
+      message(errorMessage(error), true);
+      render();
+    }
+    if (retraceQueued) {
+      retraceQueued = false;
+      void retraceFromCapture();
+    }
   }
 
   function loadFixture(): void {
@@ -1002,14 +1052,20 @@ function start(): void {
     state.child.kill();
     message("กำลังยกเลิก…");
   });
-  ui.colors.addEventListener("input", syncOutputs);
+  ui.colors.addEventListener("input", () => {
+    syncOutputs();
+    scheduleRetrace();
+  });
+  ui.backdrop.addEventListener("change", () => {
+    scheduleRetrace();
+  });
   ui.smooth.addEventListener("input", () => {
     syncOutputs();
-    refair();
+    scheduleFair();
   });
   ui.corner.addEventListener("input", () => {
     syncOutputs();
-    refair();
+    scheduleFair();
   });
   ui.preset.addEventListener("change", () => {
     const preset = ui.preset.value;
