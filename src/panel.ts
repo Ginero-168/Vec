@@ -28,7 +28,7 @@ type Selection = {
   readonly documentName: string;
   readonly documentIdentity: string;
   readonly itemName: string;
-  readonly itemType: "PlacedItem" | "RasterItem";
+  readonly itemType: string;
   readonly uuid: string;
   readonly bounds: readonly [number, number, number, number];
   readonly widthPt: number;
@@ -224,8 +224,8 @@ function parseFiniteNumber(raw: string | undefined, label: string): number {
 
 function parseSelection(parts: string[]): Selection {
   if (parts.length !== 11) throw new Error("ข้อมูลภาพที่เลือกไม่ครบ");
-  const itemType = parts[3];
-  if (itemType !== "PlacedItem" && itemType !== "RasterItem") throw new Error("รองรับภาพ raster ที่เลือกหนึ่งภาพ");
+  const itemType = parts[3] ?? "";
+  if (itemType === "") throw new Error("ข้อมูลภาพที่เลือกไม่ครบ");
   const uuid = parts[4];
   if (!uuid) throw new Error("ภาพที่เลือกไม่มี Illustrator UUID");
   const left = parseFiniteNumber(parts[5], "left");
@@ -395,13 +395,14 @@ function showFacts(ui: Ui, facts: TraceFacts | null): void {
 function showSelection(ui: Ui, selection: Selection | null): void {
   ui.selection.replaceChildren();
   if (selection === null) {
-    ui.selection.textContent = "เลือกภาพ raster หนึ่งภาพบน artboard";
+    ui.selection.textContent = "เลือกภาพหรือกลุ่มบน artboard";
     return;
   }
   const title = document.createElement("strong");
   title.textContent = selection.itemName || selection.itemType;
   const detail = document.createElement("small");
-  detail.textContent = selection.documentName + " · " + (selection.embedded ? "embedded" : "linked") + " · " + Math.round(selection.widthPt) + " × " + Math.round(selection.heightPt) + " pt";
+  const kind = selection.itemType === "GroupItem" ? "กลุ่ม" : selection.itemType === "PlacedItem" ? "linked" : selection.embedded ? "embedded" : "raster";
+  detail.textContent = selection.documentName + " · " + kind + " · " + Math.round(selection.widthPt) + " × " + Math.round(selection.heightPt) + " pt";
   if (selection.fromResult) detail.textContent += " · แปลงซ้ำเป็นเวอร์ชันใหม่";
   ui.selection.append(title, detail);
 }
