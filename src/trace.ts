@@ -8,6 +8,11 @@ export type TraceRequest = {
   readonly removeBackground: boolean;
   readonly stacking: Stacking;
   readonly palette?: readonly string[];
+  readonly colorPrecision?: number;
+  readonly filterSpeckle?: number;
+  readonly clustering?: "watershed" | "off";
+  readonly watershedDetail?: number;
+  readonly simplify?: number;
 };
 
 export function presetDefaults(preset: TracePreset): {
@@ -29,7 +34,12 @@ export function simplifyTolerance(smoothness: number): number {
   return Math.round(Math.max(0.15, tolerance) * 100) / 100;
 }
 
+function clampInt(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
 export function vtracerArguments(input: string, output: string, request: TraceRequest): string[] {
+  const simplify = request.simplify ?? simplifyTolerance(request.smoothness);
   const args = [
     input,
     output,
@@ -40,20 +50,16 @@ export function vtracerArguments(input: string, output: string, request: TraceRe
     "--hierarchical",
     request.stacking,
     "--simplify",
-    simplifyTolerance(request.smoothness).toFixed(2)
+    Math.min(2.2, Math.max(0.15, simplify)).toFixed(2)
   ];
-  if (request.maxColors > 0) args.push("--max-colors", String(request.maxColors));
+  if (request.maxColors > 0) args.push("--max-colors", String(Math.round(request.maxColors)));
   if (request.palette !== undefined && request.palette.length > 0 && request.palette.length <= 32) {
     args.push("--palette", request.palette.join(","));
   }
-  if (request.preset === "photo") {
-    args.push("--preset", "photo", "--clustering", "watershed", "--watershed-detail", "128", "--color-precision", "8", "--filter-speckle", "1");
-  } else if (request.preset === "poster") {
-    args.push("--preset", "poster", "--color-precision", "4", "--filter-speckle", "0");
-  } else if (request.preset === "icon") {
-    args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "0");
-  } else {
-    args.push("--preset", "poster", "--color-precision", "6", "--filter-speckle", "0");
-  }
+  const precision = request.colorPrecision ?? (request.preset === "photo" ? 8 : request.preset === "poster" ? 4 : request.preset === "icon" ? 5 : 6);
+  const speckle = request.filterSpeckle ?? (request.preset === "photo" ? 1 : 0);
+  args.push("--preset", request.preset === "photo" ? "photo" : "poster", "--color-precision", String(clampInt(precision, 1, 8)), "--filter-speckle", String(clampInt(speckle, 0, 128)));
+  const watershed = request.clustering === "watershed" || (request.clustering === undefined && request.preset === "photo");
+  if (watershed) args.push("--clustering", "watershed", "--watershed-detail", String(clampInt(request.watershedDetail ?? 128, 1, 512)));
   return args;
 }

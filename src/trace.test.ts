@@ -71,4 +71,20 @@ test("every preset fits splines and the icon preset is not forced to polygons", 
   });
   assert.equal(auto.includes("--max-colors"), false);
   assert.equal(auto[auto.indexOf("--simplify") + 1], "0.40");
+
+  const tuned = vtracerArguments("in.png", "out.svg", {
+    preset: "photo",
+    maxColors: 12,
+    smoothness: 2,
+    removeBackground: false,
+    stacking: "stacked",
+    colorPrecision: 3,
+    filterSpeckle: 4,
+    clustering: "off",
+    simplify: 1.25
+  });
+  assert.equal(tuned[tuned.indexOf("--color-precision") + 1], "3");
+  assert.equal(tuned[tuned.indexOf("--filter-speckle") + 1], "4");
+  assert.equal(tuned[tuned.indexOf("--simplify") + 1], "1.25");
+  assert.equal(tuned.includes("--clustering"), false);
 });

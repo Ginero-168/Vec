@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vector Panel · ทีละขั้น</title>
+    <link rel="stylesheet" href="lab.css" />
+  </head>
+  <body>
+    <header class="top">
+      <p class="eyebrow">Vector Panel</p>
+      <h1>ดูทีละขั้นจากภาพนี้</h1>
+      <p>ภาพแถบไอคอนนี้เป็นต้นฉบับ ค่าเริ่มต้นเป็นโหมดไอคอน เลื่อนค่าของขั้นที่เลือก แล้วผลของขั้นนั้นกับขั้นถัดไปเปลี่ยนตามทันที</p>
+    </header>
+
+    <ol class="film">
+      <li>
+        <button type="button" data-step="capture" aria-pressed="true">
+          <canvas id="thumb-capture" width="658" height="168" aria-hidden="true"></canvas>
+          <span>1 ต้นฉบับ</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="colors" aria-pressed="false">
+          <canvas id="thumb-colors" width="658" height="168" aria-hidden="true"></canvas>
+          <span>2 จัดกลุ่มสี</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="backdrop" aria-pressed="false">
+          <canvas id="thumb-backdrop" width="658" height="168" aria-hidden="true"></canvas>
+          <span>3 ลบพื้นหลัง</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="punch" aria-pressed="false">
+          <canvas id="thumb-punch" width="658" height="168" aria-hidden="true"></canvas>
+          <span>4 ตัดขอบโปร่ง</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="trace" aria-pressed="false">
+          <img id="thumb-trace" alt="" width="658" height="168" />
+          <span>5 ลากเส้น</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="fit" aria-pressed="false">
+          <img id="thumb-fit" alt="" width="658" height="168" />
+          <span>6 จับรูป</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="fair" aria-pressed="false">
+          <img id="thumb-fair" alt="" width="658" height="168" />
+          <span>7 เกลาเส้น</span>
+        </button>
+      </li>
+      <li>
+        <button type="button" data-step="seal" aria-pressed="false">
+          <img id="thumb-seal" alt="" width="658" height="168" />
+          <span>8 ปิดช่อง</span>
+        </button>
+      </li>
+    </ol>
+
+    <div class="workspace">
+      <section class="stage" aria-labelledby="stage-title">
+        <div class="stage-bar">
+          <h2 id="stage-title">1 · ต้นฉบับ</h2>
+          <label class="check" for="pixels"><input id="pixels" type="checkbox" checked /> ขยายพิกเซล</label>
+        </div>
+        <div class="frame pixelated" id="frame">
+          <img id="source-photo" src="fixture.png" alt="แถบไอคอนบน Dock ใช้เป็นต้นฉบับ" width="658" height="168" fetchpriority="high" />
+          <canvas id="stage-raster" hidden></canvas>
+          <div id="stage-vector" hidden></div>
+        </div>
+        <p id="explain">กำลังอ่านภาพต้นฉบับ</p>
+        <dl class="metrics">
+          <div><dt>สี</dt><dd id="metric-colors">–</dd></div>
+          <div><dt>จุด</dt><dd id="metric-anchors">–</dd></div>
+          <div><dt>ใช้เวลา</dt><dd id="metric-time">–</dd></div>
+        </dl>
+        <ul id="chips" class="chips" aria-label="สีที่เห็นในขั้นนี้"></ul>
+        <p id="status" class="status" role="status">กำลังเปิดภาพ</p>
+      </section>
+
+      <aside class="controls">
+        <label for="mode">ลักษณะภาพ</label>
+        <select id="mode">
+          <option value="logo">โลโก้ / สีแบน</option>
+          <option value="icon" selected>ไอคอน / ขอบคม</option>
+          <option value="photo">ภาพหลายสี</option>
+          <option value="poster">โปสเตอร์ขาวดำ</option>
+        </select>
+        <p class="hint">เปลี่ยนโหมดแล้วทุกขั้นกลับไปใช้ค่าของโหมดนั้น</p>
+        <button id="reset" class="text-button" type="button">กลับค่าของโหมดนี้</button>
+
+        <form id="controls">
+          <fieldset id="fields-capture">
+            <legend>ต้นฉบับ</legend>
+            <p>ขั้นนี้คือภาพที่ส่งเข้ามา ไม่มีค่าให้ปรับ เลือกขั้นจัดกลุ่มสีเพื่อเริ่มยุบสี</p>
+          </fieldset>
+
+          <fieldset id="fields-colors" hidden>
+            <legend>จัดกลุ่มสี</legend>
+            <div class="field-row">
+              <label for="max-colors">เพดานจำนวนสี</label>
+              <output id="max-colors-value" for="max-colors">8</output>
+            </div>
+            <input id="max-colors" type="range" min="2" max="32" step="1" value="8" />
+            <p class="hint">ตัวจัดสีรับได้ไม่เกิน 32 สี ยิ่งต่ำ สีที่ใกล้กันยิ่งกลายเป็นสีเดียวกัน</p>
+            <label class="check" for="snap"><input id="snap" type="checkbox" checked /> ยุบสีที่อยู่ระหว่างสองสี</label>
+            <div class="field-row">
+              <label for="speck">ขนาดจุดฝุ่นที่ยุบ</label>
+              <output id="speck-value" for="speck">12</output>
+            </div>
+            <input id="speck" type="range" min="0" max="80" step="1" value="12" />
+            <p class="hint">ก้อนที่เล็กกว่าค่านี้ถูกเทเข้าสีข้างเคียง เส้นบางยังถูกเก็บไว้</p>
+          </fieldset>
+
+          <fieldset id="fields-backdrop" hidden>
+            <legend>ลบพื้นหลัง</legend>
+            <label class="check" for="backdrop"><input id="backdrop" type="checkbox" checked /> ลบพื้นหลัง</label>
+            <div class="field-row">
+              <label for="spread">เกณฑ์ความแบนของขอบ</label>
+              <output id="spread-value" for="spread">22</output>
+            </div>
+            <input id="spread" type="range" min="0" max="80" step="1" value="22" />
+            <p id="spread-now" class="hint">กำลังวัดขอบภาพ</p>
+          </fieldset>
+
+          <fieldset id="fields-punch" hidden>
+            <legend>ตัดขอบโปร่ง</legend>
+            <div class="field-row">
+              <label for="opaque">ความทึบที่ถือว่าทึบ</label>
+              <output id="opaque-value" for="opaque">200</output>
+            </div>
+            <input id="opaque" type="range" min="0" max="255" step="1" value="200" />
+            <p class="hint">พิกเซลที่จางกว่าค่านี้ถูกตัดออก โลโก้และไอคอนใช้ 200 ภาพถ่ายใช้ 128</p>
+          </fieldset>
+
+          <fieldset id="fields-trace" hidden>
+            <legend>ลากเส้น</legend>
+            <label class="check" for="lock"><input id="lock" type="checkbox" checked /> ล็อกสีจากขั้นจัดกลุ่ม</label>
+            <div class="field-row">
+              <label for="trace-colors">จำนวนสีตอนลากเส้น</label>
+              <output id="trace-colors-value" for="trace-colors">8</output>
+            </div>
+            <input id="trace-colors" type="range" min="2" max="48" step="1" value="8" />
+            <p class="hint">ใช้เมื่อปลดล็อกสี แล้วให้ VTracer ยุบสีอีกชั้น</p>
+            <div class="field-row">
+              <label for="precision">ความละเอียดสี</label>
+              <output id="precision-value" for="precision">5</output>
+            </div>
+            <input id="precision" type="range" min="1" max="8" step="1" value="5" />
+            <div class="field-row">
+              <label for="speckle">จุดเล็กสุดที่เก็บ</label>
+              <output id="speckle-value" for="speckle">0</output>
+            </div>
+            <input id="speckle" type="range" min="0" max="32" step="1" value="0" />
+            <div class="field-row">
+              <label for="simplify">ความคลาดเคลื่อนของเส้น</label>
+              <output id="simplify-value" for="simplify">0.70</output>
+            </div>
+            <input id="simplify" type="range" min="0.15" max="2.2" step="0.05" value="0.7" />
+            <label for="clustering">การแยกโซน</label>
+            <select id="clustering">
+              <option value="off" selected>จัดกลุ่มสี</option>
+              <option value="watershed">watershed</option>
+            </select>
+            <div class="field-row">
+              <label for="watershed">รายละเอียด watershed</label>
+              <output id="watershed-value" for="watershed">128</output>
+            </div>
+            <input id="watershed" type="range" min="16" max="256" step="1" value="128" />
+            <label for="stacking">การวางรูป</label>
+            <select id="stacking">
+              <option value="cutout" selected>ตัดชน</option>
+              <option value="stacked">ซ้อนชั้น</option>
+            </select>
+            <p class="hint">ขั้นนี้รอ VTracer สั้นๆ ก่อนเส้นใหม่มาแทน</p>
+          </fieldset>
+
+          <fieldset id="fields-fit" hidden>
+            <legend>ทิ้งแผ่นและจับรูป</legend>
+            <label class="check" for="drop-plate"><input id="drop-plate" type="checkbox" checked /> ทิ้งแผ่นสีที่คลุมทั้งเฟรม</label>
+            <label class="check" for="fit"><input id="fit" type="checkbox" checked /> จับวงกลม สี่เหลี่ยม และสี่เหลี่ยมมน</label>
+          </fieldset>
+
+          <fieldset id="fields-fair" hidden>
+            <legend>เกลาเส้น</legend>
+            <div class="field-row">
+              <label for="smooth">ความเรียบ</label>
+              <output id="smooth-value" for="smooth">2.0</output>
+            </div>
+            <input id="smooth" type="range" min="0" max="3" step="0.1" value="2" />
+            <p id="smooth-hint" class="hint">ระยะยอมของเส้น</p>
+            <div class="field-row">
+              <label for="corner">คมของมุม</label>
+              <output id="corner-value" for="corner">55°</output>
+            </div>
+            <input id="corner" type="range" min="0" max="90" step="1" value="55" />
+            <p id="corner-hint" class="hint">มุมที่ถูกล็อก</p>
+          </fieldset>
+
+          <fieldset id="fields-seal" hidden>
+            <legend>ปิดช่อง</legend>
+            <label class="check" for="seal"><input id="seal" type="checkbox" checked /> ถมรอยระหว่างชิ้น</label>
+            <div class="field-row">
+              <label for="seal-width">ความหนาของรอยที่ถม</label>
+              <output id="seal-width-value" for="seal-width">2.0</output>
+            </div>
+            <input id="seal-width" type="range" min="0.8" max="4" step="0.1" value="2" />
+            <p class="hint">โหมดตัดชนใช้ 2px โหมดซ้อนใช้ 0.8px แล้วจัดเส้นสีเดียวกันเข้ากลุ่ม</p>
+          </fieldset>
+        </form>
+      </aside>
+    </div>
+    <script src="lab.js"></script>
+  </body>
+</html>

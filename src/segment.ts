@@ -4,6 +4,16 @@ export type SegmentOptions = {
   readonly mode: TracePreset;
   readonly maxColors: number;
   readonly removeBackground: boolean;
+  readonly snapBlends?: boolean;
+  readonly speckArea?: number;
+  readonly backdropSpread?: number;
+};
+
+export type SegmentViews = {
+  readonly colors: Uint8Array;
+  readonly backdrop: Uint8Array;
+  readonly spread: number;
+  readonly paletteSize: number;
 };
 
 type RGB = { r: number; g: number; b: number };
@@ -12,24 +22,44 @@ const MODE_CAP: Readonly<Record<TracePreset, number>> = { logo: 8, icon: 8, phot
 const SPECK_AREA: Readonly<Record<TracePreset, number>> = { logo: 18, icon: 12, photo: 6, poster: 28 };
 
 export function segmentRaster(rgba: Uint8Array, width: number, height: number, options: SegmentOptions): Uint8Array {
+  return segmentViews(rgba, width, height, options).backdrop;
+}
+
+export function segmentViews(rgba: Uint8Array, width: number, height: number, options: SegmentOptions): SegmentViews {
   const count = width * height;
-  if (width < 2 || height < 2 || rgba.length < count * 4) return rgba.slice();
+  if (width < 2 || height < 2 || rgba.length < count * 4) {
+    const copy = rgba.slice();
+    return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
+  }
   const source = options.mode === "poster" ? grayscale(rgba, count) : rgba;
   const samples = collectSamples(source, width, height);
   const centroids = cluster(samples, colorCap(options));
-  const snapBlends = options.mode === "logo" || options.mode === "icon";
+  const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
   const palette = snapBlends ? foldBlends(centroids) : centroids;
   const labels = new Int16Array(count);
-  for (let index = 0; index < count; index += 1) {
-    labels[index] = nearest(pixelAt(source, index), palette);
-  }
+  for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source, index), palette);
   cleanupEdges(labels, width, height);
-  mergeSpecks(labels, width, height, SPECK_AREA[options.mode]);
-  const alpha = new Uint8Array(count);
-  alpha.fill(255);
-  if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha);
-  const next = new Uint8Array(count * 4);
-  for (let index = 0; index < count; index += 1) {
+  mergeSpecks(labels, width, height, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
+  const opaque = new Uint8Array(count);
+  opaque.fill(255);
+  const colors = paintLabels(labels, palette, opaque);
+  const alpha = opaque.slice();
+  if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha, options.backdropSpread ?? 22);
+  return {
+    colors,
+    backdrop: paintLabels(labels, palette, alpha),
+    spread: borderMeasure(source, width, height)?.spread ?? 0,
+    paletteSize: palette.length
+  };
+}
+
+export function borderSpread(rgba: Uint8Array, width: number, height: number): number {
+  return borderMeasure(rgba, width, height)?.spread ?? 0;
+}
+
+function paintLabels(labels: Int16Array, palette: readonly RGB[], alpha: Uint8Array): Uint8Array {
+  const next = new Uint8Array(alpha.length * 4);
+  for (let index = 0; index < alpha.length; index += 1) {
     const offset = index * 4;
     if ((alpha[index] ?? 0) === 0) continue;
     const color = palette[labels[index] ?? 0] ?? { r: 0, g: 0, b: 0 };
@@ -276,7 +306,7 @@ function mergeSpecks(labels: Int16Array, width: number, height: number, minArea:
   }
 }
 
-function clearFlatBackdrop(rgba: Uint8Array, labels: Int16Array, width: number, height: number, palette: readonly RGB[], alpha: Uint8Array): void {
+function borderMeasure(rgba: Uint8Array, width: number, height: number): { readonly mean: RGB; readonly spread: number } | null {
   let red = 0;
   let green = 0;
   let blue = 0;
@@ -296,7 +326,7 @@ function clearFlatBackdrop(rgba: Uint8Array, labels: Int16Array, width: number, 
     visit(0, y);
     if (width > 1) visit(width - 1, y);
   }
-  if (border === 0) return;
+  if (border === 0) return null;
   const mean = { r: red / border, g: green / border, b: blue / border };
   let spread = 0;
   const revisit = (x: number, y: number): void => {
@@ -310,7 +340,13 @@ function clearFlatBackdrop(rgba: Uint8Array, labels: Int16Array, width: number, 
     revisit(0, y);
     if (width > 1) revisit(width - 1, y);
   }
-  if (spread / border > 22) return;
+  return { mean, spread: spread / border };
+}
+
+function clearFlatBackdrop(rgba: Uint8Array, labels: Int16Array, width: number, height: number, palette: readonly RGB[], alpha: Uint8Array, spreadLimit: number): void {
+  const measured = borderMeasure(rgba, width, height);
+  if (measured === null || measured.spread > spreadLimit) return;
+  const mean = measured.mean;
   const backdrop = nearest(mean, palette);
   const count = width * height;
   const queue = new Int32Array(count);

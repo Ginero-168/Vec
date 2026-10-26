@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { segmentRaster } from "./segment.ts";
+import { borderSpread, segmentRaster } from "./segment.ts";
 
 function fill(width: number, height: number, paint: (x: number, y: number) => readonly [number, number, number, number]): Uint8Array {
   const rgba = new Uint8Array(width * height * 4);
@@ -64,6 +64,38 @@ test("a full-bleed gradient is not treated as a flat backdrop", () => {
   let opaque = 0;
   for (let index = 3; index < segmented.length; index += 4) if ((segmented[index] ?? 0) === 255) opaque += 1;
   assert.ok(opaque > 32 * 32 * 0.9);
+});
+
+test("a flat border reports almost no spread and a split border reports a wide one", () => {
+  const flat = fill(24, 24, () => [70, 140, 220, 255]);
+  const split = fill(24, 24, (x) => (x < 12 ? [20, 20, 20, 255] : [230, 230, 230, 255]));
+  assert.ok(borderSpread(flat, 24, 24) < 1);
+  assert.ok(borderSpread(split, 24, 24) > 22);
+});
+
+test("a wider backdrop gate removes a border the default gate keeps", () => {
+  const rgba = fill(36, 36, (x, y) => {
+    const inside = x >= 8 && x < 28 && y >= 8 && y < 28;
+    if (inside) return [214, 54, 62, 255];
+    return x % 2 === 0 ? [20, 40, 80, 255] : [48, 68, 108, 255];
+  });
+  const kept = segmentRaster(rgba, 36, 36, { mode: "logo", maxColors: 4, removeBackground: true, backdropSpread: 22 });
+  const cleared = segmentRaster(rgba, 36, 36, { mode: "logo", maxColors: 4, removeBackground: true, backdropSpread: 40 });
+  assert.equal(kept[3], 255);
+  assert.equal(cleared[3], 0);
+});
+
+test("speck area decides whether a small block survives", () => {
+  const rgba = fill(40, 24, (x, y) => (x >= 10 && x < 16 && y >= 8 && y < 14 ? [0, 0, 0, 255] : [255, 255, 255, 255]));
+  const merged = segmentRaster(rgba, 40, 24, { mode: "logo", maxColors: 4, removeBackground: false, speckArea: 80 });
+  const kept = segmentRaster(rgba, 40, 24, { mode: "logo", maxColors: 4, removeBackground: false, speckArea: 1 });
+  const dark = (pixels: Uint8Array): number => {
+    let count = 0;
+    for (let index = 0; index < pixels.length; index += 4) if ((pixels[index] ?? 255) < 40) count += 1;
+    return count;
+  };
+  assert.equal(dark(merged), 0);
+  assert.ok(dark(kept) >= 4);
 });
 
 test("poster mode keeps gray tones and a thin line survives", () => {

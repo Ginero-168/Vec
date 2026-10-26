@@ -875,6 +875,49 @@
 
   // src/png-alpha.ts
   var zlib = __toESM(__require("zlib"));
+
+  // src/punch-rgba.ts
+  function punchRgba(rgba, width, height, opaqueAt = 128) {
+    const count = width * height;
+    if (rgba.length < count * 4) return { rgba, droppedColor: null };
+    const cutoff = Math.min(255, Math.max(0, opaqueAt));
+    const used = /* @__PURE__ */ new Set();
+    let transparent = 0;
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * 4;
+      const alpha = rgba[offset + 3] ?? 255;
+      if (alpha < cutoff) {
+        transparent += 1;
+        continue;
+      }
+      used.add((rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0));
+    }
+    if (transparent === 0) return { rgba, droppedColor: null };
+    const sentinel = unusedColor(used);
+    const next = new Uint8Array(count * 4);
+    next.set(rgba.subarray(0, count * 4));
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * 4;
+      if ((next[offset + 3] ?? 255) < cutoff) {
+        next[offset] = sentinel >> 16 & 255;
+        next[offset + 1] = sentinel >> 8 & 255;
+        next[offset + 2] = sentinel & 255;
+      }
+      next[offset + 3] = 255;
+    }
+    return { rgba: next, droppedColor: hex(sentinel) };
+  }
+  function unusedColor(used) {
+    const candidates = [16711935, 65280, 16711850, 65535, 16776960];
+    for (const color of candidates) if (!used.has(color)) return color;
+    for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
+    return 16711935;
+  }
+  function hex(color) {
+    return "#" + color.toString(16).padStart(6, "0");
+  }
+
+  // src/png-alpha.ts
   function pngSignature() {
     return Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   }
@@ -885,35 +928,11 @@
     CRC_TABLE[index] = value;
   }
   function punchTransparency(png, opaqueAt = 128) {
-    const cutoff = Math.min(255, Math.max(0, opaqueAt));
     const image = readRgbaPng(png);
     if (image === null) return { png, droppedColor: null };
-    const used = /* @__PURE__ */ new Set();
-    let transparent = 0;
-    for (let index = 0; index < image.rgba.length; index += 4) {
-      const alpha = image.rgba[index + 3] ?? 255;
-      if (alpha < cutoff) {
-        transparent += 1;
-        continue;
-      }
-      const red = image.rgba[index] ?? 0;
-      const green = image.rgba[index + 1] ?? 0;
-      const blue = image.rgba[index + 2] ?? 0;
-      used.add(red << 16 | green << 8 | blue);
-    }
-    if (transparent === 0) return { png, droppedColor: null };
-    const sentinel = unusedColor(used);
-    const next = new Uint8Array(image.rgba);
-    for (let index = 0; index < next.length; index += 4) {
-      const alpha = next[index + 3] ?? 255;
-      if (alpha < cutoff) {
-        next[index] = sentinel >> 16 & 255;
-        next[index + 1] = sentinel >> 8 & 255;
-        next[index + 2] = sentinel & 255;
-      }
-      next[index + 3] = 255;
-    }
-    return { png: encodeRgbaPng(image.width, image.height, next), droppedColor: hex(sentinel) };
+    const punched = punchRgba(image.rgba, image.width, image.height, opaqueAt);
+    if (punched.droppedColor === null) return { png, droppedColor: null };
+    return { png: encodeRgbaPng(image.width, image.height, punched.rgba), droppedColor: punched.droppedColor };
   }
   function encodeRgbaPng(width, height, rgba) {
     const stride = width * 4;
@@ -1055,15 +1074,6 @@
     if (leftDistance <= upDistance && leftDistance <= diagonal) return left;
     if (upDistance <= diagonal) return up;
     return upLeft;
-  }
-  function unusedColor(used) {
-    const candidates = [16711935, 65280, 16711850, 65535, 16776960];
-    for (const color of candidates) if (!used.has(color)) return color;
-    for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
-    return 16711935;
-  }
-  function hex(color) {
-    return "#" + color.toString(16).padStart(6, "0");
   }
   function crc32(data) {
     let crc = 4294967295;
@@ -1770,24 +1780,38 @@
   var MODE_CAP = { logo: 8, icon: 8, photo: 32, poster: 10 };
   var SPECK_AREA = { logo: 18, icon: 12, photo: 6, poster: 28 };
   function segmentRaster(rgba, width, height, options) {
+    return segmentViews(rgba, width, height, options).backdrop;
+  }
+  function segmentViews(rgba, width, height, options) {
     const count = width * height;
-    if (width < 2 || height < 2 || rgba.length < count * 4) return rgba.slice();
+    if (width < 2 || height < 2 || rgba.length < count * 4) {
+      const copy = rgba.slice();
+      return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
+    }
     const source = options.mode === "poster" ? grayscale(rgba, count) : rgba;
     const samples = collectSamples(source, width, height);
     const centroids = cluster(samples, colorCap(options));
-    const snapBlends = options.mode === "logo" || options.mode === "icon";
+    const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
     const palette = snapBlends ? foldBlends(centroids) : centroids;
     const labels = new Int16Array(count);
-    for (let index = 0; index < count; index += 1) {
-      labels[index] = nearest(pixelAt(source, index), palette);
-    }
+    for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source, index), palette);
     cleanupEdges(labels, width, height);
-    mergeSpecks(labels, width, height, SPECK_AREA[options.mode]);
-    const alpha = new Uint8Array(count);
-    alpha.fill(255);
-    if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha);
-    const next = new Uint8Array(count * 4);
-    for (let index = 0; index < count; index += 1) {
+    mergeSpecks(labels, width, height, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
+    const opaque = new Uint8Array(count);
+    opaque.fill(255);
+    const colors = paintLabels(labels, palette, opaque);
+    const alpha = opaque.slice();
+    if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha, options.backdropSpread ?? 22);
+    return {
+      colors,
+      backdrop: paintLabels(labels, palette, alpha),
+      spread: borderMeasure(source, width, height)?.spread ?? 0,
+      paletteSize: palette.length
+    };
+  }
+  function paintLabels(labels, palette, alpha) {
+    const next = new Uint8Array(alpha.length * 4);
+    for (let index = 0; index < alpha.length; index += 1) {
       const offset = index * 4;
       if ((alpha[index] ?? 0) === 0) continue;
       const color = palette[labels[index] ?? 0] ?? { r: 0, g: 0, b: 0 };
@@ -2023,7 +2047,7 @@
       for (let cursor = 0; cursor < tail; cursor += 1) labels[queue[cursor] ?? 0] = replacement;
     }
   }
-  function clearFlatBackdrop(rgba, labels, width, height, palette, alpha) {
+  function borderMeasure(rgba, width, height) {
     let red = 0;
     let green = 0;
     let blue = 0;
@@ -2043,7 +2067,7 @@
       visit(0, y);
       if (width > 1) visit(width - 1, y);
     }
-    if (border === 0) return;
+    if (border === 0) return null;
     const mean = { r: red / border, g: green / border, b: blue / border };
     let spread = 0;
     const revisit = (x, y) => {
@@ -2057,7 +2081,12 @@
       revisit(0, y);
       if (width > 1) revisit(width - 1, y);
     }
-    if (spread / border > 22) return;
+    return { mean, spread: spread / border };
+  }
+  function clearFlatBackdrop(rgba, labels, width, height, palette, alpha, spreadLimit) {
+    const measured = borderMeasure(rgba, width, height);
+    if (measured === null || measured.spread > spreadLimit) return;
+    const mean = measured.mean;
     const backdrop = nearest(mean, palette);
     const count = width * height;
     const queue = new Int32Array(count);
@@ -2137,7 +2166,11 @@
     const tolerance = 2.2 - clamped * 0.75;
     return Math.round(Math.max(0.15, tolerance) * 100) / 100;
   }
+  function clampInt(value, min, max) {
+    return Math.min(max, Math.max(min, Math.round(value)));
+  }
   function vtracerArguments(input, output, request) {
+    const simplify = request.simplify ?? simplifyTolerance(request.smoothness);
     const args = [
       input,
       output,
@@ -2148,21 +2181,17 @@
       "--hierarchical",
       request.stacking,
       "--simplify",
-      simplifyTolerance(request.smoothness).toFixed(2)
+      Math.min(2.2, Math.max(0.15, simplify)).toFixed(2)
     ];
-    if (request.maxColors > 0) args.push("--max-colors", String(request.maxColors));
+    if (request.maxColors > 0) args.push("--max-colors", String(Math.round(request.maxColors)));
     if (request.palette !== void 0 && request.palette.length > 0 && request.palette.length <= 32) {
       args.push("--palette", request.palette.join(","));
     }
-    if (request.preset === "photo") {
-      args.push("--preset", "photo", "--clustering", "watershed", "--watershed-detail", "128", "--color-precision", "8", "--filter-speckle", "1");
-    } else if (request.preset === "poster") {
-      args.push("--preset", "poster", "--color-precision", "4", "--filter-speckle", "0");
-    } else if (request.preset === "icon") {
-      args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "0");
-    } else {
-      args.push("--preset", "poster", "--color-precision", "6", "--filter-speckle", "0");
-    }
+    const precision = request.colorPrecision ?? (request.preset === "photo" ? 8 : request.preset === "poster" ? 4 : request.preset === "icon" ? 5 : 6);
+    const speckle = request.filterSpeckle ?? (request.preset === "photo" ? 1 : 0);
+    args.push("--preset", request.preset === "photo" ? "photo" : "poster", "--color-precision", String(clampInt(precision, 1, 8)), "--filter-speckle", String(clampInt(speckle, 0, 128)));
+    const watershed = request.clustering === "watershed" || request.clustering === void 0 && request.preset === "photo";
+    if (watershed) args.push("--clustering", "watershed", "--watershed-detail", String(clampInt(request.watershedDetail ?? 128, 1, 512)));
     return args;
   }
 

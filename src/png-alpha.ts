@@ -1,4 +1,5 @@
 import * as zlib from "zlib";
+import { punchRgba } from "./punch-rgba.ts";
 
 function pngSignature(): Buffer {
   return Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -17,35 +18,11 @@ export type PunchedPng = {
 };
 
 export function punchTransparency(png: Buffer, opaqueAt = 128): PunchedPng {
-  const cutoff = Math.min(255, Math.max(0, opaqueAt));
   const image = readRgbaPng(png);
   if (image === null) return { png, droppedColor: null };
-  const used = new Set<number>();
-  let transparent = 0;
-  for (let index = 0; index < image.rgba.length; index += 4) {
-    const alpha = image.rgba[index + 3] ?? 255;
-    if (alpha < cutoff) {
-      transparent += 1;
-      continue;
-    }
-    const red = image.rgba[index] ?? 0;
-    const green = image.rgba[index + 1] ?? 0;
-    const blue = image.rgba[index + 2] ?? 0;
-    used.add((red << 16) | (green << 8) | blue);
-  }
-  if (transparent === 0) return { png, droppedColor: null };
-  const sentinel = unusedColor(used);
-  const next = new Uint8Array(image.rgba);
-  for (let index = 0; index < next.length; index += 4) {
-    const alpha = next[index + 3] ?? 255;
-    if (alpha < cutoff) {
-      next[index] = (sentinel >> 16) & 255;
-      next[index + 1] = (sentinel >> 8) & 255;
-      next[index + 2] = sentinel & 255;
-    }
-    next[index + 3] = 255;
-  }
-  return { png: encodeRgbaPng(image.width, image.height, next), droppedColor: hex(sentinel) };
+  const punched = punchRgba(image.rgba, image.width, image.height, opaqueAt);
+  if (punched.droppedColor === null) return { png, droppedColor: null };
+  return { png: encodeRgbaPng(image.width, image.height, punched.rgba), droppedColor: punched.droppedColor };
 }
 
 export function encodeRgbaPng(width: number, height: number, rgba: Uint8Array): Buffer {
@@ -193,17 +170,6 @@ function paeth(left: number, up: number, upLeft: number): number {
   if (leftDistance <= upDistance && leftDistance <= diagonal) return left;
   if (upDistance <= diagonal) return up;
   return upLeft;
-}
-
-function unusedColor(used: Set<number>): number {
-  const candidates = [0xff00ff, 0x00ff00, 0xff00aa, 0x00ffff, 0xffff00];
-  for (const color of candidates) if (!used.has(color)) return color;
-  for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
-  return 0xff00ff;
-}
-
-function hex(color: number): string {
-  return "#" + color.toString(16).padStart(6, "0");
 }
 
 function crc32(data: Buffer): number {

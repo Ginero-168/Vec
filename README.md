@@ -33,6 +33,14 @@ npm run build
 
 ขั้นตอนอ่านภาพจะคัดลอกภาพที่เลือกไปยังเอกสารชั่วคราวแล้วใช้ `Document.imageCapture()` ทำ PNG วิธีนี้เปลี่ยนเนื้อหา clipboard ของระบบและสร้างไฟล์ชั่วคราวในโฟลเดอร์ระบบ ซึ่ง Panel ลบเมื่อจบงาน
 
+## ห้องทดลองทีละขั้น
+
+```bash
+npm run lab
+```
+
+เปิด <http://127.0.0.1:4191> หน้านี้ใช้ภาพแถบไอคอนใน `fixtures/dock-icons.png` เป็นต้นฉบับ ให้เลื่อนค่าของแต่ละขั้นแล้วเห็นผลทันที ขั้นจัดสีอัปเดตในเบราว์เซอร์ ขั้นลากเส้นเรียก VTracer บนเครื่อง (macOS ใช้ `extension/bin/vtracer`)
+
 ## โครงสร้าง
 
 | Path | หน้าที่ |
@@ -40,6 +48,8 @@ npm run build
 | `extension/CSXS/manifest.xml` | ประกาศ CEP Panel สำหรับ Illustrator |
 | `extension/index.html`, `extension/style.css` | UI ใน Panel |
 | `src/panel.ts` | สถานะ UI, เรียก JSX, เรียก worker และ preview |
+| `lab/index.html` | ห้องทดลองทีละขั้น พร้อมแถบปรับค่า |
+| `fixtures/dock-icons.png` | ภาพต้นฉบับของห้องทดลอง |
 | `extension/jsx/host.jsx` | อ่าน selection/capture ภาพ/นำ SVG เข้าเอกสาร |
 | `extension/bin/vtracer` | VTracer CLI สำหรับ macOS arm64 |
 | `scripts/` | Build worker และติดตั้ง/ถอด link สำหรับพัฒนา |
