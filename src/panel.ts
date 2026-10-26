@@ -7,6 +7,7 @@ import * as path from "path";
 import { expandPrimitives, fairPaths, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape } from "./edit";
 import { readRgbaPng, encodeRgbaPng, punchTransparency } from "./png-alpha";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, holeNote, scoreSvg, sealGaps, shapeNote, type TraceFacts } from "./score";
+import { segmentRaster } from "./segment";
 import { presetDefaults, vtracerArguments, type Stacking, type TracePreset } from "./trace";
 
 interface CepBridge {
@@ -344,7 +345,7 @@ function runVtracer(binary: string, job: Job, inputPath: string, palette: readon
 
 function readSettings(ui: Ui): Settings {
   const preset = ui.preset.value;
-  if (preset !== "logo" && preset !== "icon" && preset !== "photo") throw new Error("Preset ไม่ถูกต้อง");
+  if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") throw new Error("Preset ไม่ถูกต้อง");
   const maxColors = Number(ui.colors.value);
   const smoothness = Number(ui.smooth.value) / 10;
   const corner = Number(ui.corner.value);
@@ -719,10 +720,16 @@ function start(): void {
     const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
     if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
     const sourcePng = fs.readFileSync(job.pngPath);
-    const punched = punchTransparency(sourcePng, job.settings.preset === "photo" ? 128 : 200);
+    const decodedSource = readRgbaPng(sourcePng);
+    const prepared = decodedSource === null ? sourcePng : encodeRgbaPng(decodedSource.width, decodedSource.height, segmentRaster(decodedSource.rgba, decodedSource.width, decodedSource.height, {
+      mode: job.settings.preset,
+      maxColors: job.settings.maxColors,
+      removeBackground: job.settings.removeBackground
+    }));
+    const punched = punchTransparency(prepared, job.settings.preset === "photo" || job.settings.preset === "poster" ? 128 : 200);
     const traceInput = path.join(job.directory, "trace.png");
     fs.writeFileSync(traceInput, punched.png);
-    message("กำลังสร้างเส้นเวกเตอร์…");
+    message("กำลังแยกโซนสี แล้วสร้างเส้นเวกเตอร์…");
     await runVtracer(binary, job, traceInput, palette, (child) => {
       state = { kind: "tracing", selection, job, child };
       render();
@@ -1005,7 +1012,7 @@ function start(): void {
   });
   ui.preset.addEventListener("change", () => {
     const preset = ui.preset.value;
-    if (preset !== "logo" && preset !== "icon" && preset !== "photo") return;
+    if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") return;
     const defaults = presetDefaults(preset);
     ui.colors.value = String(defaults.maxColors);
     ui.smooth.value = String(Math.round(defaults.smoothness * 10));

@@ -1,4 +1,4 @@
-export type TracePreset = "logo" | "icon" | "photo";
+export type TracePreset = "logo" | "icon" | "photo" | "poster";
 export type Stacking = "cutout" | "stacked";
 
 export type TraceRequest = {
@@ -18,6 +18,7 @@ export function presetDefaults(preset: TracePreset): {
   readonly stacking: Stacking;
 } {
   if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
+  if (preset === "poster") return { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" };
   if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
   return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
 }
@@ -47,10 +48,12 @@ export function vtracerArguments(input: string, output: string, request: TraceRe
   }
   if (request.preset === "photo") {
     args.push("--preset", "photo", "--clustering", "watershed", "--watershed-detail", "128", "--color-precision", "8", "--filter-speckle", "1");
+  } else if (request.preset === "poster") {
+    args.push("--preset", "poster", "--color-precision", "4", "--filter-speckle", "0");
   } else if (request.preset === "icon") {
-    args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "2");
+    args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "0");
   } else {
-    args.push("--preset", "poster", "--color-precision", "6", "--filter-speckle", "2");
+    args.push("--preset", "poster", "--color-precision", "6", "--filter-speckle", "0");
   }
   return args;
 }
