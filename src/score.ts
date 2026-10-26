@@ -135,13 +135,14 @@ export function fitShapes(svg: string): string {
   return result + svg.slice(cursor);
 }
 
-export function sealGaps(svg: string): string {
+export function sealGaps(svg: string, strokeWidth = 0.8): string {
+  const width = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;
   return svg.replace(/<(path|circle|ellipse|rect)\b([^>]*?)\s*(\/?)\s*>/gi, (full, name: string, attrs: string, slash: string) => {
     if (/\bstroke\s*=/i.test(attrs)) return full;
     const fill = fillOf(attrs);
     const paint = normalizeFill(fill);
     if (fill === null || paint === null) return full;
-    return "<" + name + attrs + ' stroke="' + fill.replace(/"/g, "") + '" stroke-width="0.8" stroke-linejoin="round"' + (slash === "/" ? "/" : "") + ">";
+    return "<" + name + attrs + ' stroke="' + fill.replace(/"/g, "") + '" stroke-width="' + String(width) + '" stroke-linejoin="round"' + (slash === "/" ? "/" : "") + ">";
   });
 }
 
@@ -277,7 +278,7 @@ function fitCircle(measured: MeasuredPath): { readonly cx: number; readonly cy: 
   if (!(radius > 1.5)) return null;
   let maxError = 0;
   for (const point of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point.x - cx, point.y - cy) - radius));
-  if (maxError > Math.max(0.75, radius * 0.02)) return null;
+  if (maxError > Math.max(1.25, radius * 0.04)) return null;
   const expected = Math.PI * radius * radius;
   if (Math.abs(measured.area - expected) / expected > 0.12) return null;
   return { cx, cy, r: radius };

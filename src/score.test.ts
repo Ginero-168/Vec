@@ -170,6 +170,7 @@ test("gap strokes use the shape fill and a punched color can be removed", () => 
   const sealed = sealGaps('<svg><circle cx="1" cy="2" r="3" fill="#abc"/></svg>');
   assert.match(sealed, /stroke="#abc"/);
   assert.match(sealed, /stroke-width="0.8"/);
+  assert.match(sealGaps('<svg><path d="M0,0 H2 V2 Z" fill="#abc"/></svg>', 2), /stroke-width="2"/);
   const svg = '<svg width="20" height="20"><rect x="0" y="0" width="20" height="20" fill="#ff00ff"/><circle cx="5" cy="5" r="2" fill="#111"/></svg>';
   const dropped = dropFill(svg, "#ff00ff");
   assert.equal(dropped.includes("#ff00ff"), false);

@@ -228,8 +228,9 @@ function protectedStarts(cubics: readonly Cubic[], closed: boolean, minTurn: num
 function stairRunIndices(flags: readonly boolean[], closed: boolean): Set<number> {
   const skip = new Set<number>();
   const count = flags.length;
+  const minimum = closed ? 5 : 3;
   const mark = (run: readonly number[]): void => {
-    if (run.length < 6) return;
+    if (run.length < minimum) return;
     for (const index of run) skip.add(index);
   };
   if (!closed) {
@@ -252,7 +253,7 @@ function stairRunIndices(flags: readonly boolean[], closed: boolean): Set<number
     }
   }
   if (gap < 0) {
-    if (count >= 6) for (let index = 0; index < count; index += 1) skip.add(index);
+    if (count >= 5) for (let index = 0; index < count; index += 1) skip.add(index);
     return skip;
   }
   let run: number[] = [];
@@ -275,7 +276,7 @@ function isStairJoint(previous: Cubic, next: Cubic): boolean {
 }
 
 function isStairChain(chain: readonly Cubic[]): boolean {
-  if (chain.length < 6) return false;
+  if (chain.length < 3) return false;
   for (let index = 1; index < chain.length; index += 1) {
     const previous = chain[index - 1];
     const next = chain[index];
@@ -332,7 +333,7 @@ function sliceWrap(cubics: readonly Cubic[], from: number, to: number): Cubic[] 
 
 function fitChain(chain: readonly Cubic[], tolerance: number): Cubic[] {
   if (chain.length <= 1) return chain.slice();
-  const limit = isStairChain(chain) ? Math.max(tolerance, 6) : tolerance;
+  const limit = isStairChain(chain) && tolerance >= 1 ? Math.max(tolerance, 6) : tolerance;
   const samples = sampleChain(chain);
   const first = samples[0];
   const last = samples[samples.length - 1];
@@ -348,13 +349,14 @@ function fitSamples(samples: readonly Point[], tolerance: number, tanStart: Poin
   if (first === undefined || last === undefined) return null;
   if (distance(first, last) < 0.05) return [];
   if (maxSegmentDistance(samples, first, last) <= tolerance) return [straightCubic(first, last)];
-  const cubic = cubicFromTangents(first, last, tanStart, tanEnd);
+  const cubic = fitCubic(samples, tanStart, tanEnd);
   const worst = farthest(samples, cubic);
   if (worst.distance <= tolerance) return [cubic];
-  if (depth >= 12 || worst.index <= 0 || worst.index >= samples.length - 1) return null;
-  const tangent = tangentAt(samples, worst.index);
-  const left = fitSamples(samples.slice(0, worst.index + 1), tolerance, tanStart, tangent, depth + 1);
-  const right = fitSamples(samples.slice(worst.index), tolerance, tangent, tanEnd, depth + 1);
+  const index = splitIndex(samples, worst.index);
+  if (depth >= 12 || index <= 0 || index >= samples.length - 1) return null;
+  const tangent = tangentAt(samples, index);
+  const left = fitSamples(samples.slice(0, index + 1), tolerance, tanStart, tangent, depth + 1);
+  const right = fitSamples(samples.slice(index), tolerance, tangent, tanEnd, depth + 1);
   if (left === null || right === null) return null;
   return [...left, ...right];
 }
@@ -366,6 +368,26 @@ function sampleChain(chain: readonly Cubic[]): Point[] {
     for (const t of [0.25, 0.5, 0.75, 1]) samples.push(bezier(cubic, t));
   });
   return samples;
+}
+
+function splitIndex(samples: readonly Point[], errorIndex: number): number {
+  const last = samples.length - 1;
+  if (errorIndex >= 3 && errorIndex <= last - 3) return errorIndex;
+  const first = samples[0];
+  const end = samples[last];
+  if (first === undefined || end === undefined) return Math.max(1, Math.floor(last / 2));
+  let bulge = 0;
+  let at = Math.max(1, Math.floor(last / 2));
+  for (let index = 2; index <= last - 2; index += 1) {
+    const point = samples[index];
+    if (point === undefined) continue;
+    const error = distanceToSegment(point, first, end);
+    if (error > bulge) {
+      bulge = error;
+      at = index;
+    }
+  }
+  return at;
 }
 
 function farthest(samples: readonly Point[], cubic: Cubic): { readonly distance: number; readonly index: number } {
@@ -419,6 +441,102 @@ function straightCubic(start: Point, end: Point): Cubic {
     p2: { x: start.x + (2 * (end.x - start.x)) / 3, y: start.y + (2 * (end.y - start.y)) / 3 },
     p3: end
   };
+}
+
+function fitCubic(samples: readonly Point[], tanStart: Point, tanEnd: Point): Cubic {
+  const start = samples[0];
+  const end = samples[samples.length - 1];
+  if (start === undefined || end === undefined) return straightCubic(start ?? { x: 0, y: 0 }, end ?? { x: 0, y: 0 });
+  const fallback = cubicFromTangents(start, end, tanStart, tanEnd);
+  const startDir = unit(tanStart);
+  const endDir = unit(tanEnd);
+  if (startDir === null || endDir === null || samples.length < 4) return fallback;
+  const parameters = chordParameters(samples);
+  const solved = solveCubic(samples, parameters, start, end, startDir, endDir);
+  const refined = solved === null ? null : solveCubic(samples, projectParameters(samples, solved), start, end, startDir, endDir);
+  let best = fallback;
+  for (const next of [solved, refined]) {
+    if (next !== null && cubicError(samples, next) < cubicError(samples, best)) best = next;
+  }
+  return best;
+}
+
+function cubicError(samples: readonly Point[], cubic: Cubic): number {
+  let worst = 0;
+  for (const sample of samples) worst = Math.max(worst, distanceToCubic(sample, cubic));
+  return worst;
+}
+
+function chordParameters(samples: readonly Point[]): number[] {
+  const lengths: number[] = [0];
+  let total = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const next = samples[index];
+    total += previous === undefined || next === undefined ? 0 : distance(previous, next);
+    lengths.push(total);
+  }
+  if (total < 1e-6) return samples.map((_, index) => (samples.length <= 1 ? 0 : index / (samples.length - 1)));
+  return lengths.map((length) => length / total);
+}
+
+function solveCubic(samples: readonly Point[], parameters: readonly number[], start: Point, end: Point, startDir: Point, endDir: Point): Cubic | null {
+  let c00 = 0;
+  let c01 = 0;
+  let c11 = 0;
+  let d0 = 0;
+  let d1 = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index];
+    const t = parameters[index] ?? 0;
+    if (sample === undefined) continue;
+    const u = 1 - t;
+    const b1 = 3 * u * u * t;
+    const b2 = 3 * u * t * t;
+    const baseX = (u * u * u + b1) * start.x + (b2 + t * t * t) * end.x;
+    const baseY = (u * u * u + b1) * start.y + (b2 + t * t * t) * end.y;
+    const ux = b1 * startDir.x;
+    const uy = b1 * startDir.y;
+    const vx = -b2 * endDir.x;
+    const vy = -b2 * endDir.y;
+    const rx = sample.x - baseX;
+    const ry = sample.y - baseY;
+    c00 += ux * ux + uy * uy;
+    c01 += ux * vx + uy * vy;
+    c11 += vx * vx + vy * vy;
+    d0 += ux * rx + uy * ry;
+    d1 += vx * rx + vy * ry;
+  }
+  const det = c00 * c11 - c01 * c01;
+  if (Math.abs(det) < 1e-8) return null;
+  const alpha = (d0 * c11 - c01 * d1) / det;
+  const beta = (c00 * d1 - c01 * d0) / det;
+  const limit = distance(start, end) * 3;
+  if (!(alpha > 0.05) || !(beta > 0.05) || alpha > limit || beta > limit) return null;
+  return {
+    p0: start,
+    p1: { x: start.x + startDir.x * alpha, y: start.y + startDir.y * alpha },
+    p2: { x: end.x - endDir.x * beta, y: end.y - endDir.y * beta },
+    p3: end
+  };
+}
+
+function projectParameters(samples: readonly Point[], cubic: Cubic): number[] {
+  return samples.map((sample, index) => {
+    if (index === 0) return 0;
+    if (index === samples.length - 1) return 1;
+    let bestT = index / (samples.length - 1);
+    let best = Infinity;
+    for (let step = 0; step <= 16; step += 1) {
+      const t = step / 16;
+      const error = distance(sample, bezier(cubic, t));
+      if (error < best) {
+        best = error;
+        bestT = t;
+      }
+    }
+    return bestT;
+  });
 }
 
 function cubicFromTangents(start: Point, end: Point, tanStart: Point, tanEnd: Point): Cubic {

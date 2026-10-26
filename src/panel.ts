@@ -316,7 +316,8 @@ function fittedSource(svg: string, droppedColor: string | null, settings: Settin
 }
 
 function styledSvg(fitted: string, settings: Settings): string {
-  return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner })));
+  const strokeWidth = settings.stacking === "cutout" ? 2 : 0.8;
+  return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), strokeWidth));
 }
 
 function runVtracer(binary: string, job: Job, inputPath: string, palette: readonly string[] | undefined, onStart: (child: ChildProcess) => void): Promise<void> {

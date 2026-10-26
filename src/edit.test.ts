@@ -45,6 +45,21 @@ test("pixel stairs collapse and a long square keeps its corners", () => {
   assert.deepEqual(listAnchors(small).map((anchor) => [anchor.x, anchor.y]), [[0, 0], [20, 0], [20, 20], [0, 20]]);
   const tiny = fairPaths('<svg><path d="M0,0 H6 V6 H0 Z" fill="#f00"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
   assert.deepEqual(listAnchors(tiny).map((anchor) => [anchor.x, anchor.y]), [[0, 0], [6, 0], [6, 6], [0, 6]]);
+
+  let brief = "M0,0";
+  for (let step = 0; step < 3; step += 1) brief += " H" + String((step + 1) * 5) + " V" + String((step + 1) * 5);
+  const briefFair = fairPaths('<svg><path d="' + brief + '"/></svg>', { smoothness: 2.4, cornerDegrees: 90 });
+  assert.ok(cubicCount(briefFair) <= 2);
+  const briefEnds = listAnchors(briefFair);
+  assert.equal(briefEnds[0]?.x, 0);
+  assert.equal(briefEnds[briefEnds.length - 1]?.y, 15);
+
+  const oneCorner = listAnchors(fairPaths('<svg><path d="M0,0 H10 V10"/></svg>', { smoothness: 2.4, cornerDegrees: 35 }));
+  assert.equal(oneCorner.length, 3);
+  assert.ok(Math.hypot((oneCorner[1]?.x ?? 0) - 10, oneCorner[1]?.y ?? 0) < 0.05);
+
+  const rough = fairPaths('<svg><path d="' + brief + '"/></svg>', { smoothness: 0, cornerDegrees: 35 });
+  assert.ok(cubicCount(rough) >= 6);
 });
 
 test("a shallow kink is kept only when the corner slider is high", () => {
@@ -65,8 +80,11 @@ test("a wide curve stays curved and unsupported commands stay untouched", () => 
     steps.push("L" + (40 * Math.cos(angle)).toFixed(3) + "," + (40 * Math.sin(angle)).toFixed(3));
   }
   const faired = fairPaths('<svg><path d="' + steps.join(" ") + '"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
-  assert.ok(cubicCount(faired) > 2);
-  assert.ok(cubicCount(faired) < 18);
+  assert.ok(cubicCount(faired) >= 2);
+  assert.ok(cubicCount(faired) <= 6);
+  const arcAnchors = listAnchors(faired);
+  const mid = arcAnchors[Math.floor(arcAnchors.length / 2)];
+  assert.ok(mid !== undefined && mid.y > 20);
   const arc = '<svg><path d="M0,0 A10,10 0 0 1 10,10"/></svg>';
   assert.equal(fairPaths(arc, { smoothness: 3, cornerDegrees: 0 }), arc);
   const circle = '<svg><circle cx="4" cy="4" r="3"/></svg>';
