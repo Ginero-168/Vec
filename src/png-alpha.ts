@@ -16,14 +16,15 @@ export type PunchedPng = {
   readonly droppedColor: string | null;
 };
 
-export function punchTransparency(png: Buffer): PunchedPng {
+export function punchTransparency(png: Buffer, opaqueAt = 128): PunchedPng {
+  const cutoff = Math.min(255, Math.max(0, opaqueAt));
   const image = readRgbaPng(png);
   if (image === null) return { png, droppedColor: null };
   const used = new Set<number>();
   let transparent = 0;
   for (let index = 0; index < image.rgba.length; index += 4) {
     const alpha = image.rgba[index + 3] ?? 255;
-    if (alpha < 128) {
+    if (alpha < cutoff) {
       transparent += 1;
       continue;
     }
@@ -37,7 +38,7 @@ export function punchTransparency(png: Buffer): PunchedPng {
   const next = new Uint8Array(image.rgba);
   for (let index = 0; index < next.length; index += 4) {
     const alpha = next[index + 3] ?? 255;
-    if (alpha < 128) {
+    if (alpha < cutoff) {
       next[index] = (sentinel >> 16) & 255;
       next[index + 1] = (sentinel >> 8) & 255;
       next[index + 2] = sentinel & 255;

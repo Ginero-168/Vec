@@ -7,6 +7,7 @@ export type TraceFacts = {
   readonly circles: number;
   readonly ellipses: number;
   readonly rects: number;
+  readonly roundRects: number;
 };
 
 type Point = { readonly x: number; readonly y: number };
@@ -35,7 +36,9 @@ export function shapeNote(facts: TraceFacts): string | null {
   const parts: string[] = [];
   if (facts.circles > 0) parts.push("วงกลม " + String(facts.circles));
   if (facts.ellipses > 0) parts.push("วงรี " + String(facts.ellipses));
-  if (facts.rects > 0) parts.push("สี่เหลี่ยม " + String(facts.rects));
+  const sharpRects = Math.max(0, facts.rects - facts.roundRects);
+  if (sharpRects > 0) parts.push("สี่เหลี่ยม " + String(sharpRects));
+  if (facts.roundRects > 0) parts.push("สี่เหลี่ยมมุมมน " + String(facts.roundRects));
   return parts.length === 0 ? null : parts.join(" · ");
 }
 
@@ -48,6 +51,7 @@ export function scoreSvg(svg: string): TraceFacts {
   let circles = 0;
   let ellipses = 0;
   let rects = 0;
+  let roundRects = 0;
   for (const tag of pathTags(svg)) {
     const name = elementName(tag.source);
     const attrs = tagAttrs(tag.source);
@@ -68,9 +72,14 @@ export function scoreSvg(svg: string): TraceFacts {
     rememberFill(fill, seen, palette);
     if (name === "circle") circles += 1;
     else if (name === "ellipse") ellipses += 1;
-    else if (name === "rect") rects += 1;
+    else if (name === "rect") {
+      rects += 1;
+      const rx = Number(readAttr(attrs, "rx") ?? "0");
+      const ry = Number(readAttr(attrs, "ry") ?? "0");
+      if ((Number.isFinite(rx) && rx > 0.5) || (Number.isFinite(ry) && ry > 0.5)) roundRects += 1;
+    }
   }
-  return { paths, anchors, holes, colors: palette.length, palette, circles, ellipses, rects };
+  return { paths, anchors, holes, colors: palette.length, palette, circles, ellipses, rects, roundRects };
 }
 
 function rememberFill(fill: string | null, seen: Set<string>, palette: string[]): void {
@@ -147,6 +156,8 @@ function fittedMarkup(tag: PathTag): string | null {
   const fillAttr = fill === null ? "" : ' fill="' + fill.replace(/"/g, "") + '"';
   const rect = fitRect(measured);
   if (rect !== null) return '<rect x="' + fmt(rect.x) + '" y="' + fmt(rect.y) + '" width="' + fmt(rect.width) + '" height="' + fmt(rect.height) + '"' + fillAttr + "/>";
+  const round = fitRoundRect(measured);
+  if (round !== null) return '<rect x="' + fmt(round.x) + '" y="' + fmt(round.y) + '" width="' + fmt(round.width) + '" height="' + fmt(round.height) + '" rx="' + fmt(round.r) + '" ry="' + fmt(round.r) + '"' + fillAttr + "/>";
   const circle = fitCircle(measured);
   if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
   const ellipse = fitEllipse(measured);
@@ -177,6 +188,50 @@ function fitRect(measured: MeasuredPath): { readonly x: number; readonly y: numb
   const boxArea = width * height;
   if (!left || !right || !top || !bottom || !(boxArea > 0) || measured.area / boxArea < 0.92) return null;
   return { x: measured.minX, y: measured.minY, width, height };
+}
+
+function fitRoundRect(measured: MeasuredPath): { readonly x: number; readonly y: number; readonly width: number; readonly height: number; readonly r: number } | null {
+  const width = measured.maxX - measured.minX;
+  const height = measured.maxY - measured.minY;
+  const small = Math.min(width, height);
+  if (!(width >= 6) || !(height >= 6)) return null;
+  const maxRadius = small * 0.45;
+  if (!(maxRadius >= 2)) return null;
+  const limit = Math.max(0.9, small * 0.01);
+  let best: { readonly r: number; readonly error: number } | null = null;
+  for (let radius = 2; radius <= maxRadius + 1e-6; radius += 0.25) {
+    const scored = roundRectError(measured, radius);
+    if (scored === null) continue;
+    if (best === null || scored < best.error) best = { r: radius, error: scored };
+  }
+  if (best === null || best.error > limit) return null;
+  const expected = width * height - (4 - Math.PI) * best.r * best.r;
+  if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.08) return null;
+  const flatShort = small - 2 * best.r;
+  if (flatShort < Math.max(4, small * 0.12)) return null;
+  const ratio = width / height;
+  if (ratio > 0.92 && ratio < 1.08 && best.r > small * 0.3) return null;
+  return { x: measured.minX, y: measured.minY, width, height, r: best.r };
+}
+
+function roundRectError(measured: MeasuredPath, radius: number): number | null {
+  const halfW = (measured.maxX - measured.minX) / 2;
+  const halfH = (measured.maxY - measured.minY) / 2;
+  const cx = (measured.minX + measured.maxX) / 2;
+  const cy = (measured.minY + measured.maxY) / 2;
+  let maxError = 0;
+  let arc = false;
+  let side = false;
+  for (const point of measured.samples) {
+    const qx = Math.abs(point.x - cx) - (halfW - radius);
+    const qy = Math.abs(point.y - cy) - (halfH - radius);
+    const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
+    const inside = Math.min(Math.max(qx, qy), 0);
+    maxError = Math.max(maxError, Math.abs(outside + inside - radius));
+    if (qx > 0.4 && qy > 0.4) arc = true;
+    if ((qx <= 0.4 && qy > radius * 0.4) || (qy <= 0.4 && qx > radius * 0.4)) side = true;
+  }
+  return arc && side ? maxError : null;
 }
 
 function fitCircle(measured: MeasuredPath): { readonly cx: number; readonly cy: number; readonly r: number } | null {

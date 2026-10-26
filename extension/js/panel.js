@@ -205,14 +205,76 @@
     return { cubics: chains.flatMap((chain) => fitChain(chain, tolerance)), closed: subpath.closed };
   }
   function protectedStarts(cubics, closed, minTurn) {
+    const stairs = stairRunIndices(cubics.map((_, index) => {
+      const previous = cubics[closed ? (index - 1 + cubics.length) % cubics.length : index - 1];
+      const next = cubics[index];
+      return previous !== void 0 && next !== void 0 && isStairJoint(previous, next);
+    }), closed);
     const starts = [];
     for (let index = 0; index < cubics.length; index += 1) {
+      if (stairs.has(index)) continue;
       const previous = cubics[closed ? (index - 1 + cubics.length) % cubics.length : index - 1];
       const next = cubics[index];
       if (previous === void 0 || next === void 0) continue;
       if (isCorner(previous, next, minTurn)) starts.push(index);
     }
     return starts;
+  }
+  function stairRunIndices(flags, closed) {
+    const skip = /* @__PURE__ */ new Set();
+    const count = flags.length;
+    const mark = (run2) => {
+      if (run2.length < 6) return;
+      for (const index of run2) skip.add(index);
+    };
+    if (!closed) {
+      let run2 = [];
+      for (let index = 0; index < count; index += 1) {
+        if (flags[index] === true) run2.push(index);
+        else {
+          mark(run2);
+          run2 = [];
+        }
+      }
+      mark(run2);
+      return skip;
+    }
+    let gap = -1;
+    for (let index = 0; index < count; index += 1) {
+      if (flags[index] !== true) {
+        gap = index;
+        break;
+      }
+    }
+    if (gap < 0) {
+      if (count >= 6) for (let index = 0; index < count; index += 1) skip.add(index);
+      return skip;
+    }
+    let run = [];
+    for (let step = 1; step <= count; step += 1) {
+      const index = (gap + step) % count;
+      if (flags[index] === true) run.push(index);
+      else {
+        mark(run);
+        run = [];
+      }
+    }
+    mark(run);
+    return skip;
+  }
+  function isStairJoint(previous, next) {
+    if (chord(previous) > 8 || chord(next) > 8) return false;
+    const turn = turnDegrees(incoming(previous), outgoing(next));
+    return turn >= 60 && turn <= 120;
+  }
+  function isStairChain(chain) {
+    if (chain.length < 6) return false;
+    for (let index = 1; index < chain.length; index += 1) {
+      const previous = chain[index - 1];
+      const next = chain[index];
+      if (previous === void 0 || next === void 0 || !isStairJoint(previous, next)) return false;
+    }
+    return true;
   }
   function isCorner(previous, next, minTurn) {
     const longer = Math.max(chord(previous), chord(next));
@@ -258,11 +320,12 @@
   }
   function fitChain(chain, tolerance) {
     if (chain.length <= 1) return chain.slice();
+    const limit = isStairChain(chain) ? Math.max(tolerance, 6) : tolerance;
     const samples = sampleChain(chain);
     const first = samples[0];
     const last = samples[samples.length - 1];
     if (first === void 0 || last === void 0 || distance(first, last) < 0.05) return chain.slice();
-    const fitted = fitSamples(samples, tolerance, outgoing(chain[0] ?? line(first, last)), incoming(chain[chain.length - 1] ?? line(first, last)), 0);
+    const fitted = fitSamples(samples, limit, outgoing(chain[0] ?? line(first, last)), incoming(chain[chain.length - 1] ?? line(first, last)), 0);
     if (fitted === null || fitted.length === 0 || fitted.length >= chain.length) return chain.slice();
     return fitted;
   }
@@ -630,14 +693,15 @@
     for (let bit = 0; bit < 8; bit += 1) value = (value & 1) === 1 ? 3988292384 ^ value >>> 1 : value >>> 1;
     CRC_TABLE[index] = value;
   }
-  function punchTransparency(png) {
+  function punchTransparency(png, opaqueAt = 128) {
+    const cutoff = Math.min(255, Math.max(0, opaqueAt));
     const image = readRgbaPng(png);
     if (image === null) return { png, droppedColor: null };
     const used = /* @__PURE__ */ new Set();
     let transparent = 0;
     for (let index = 0; index < image.rgba.length; index += 4) {
       const alpha = image.rgba[index + 3] ?? 255;
-      if (alpha < 128) {
+      if (alpha < cutoff) {
         transparent += 1;
         continue;
       }
@@ -651,7 +715,7 @@
     const next = new Uint8Array(image.rgba);
     for (let index = 0; index < next.length; index += 4) {
       const alpha = next[index + 3] ?? 255;
-      if (alpha < 128) {
+      if (alpha < cutoff) {
         next[index] = sentinel >> 16 & 255;
         next[index + 1] = sentinel >> 8 & 255;
         next[index + 2] = sentinel & 255;
@@ -845,7 +909,9 @@
     const parts = [];
     if (facts.circles > 0) parts.push("\u0E27\u0E07\u0E01\u0E25\u0E21 " + String(facts.circles));
     if (facts.ellipses > 0) parts.push("\u0E27\u0E07\u0E23\u0E35 " + String(facts.ellipses));
-    if (facts.rects > 0) parts.push("\u0E2A\u0E35\u0E48\u0E40\u0E2B\u0E25\u0E35\u0E48\u0E22\u0E21 " + String(facts.rects));
+    const sharpRects = Math.max(0, facts.rects - facts.roundRects);
+    if (sharpRects > 0) parts.push("\u0E2A\u0E35\u0E48\u0E40\u0E2B\u0E25\u0E35\u0E48\u0E22\u0E21 " + String(sharpRects));
+    if (facts.roundRects > 0) parts.push("\u0E2A\u0E35\u0E48\u0E40\u0E2B\u0E25\u0E35\u0E48\u0E22\u0E21\u0E21\u0E38\u0E21\u0E21\u0E19 " + String(facts.roundRects));
     return parts.length === 0 ? null : parts.join(" \xB7 ");
   }
   function scoreSvg(svg) {
@@ -857,6 +923,7 @@
     let circles = 0;
     let ellipses = 0;
     let rects = 0;
+    let roundRects = 0;
     for (const tag of pathTags(svg)) {
       const name = elementName(tag.source);
       const attrs = tagAttrs(tag.source);
@@ -877,9 +944,14 @@
       rememberFill(fill, seen, palette);
       if (name === "circle") circles += 1;
       else if (name === "ellipse") ellipses += 1;
-      else if (name === "rect") rects += 1;
+      else if (name === "rect") {
+        rects += 1;
+        const rx = Number(readAttr2(attrs, "rx") ?? "0");
+        const ry = Number(readAttr2(attrs, "ry") ?? "0");
+        if (Number.isFinite(rx) && rx > 0.5 || Number.isFinite(ry) && ry > 0.5) roundRects += 1;
+      }
     }
-    return { paths, anchors, holes, colors: palette.length, palette, circles, ellipses, rects };
+    return { paths, anchors, holes, colors: palette.length, palette, circles, ellipses, rects, roundRects };
   }
   function rememberFill(fill, seen, palette) {
     if (fill === null || seen.has(fill)) return;
@@ -950,6 +1022,8 @@
     const fillAttr = fill === null ? "" : ' fill="' + fill.replace(/"/g, "") + '"';
     const rect = fitRect(measured);
     if (rect !== null) return '<rect x="' + fmt2(rect.x) + '" y="' + fmt2(rect.y) + '" width="' + fmt2(rect.width) + '" height="' + fmt2(rect.height) + '"' + fillAttr + "/>";
+    const round = fitRoundRect(measured);
+    if (round !== null) return '<rect x="' + fmt2(round.x) + '" y="' + fmt2(round.y) + '" width="' + fmt2(round.width) + '" height="' + fmt2(round.height) + '" rx="' + fmt2(round.r) + '" ry="' + fmt2(round.r) + '"' + fillAttr + "/>";
     const circle = fitCircle(measured);
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
@@ -979,6 +1053,48 @@
     const boxArea = width * height;
     if (!left || !right || !top || !bottom || !(boxArea > 0) || measured.area / boxArea < 0.92) return null;
     return { x: measured.minX, y: measured.minY, width, height };
+  }
+  function fitRoundRect(measured) {
+    const width = measured.maxX - measured.minX;
+    const height = measured.maxY - measured.minY;
+    const small = Math.min(width, height);
+    if (!(width >= 6) || !(height >= 6)) return null;
+    const maxRadius = small * 0.45;
+    if (!(maxRadius >= 2)) return null;
+    const limit = Math.max(0.9, small * 0.01);
+    let best = null;
+    for (let radius = 2; radius <= maxRadius + 1e-6; radius += 0.25) {
+      const scored = roundRectError(measured, radius);
+      if (scored === null) continue;
+      if (best === null || scored < best.error) best = { r: radius, error: scored };
+    }
+    if (best === null || best.error > limit) return null;
+    const expected = width * height - (4 - Math.PI) * best.r * best.r;
+    if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.08) return null;
+    const flatShort = small - 2 * best.r;
+    if (flatShort < Math.max(4, small * 0.12)) return null;
+    const ratio = width / height;
+    if (ratio > 0.92 && ratio < 1.08 && best.r > small * 0.3) return null;
+    return { x: measured.minX, y: measured.minY, width, height, r: best.r };
+  }
+  function roundRectError(measured, radius) {
+    const halfW = (measured.maxX - measured.minX) / 2;
+    const halfH = (measured.maxY - measured.minY) / 2;
+    const cx = (measured.minX + measured.maxX) / 2;
+    const cy = (measured.minY + measured.maxY) / 2;
+    let maxError = 0;
+    let arc = false;
+    let side = false;
+    for (const point of measured.samples) {
+      const qx = Math.abs(point.x - cx) - (halfW - radius);
+      const qy = Math.abs(point.y - cy) - (halfH - radius);
+      const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
+      const inside = Math.min(Math.max(qx, qy), 0);
+      maxError = Math.max(maxError, Math.abs(outside + inside - radius));
+      if (qx > 0.4 && qy > 0.4) arc = true;
+      if (qx <= 0.4 && qy > radius * 0.4 || qy <= 0.4 && qx > radius * 0.4) side = true;
+    }
+    return arc && side ? maxError : null;
   }
   function fitCircle(measured) {
     const points = measured.samples;
@@ -1487,7 +1603,7 @@
       args.push("--palette", request.palette.join(","));
     }
     if (request.preset === "photo") {
-      args.push("--preset", "photo", "--color-precision", "8", "--filter-speckle", "1");
+      args.push("--preset", "photo", "--clustering", "watershed", "--watershed-detail", "128", "--color-precision", "8", "--filter-speckle", "1");
     } else if (request.preset === "icon") {
       args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "2");
     } else {
@@ -2064,7 +2180,7 @@
       const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
       if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
       const sourcePng = fs.readFileSync(job.pngPath);
-      const punched = punchTransparency(sourcePng);
+      const punched = punchTransparency(sourcePng, job.settings.preset === "photo" ? 128 : 200);
       const traceInput = path.join(job.directory, "trace.png");
       fs.writeFileSync(traceInput, punched.png);
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");

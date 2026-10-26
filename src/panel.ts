@@ -718,7 +718,7 @@ function start(): void {
     const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
     if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
     const sourcePng = fs.readFileSync(job.pngPath);
-    const punched = punchTransparency(sourcePng);
+    const punched = punchTransparency(sourcePng, job.settings.preset === "photo" ? 128 : 200);
     const traceInput = path.join(job.directory, "trace.png");
     fs.writeFileSync(traceInput, punched.png);
     message("กำลังสร้างเส้นเวกเตอร์…");

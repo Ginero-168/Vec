@@ -22,6 +22,18 @@ test("transparent pixels are replaced with a color the tracer can drop", () => {
   assert.equal(punchTransparency(punched.png).droppedColor, null);
 });
 
+test("a faint fringe stays at 128 and becomes the sentinel at 200", () => {
+  const rgba = new Uint8Array([10, 20, 30, 150, 1, 2, 3, 255]);
+  const png = encodeRgbaPng(2, 1, rgba);
+  assert.equal(punchTransparency(png, 128).droppedColor, null);
+  const punched = punchTransparency(png, 200);
+  assert.equal(punched.droppedColor, "#ff00ff");
+  const image = readRgbaPng(punched.png);
+  assert.ok(image);
+  assert.deepEqual(Array.from(image.rgba.slice(0, 4)), [255, 0, 255, 255]);
+  assert.deepEqual(Array.from(image.rgba.slice(4, 8)), [1, 2, 3, 255]);
+});
+
 test("an opaque image and a non-png are left unchanged", () => {
   const rgba = new Uint8Array([1, 2, 3, 255, 4, 5, 6, 255]);
   const png = encodeRgbaPng(2, 1, rgba);

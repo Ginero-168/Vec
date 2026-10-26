@@ -30,6 +30,21 @@ test("pixel stairs collapse and a long square keeps its corners", () => {
   const square = fairPaths('<svg><path d="M0,0 H100 V100 H0 Z" fill="#f00"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
   const corners = listAnchors(square).map((anchor) => [anchor.x, anchor.y]);
   assert.deepEqual(corners, [[0, 0], [100, 0], [100, 100], [0, 100]]);
+
+  let coarse = "M0,0";
+  for (let step = 0; step < 8; step += 1) coarse += " H" + String((step + 1) * 5) + " V" + String((step + 1) * 5);
+  const collapsed = fairPaths('<svg><path d="' + coarse + '"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
+  assert.ok(cubicCount(collapsed) <= 3);
+  const ends = listAnchors(collapsed);
+  assert.equal(ends[0]?.x, 0);
+  assert.equal(ends[0]?.y, 0);
+  assert.equal(ends[ends.length - 1]?.x, 40);
+  assert.equal(ends[ends.length - 1]?.y, 40);
+
+  const small = fairPaths('<svg><path d="M0,0 H20 V20 H0 Z" fill="#f00"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
+  assert.deepEqual(listAnchors(small).map((anchor) => [anchor.x, anchor.y]), [[0, 0], [20, 0], [20, 20], [0, 20]]);
+  const tiny = fairPaths('<svg><path d="M0,0 H6 V6 H0 Z" fill="#f00"/></svg>', { smoothness: 2.4, cornerDegrees: 35 });
+  assert.deepEqual(listAnchors(tiny).map((anchor) => [anchor.x, anchor.y]), [[0, 0], [6, 0], [6, 6], [0, 6]]);
 });
 
 test("a shallow kink is kept only when the corner slider is high", () => {

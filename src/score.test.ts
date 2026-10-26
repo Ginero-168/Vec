@@ -12,7 +12,7 @@ const tracedLogo = `<?xml version="1.0" encoding="UTF-8"?>
 
 test("a closed rectangle is four anchors and no hole", () => {
   const facts = scoreSvg('<svg><path d="M0,0 H10 V10 H0 Z" fill="#000"/></svg>');
-  assert.deepEqual(facts, { paths: 1, anchors: 4, holes: 0, colors: 1, palette: ["#000000"], circles: 0, ellipses: 0, rects: 0 });
+  assert.deepEqual(facts, { paths: 1, anchors: 4, holes: 0, colors: 1, palette: ["#000000"], circles: 0, ellipses: 0, rects: 0, roundRects: 0 });
 });
 
 test("an opposite winding ring inside a shape is one hole", () => {
@@ -46,7 +46,8 @@ test("the traced logo reports paths, anchors, holes, and colors", () => {
     palette: ["#ffffff", "#d6363e", "#2e66d6", "#f2b830"],
     circles: 0,
     ellipses: 0,
-    rects: 0
+    rects: 0,
+    roundRects: 0
   });
   assert.equal(holeNote(facts.holes), "มีรู 3 จุด");
 });
@@ -125,6 +126,35 @@ test("a wide oval becomes an ellipse", () => {
   const fitted = fitShapes('<svg width="160" height="80"><path d="' + d + '" fill="#16a34a"/></svg>');
   assert.match(fitted, /<ellipse /);
   assert.equal(scoreSvg(fitted).ellipses, 1);
+});
+
+function roundRectPath(x: number, y: number, width: number, height: number, radius: number): string {
+  const k = radius * 0.5522847498;
+  const n = (value: number): string => String(Math.round(value * 100) / 100);
+  const right = x + width;
+  const bottom = y + height;
+  return "M" + n(x + radius) + "," + n(y)
+    + "H" + n(right - radius)
+    + "C" + n(right - radius + k) + "," + n(y) + " " + n(right) + "," + n(y + radius - k) + " " + n(right) + "," + n(y + radius)
+    + "V" + n(bottom - radius)
+    + "C" + n(right) + "," + n(bottom - radius + k) + " " + n(right - radius + k) + "," + n(bottom) + " " + n(right - radius) + "," + n(bottom)
+    + "H" + n(x + radius)
+    + "C" + n(x + radius - k) + "," + n(bottom) + " " + n(x) + "," + n(bottom - radius + k) + " " + n(x) + "," + n(bottom - radius)
+    + "V" + n(y + radius)
+    + "C" + n(x) + "," + n(y + radius - k) + " " + n(x + radius - k) + "," + n(y) + " " + n(x + radius) + "," + n(y)
+    + "Z";
+}
+
+test("a rounded rectangle becomes a rect with corner radii", () => {
+  const fitted = fitShapes('<svg width="120" height="80"><path d="' + roundRectPath(10, 8, 100, 60, 12) + '" fill="#d6363e"/></svg>');
+  assert.match(fitted, /<rect /);
+  assert.equal(fitted.includes("<path"), false);
+  const facts = scoreSvg(fitted);
+  assert.equal(facts.rects, 1);
+  assert.equal(facts.roundRects, 1);
+  assert.equal(shapeNote(facts), "สี่เหลี่ยมมุมมน 1");
+  const radius = /rx="([^"]+)"/.exec(fitted);
+  assert.ok(Math.abs(Number(radius?.[1]) - 12) < 1);
 });
 
 test("an L-shaped path is left as a path", () => {

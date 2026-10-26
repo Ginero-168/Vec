@@ -46,7 +46,7 @@ export function vtracerArguments(input: string, output: string, request: TraceRe
     args.push("--palette", request.palette.join(","));
   }
   if (request.preset === "photo") {
-    args.push("--preset", "photo", "--color-precision", "8", "--filter-speckle", "1");
+    args.push("--preset", "photo", "--clustering", "watershed", "--watershed-detail", "128", "--color-precision", "8", "--filter-speckle", "1");
   } else if (request.preset === "icon") {
     args.push("--preset", "poster", "--color-precision", "5", "--filter-speckle", "2");
   } else {

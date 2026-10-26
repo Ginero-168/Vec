@@ -209,14 +209,79 @@ function fairSubpath(subpath: Subpath, tolerance: number, minTurn: number): Subp
 }
 
 function protectedStarts(cubics: readonly Cubic[], closed: boolean, minTurn: number): number[] {
+  const stairs = stairRunIndices(cubics.map((_, index) => {
+    const previous = cubics[closed ? (index - 1 + cubics.length) % cubics.length : index - 1];
+    const next = cubics[index];
+    return previous !== undefined && next !== undefined && isStairJoint(previous, next);
+  }), closed);
   const starts: number[] = [];
   for (let index = 0; index < cubics.length; index += 1) {
+    if (stairs.has(index)) continue;
     const previous = cubics[closed ? (index - 1 + cubics.length) % cubics.length : index - 1];
     const next = cubics[index];
     if (previous === undefined || next === undefined) continue;
     if (isCorner(previous, next, minTurn)) starts.push(index);
   }
   return starts;
+}
+
+function stairRunIndices(flags: readonly boolean[], closed: boolean): Set<number> {
+  const skip = new Set<number>();
+  const count = flags.length;
+  const mark = (run: readonly number[]): void => {
+    if (run.length < 6) return;
+    for (const index of run) skip.add(index);
+  };
+  if (!closed) {
+    let run: number[] = [];
+    for (let index = 0; index < count; index += 1) {
+      if (flags[index] === true) run.push(index);
+      else {
+        mark(run);
+        run = [];
+      }
+    }
+    mark(run);
+    return skip;
+  }
+  let gap = -1;
+  for (let index = 0; index < count; index += 1) {
+    if (flags[index] !== true) {
+      gap = index;
+      break;
+    }
+  }
+  if (gap < 0) {
+    if (count >= 6) for (let index = 0; index < count; index += 1) skip.add(index);
+    return skip;
+  }
+  let run: number[] = [];
+  for (let step = 1; step <= count; step += 1) {
+    const index = (gap + step) % count;
+    if (flags[index] === true) run.push(index);
+    else {
+      mark(run);
+      run = [];
+    }
+  }
+  mark(run);
+  return skip;
+}
+
+function isStairJoint(previous: Cubic, next: Cubic): boolean {
+  if (chord(previous) > 8 || chord(next) > 8) return false;
+  const turn = turnDegrees(incoming(previous), outgoing(next));
+  return turn >= 60 && turn <= 120;
+}
+
+function isStairChain(chain: readonly Cubic[]): boolean {
+  if (chain.length < 6) return false;
+  for (let index = 1; index < chain.length; index += 1) {
+    const previous = chain[index - 1];
+    const next = chain[index];
+    if (previous === undefined || next === undefined || !isStairJoint(previous, next)) return false;
+  }
+  return true;
 }
 
 function isCorner(previous: Cubic, next: Cubic, minTurn: number): boolean {
@@ -267,11 +332,12 @@ function sliceWrap(cubics: readonly Cubic[], from: number, to: number): Cubic[] 
 
 function fitChain(chain: readonly Cubic[], tolerance: number): Cubic[] {
   if (chain.length <= 1) return chain.slice();
+  const limit = isStairChain(chain) ? Math.max(tolerance, 6) : tolerance;
   const samples = sampleChain(chain);
   const first = samples[0];
   const last = samples[samples.length - 1];
   if (first === undefined || last === undefined || distance(first, last) < 0.05) return chain.slice();
-  const fitted = fitSamples(samples, tolerance, outgoing(chain[0] ?? line(first, last)), incoming(chain[chain.length - 1] ?? line(first, last)), 0);
+  const fitted = fitSamples(samples, limit, outgoing(chain[0] ?? line(first, last)), incoming(chain[chain.length - 1] ?? line(first, last)), 0);
   if (fitted === null || fitted.length === 0 || fitted.length >= chain.length) return chain.slice();
   return fitted;
 }

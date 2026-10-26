@@ -39,6 +39,8 @@ test("every preset fits splines and the icon preset is not forced to polygons", 
   assert.equal(photo[photo.indexOf("--simplify") + 1], "1.00");
   assert.equal(photo[photo.indexOf("--color-precision") + 1], "8");
   assert.equal(photo[photo.indexOf("--filter-speckle") + 1], "1");
+  assert.equal(photo[photo.indexOf("--clustering") + 1], "watershed");
+  assert.equal(photo[photo.indexOf("--watershed-detail") + 1], "128");
   assert.deepEqual(presetDefaults("photo"), { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" });
   const fixed = vtracerArguments("in.png", "out.svg", {
     preset: "logo",
