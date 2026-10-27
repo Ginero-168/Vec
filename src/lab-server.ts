@@ -105,7 +105,7 @@ async function pipeline(png: Buffer, settings: PipelineSettings, ticket: number)
   const svgs: string[] = [];
   for (const plate of plan.plates) {
     if (ticket !== generation) throw new Error("cancelled");
-    svgs.push(await trace(plate.png, plate.request, ticket));
+    svgs.push(plate.sharedSvg ?? (await trace(plate.png, plate.request, ticket)));
   }
   return {
     svg: finishTrace(svgs, plan, settings),

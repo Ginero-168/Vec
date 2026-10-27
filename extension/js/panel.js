@@ -14,9 +14,9 @@
   });
   var __copyProps = (to, from, except, desc) => {
     if (from && typeof from === "object" || typeof from === "function") {
-      for (let key of __getOwnPropNames(from))
-        if (!__hasOwnProp.call(to, key) && key !== except)
-          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+      for (let key2 of __getOwnPropNames(from))
+        if (!__hasOwnProp.call(to, key2) && key2 !== except)
+          __defProp(to, key2, { get: () => from[key2], enumerable: !(desc = __getOwnPropDesc(from, key2)) || desc.enumerable });
     }
     return to;
   };
@@ -44,6 +44,10 @@
   function fairTolerance(smoothness) {
     const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
     return Math.round((0.4 + clamped * 2.2) * 100) / 100;
+  }
+  function geometryTolerance(smoothness) {
+    const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
+    return Math.round((0.12 + clamped * 0.08) * 100) / 100;
   }
   function relaxPaths(svg, tolerance = 0.15) {
     const limit = Math.min(0.5, Math.max(0.05, Number.isFinite(tolerance) ? tolerance : 0.15));
@@ -226,8 +230,8 @@
   function parseHex(color) {
     const match = /^#([0-9a-f]{6})$/i.exec(color.trim());
     if (match === null) return null;
-    const hex3 = match[1] ?? "";
-    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
+    const hex4 = match[1] ?? "";
+    return [Number.parseInt(hex4.slice(0, 2), 16), Number.parseInt(hex4.slice(2, 4), 16), Number.parseInt(hex4.slice(4, 6), 16)];
   }
   function readD(tag) {
     const match = /\bd\s*=\s*(["'])([\s\S]*?)\1/i.exec(tag);
@@ -867,8 +871,8 @@
     const name = (/^<([a-z]+)/i.exec(tag)?.[1] ?? "").toLowerCase();
     if (name !== "circle" && name !== "ellipse" && name !== "rect") return null;
     const attrs = /^<(?:circle|ellipse|rect)\b([^>]*)\/?>/i.exec(tag)?.[1] ?? "";
-    const numberAttr = (key) => {
-      const raw = readAttr(attrs, key);
+    const numberAttr = (key2) => {
+      const raw = readAttr(attrs, key2);
       if (raw === null) return null;
       const value = Number(raw);
       return Number.isFinite(value) ? value : null;
@@ -889,9 +893,9 @@
       const cy = numberAttr("cy") ?? 0;
       data = ellipsePath(cx, cy, rx, ry);
     }
-    const kept = ["fill", "stroke", "stroke-width", "stroke-linejoin", "opacity", "transform", "fill-rule", "id"].map((key) => {
-      const value = readAttr(attrs, key);
-      return value === null ? "" : " " + key + '="' + value.replace(/"/g, "") + '"';
+    const kept = ["fill", "stroke", "stroke-width", "stroke-linejoin", "opacity", "transform", "fill-rule", "id"].map((key2) => {
+      const value = readAttr(attrs, key2);
+      return value === null ? "" : " " + key2 + '="' + value.replace(/"/g, "") + '"';
     }).join("");
     return '<path d="' + data + '"' + kept + "/>";
   }
@@ -1359,8 +1363,8 @@
   function rgbOf(fill) {
     const match = /^#([0-9a-f]{6})$/i.exec(fill);
     if (match === null) return null;
-    const hex3 = match[1] ?? "";
-    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
+    const hex4 = match[1] ?? "";
+    return [Number.parseInt(hex4.slice(0, 2), 16), Number.parseInt(hex4.slice(2, 4), 16), Number.parseInt(hex4.slice(4, 6), 16)];
   }
   function dropFill(svg, fill) {
     const target = normalizeFill(fill);
@@ -1638,8 +1642,8 @@
     return measurePath(data);
   }
   function measurePrimitive(name, attrs) {
-    const numberAttr = (key) => {
-      const raw = readAttr2(attrs, key);
+    const numberAttr = (key2) => {
+      const raw = readAttr2(attrs, key2);
       if (raw === null) return null;
       const value = Number(raw);
       return Number.isFinite(value) ? value : null;
@@ -1717,8 +1721,8 @@
     if (value === "" || value === "none") return null;
     const short = /^#([0-9a-f]{3})$/.exec(value);
     if (short !== null) {
-      const hex3 = short[1] ?? "";
-      return "#" + hex3[0] + hex3[0] + hex3[1] + hex3[1] + hex3[2] + hex3[2];
+      const hex4 = short[1] ?? "";
+      return "#" + hex4[0] + hex4[0] + hex4[1] + hex4[1] + hex4[2] + hex4[2];
     }
     return value;
   }
@@ -2017,16 +2021,16 @@
   function identityRaster(rgba, _width, _height) {
     return rgba;
   }
-  function flatPlates(rgba, width, height, maxColors, preprocess = identityRaster) {
+  function flatPlates(rgba, width, height, maxColors, preprocess = identityRaster, smoothSigma = SMOOTH_SOURCE, recoverSoft = true) {
     const boxes = subjectBoxes(rgba, width, height);
-    return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess));
+    return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess, smoothSigma, recoverSoft));
   }
   function subjectBoxes(rgba, width, height) {
     const found = enclosedBoxes(rgba, width, height);
     if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
     return found;
   }
-  function plateFor(rgba, width, height, box, maxColors, preprocess) {
+  function plateFor(rgba, width, height, box, maxColors, preprocess, smoothSigma, recoverSoft) {
     const cropW = box.width;
     const cropH = box.height;
     const crop = new Uint8Array(cropW * cropH * 4);
@@ -2034,7 +2038,7 @@
       const from = ((box.y + y) * width + box.x) * 4;
       crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
     }
-    const painted = labelImage(crop, cropW, cropH, maxColors, preprocess);
+    const painted = labelImage(crop, cropW, cropH, maxColors, preprocess, smoothSigma, recoverSoft);
     return {
       rgba: painted.rgba,
       width: painted.width,
@@ -2045,7 +2049,10 @@
       originY: box.y,
       sourceWidth: cropW,
       sourceHeight: cropH,
-      borderColor: cornerColor(crop, cropW, cropH)
+      borderColor: cornerColor(crop, cropW, cropH),
+      labels: painted.labels,
+      colors: painted.colors,
+      source: crop
     };
   }
   function cornerColor(rgba, width, height) {
@@ -2074,7 +2081,7 @@
     }
     return hex2(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
   }
-  function labelImage(rgba, width, height, maxColors, preprocess = identityRaster) {
+  function labelImage(rgba, width, height, maxColors, preprocess = identityRaster, smoothSigma = SMOOTH_SOURCE, recoverSoft = true) {
     const prepared = preprocess(rgba, width, height);
     const source = prepared.length === rgba.length ? prepared : rgba;
     const count = width * height;
@@ -2096,12 +2103,13 @@
     let core = coreMask(lab, alpha, width, height, CORE_TAU);
     if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08);
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-    const centers = buildPalette(lab, core, width, height, userK);
-    const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
+    const built = buildPalette(lab, core, width, height, userK);
+    const centers = recoverSoft ? coverResiduals(lab, alpha, width, height, built, userK) : built;
+    const labels = assignLabels(linear, lab, core, alpha, width, height, centers, smoothSigma);
     const colors = fillColors(source, alpha, core, labels, width, height, centers);
     return paintLabels(labels, colors, width * UP, height * UP);
   }
-  function assignLabels(linear, lab, core, alpha, width, height, centers) {
+  function assignLabels(linear, lab, core, alpha, width, height, centers, smoothSigma) {
     const count = width * height;
     const kCount = centers.length;
     const coreLabel = new Int16Array(count);
@@ -2183,7 +2191,7 @@
       }
     }
     cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP));
-    smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP);
+    smoothLabels(labels, upW, upH, kCount, smoothSigma * UP);
     for (let y = 0; y < height; y += 1) {
       for (let x = 0; x < width; x += 1) {
         if (alpha[y * width + x] !== 0) continue;
@@ -2305,20 +2313,20 @@
       rgba[offset + 2] = color.b;
       rgba[offset + 3] = 255;
     }
-    return { rgba, width, height, palette };
+    return { rgba, width, height, palette, labels, colors };
   }
   function buildPalette(lab, core, width, height, userK) {
     const bins = /* @__PURE__ */ new Map();
     for (let index = 0; index < core.length; index += 1) {
       if (core[index] !== 1) continue;
       const color = readLab(lab, index);
-      const key = Math.round(color.L / 8e-3) + "," + Math.round(color.a / 8e-3) + "," + Math.round(color.b / 8e-3);
-      const bin = bins.get(key) ?? { x: 0, y: 0, z: 0, n: 0 };
+      const key2 = Math.round(color.L / 8e-3) + "," + Math.round(color.a / 8e-3) + "," + Math.round(color.b / 8e-3);
+      const bin = bins.get(key2) ?? { x: 0, y: 0, z: 0, n: 0 };
       bin.x += color.L;
       bin.y += color.a;
       bin.z += color.b;
       bin.n += 1;
-      bins.set(key, bin);
+      bins.set(key2, bin);
     }
     const samples = [];
     const weights = [];
@@ -2355,9 +2363,9 @@
     for (let index = 0; index < core.length; index += 1) {
       if (core[index] !== 1) continue;
       const color = readLab(lab, index);
-      const key = (Math.round(color.L / 0.05) + 40) * 1e4 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
-      const list = groups.get(key);
-      if (list === void 0) groups.set(key, [index]);
+      const key2 = (Math.round(color.L / 0.05) + 40) * 1e4 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
+      const list = groups.get(key2);
+      if (list === void 0) groups.set(key2, [index]);
       else list.push(index);
     }
     const means = [];
@@ -2464,6 +2472,74 @@
       }
     }
     return centers;
+  }
+  function coverResiduals(lab, alpha, width, height, centers, userK) {
+    const kept = uniqueCenters(centers);
+    const limit = Math.min(K_MAX, userK > 0 ? Math.max(userK, kept.length) : K_MAX);
+    const minCount = Math.max(24, Math.floor(width * height * 4e-3));
+    const next = kept.slice();
+    for (let round = 0; round < K_MAX && next.length < limit; round += 1) {
+      const residual = largestResidual(lab, alpha, width, height, next, minCount);
+      if (residual === null) break;
+      next.push(residual);
+    }
+    return next;
+  }
+  function uniqueCenters(centers) {
+    const kept = [];
+    for (const center of centers) {
+      if (kept.every((other) => Math.sqrt(labDistance2(other, center)) > COLOR_FLOOR)) kept.push({ L: center.L, a: center.a, b: center.b });
+    }
+    return kept.length > 0 ? kept : [{ L: 0, a: 0, b: 0 }];
+  }
+  function largestResidual(lab, alpha, width, height, centers, minCount) {
+    const bins = /* @__PURE__ */ new Map();
+    for (let index = 0; index < width * height; index += 1) {
+      if (alpha[index] === 0) continue;
+      const color = readLab(lab, index);
+      let nearest2 = Infinity;
+      for (const center of centers) nearest2 = Math.min(nearest2, Math.sqrt(labDistance2(color, center)));
+      if (nearest2 <= COLOR_FLOOR) continue;
+      const key2 = Math.round(color.L / 0.04) + "," + Math.round(color.a / 0.04) + "," + Math.round(color.b / 0.04);
+      const bin = bins.get(key2) ?? { L: 0, a: 0, b: 0, n: 0, vL: 0, vA: 0, vB: 0 };
+      bin.L += color.L;
+      bin.a += color.a;
+      bin.b += color.b;
+      bin.n += 1;
+      bin.vL += color.L * color.L;
+      bin.vA += color.a * color.a;
+      bin.vB += color.b * color.b;
+      bins.set(key2, bin);
+    }
+    let best = null;
+    let bestCount = minCount - 1;
+    for (const bin of bins.values()) {
+      if (bin.n < minCount || bin.n <= bestCount) continue;
+      const mean = { L: bin.L / bin.n, a: bin.a / bin.n, b: bin.b / bin.n };
+      const spread = Math.max(
+        Math.sqrt(Math.max(0, bin.vL / bin.n - mean.L * mean.L)),
+        Math.sqrt(Math.max(0, bin.vA / bin.n - mean.a * mean.a)),
+        Math.sqrt(Math.max(0, bin.vB / bin.n - mean.b * mean.b))
+      );
+      if (spread > 0.02) continue;
+      if (centers.some((center) => Math.sqrt(labDistance2(center, mean)) <= COLOR_FLOOR)) continue;
+      if (blendOf(mean, centers)) continue;
+      best = mean;
+      bestCount = bin.n;
+    }
+    return best;
+  }
+  function blendOf(color, centers) {
+    for (let left = 0; left < centers.length; left += 1) {
+      for (let right = left + 1; right < centers.length; right += 1) {
+        const first = centers[left];
+        const second = centers[right];
+        if (first === void 0 || second === void 0) continue;
+        const projected = projectLab(color, first, second);
+        if (projected.t > 0.04 && projected.t < 0.96 && projected.distance <= 0.02) return true;
+      }
+    }
+    return false;
   }
   function cleanLabels(labels, width, height, kCount, minArea) {
     for (let pass = 0; pass < 2; pass += 1) {
@@ -2621,7 +2697,35 @@
       const y = Math.max(0, minY - pad);
       boxes.push({ x, y, width: Math.min(width, maxX + 1 + pad) - x, height: Math.min(height, maxY + 1 + pad) - y });
     }
-    return mergeBoxes(boxes, 8);
+    return mergeStackedFragments(mergeBoxes(boxes, 8));
+  }
+  function mergeStackedFragments(boxes) {
+    const open = boxes.map((box) => ({ ...box }));
+    let merged = true;
+    while (merged) {
+      merged = false;
+      for (let left = 0; left < open.length && !merged; left += 1) {
+        for (let right = left + 1; right < open.length; right += 1) {
+          const a = open[left];
+          const b = open[right];
+          if (a === void 0 || b === void 0) continue;
+          const upper = a.y <= b.y ? a : b;
+          const lower = a.y <= b.y ? b : a;
+          const yGap = lower.y - (upper.y + upper.height);
+          const overlap = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+          const ratio = Math.max(a.width, b.width) / Math.max(1, Math.min(a.width, b.width));
+          const gapLimit = Math.max(upper.height, lower.height) * 1.2;
+          if (yGap < 0 || yGap > gapLimit || overlap < 0.7 * Math.min(a.width, b.width) || ratio > 1.4) continue;
+          const x = Math.min(a.x, b.x);
+          const y = Math.min(a.y, b.y);
+          open[left] = { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
+          open.splice(right, 1);
+          merged = true;
+          break;
+        }
+      }
+    }
+    return open;
   }
   function seedOutside(index, edge, outside, queue) {
     if (edge[index] === 1 || outside[index] === 1) return;
@@ -2843,6 +2947,652 @@
   }
   function hex2(red, green, blue) {
     return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
+  }
+
+  // src/shared-boundary.ts
+  function traceSharedBoundary(input) {
+    const scale = input.scale > 0 ? input.scale : 1;
+    const width = input.labelWidth;
+    const height = input.labelHeight;
+    if (width < 1 || height < 1 || input.labels.length < width * height) return emptySvg(input.sourceWidth, input.sourceHeight);
+    const labels = new Int16Array(width * height);
+    for (let index = 0; index < labels.length; index += 1) {
+      const value = input.labels[index] ?? 255;
+      labels[index] = value === 255 ? -1 : value;
+    }
+    const labelAt = (x, y) => {
+      if (x < 0 || y < 0 || x >= width || y >= height) return -1;
+      return labels[y * width + x] ?? -1;
+    };
+    const hActive = (x, y) => labelAt(x, y - 1) !== labelAt(x, y);
+    const vActive = (x, y) => labelAt(x - 1, y) !== labelAt(x, y);
+    const seenH = new Uint8Array(width * (height + 1));
+    const seenV = new Uint8Array((width + 1) * height);
+    const degree = (x, y) => {
+      let count = 0;
+      if (x < width && hActive(x, y)) count += 1;
+      if (x > 0 && hActive(x - 1, y)) count += 1;
+      if (y < height && vActive(x, y)) count += 1;
+      if (y > 0 && vActive(x, y - 1)) count += 1;
+      return count;
+    };
+    const crackSeen = (x, y, dir) => {
+      if (dir === 0 || dir === 2) {
+        const hx = dir === 0 ? x : x - 1;
+        return (seenH[y * width + hx] ?? 0) === 1;
+      }
+      const vy = dir === 1 ? y : y - 1;
+      return (seenV[vy * (width + 1) + x] ?? 0) === 1;
+    };
+    const markCrack = (x, y, dir) => {
+      if (dir === 0 || dir === 2) seenH[y * width + (dir === 0 ? x : x - 1)] = 1;
+      else seenV[(dir === 1 ? y : y - 1) * (width + 1) + x] = 1;
+    };
+    const otherDir = (x, y, arrivedBy) => {
+      const back = (arrivedBy + 2) % 4;
+      const options = [];
+      if (x < width && hActive(x, y)) options.push(0);
+      if (y < height && vActive(x, y)) options.push(1);
+      if (x > 0 && hActive(x - 1, y)) options.push(2);
+      if (y > 0 && vActive(x, y - 1)) options.push(3);
+      for (const option of options) if (option !== back) return option;
+      return -1;
+    };
+    const limit = (width + 1) * (height + 1) + 4;
+    const walk = (x, y, dir, loop) => {
+      const steps = [];
+      let cx = x;
+      let cy = y;
+      let cd = dir;
+      for (let guard = 0; guard < limit; guard += 1) {
+        if (crackSeen(cx, cy, cd)) break;
+        markCrack(cx, cy, cd);
+        steps.push({ x: cx, y: cy, dir: cd });
+        if (cd === 0) cx += 1;
+        else if (cd === 1) cy += 1;
+        else if (cd === 2) cx -= 1;
+        else cy -= 1;
+        if (loop && cx === x && cy === y) return { steps, endX: cx, endY: cy, loop: true };
+        if (!loop && degree(cx, cy) !== 2) return { steps, endX: cx, endY: cy, loop: false };
+        const next = otherDir(cx, cy, cd);
+        if (next < 0) return { steps, endX: cx, endY: cy, loop: false };
+        cd = next;
+      }
+      return { steps, endX: cx, endY: cy, loop };
+    };
+    const chains = [];
+    const begin = (x, y, dir, loop) => {
+      if (crackSeen(x, y, dir)) return;
+      const traced = walk(x, y, dir, loop);
+      if (traced.steps.length === 0) return;
+      const first = traced.steps[0];
+      if (first === void 0) return;
+      const sides = sidePixels(first.x, first.y, first.dir);
+      chains.push({
+        steps: traced.steps,
+        loop: traced.loop,
+        startKey: key(x, y),
+        endKey: key(traced.endX, traced.endY),
+        left: labelAt(sides.lx, sides.ly),
+        right: labelAt(sides.rx, sides.ry),
+        points: [],
+        cubics: []
+      });
+    };
+    for (let y = 0; y <= height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (!hActive(x, y) || (seenH[y * width + x] ?? 0) === 1) continue;
+        if (degree(x, y) !== 2) begin(x, y, 0, false);
+        else if (degree(x + 1, y) !== 2) begin(x + 1, y, 2, false);
+      }
+    }
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x <= width; x += 1) {
+        if (!vActive(x, y) || (seenV[y * (width + 1) + x] ?? 0) === 1) continue;
+        if (degree(x, y) !== 2) begin(x, y, 1, false);
+        else if (degree(x, y + 1) !== 2) begin(x, y + 1, 3, false);
+      }
+    }
+    for (let y = 0; y <= height; y += 1) {
+      for (let x = 0; x < width; x += 1) if (hActive(x, y) && (seenH[y * width + x] ?? 0) === 0) begin(x, y, 0, true);
+    }
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x <= width; x += 1) if (vActive(x, y) && (seenV[y * (width + 1) + x] ?? 0) === 0) begin(x, y, 1, true);
+    }
+    const linear = new Float32Array(input.sourceWidth * input.sourceHeight * 3);
+    const alpha = new Uint8Array(input.sourceWidth * input.sourceHeight);
+    for (let index = 0; index < alpha.length; index += 1) {
+      const offset = index * 4;
+      linear[index * 3] = srgbChannelToLinear(input.source[offset] ?? 0);
+      linear[index * 3 + 1] = srgbChannelToLinear(input.source[offset + 1] ?? 0);
+      linear[index * 3 + 2] = srgbChannelToLinear(input.source[offset + 2] ?? 0);
+      alpha[index] = input.source[offset + 3] ?? 0;
+    }
+    const flat = input.colors.map((color) => ({
+      r: srgbChannelToLinear(color.r),
+      g: srgbChannelToLinear(color.g),
+      b: srgbChannelToLinear(color.b)
+    }));
+    const sample = (sx, sy) => {
+      const x0 = Math.floor(sx);
+      const y0 = Math.floor(sy);
+      const tx = sx - x0;
+      const ty = sy - y0;
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let a = 0;
+      for (let oy = 0; oy <= 1; oy += 1) {
+        for (let ox = 0; ox <= 1; ox += 1) {
+          const px = x0 + ox;
+          const py = y0 + oy;
+          const weight = (ox === 0 ? 1 - tx : tx) * (oy === 0 ? 1 - ty : ty);
+          if (px < 0 || py < 0 || px >= input.sourceWidth || py >= input.sourceHeight) continue;
+          const index = py * input.sourceWidth + px;
+          r += (linear[index * 3] ?? 0) * weight;
+          g += (linear[index * 3 + 1] ?? 0) * weight;
+          b += (linear[index * 3 + 2] ?? 0) * weight;
+          a += (alpha[index] ?? 0) * weight;
+        }
+      }
+      return { r, g, b, a };
+    };
+    const place = (step) => {
+      const sides = sidePixels(step.x, step.y, step.dir);
+      const leftLabel = labelAt(sides.lx, sides.ly);
+      const rightLabel = labelAt(sides.rx, sides.ry);
+      const left = pixelCenter(sides.lx, sides.ly, scale);
+      const right = pixelCenter(sides.rx, sides.ry, scale);
+      const mid = { x: (left.x + right.x) / 2, y: (left.y + right.y) / 2 };
+      const dx = right.x - left.x;
+      const dy = right.y - left.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const dir = { x: dx / length, y: dy / length };
+      const span = Math.max(0.2, 1.6 / scale);
+      const colorEdge = leftLabel >= 0 && rightLabel >= 0;
+      const leftFlat = flat[leftLabel];
+      const rightFlat = flat[rightLabel];
+      const goal = colorEdge ? 0.5 : 128;
+      const miss = (distance3) => {
+        const probed = sample(mid.x + dir.x * distance3, mid.y + dir.y * distance3);
+        const value = colorEdge && leftFlat !== void 0 && rightFlat !== void 0 ? project(probed, leftFlat, rightFlat) : probed.a;
+        return Math.abs(value - goal);
+      };
+      let bestD = 0;
+      let bestError = Infinity;
+      const steps = 16;
+      for (let stepIndex = 0; stepIndex <= steps; stepIndex += 1) {
+        const distance3 = -span + span * 2 * stepIndex / steps;
+        const error = miss(distance3);
+        if (error < bestError) {
+          bestError = error;
+          bestD = distance3;
+        }
+      }
+      let low = Math.max(-span, bestD - span / steps);
+      let high = Math.min(span, bestD + span / steps);
+      for (let refine = 0; refine < 6; refine += 1) {
+        const left2 = low + (high - low) / 3;
+        const right2 = high - (high - low) / 3;
+        if (miss(left2) < miss(right2)) high = right2;
+        else low = left2;
+      }
+      bestD = (low + high) / 2;
+      return quantize({ x: mid.x + dir.x * bestD, y: mid.y + dir.y * bestD });
+    };
+    const junction = /* @__PURE__ */ new Map();
+    const accumulate = (at, point) => {
+      const bin = junction.get(at) ?? { x: 0, y: 0, n: 0 };
+      bin.x += point.x;
+      bin.y += point.y;
+      bin.n += 1;
+      junction.set(at, bin);
+    };
+    for (const chain of chains) {
+      if (chain.loop || chain.steps.length === 0) continue;
+      const first = chain.steps[0];
+      const last = chain.steps[chain.steps.length - 1];
+      if (first === void 0 || last === void 0) continue;
+      accumulate(chain.startKey, place(first));
+      accumulate(chain.endKey, place(last));
+    }
+    const junctionAt = (at) => {
+      const bin = junction.get(at);
+      if (bin === void 0 || bin.n === 0) return quantize(vertexPoint(at, scale));
+      return quantize({ x: bin.x / bin.n, y: bin.y / bin.n });
+    };
+    const tolerance = input.tolerance ?? 0.18;
+    const minTurn = Math.max(18, 90 - (input.cornerDegrees ?? 45));
+    for (const chain of chains) {
+      const raw = [];
+      if (!chain.loop) raw.push(junctionAt(chain.startKey));
+      for (const step of chain.steps) raw.push(place(step));
+      if (!chain.loop) raw.push(junctionAt(chain.endKey));
+      const points = dedupe(raw);
+      chain.points = chain.loop ? points : points;
+      const ring = chain.loop && points.length >= 3 ? [...points, points[0] ?? quantize({ x: 0, y: 0 })] : points;
+      chain.cubics = fitPolyline(ring, tolerance, minTurn).map(quantizeCubic);
+    }
+    const cycles = [];
+    const pushCycle = (label, points, cubics) => {
+      if (label < 0 || cubics.length === 0 || points.length < 3) return;
+      cycles.push({
+        label,
+        points,
+        cubics,
+        area: Math.abs(shoelace(points)),
+        edges: edgeCount(points, input.sourceWidth, input.sourceHeight),
+        parent: -1,
+        children: []
+      });
+    };
+    for (const chain of chains) {
+      if (!chain.loop) continue;
+      if (chain.left >= 0) pushCycle(chain.left, chain.points, chain.cubics);
+      if (chain.right >= 0) pushCycle(chain.right, chain.points.slice().reverse(), reverseCubics(chain.cubics));
+    }
+    const dirs = [];
+    for (let index = 0; index < chains.length; index += 1) {
+      const chain = chains[index];
+      if (chain === void 0 || chain.loop || chain.points.length < 2) continue;
+      dirs.push({
+        chain: index,
+        rev: false,
+        from: chain.startKey,
+        to: chain.endKey,
+        left: chain.left,
+        angle: travelAngle(chain.points, false),
+        used: false
+      });
+      dirs.push({
+        chain: index,
+        rev: true,
+        from: chain.endKey,
+        to: chain.startKey,
+        left: chain.right,
+        angle: travelAngle(chain.points, true),
+        used: false
+      });
+    }
+    const outgoing2 = /* @__PURE__ */ new Map();
+    for (const dir of dirs) {
+      const list = outgoing2.get(dir.from);
+      if (list === void 0) outgoing2.set(dir.from, [dir]);
+      else list.push(dir);
+    }
+    for (const dir of dirs) {
+      if (dir.used || dir.left < 0) continue;
+      const walked = [];
+      let cursor = dir;
+      for (let guard = 0; cursor !== null && guard < dirs.length + 2; guard += 1) {
+        if (cursor.used && cursor !== dir) break;
+        cursor.used = true;
+        walked.push(cursor);
+        const fromLabel = cursor.left;
+        const heading = cursor.angle;
+        const arrivedAt = cursor.to;
+        const options = (outgoing2.get(arrivedAt) ?? []).filter((option) => option.left === fromLabel && (!option.used || option === dir));
+        let best = null;
+        let bestTurn = Infinity;
+        for (const option of options) {
+          let turn = heading - option.angle;
+          turn = (turn % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+          if (turn < bestTurn) {
+            bestTurn = turn;
+            best = option;
+          }
+        }
+        if (best === null || best === dir) break;
+        cursor = best;
+      }
+      const first = walked[0];
+      const last = walked[walked.length - 1];
+      if (first === void 0 || last === void 0 || last.to !== first.from) continue;
+      const points = [];
+      const cubics = [];
+      for (const piece of walked) {
+        const chain = chains[piece.chain];
+        if (chain === void 0) continue;
+        const pts = piece.rev ? chain.points.slice().reverse() : chain.points;
+        const curves = piece.rev ? reverseCubics(chain.cubics) : chain.cubics;
+        if (points.length === 0) points.push(...pts);
+        else points.push(...pts.slice(1));
+        cubics.push(...curves);
+      }
+      pushCycle(first.left, points, cubics);
+    }
+    nest(cycles);
+    const omit = normalizeHex(input.omitFill ?? null);
+    const canvasArea = Math.max(1, input.sourceWidth * input.sourceHeight);
+    const paths = [];
+    const emitCompound = (index) => {
+      const cycle = cycles[index];
+      if (cycle === void 0 || cycle.area < 0.2) return;
+      const parts = [cyclePath(cycle.cubics)];
+      for (const child of cycle.children) {
+        const hole = cycles[child];
+        if (hole === void 0) continue;
+        parts.push(cyclePath(hole.cubics));
+        for (const island of hole.children) emitCompound(island);
+      }
+      const color = input.colors[cycle.label];
+      if (color === void 0 || parts.every((part) => part === "")) return;
+      paths.push({ area: cycle.area, markup: '<path d="' + parts.filter((part) => part !== "").join(" ") + '" fill="' + hex3(color) + '"/>' });
+    };
+    for (let index = 0; index < cycles.length; index += 1) {
+      const cycle = cycles[index];
+      if (cycle === void 0 || cycle.parent >= 0) continue;
+      const backdrop = omit !== null && cycle.edges >= 3 && cycle.area > canvasArea * 0.5 && hex3(input.colors[cycle.label] ?? { r: 0, g: 0, b: 0 }) === omit;
+      if (backdrop) {
+        for (const hole of cycle.children) {
+          const cutout = cycles[hole];
+          if (cutout === void 0) continue;
+          for (const island of cutout.children) emitCompound(island);
+        }
+        continue;
+      }
+      emitCompound(index);
+    }
+    paths.sort((left, right) => right.area - left.area);
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + String(input.sourceWidth) + '" height="' + String(input.sourceHeight) + '" viewBox="0 0 ' + String(input.sourceWidth) + " " + String(input.sourceHeight) + '">' + paths.map((path2) => path2.markup).join("") + "</svg>";
+  }
+  function edgeCount(points, width, height) {
+    const margin = 0.75;
+    let count = 0;
+    if (points.some((point) => point.y <= margin)) count += 1;
+    if (points.some((point) => point.x >= width - margin)) count += 1;
+    if (points.some((point) => point.y >= height - margin)) count += 1;
+    if (points.some((point) => point.x <= margin)) count += 1;
+    return count;
+  }
+  function sidePixels(x, y, dir) {
+    if (dir === 0) return { lx: x, ly: y - 1, rx: x, ry: y };
+    if (dir === 1) return { lx: x, ly: y, rx: x - 1, ry: y };
+    if (dir === 2) return { lx: x - 1, ly: y, rx: x - 1, ry: y - 1 };
+    return { lx: x - 1, ly: y - 1, rx: x, ry: y - 1 };
+  }
+  function pixelCenter(x, y, scale) {
+    return { x: (x + 0.5) / scale, y: (y + 0.5) / scale };
+  }
+  function vertexPoint(at, scale) {
+    const [x, y] = at.split(",").map((value) => Number(value));
+    return { x: (x ?? 0) / scale, y: (y ?? 0) / scale };
+  }
+  function project(sample, left, right) {
+    const dr = right.r - left.r;
+    const dg = right.g - left.g;
+    const db = right.b - left.b;
+    const length = dr * dr + dg * dg + db * db;
+    if (length < 1e-8) return 0.5;
+    return Math.min(1, Math.max(0, ((sample.r - left.r) * dr + (sample.g - left.g) * dg + (sample.b - left.b) * db) / length));
+  }
+  function key(x, y) {
+    return String(x) + "," + String(y);
+  }
+  function quantize(point) {
+    return { x: Math.round(point.x * 1e3) / 1e3, y: Math.round(point.y * 1e3) / 1e3 };
+  }
+  function quantizeCubic(cubic) {
+    return { p0: quantize(cubic.p0), c1: quantize(cubic.c1), c2: quantize(cubic.c2), p1: quantize(cubic.p1) };
+  }
+  function dedupe(points) {
+    const next = [];
+    for (const point of points) {
+      const last = next[next.length - 1];
+      if (last !== void 0 && Math.hypot(last.x - point.x, last.y - point.y) < 5e-4) continue;
+      next.push(point);
+    }
+    return next;
+  }
+  function fitPolyline(points, tolerance, minTurn) {
+    if (points.length < 2) return [];
+    const cuts = [0];
+    for (let index = 1; index < points.length - 1; index += 1) {
+      const before = points[index - 1];
+      const current = points[index];
+      const after = points[index + 1];
+      if (before === void 0 || current === void 0 || after === void 0) continue;
+      const turn = Math.abs(Math.atan2((current.x - before.x) * (after.y - current.y) - (current.y - before.y) * (after.x - current.x), (current.x - before.x) * (after.x - current.x) + (current.y - before.y) * (after.y - current.y)) * 180 / Math.PI);
+      if (turn >= minTurn) cuts.push(index);
+    }
+    cuts.push(points.length - 1);
+    const cubics = [];
+    for (let index = 0; index < cuts.length - 1; index += 1) {
+      const from = cuts[index] ?? 0;
+      const to = cuts[index + 1] ?? from;
+      cubics.push(...fitOpen(points.slice(from, to + 1), tolerance, 0));
+    }
+    return cubics;
+  }
+  function fitOpen(points, tolerance, depth) {
+    const first = points[0];
+    const last = points[points.length - 1];
+    if (first === void 0 || last === void 0) return [];
+    if (points.length < 2 || Math.hypot(last.x - first.x, last.y - first.y) < 5e-4) return [];
+    if (points.length === 2 || maxChordDistance(points, first, last) <= tolerance) return [lineCubic(first, last)];
+    const start2 = tangentStart(points);
+    const end = tangentEnd(points);
+    const cubic = fitCubic2(points, start2, end);
+    const worst = maxCubicDistance(points, cubic);
+    if (worst.distance <= tolerance) return [cubic];
+    const split = worst.index <= 0 || worst.index >= points.length - 1 ? Math.floor(points.length / 2) : worst.index;
+    if (depth >= 12 || split <= 0 || split >= points.length - 1) return [cubic];
+    return [...fitOpen(points.slice(0, split + 1), tolerance, depth + 1), ...fitOpen(points.slice(split), tolerance, depth + 1)];
+  }
+  function fitCubic2(points, tanStart, tanEnd) {
+    const first = points[0] ?? { x: 0, y: 0 };
+    const last = points[points.length - 1] ?? first;
+    const t = chordParams(points);
+    let c00 = 0;
+    let c01 = 0;
+    let c11 = 0;
+    let x0 = 0;
+    let x1 = 0;
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      const ti = t[index] ?? 0;
+      if (point === void 0) continue;
+      const u = 1 - ti;
+      const b0 = u * u * u;
+      const b1 = 3 * u * u * ti;
+      const b2 = 3 * u * ti * ti;
+      const b3 = ti * ti * ti;
+      const a1x = tanStart.x * b1;
+      const a1y = tanStart.y * b1;
+      const a2x = tanEnd.x * b2;
+      const a2y = tanEnd.y * b2;
+      c00 += a1x * a1x + a1y * a1y;
+      c01 += a1x * a2x + a1y * a2y;
+      c11 += a2x * a2x + a2y * a2y;
+      const restX = point.x - (first.x * b0 + last.x * b3);
+      const restY = point.y - (first.y * b0 + last.y * b3);
+      x0 += a1x * restX + a1y * restY;
+      x1 += a2x * restX + a2y * restY;
+    }
+    const det = c00 * c11 - c01 * c01;
+    const length = Math.hypot(last.x - first.x, last.y - first.y);
+    let alpha = length / 3;
+    let beta = length / 3;
+    if (Math.abs(det) > 1e-10) {
+      alpha = (x0 * c11 - x1 * c01) / det;
+      beta = (c00 * x1 - c01 * x0) / det;
+    }
+    if (!(alpha > length * 0.02) || !(beta > length * 0.02)) {
+      alpha = length / 3;
+      beta = length / 3;
+    }
+    return {
+      p0: first,
+      c1: { x: first.x + tanStart.x * alpha, y: first.y + tanStart.y * alpha },
+      c2: { x: last.x + tanEnd.x * beta, y: last.y + tanEnd.y * beta },
+      p1: last
+    };
+  }
+  function chordParams(points) {
+    const lengths = [0];
+    let total = 0;
+    for (let index = 1; index < points.length; index += 1) {
+      const previous = points[index - 1];
+      const point = points[index];
+      const delta = previous === void 0 || point === void 0 ? 0 : Math.hypot(point.x - previous.x, point.y - previous.y);
+      total += delta;
+      lengths.push(total);
+    }
+    if (total < 1e-8) return points.map((_point, index) => points.length === 1 ? 0 : index / (points.length - 1));
+    return lengths.map((value) => value / total);
+  }
+  function tangentStart(points) {
+    const first = points[0] ?? { x: 0, y: 0 };
+    const next = points[Math.min(2, points.length - 1)] ?? first;
+    return unit2(next.x - first.x, next.y - first.y);
+  }
+  function tangentEnd(points) {
+    const last = points[points.length - 1] ?? { x: 0, y: 0 };
+    const previous = points[Math.max(0, points.length - 3)] ?? last;
+    return unit2(previous.x - last.x, previous.y - last.y);
+  }
+  function unit2(x, y) {
+    const length = Math.hypot(x, y);
+    if (length < 1e-8) return { x: 1, y: 0 };
+    return { x: x / length, y: y / length };
+  }
+  function lineCubic(from, to) {
+    return {
+      p0: from,
+      c1: { x: from.x + (to.x - from.x) / 3, y: from.y + (to.y - from.y) / 3 },
+      c2: { x: from.x + 2 * (to.x - from.x) / 3, y: from.y + 2 * (to.y - from.y) / 3 },
+      p1: to
+    };
+  }
+  function maxChordDistance(points, from, to) {
+    let worst = 0;
+    for (const point of points) worst = Math.max(worst, distanceToSegment2(point, from, to));
+    return worst;
+  }
+  function distanceToSegment2(point, from, to) {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = dx * dx + dy * dy;
+    if (length < 1e-10) return Math.hypot(point.x - from.x, point.y - from.y);
+    const t = Math.min(1, Math.max(0, ((point.x - from.x) * dx + (point.y - from.y) * dy) / length));
+    return Math.hypot(point.x - (from.x + dx * t), point.y - (from.y + dy * t));
+  }
+  function maxCubicDistance(points, cubic) {
+    const t = chordParams(points);
+    let distance3 = 0;
+    let index = 0;
+    for (let sample = 1; sample < points.length - 1; sample += 1) {
+      const point = points[sample];
+      if (point === void 0) continue;
+      const at = bezier3(cubic, t[sample] ?? 0);
+      const error = Math.hypot(point.x - at.x, point.y - at.y);
+      if (error > distance3) {
+        distance3 = error;
+        index = sample;
+      }
+    }
+    return { distance: distance3, index };
+  }
+  function bezier3(cubic, t) {
+    const u = 1 - t;
+    const b0 = u * u * u;
+    const b1 = 3 * u * u * t;
+    const b2 = 3 * u * t * t;
+    const b3 = t * t * t;
+    return {
+      x: cubic.p0.x * b0 + cubic.c1.x * b1 + cubic.c2.x * b2 + cubic.p1.x * b3,
+      y: cubic.p0.y * b0 + cubic.c1.y * b1 + cubic.c2.y * b2 + cubic.p1.y * b3
+    };
+  }
+  function reverseCubics(cubics) {
+    return cubics.slice().reverse().map((cubic) => ({ p0: cubic.p1, c1: cubic.c2, c2: cubic.c1, p1: cubic.p0 }));
+  }
+  function travelAngle(points, rev) {
+    if (!rev) {
+      const from2 = points[0];
+      const to2 = points[1] ?? from2;
+      if (from2 === void 0 || to2 === void 0) return 0;
+      return Math.atan2(to2.y - from2.y, to2.x - from2.x);
+    }
+    const from = points[points.length - 1];
+    const to = points[points.length - 2] ?? from;
+    if (from === void 0 || to === void 0) return 0;
+    return Math.atan2(to.y - from.y, to.x - from.x);
+  }
+  function shoelace(points) {
+    let sum = 0;
+    for (let index = 0; index < points.length; index += 1) {
+      const current = points[index];
+      const next = points[(index + 1) % points.length];
+      if (current === void 0 || next === void 0) continue;
+      sum += current.x * next.y - next.x * current.y;
+    }
+    return sum / 2;
+  }
+  function nest(cycles) {
+    const probes = cycles.map((cycle) => interiorProbe(cycle.points));
+    for (let index = 0; index < cycles.length; index += 1) {
+      const cycle = cycles[index];
+      const probe = probes[index];
+      if (cycle === void 0 || probe === void 0) continue;
+      let parent = -1;
+      let parentArea = Infinity;
+      for (let otherIndex = 0; otherIndex < cycles.length; otherIndex += 1) {
+        if (otherIndex === index) continue;
+        const other = cycles[otherIndex];
+        if (other === void 0 || other.label !== cycle.label || other.area <= cycle.area) continue;
+        if (!pointInPoly2(other.points, probe.x, probe.y)) continue;
+        if (other.area < parentArea) {
+          parentArea = other.area;
+          parent = otherIndex;
+        }
+      }
+      cycle.parent = parent;
+      if (parent >= 0) cycles[parent]?.children.push(index);
+    }
+  }
+  function interiorProbe(points) {
+    const first = points[0];
+    const second = points[1] ?? first;
+    if (first === void 0 || second === void 0) return { x: 0, y: 0 };
+    const dx = second.x - first.x;
+    const dy = second.y - first.y;
+    const length = Math.hypot(dx, dy) || 1;
+    return { x: (first.x + second.x) / 2 + dy / length * 0.02, y: (first.y + second.y) / 2 - dx / length * 0.02 };
+  }
+  function pointInPoly2(points, x, y) {
+    let inside = false;
+    for (let index = 0, previous = points.length - 1; index < points.length; previous = index, index += 1) {
+      const a = points[index];
+      const b = points[previous];
+      if (a === void 0 || b === void 0) continue;
+      if (a.y > y !== b.y > y && x < (b.x - a.x) * (y - a.y) / (b.y - a.y || 1e-12) + a.x) inside = !inside;
+    }
+    return inside;
+  }
+  function cyclePath(cubics) {
+    const first = cubics[0];
+    if (first === void 0) return "";
+    const commands = ["M " + fmt3(first.p0.x) + " " + fmt3(first.p0.y)];
+    for (const cubic of cubics) commands.push("C " + fmt3(cubic.c1.x) + " " + fmt3(cubic.c1.y) + " " + fmt3(cubic.c2.x) + " " + fmt3(cubic.c2.y) + " " + fmt3(cubic.p1.x) + " " + fmt3(cubic.p1.y));
+    commands.push("Z");
+    return commands.join(" ");
+  }
+  function fmt3(value) {
+    const rounded = Math.round(value * 1e3) / 1e3;
+    if (Object.is(rounded, -0)) return "0";
+    return String(rounded);
+  }
+  function hex3(color) {
+    return "#" + [color.r, color.g, color.b].map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0")).join("");
+  }
+  function normalizeHex(fill) {
+    if (fill === null) return null;
+    const match = /#([0-9a-fA-F]{6})/.exec(fill.trim());
+    return match === null ? null : "#" + (match[1] ?? "").toLowerCase();
+  }
+  function emptySvg(width, height) {
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + String(width) + '" height="' + String(height) + '" viewBox="0 0 ' + String(width) + " " + String(height) + '"></svg>';
   }
 
   // src/trace.ts
@@ -3371,11 +4121,12 @@
       if (plate === void 0 || svg === void 0) continue;
       let next = scaleSvg(svg, 1 / plate.scale);
       if (droppedColor !== null) next = dropFill(next, droppedColor);
-      if (removeBackground) next = dropCanvasBackground(next, plate.borderColor);
+      if (removeBackground && plate.preservePaths !== true) next = dropCanvasBackground(next, plate.borderColor);
       next = translateSvg(next, plate.originX, plate.originY);
       drawings.push((next.match(SHAPE) ?? []).join(""));
     }
     const merged = '<svg xmlns="http://www.w3.org/2000/svg" width="' + String(width) + '" height="' + String(height) + '" viewBox="0 0 ' + String(width) + " " + String(height) + '">' + drawings.join("") + "</svg>";
+    if (plates.some((plate) => plate.preservePaths)) return merged;
     return fitShapes(merged);
   }
 
@@ -3389,23 +4140,41 @@
   function fittedPlan(svgs, plan, removeBackground) {
     return mergePlates(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, removeBackground);
   }
-  function styledTraceSvg(fitted, settings) {
-    if (settings.preset === "logo" || settings.preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
+  function styledTraceSvg(fitted, settings, preservePaths = false) {
+    if (settings.preset === "logo" || settings.preset === "icon") {
+      if (preservePaths) return groupPathsByFill(fitted);
+      return groupPathsByFill(relaxPaths(fitted, 0.15));
+    }
     const stroke = settings.stacking === "cutout" ? 2 : 0.8;
     return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
   }
   function planFlat(rgba, width, height, settings) {
-    const plates = flatPlates(rgba, width, height, settings.maxColors);
+    const separateMarks = subjectBoxes(rgba, width, height).length > 1;
+    const plates = flatPlates(rgba, width, height, settings.maxColors, identityRaster, separateMarks ? SMOOTH_SOURCE : 0, !separateMarks);
     return {
       width,
       height,
       droppedColor: null,
       plates: plates.map((plate) => ({
         png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
-        scale: plate.scale,
+        scale: separateMarks ? plate.scale : 1,
         originX: plate.originX,
         originY: plate.originY,
         borderColor: plate.borderColor,
+        preservePaths: !separateMarks,
+        sharedSvg: separateMarks ? void 0 : traceSharedBoundary({
+          labels: plate.labels,
+          labelWidth: plate.width,
+          labelHeight: plate.height,
+          colors: plate.colors,
+          source: plate.source,
+          sourceWidth: plate.sourceWidth,
+          sourceHeight: plate.sourceHeight,
+          scale: plate.scale,
+          omitFill: settings.removeBackground ? plate.borderColor : null,
+          tolerance: Math.min(0.1, geometryTolerance(settings.smoothness) * 0.45),
+          cornerDegrees: settings.corner
+        }),
         request: flatRequest(settings, plate.palette, plate.scale)
       }))
     };
@@ -4022,16 +4791,21 @@
     }
     async function vectorize(selection, job, palette) {
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
-      const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
-      if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer \u0E17\u0E35\u0E48 " + binary);
       const sourcePng = fs.readFileSync(job.pngPath);
       const plan = planTrace(sourcePng, job.settings);
       if (plan === null || plan.plates.length === 0) throw new Error("\u0E2D\u0E48\u0E32\u0E19 PNG \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49");
+      const sharedOnly = plan.plates.every((plate) => plate.sharedSvg !== void 0);
+      const binary = sharedOnly ? "" : resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
+      if (!sharedOnly && !fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer \u0E17\u0E35\u0E48 " + binary);
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E22\u0E01\u0E42\u0E0B\u0E19\u0E2A\u0E35 \u0E41\u0E25\u0E49\u0E27\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");
       const svgs = [];
       for (let index = 0; index < plan.plates.length; index += 1) {
         const plate = plan.plates[index];
         if (plate === void 0) continue;
+        if (plate.sharedSvg !== void 0) {
+          svgs.push(plate.sharedSvg);
+          continue;
+        }
         const pngPath = path.join(job.directory, "trace-" + String(index) + ".png");
         const svgPath = path.join(job.directory, "trace-" + String(index) + ".svg");
         fs.writeFileSync(pngPath, plate.png);
@@ -4045,7 +4819,7 @@
       }
       edited = false;
       fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
-      const svgText = styledTraceSvg(fittedSvg, job.settings);
+      const svgText = styledTraceSvg(fittedSvg, job.settings, plan.plates.some((plate) => plate.preservePaths === true));
       fs.writeFileSync(job.svgPath, svgText);
       const decoded = readRgbaPng(sourcePng);
       brushPixels = null;

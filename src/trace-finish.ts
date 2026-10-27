@@ -8,6 +8,7 @@ export type PlacedPlate = {
   readonly originX: number;
   readonly originY: number;
   readonly borderColor: string | null;
+  readonly preservePaths?: boolean;
 };
 
 const SHAPE = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
@@ -27,7 +28,7 @@ export function mergePlates(
     if (plate === undefined || svg === undefined) continue;
     let next = scaleSvg(svg, 1 / plate.scale);
     if (droppedColor !== null) next = dropFill(next, droppedColor);
-    if (removeBackground) next = dropCanvasBackground(next, plate.borderColor);
+    if (removeBackground && plate.preservePaths !== true) next = dropCanvasBackground(next, plate.borderColor);
     next = translateSvg(next, plate.originX, plate.originY);
     drawings.push((next.match(SHAPE) ?? []).join(""));
   }
@@ -43,6 +44,7 @@ export function mergePlates(
     '">' +
     drawings.join("") +
     "</svg>";
+  if (plates.some((plate) => plate.preservePaths)) return merged;
   return fitShapes(merged);
 }
 
@@ -59,7 +61,10 @@ export function assembleTrace(
   stacking: Stacking
 ): string {
   const fitted = mergePlates(svgs, plates, width, height, droppedColor, removeBackground);
-  if (preset === "logo" || preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
+  if (preset === "logo" || preset === "icon") {
+    if (plates.some((plate) => plate.preservePaths)) return groupPathsByFill(fitted);
+    return groupPathsByFill(relaxPaths(fitted, 0.15));
+  }
   const stroke = stacking === "cutout" ? 2 : 0.8;
   return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness, cornerDegrees: corner }), stroke));
 }

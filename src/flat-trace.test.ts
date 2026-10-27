@@ -86,7 +86,15 @@ test("a small red flat stays in the palette and gray is not painted green", () =
   assert.ok(purple.b > purple.g && purple.r > purple.g);
 });
 
-test("a logo plan is one 8x plate with the prototype trace settings", () => {
+test("a two-pixel band that is not a flat core still keeps its color", () => {
+  const image = fill(36, 36, 255, 255, 255, 255);
+  paint(image, 36, 6, 16, 24, 2, 235, 70, 80);
+  const painted = labelImage(image.rgba, 36, 36, 8);
+  const sample = pixel(painted.rgba, painted.width, 18 * 8 + 4, 16 * 8 + 4);
+  assert.ok(sample.r > sample.g + 40 && sample.g < 140, "center " + sample.r + "," + sample.g + "," + sample.b);
+});
+
+test("a logo plan is one shared-boundary plate in source pixels", () => {
   const image = fill(24, 24, 220, 30, 30, 255);
   for (let y = 0; y < 24; y += 1) {
     for (let x = 12; x < 24; x += 1) setPixel(image, 24, x, y, 20, 30, 200, 255);
@@ -102,7 +110,9 @@ test("a logo plan is one 8x plate with the prototype trace settings", () => {
   assert.ok(plan !== null);
   const plate = plan?.plates[0];
   assert.ok(plate !== undefined);
-  assert.equal(plate?.scale, 8);
+  assert.equal(plate?.scale, 1);
+  assert.equal(plate?.preservePaths, true);
+  assert.ok((plate?.sharedSvg?.includes("<path") ?? false) === true);
   assert.equal(plate?.request.maxColors, 0);
   assert.equal(plate?.request.simplify, 2.4);
   assert.equal(plate?.request.filterSpeckle, 9);
