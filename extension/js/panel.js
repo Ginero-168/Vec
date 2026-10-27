@@ -1974,21 +1974,25 @@
   var UP = 8;
   var CORE_TAU = 0.035;
   var REGION_TOLERANCE = 0.06;
+  var COLOR_FLOOR = 0.035;
   var OWN_COLOR = 0.05;
   var DILATE_RADIUS = 3;
   var SPECK_SOURCE = 1.44;
   var SMOOTH_SOURCE = 0.6;
   var K_MAX = 16;
-  function flatPlates(rgba, width, height, maxColors) {
+  function identityRaster(rgba, _width, _height) {
+    return rgba;
+  }
+  function flatPlates(rgba, width, height, maxColors, preprocess = identityRaster) {
     const boxes = subjectBoxes(rgba, width, height);
-    return boxes.map((box) => plateFor(rgba, width, height, box, maxColors));
+    return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess));
   }
   function subjectBoxes(rgba, width, height) {
     const found = enclosedBoxes(rgba, width, height);
     if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
     return found;
   }
-  function plateFor(rgba, width, height, box, maxColors) {
+  function plateFor(rgba, width, height, box, maxColors, preprocess) {
     const cropW = box.width;
     const cropH = box.height;
     const crop = new Uint8Array(cropW * cropH * 4);
@@ -1996,7 +2000,7 @@
       const from = ((box.y + y) * width + box.x) * 4;
       crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
     }
-    const painted = labelImage(crop, cropW, cropH, maxColors);
+    const painted = labelImage(crop, cropW, cropH, maxColors, preprocess);
     return {
       rgba: painted.rgba,
       width: painted.width,
@@ -2036,15 +2040,17 @@
     }
     return hex2(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
   }
-  function labelImage(rgba, width, height, maxColors) {
+  function labelImage(rgba, width, height, maxColors, preprocess = identityRaster) {
+    const prepared = preprocess(rgba, width, height);
+    const source = prepared.length === rgba.length ? prepared : rgba;
     const count = width * height;
     const lab = new Float64Array(count * 3);
     const linear = new Float64Array(count * 3);
     const alpha = new Uint8Array(count);
     for (let index = 0; index < count; index += 1) {
       const offset = index * 4;
-      const color = { r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 };
-      alpha[index] = (rgba[offset + 3] ?? 0) >= 128 ? 255 : 0;
+      const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
+      alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
       const converted = rgbToOklab(color);
       lab[index * 3] = converted.L;
       lab[index * 3 + 1] = converted.a;
@@ -2058,7 +2064,7 @@
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
     const centers = buildPalette(lab, core, width, height, userK);
     const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
-    const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
+    const colors = fillColors(source, alpha, core, labels, width, height, centers);
     return paintLabels(labels, colors, width * UP, height * UP);
   }
   function assignLabels(linear, lab, core, alpha, width, height, centers) {
@@ -2107,8 +2113,12 @@
         allow[at] = (allow[at] ?? 0) | near;
       }
     }
-    const all = (1 << kCount) - 1;
-    for (let index = 0; index < count; index += 1) if ((allow[index] ?? 0) === 0) allow[index] = all;
+    const nearestCore = nearestCoreLabel(coreLabel, width, height);
+    for (let index = 0; index < count; index += 1) {
+      if ((allow[index] ?? 0) !== 0) continue;
+      const label = nearestCore[index] ?? -1;
+      if (label >= 0) allow[index] = 1 << label;
+    }
     const upW = width * UP;
     const upH = height * UP;
     const labels = new Uint8Array(upW * upH);
@@ -2119,13 +2129,14 @@
       for (let y = y0; y < y1; y += 1) {
         for (let x = 0; x < width; x += 1) {
           if (alpha[y * width + x] === 0) continue;
-          const mask = allow[y * width + x] ?? all;
+          const mask = allow[y * width + x] ?? 0;
           const bits = bitList(mask, kCount);
           for (let oy = 0; oy < UP; oy += 1) {
             for (let ox = 0; ox < UP; ox += 1) {
               const ux = x * UP + ox;
               const uy = y * UP + oy;
               const at = uy * upW + ux;
+              if (bits.length === 0) continue;
               if (bits.length === 1) {
                 labels[at] = bits[0] ?? 0;
                 continue;
@@ -2148,6 +2159,39 @@
       }
     }
     return labels;
+  }
+  function nearestCoreLabel(coreLabel, width, height) {
+    const nearest2 = new Int16Array(coreLabel.length);
+    nearest2.fill(-1);
+    const queue = [];
+    for (let index = 0; index < coreLabel.length; index += 1) {
+      const label = coreLabel[index] ?? -1;
+      if (label < 0) continue;
+      nearest2[index] = label;
+      queue.push(index);
+    }
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const index = queue[cursor] ?? 0;
+      const label = nearest2[index] ?? -1;
+      const x = index % width;
+      const y = (index - x) / width;
+      const steps = [
+        [x - 1, y],
+        [x + 1, y],
+        [x, y - 1],
+        [x, y + 1]
+      ];
+      for (const step of steps) {
+        const nx = step[0] ?? 0;
+        const ny = step[1] ?? 0;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const at = ny * width + nx;
+        if ((nearest2[at] ?? -1) >= 0) continue;
+        nearest2[at] = label;
+        queue.push(at);
+      }
+    }
+    return nearest2;
   }
   function explain(sample, bits, centers) {
     let best = bits[0] ?? 0;
@@ -2251,15 +2295,26 @@
     }
     if (samples.length === 0) return [{ L: 0, a: 0, b: 0 }];
     const regions = regionMeans(lab, core, width, height);
-    if (userK > 0) return wkmeans(samples, weights, Math.min(userK, samples.length));
-    let chosen = wkmeans(samples, weights, Math.min(2, samples.length));
+    const anchors = distinctAnchors(regions);
+    const floorK = Math.max(2, anchors.length);
+    if (userK > 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(userK, anchors.length)), anchors);
     if (regions.length === 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(2, Math.min(8, samples.length))));
-    for (let k = 2; k <= Math.min(K_MAX, samples.length); k += 1) {
-      chosen = wkmeans(samples, weights, k);
-      const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region)) > REGION_TOLERANCE));
+    let chosen = wkmeans(samples, weights, Math.min(floorK, samples.length), anchors);
+    for (let k = floorK; k <= Math.min(K_MAX, Math.max(samples.length, anchors.length)); k += 1) {
+      chosen = wkmeans(samples, weights, k, anchors);
+      const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region.mean)) > REGION_TOLERANCE));
       if (!missed) return chosen;
     }
     return chosen;
+  }
+  function distinctAnchors(regions) {
+    const ordered = [...regions].sort((left, right) => right.size - left.size);
+    const kept = [];
+    for (const region of ordered) {
+      if (kept.length >= K_MAX) break;
+      if (kept.every((color) => Math.sqrt(labDistance2(color, region.mean)) > COLOR_FLOOR)) kept.push({ ...region.mean });
+    }
+    return kept;
   }
   function regionMeans(lab, core, width, height) {
     const groups = /* @__PURE__ */ new Map();
@@ -2303,27 +2358,41 @@
           varB += (color.b - mean.b) ** 2;
         }
         const spread = Math.max(Math.sqrt(varL / n), Math.sqrt(varA / n), Math.sqrt(varB / n));
-        if (spread < 0.015) means.push(mean);
+        if (spread < 0.015) means.push({ mean, size });
       }
     }
     return means;
   }
-  function wkmeans(samples, weights, kCount) {
+  function wkmeans(samples, weights, kCount, frozen = []) {
     const count = samples.length;
-    const k = Math.max(1, Math.min(kCount, count));
-    let first = 0;
-    let bestWeight = -1;
-    for (let index = 0; index < count; index += 1) {
-      const weight = weights[index] ?? 0;
-      if (weight > bestWeight) {
-        bestWeight = weight;
-        first = index;
-      }
+    const pinned = Math.min(frozen.length, K_MAX);
+    const k = Math.max(1, Math.min(K_MAX, Math.max(kCount, pinned, count === 0 ? pinned : 1)));
+    const centers = [];
+    for (let index = 0; index < pinned && centers.length < k; index += 1) {
+      const seed = frozen[index] ?? zeroLab();
+      centers.push({ L: seed.L, a: seed.a, b: seed.b });
     }
-    const chosen = [first];
+    if (count === 0) return centers.length > 0 ? centers : [{ L: 0, a: 0, b: 0 }];
     const distance3 = new Float64Array(count);
-    for (let index = 0; index < count; index += 1) distance3[index] = Math.sqrt(labDistance2(samples[index] ?? zeroLab(), samples[first] ?? zeroLab()));
-    while (chosen.length < k) {
+    if (centers.length === 0) {
+      let first = 0;
+      let bestWeight = -1;
+      for (let index = 0; index < count; index += 1) {
+        const weight = weights[index] ?? 0;
+        if (weight > bestWeight) {
+          bestWeight = weight;
+          first = index;
+        }
+      }
+      centers.push({ ...samples[first] ?? zeroLab() });
+    }
+    for (let index = 0; index < count; index += 1) {
+      const sample = samples[index] ?? zeroLab();
+      let best = Infinity;
+      for (const center of centers) best = Math.min(best, Math.sqrt(labDistance2(sample, center)));
+      distance3[index] = best;
+    }
+    while (centers.length < k && centers.length < count + pinned) {
       let at = 0;
       let score = -1;
       for (let index = 0; index < count; index += 1) {
@@ -2333,13 +2402,14 @@
           at = index;
         }
       }
-      chosen.push(at);
+      if (score <= 0 && centers.length >= pinned) break;
       const center = samples[at] ?? zeroLab();
+      centers.push({ L: center.L, a: center.a, b: center.b });
       for (let index = 0; index < count; index += 1) {
         distance3[index] = Math.min(distance3[index] ?? 0, Math.sqrt(labDistance2(samples[index] ?? zeroLab(), center)));
       }
     }
-    const centers = chosen.map((index) => ({ ...samples[index] ?? zeroLab() }));
+    const pinCount = Math.min(pinned, centers.length);
     for (let round = 0; round < 40; round += 1) {
       const bins = centers.map(() => ({ L: 0, a: 0, b: 0, w: 0 }));
       for (let index = 0; index < count; index += 1) {
@@ -2353,7 +2423,7 @@
         bin.b += sample.b * weight;
         bin.w += weight;
       }
-      for (let index = 0; index < centers.length; index += 1) {
+      for (let index = pinCount; index < centers.length; index += 1) {
         const bin = bins[index];
         if (bin === void 0 || bin.w === 0) continue;
         centers[index] = { L: bin.L / bin.w, a: bin.a / bin.w, b: bin.b / bin.w };
@@ -2458,7 +2528,7 @@
             strong = true;
             break;
           }
-          if (Math.sqrt(labDistance2(color, readLab(lab, next))) > 0.06) {
+          if (Math.sqrt(labDistance2(color, readLab(lab, next))) > COLOR_FLOOR) {
             strong = true;
             break;
           }
