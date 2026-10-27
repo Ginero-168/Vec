@@ -1788,7 +1788,7 @@
       const copy = rgba.slice();
       return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
     }
-    const source = options.mode === "poster" ? grayscale(rgba, count) : rgba;
+    const source = rgba;
     const samples = collectSamples(source, width, height);
     const centroids = cluster(samples, colorCap(options));
     const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
@@ -1830,18 +1830,6 @@
   function colorCap(options) {
     const requested = options.maxColors > 0 ? options.maxColors : MODE_CAP[options.mode];
     return Math.min(32, Math.max(2, requested));
-  }
-  function grayscale(rgba, count) {
-    const next = new Uint8Array(rgba.length);
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      const y = Math.round(0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0));
-      next[offset] = y;
-      next[offset + 1] = y;
-      next[offset + 2] = y;
-      next[offset + 3] = rgba[offset + 3] ?? 255;
-    }
-    return next;
   }
   function collectSamples(rgba, width, height) {
     const target = 8e3;
