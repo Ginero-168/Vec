@@ -1,3 +1,5 @@
+import { fitSquircle } from "./squircle.ts";
+
 export type TraceFacts = {
   readonly paths: number;
   readonly anchors: number;
@@ -248,7 +250,7 @@ export function fitShapes(svg: string): string {
   let cursor = 0;
   for (const tag of tags) {
     result += svg.slice(cursor, tag.index);
-    result += /\bdata-vec-squircle-fit\s*=\s*["']true["']/i.test(tag.source) ? tag.source : fittedMarkup(tag) ?? tag.source;
+    result += /\bdata-vec-shape\s*=\s*["']squircle["']/i.test(tag.source) ? tag.source : fittedMarkup(tag) ?? tag.source;
     cursor = tag.index + tag.length;
   }
   return result + svg.slice(cursor);
@@ -268,6 +270,7 @@ export function sealGaps(svg: string, strokeWidth = 0.8): string {
 function fittedMarkup(tag: PathTag): string | null {
   if (elementName(tag.source) !== "path") return null;
   const attrs = tagAttrs(tag.source);
+  if (/\bdata-vec-shape\s*=\s*["']squircle["']/i.test(attrs)) return null;
   const data = readAttr(attrs, "d");
   if (data === null) return null;
   const measured = measurePath(data);
@@ -277,10 +280,12 @@ function fittedMarkup(tag: PathTag): string | null {
   const rect = fitRect(measured);
   if (rect !== null) return '<rect x="' + fmt(rect.x) + '" y="' + fmt(rect.y) + '" width="' + fmt(rect.width) + '" height="' + fmt(rect.height) + '"' + fillAttr + "/>";
   const round = fitRoundRect(measured);
-  if (round !== null) return '<rect x="' + fmt(round.x) + '" y="' + fmt(round.y) + '" width="' + fmt(round.width) + '" height="' + fmt(round.height) + '" rx="' + fmt(round.r) + '" ry="' + fmt(round.r) + '"' + fillAttr + "/>";
   const circle = fitCircle(measured);
-  if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
   const ellipse = fitEllipse(measured);
+  const squircle = fitSquircle(measured, round?.r ?? null);
+  if (squircle !== null) return '<path d="' + squircle + '"' + fillAttr + ' data-vec-shape="squircle"/>';
+  if (round !== null) return '<rect x="' + fmt(round.x) + '" y="' + fmt(round.y) + '" width="' + fmt(round.width) + '" height="' + fmt(round.height) + '" rx="' + fmt(round.r) + '" ry="' + fmt(round.r) + '"' + fillAttr + "/>";
+  if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
   if (ellipse !== null) return '<ellipse cx="' + fmt(ellipse.cx) + '" cy="' + fmt(ellipse.cy) + '" rx="' + fmt(ellipse.rx) + '" ry="' + fmt(ellipse.ry) + '"' + fillAttr + "/>";
   return null;
 }
@@ -672,6 +677,18 @@ function measurePath(data: string): MeasuredPath {
     cy = y;
   }
 
+  function addLineSamples(x: number, y: number): void {
+    const start = { x: cx, y: cy };
+    const end = { x, y };
+    const steps = Math.max(1, Math.ceil(Math.hypot(x - cx, y - cy)));
+    for (let index = 1; index < steps; index += 1) {
+      const t = index / steps;
+      const point = { x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t };
+      open.push(point);
+      track(point);
+    }
+  }
+
   for (const command of commands) {
     const op = command.cmd.toLowerCase();
     const relative = command.cmd === op;
@@ -685,15 +702,23 @@ function measurePath(data: string): MeasuredPath {
       sy = y;
       addAnchor(x, y, false);
     } else if (op === "l") {
-      addAnchor(relative ? cx + (args[0] ?? 0) : (args[0] ?? 0), relative ? cy + (args[1] ?? 0) : (args[1] ?? 0), false);
+      const x = relative ? cx + (args[0] ?? 0) : (args[0] ?? 0);
+      const y = relative ? cy + (args[1] ?? 0) : (args[1] ?? 0);
+      addLineSamples(x, y);
+      addAnchor(x, y, false);
     } else if (op === "h") {
-      addAnchor(relative ? cx + (args[0] ?? 0) : (args[0] ?? 0), cy, false);
+      const x = relative ? cx + (args[0] ?? 0) : (args[0] ?? 0);
+      addLineSamples(x, cy);
+      addAnchor(x, cy, false);
     } else if (op === "v") {
-      addAnchor(cx, relative ? cy + (args[0] ?? 0) : (args[0] ?? 0), false);
+      const y = relative ? cy + (args[0] ?? 0) : (args[0] ?? 0);
+      addLineSamples(cx, y);
+      addAnchor(cx, y, false);
     } else if (op === "c" || op === "s" || op === "q" || op === "t") {
       const start = { x: cx, y: cy };
       const cubic = curveControls(op, relative, args, start, prevControl);
-      for (const t of [0.25, 0.5, 0.75, 1]) {
+      for (let step = 1; step <= 16; step += 1) {
+        const t = step / 16;
         const point = bezier(start, cubic.p1, cubic.p2, cubic.p3, t);
         open.push(point);
         track(point);
@@ -705,6 +730,7 @@ function measurePath(data: string): MeasuredPath {
       addAnchor(end.x, end.y, false);
     } else if (op === "z") {
       if (Math.hypot(cx - sx, cy - sy) >= 0.05) {
+        addLineSamples(sx, sy);
         const point = { x: sx, y: sy };
         open.push(point);
         track(point);
