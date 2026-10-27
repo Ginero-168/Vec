@@ -26,6 +26,19 @@ function opaqueColors(rgba: Uint8Array): number {
   return seen.size;
 }
 
+function opaqueNonGrayColors(rgba: Uint8Array): number {
+  const seen = new Set<string>();
+  for (let index = 0; index < rgba.length; index += 4) {
+    if ((rgba[index + 3] ?? 0) < 128) continue;
+    const red = rgba[index] ?? 0;
+    const green = rgba[index + 1] ?? 0;
+    const blue = rgba[index + 2] ?? 0;
+    if (red === green && green === blue) continue;
+    seen.add(red + "," + green + "," + blue);
+  }
+  return seen.size;
+}
+
 test("a one-color logo on a transparent ground stays a logo, not a solid square", () => {
   const rgba = fill(32, 32, (x, y) => (x >= 12 && x < 20 && y >= 12 && y < 20 ? [30, 215, 96, 255] : [0, 0, 0, 0]));
   const segmented = segmentRaster(rgba, 32, 32, { mode: "icon", maxColors: 8, removeBackground: false, opaqueAt: 200 });
@@ -126,13 +139,14 @@ test("speck area decides whether a small block survives", () => {
   assert.ok(dark(kept) >= 4);
 });
 
-test("poster mode keeps gray tones and a thin line survives", () => {
+test("poster mode keeps multiple flat colors", () => {
   const color = fill(24, 24, (x) => (x < 12 ? [220, 40, 40, 255] : [40, 80, 220, 255]));
   const poster = segmentRaster(color, 24, 24, { mode: "poster", maxColors: 8, removeBackground: false });
   assert.ok(opaqueColors(poster) <= 8);
-  assert.equal(poster[0], poster[1]);
-  assert.equal(poster[1], poster[2]);
+  assert.ok(opaqueNonGrayColors(poster) >= 2);
+});
 
+test("a thin line survives", () => {
   const line = fill(40, 24, (x, y) => (y === 12 && x > 2 && x < 37 ? [0, 0, 0, 255] : [255, 255, 255, 255]));
   const kept = segmentRaster(line, 40, 24, { mode: "logo", maxColors: 0, removeBackground: false });
   let dark = 0;
