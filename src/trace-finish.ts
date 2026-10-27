@@ -18,7 +18,8 @@ export function mergePlates(
   width: number,
   height: number,
   droppedColor: string | null,
-  removeBackground: boolean
+  removeBackground: boolean,
+  fitGeometry = true
 ): string {
   const drawings: string[] = [];
   for (let index = 0; index < svgs.length; index += 1) {
@@ -43,7 +44,7 @@ export function mergePlates(
     '">' +
     drawings.join("") +
     "</svg>";
-  return fitShapes(merged);
+  return fitGeometry ? fitShapes(merged) : merged;
 }
 
 export function assembleTrace(

@@ -9,6 +9,44 @@
     const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
     return Math.round((0.4 + clamped * 2.2) * 100) / 100;
   }
+  function relaxPaths(svg2, tolerance = 0.15) {
+    const limit = Math.min(0.5, Math.max(0.05, Number.isFinite(tolerance) ? tolerance : 0.15));
+    return svg2.replace(shapePattern(), (tag) => {
+      if (!/^<path\b/i.test(tag)) return tag;
+      const quoted = readD(tag);
+      if (quoted === null) return tag;
+      const parsed = parsePath(quoted.value);
+      if (parsed === null || parsed.length === 0) return tag;
+      const relaxed = parsed.map((subpath) => relaxSubpath(subpath, limit));
+      const next = serialize(relaxed);
+      if (next === quoted.value) return tag;
+      return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+    });
+  }
+  function relaxSubpath(subpath, tolerance) {
+    const cubics = subpath.cubics.slice();
+    let guard = cubics.length;
+    let merged = true;
+    while (merged && cubics.length > 1 && guard > 0) {
+      merged = false;
+      guard -= 1;
+      const last = subpath.closed ? cubics.length : cubics.length - 1;
+      for (let index = 0; index < last; index += 1) {
+        const nextIndex = (index + 1) % cubics.length;
+        if (nextIndex === 0) continue;
+        const first = cubics[index];
+        const second = cubics[nextIndex];
+        if (first === void 0 || second === void 0) continue;
+        const fitted = fitSamples(sampleChain([first, second]), tolerance, outgoing(first), incoming(second), 0);
+        const replacement = fitted?.[0];
+        if (fitted === null || fitted.length !== 1 || replacement === void 0) continue;
+        cubics.splice(index, 2, replacement);
+        merged = true;
+        break;
+      }
+    }
+    return { cubics, closed: subpath.closed };
+  }
   function fairPaths(svg2, options) {
     const tolerance = options.tolerance ?? fairTolerance(options.smoothness);
     const minTurn = 90 - Math.min(90, Math.max(0, Number.isFinite(options.cornerDegrees) ? options.cornerDegrees : 0));
@@ -638,6 +676,186 @@
     const value = Number(raw);
     if (!Number.isFinite(value)) return null;
     return { value, next: index + raw.length };
+  }
+
+  // src/trace.ts
+  function presetDefaults(preset) {
+    if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
+    if (preset === "poster") return { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" };
+    if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
+    return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
+  }
+  function simplifyTolerance(smoothness) {
+    const clamped = Math.min(3, Math.max(0, smoothness));
+    const tolerance = 2.2 - clamped * 0.75;
+    return Math.round(Math.max(0.15, tolerance) * 100) / 100;
+  }
+
+  // src/lab-model.ts
+  var SPECK = { logo: 18, icon: 12, photo: 6, poster: 28 };
+  var PRECISION = { logo: 6, icon: 5, photo: 8, poster: 4 };
+  function controlsFor(mode2) {
+    const defaults = presetDefaults(mode2);
+    const segmentColors = mode2 === "logo" ? 0 : Math.min(32, Math.max(2, defaults.maxColors || (mode2 === "photo" ? 32 : mode2 === "poster" ? 10 : 8)));
+    return {
+      mode: mode2,
+      maxColors: segmentColors,
+      snapBlends: mode2 === "logo" || mode2 === "icon",
+      speckArea: SPECK[mode2],
+      removeBackground: defaults.removeBackground,
+      backdropSpread: 22,
+      opaqueAt: mode2 === "photo" || mode2 === "poster" ? 128 : 200,
+      traceColors: defaults.maxColors > 0 ? defaults.maxColors : segmentColors,
+      lockPalette: true,
+      colorPrecision: PRECISION[mode2],
+      filterSpeckle: mode2 === "photo" ? 1 : 0,
+      clustering: mode2 === "photo" ? "watershed" : "off",
+      watershedDetail: 128,
+      simplify: simplifyTolerance(defaults.smoothness),
+      stacking: defaults.stacking,
+      dropPlate: defaults.removeBackground,
+      fitGeometry: true,
+      smoothness: defaults.smoothness,
+      corner: defaults.corner,
+      seal: mode2 === "photo" || mode2 === "poster",
+      sealWidth: defaults.stacking === "cutout" ? 2 : 0.8
+    };
+  }
+  function traceRequest(controls, palette) {
+    const locked = controls.lockPalette && palette.length > 0;
+    return {
+      preset: controls.mode,
+      maxColors: locked ? 0 : controls.traceColors,
+      smoothness: 0,
+      removeBackground: controls.removeBackground,
+      stacking: controls.stacking,
+      palette: locked ? palette.slice(0, 32) : void 0,
+      colorPrecision: controls.colorPrecision,
+      filterSpeckle: controls.filterSpeckle,
+      clustering: controls.clustering,
+      watershedDetail: controls.watershedDetail,
+      simplify: controls.simplify
+    };
+  }
+  function paletteFromRaster(rgba, _ignore) {
+    const seen = /* @__PURE__ */ new Set();
+    for (let index = 0; index < rgba.length; index += 4) {
+      if ((rgba[index + 3] ?? 0) < 250) continue;
+      const color = "#" + byte(rgba[index] ?? 0) + byte(rgba[index + 1] ?? 0) + byte(rgba[index + 2] ?? 0);
+      seen.add(color);
+    }
+    return [...seen].sort();
+  }
+  function colorCount(rgba) {
+    return paletteFromRaster(rgba, null).length;
+  }
+  function transparentFraction(rgba) {
+    if (rgba.length === 0) return 0;
+    let clear = 0;
+    const pixels2 = rgba.length / 4;
+    for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 255) === 0) clear += 1;
+    return clear / pixels2;
+  }
+  function byte(value) {
+    return value.toString(16).padStart(2, "0");
+  }
+
+  // src/flat-trace.ts
+  function cornerColor(rgba, width2, height2) {
+    const points = [
+      [0, 0],
+      [width2 - 1, 0],
+      [0, height2 - 1],
+      [width2 - 1, height2 - 1]
+    ];
+    const opaque2 = [];
+    for (const point of points) {
+      const x = point[0] ?? 0;
+      const y = point[1] ?? 0;
+      const offset = (y * width2 + x) * 4;
+      if ((rgba[offset + 3] ?? 0) < 250) continue;
+      opaque2.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
+    }
+    if (opaque2.length === 0) return null;
+    const mean = {
+      r: opaque2.reduce((sum, color) => sum + color.r, 0) / opaque2.length,
+      g: opaque2.reduce((sum, color) => sum + color.g, 0) / opaque2.length,
+      b: opaque2.reduce((sum, color) => sum + color.b, 0) / opaque2.length
+    };
+    for (const color of opaque2) {
+      if (Math.abs(color.r - mean.r) > 18 || Math.abs(color.g - mean.g) > 18 || Math.abs(color.b - mean.b) > 18) return null;
+    }
+    return hex(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
+  }
+  function hex(red, green, blue) {
+    return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
+  }
+
+  // src/punch-rgba.ts
+  function punchRgba(rgba, width2, height2, opaqueAt = 128) {
+    const count = width2 * height2;
+    if (rgba.length < count * 4) return { rgba, droppedColor: null };
+    const cutoff = Math.min(255, Math.max(0, opaqueAt));
+    const used = /* @__PURE__ */ new Set();
+    let transparent = 0;
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * 4;
+      const alpha = rgba[offset + 3] ?? 255;
+      if (alpha < cutoff) {
+        transparent += 1;
+        continue;
+      }
+      used.add((rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0));
+    }
+    if (transparent === 0) {
+      let needsFlattening = false;
+      for (let index = 0; index < count; index += 1) {
+        if ((rgba[index * 4 + 3] ?? 255) !== 255) {
+          needsFlattening = true;
+          break;
+        }
+      }
+      if (!needsFlattening) return { rgba, droppedColor: null };
+      const opaque2 = new Uint8Array(rgba);
+      for (let index = 0; index < count; index += 1) opaque2[index * 4 + 3] = 255;
+      return { rgba: opaque2, droppedColor: null };
+    }
+    const sentinel = unusedColor(used);
+    const next = new Uint8Array(count * 4);
+    next.set(rgba.subarray(0, count * 4));
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * 4;
+      if ((next[offset + 3] ?? 255) < cutoff) {
+        next[offset] = sentinel >> 16 & 255;
+        next[offset + 1] = sentinel >> 8 & 255;
+        next[offset + 2] = sentinel & 255;
+      }
+      next[offset + 3] = 255;
+    }
+    return { rgba: next, droppedColor: hex2(sentinel) };
+  }
+  function revealSentinel(rgba, droppedColor) {
+    if (droppedColor === null) return rgba;
+    const parsed = /^#([0-9a-f]{6})$/i.exec(droppedColor);
+    if (parsed === null) return rgba;
+    const value = Number.parseInt(parsed[1] ?? "", 16);
+    const red = value >> 16 & 255;
+    const green = value >> 8 & 255;
+    const blue = value & 255;
+    const next = new Uint8Array(rgba);
+    for (let index = 0; index < next.length; index += 4) {
+      if (next[index] === red && next[index + 1] === green && next[index + 2] === blue) next[index + 3] = 0;
+    }
+    return next;
+  }
+  function unusedColor(used) {
+    const candidates = [16711935, 65280, 16711850, 65535, 16776960];
+    for (const color of candidates) if (!used.has(color)) return color;
+    for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
+    return 16711935;
+  }
+  function hex2(color) {
+    return "#" + color.toString(16).padStart(6, "0");
   }
 
   // src/score.ts
@@ -1461,192 +1679,16 @@
     return { value: Number(raw), index: cursor + raw.length };
   }
 
-  // src/trace.ts
-  function presetDefaults(preset) {
-    if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
-    if (preset === "poster") return { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" };
-    if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
-    return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
-  }
-  function simplifyTolerance(smoothness) {
-    const clamped = Math.min(3, Math.max(0, smoothness));
-    const tolerance = 2.2 - clamped * 0.75;
-    return Math.round(Math.max(0.15, tolerance) * 100) / 100;
-  }
-
-  // src/lab-model.ts
-  var SPECK = { logo: 18, icon: 12, photo: 6, poster: 28 };
-  var PRECISION = { logo: 6, icon: 5, photo: 8, poster: 4 };
-  function controlsFor(mode2) {
-    const defaults = presetDefaults(mode2);
-    const segmentColors = mode2 === "logo" ? 0 : Math.min(32, Math.max(2, defaults.maxColors || (mode2 === "photo" ? 32 : mode2 === "poster" ? 10 : 8)));
-    return {
-      mode: mode2,
-      maxColors: segmentColors,
-      snapBlends: mode2 === "logo" || mode2 === "icon",
-      speckArea: SPECK[mode2],
-      removeBackground: defaults.removeBackground,
-      backdropSpread: 22,
-      opaqueAt: mode2 === "photo" || mode2 === "poster" ? 128 : 200,
-      traceColors: defaults.maxColors > 0 ? defaults.maxColors : segmentColors,
-      lockPalette: true,
-      colorPrecision: PRECISION[mode2],
-      filterSpeckle: mode2 === "photo" ? 1 : 0,
-      clustering: mode2 === "photo" ? "watershed" : "off",
-      watershedDetail: 128,
-      simplify: simplifyTolerance(defaults.smoothness),
-      stacking: defaults.stacking,
-      dropPlate: defaults.removeBackground,
-      fitGeometry: true,
-      smoothness: defaults.smoothness,
-      corner: defaults.corner,
-      seal: mode2 === "photo" || mode2 === "poster",
-      sealWidth: defaults.stacking === "cutout" ? 2 : 0.8
-    };
-  }
-  function traceRequest(controls, palette) {
-    const locked = controls.lockPalette && palette.length > 0;
-    return {
-      preset: controls.mode,
-      maxColors: locked ? 0 : controls.traceColors,
-      smoothness: 0,
-      removeBackground: controls.removeBackground,
-      stacking: controls.stacking,
-      palette: locked ? palette.slice(0, 32) : void 0,
-      colorPrecision: controls.colorPrecision,
-      filterSpeckle: controls.filterSpeckle,
-      clustering: controls.clustering,
-      watershedDetail: controls.watershedDetail,
-      simplify: controls.simplify
-    };
-  }
-  function paletteFromRaster(rgba, _ignore) {
-    const seen = /* @__PURE__ */ new Set();
-    for (let index = 0; index < rgba.length; index += 4) {
-      if ((rgba[index + 3] ?? 0) < 250) continue;
-      const color = "#" + byte(rgba[index] ?? 0) + byte(rgba[index + 1] ?? 0) + byte(rgba[index + 2] ?? 0);
-      seen.add(color);
-    }
-    return [...seen].sort();
-  }
-  function colorCount(rgba) {
-    return paletteFromRaster(rgba, null).length;
-  }
-  function transparentFraction(rgba) {
-    if (rgba.length === 0) return 0;
-    let clear = 0;
-    const pixels2 = rgba.length / 4;
-    for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 255) === 0) clear += 1;
-    return clear / pixels2;
-  }
-  function styleVectors(svg2, controls, droppedColor, borderColor = null) {
-    let fitted = svg2;
-    if (droppedColor !== null) fitted = dropFill(fitted, droppedColor);
-    if (controls.dropPlate) fitted = dropCanvasBackground(fitted, borderColor);
-    if (controls.fitGeometry) fitted = fitShapes(fitted);
-    const flat = controls.mode === "logo" || controls.mode === "icon";
-    const faired = flat ? fitted : fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
-    const sealed = groupPathsByFill(!flat && controls.seal ? sealGaps(faired, controls.sealWidth) : faired);
-    return { fitted, faired, sealed };
-  }
-  function byte(value) {
-    return value.toString(16).padStart(2, "0");
-  }
-
-  // src/flat-trace.ts
-  function cornerColor(rgba, width2, height2) {
-    const points = [
-      [0, 0],
-      [width2 - 1, 0],
-      [0, height2 - 1],
-      [width2 - 1, height2 - 1]
-    ];
-    const opaque2 = [];
-    for (const point of points) {
-      const x = point[0] ?? 0;
-      const y = point[1] ?? 0;
-      const offset = (y * width2 + x) * 4;
-      if ((rgba[offset + 3] ?? 0) < 250) continue;
-      opaque2.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
-    }
-    if (opaque2.length === 0) return null;
-    const mean = {
-      r: opaque2.reduce((sum, color) => sum + color.r, 0) / opaque2.length,
-      g: opaque2.reduce((sum, color) => sum + color.g, 0) / opaque2.length,
-      b: opaque2.reduce((sum, color) => sum + color.b, 0) / opaque2.length
-    };
-    for (const color of opaque2) {
-      if (Math.abs(color.r - mean.r) > 18 || Math.abs(color.g - mean.g) > 18 || Math.abs(color.b - mean.b) > 18) return null;
-    }
-    return hex(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
-  }
-  function hex(red, green, blue) {
-    return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
-  }
-
-  // src/punch-rgba.ts
-  function punchRgba(rgba, width2, height2, opaqueAt = 128) {
-    const count = width2 * height2;
-    if (rgba.length < count * 4) return { rgba, droppedColor: null };
-    const cutoff = Math.min(255, Math.max(0, opaqueAt));
-    const used = /* @__PURE__ */ new Set();
-    let transparent = 0;
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      const alpha = rgba[offset + 3] ?? 255;
-      if (alpha < cutoff) {
-        transparent += 1;
-        continue;
-      }
-      used.add((rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0));
-    }
-    if (transparent === 0) return { rgba, droppedColor: null };
-    const sentinel = unusedColor(used);
-    const next = new Uint8Array(count * 4);
-    next.set(rgba.subarray(0, count * 4));
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      if ((next[offset + 3] ?? 255) < cutoff) {
-        next[offset] = sentinel >> 16 & 255;
-        next[offset + 1] = sentinel >> 8 & 255;
-        next[offset + 2] = sentinel & 255;
-      }
-      next[offset + 3] = 255;
-    }
-    return { rgba: next, droppedColor: hex2(sentinel) };
-  }
-  function revealSentinel(rgba, droppedColor) {
-    if (droppedColor === null) return rgba;
-    const parsed = /^#([0-9a-f]{6})$/i.exec(droppedColor);
-    if (parsed === null) return rgba;
-    const value = Number.parseInt(parsed[1] ?? "", 16);
-    const red = value >> 16 & 255;
-    const green = value >> 8 & 255;
-    const blue = value & 255;
-    const next = new Uint8Array(rgba);
-    for (let index = 0; index < next.length; index += 4) {
-      if (next[index] === red && next[index + 1] === green && next[index + 2] === blue) next[index + 3] = 0;
-    }
-    return next;
-  }
-  function unusedColor(used) {
-    const candidates = [16711935, 65280, 16711850, 65535, 16776960];
-    for (const color of candidates) if (!used.has(color)) return color;
-    for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
-    return 16711935;
-  }
-  function hex2(color) {
-    return "#" + color.toString(16).padStart(6, "0");
-  }
-
   // src/segment.ts
   var MODE_CAP = { logo: 8, icon: 8, photo: 32, poster: 10 };
   var SPECK_AREA = { logo: 18, icon: 12, photo: 6, poster: 28 };
-  function segmentViews(rgba, width2, height2, options) {
+  function segmentColorStage(rgba, width2, height2, options) {
     const count = width2 * height2;
     if (width2 < 2 || height2 < 2 || rgba.length < count * 4) {
       const copy = rgba.slice();
-      return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
+      const labels2 = new Int16Array(count);
+      labels2.fill(-1);
+      return { colors: copy, labels: labels2, punchLabels: labels2, palette: [], opaque: new Uint8Array(count), spread: 0 };
     }
     const source2 = rgba;
     const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
@@ -1668,16 +1710,34 @@
     }
     cleanupEdges(labels, width2, height2);
     mergeSpecks(labels, width2, height2, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
+    const punchLabels = new Int16Array(labels);
+    for (let index = 0; index < count; index += 1) {
+      if ((source2[index * 4 + 3] ?? 0) > 0 && (punchLabels[index] ?? -1) < 0) punchLabels[index] = nearest(pixelAt(source2, index), palette);
+    }
     const opaque2 = new Uint8Array(count);
     for (let index = 0; index < count; index += 1) opaque2[index] = (source2[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
     const colors = paintLabels(labels, palette, opaque2);
-    const alpha = opaque2.slice();
-    if (options.removeBackground) clearFlatBackdrop(source2, labels, width2, height2, palette, alpha, options.backdropSpread ?? 22);
+    return { colors, labels, punchLabels, palette, opaque: opaque2, spread: borderMeasure(source2, width2, height2)?.spread ?? 0 };
+  }
+  function segmentBackdropStage(rgba, width2, height2, colors, removeBackground, spreadLimit) {
+    if (colors.palette.length === 0) return { backdrop: colors.colors.slice(), punchInput: rgba.slice() };
+    const alpha = colors.opaque.slice();
+    const punchAlpha = new Uint8Array(width2 * height2);
+    for (let index = 0; index < punchAlpha.length; index += 1) {
+      if ((colors.punchLabels[index] ?? -1) >= 0) punchAlpha[index] = rgba[index * 4 + 3] ?? 0;
+    }
+    const cleared = removeBackground ? flatBackdropMask(rgba, colors.labels, width2, height2, colors.palette, spreadLimit) : null;
+    if (cleared !== null) {
+      for (let index = 0; index < cleared.length; index += 1) {
+        if (cleared[index] !== 0) {
+          alpha[index] = 0;
+          punchAlpha[index] = 0;
+        }
+      }
+    }
     return {
-      colors,
-      backdrop: paintLabels(labels, palette, alpha),
-      spread: borderMeasure(source2, width2, height2)?.spread ?? 0,
-      paletteSize: palette.length
+      backdrop: paintLabels(colors.labels, colors.palette, alpha),
+      punchInput: paintLabelsWithAlpha(colors.punchLabels, colors.palette, punchAlpha)
     };
   }
   function paintLabels(labels, palette, alpha) {
@@ -1690,6 +1750,20 @@
       next[offset + 1] = color.g;
       next[offset + 2] = color.b;
       next[offset + 3] = 255;
+    }
+    return next;
+  }
+  function paintLabelsWithAlpha(labels, palette, alpha) {
+    const next = new Uint8Array(alpha.length * 4);
+    for (let index = 0; index < alpha.length; index += 1) {
+      const offset = index * 4;
+      const opacity = alpha[index] ?? 0;
+      if (opacity === 0) continue;
+      const color = palette[labels[index] ?? 0] ?? { r: 0, g: 0, b: 0 };
+      next[offset] = color.r;
+      next[offset + 1] = color.g;
+      next[offset + 2] = color.b;
+      next[offset + 3] = opacity;
     }
     return next;
   }
@@ -1950,9 +2024,9 @@
     }
     return { mean, spread: spread2 / border };
   }
-  function clearFlatBackdrop(rgba, labels, width2, height2, palette, alpha, spreadLimit) {
+  function flatBackdropMask(rgba, labels, width2, height2, palette, spreadLimit) {
     const measured = borderMeasure(rgba, width2, height2);
-    if (measured === null || measured.spread > spreadLimit) return;
+    if (measured === null || measured.spread > spreadLimit) return null;
     const mean = measured.mean;
     const backdrop2 = nearest(mean, palette);
     const count = width2 * height2;
@@ -1988,8 +2062,10 @@
       }
     }
     const fraction = tail / count;
-    if (fraction < 0.08 || fraction > 0.92) return;
-    for (let index = 0; index < tail; index += 1) alpha[queue[index] ?? 0] = 0;
+    if (fraction < 0.08 || fraction > 0.92) return null;
+    const cleared = new Uint8Array(count);
+    for (let index = 0; index < tail; index += 1) cleared[queue[index] ?? 0] = 1;
+    return cleared;
   }
   function pixelAt(rgba, index) {
     const offset = index * 4;
@@ -2019,6 +2095,87 @@
     const dg = a.g - b.g;
     const db = a.b - b.b;
     return dr * dr + dg * dg + db * db;
+  }
+
+  // src/lab-pipeline.ts
+  var LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"];
+  function buildLabRasterStages(source2, width2, height2, controls, previous = null, from = "colors") {
+    if (controls.mode === "logo" || controls.mode === "icon") {
+      if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
+      const colors2 = source2;
+      return {
+        mode: controls.mode,
+        colors: colors2,
+        backdrop: colors2,
+        punchInput: source2,
+        punch: colors2,
+        traceInput: source2,
+        droppedColor: null,
+        spread: 0,
+        paletteSize: 0,
+        segmentation: null
+      };
+    }
+    const fromIndex = LAB_STEPS.indexOf(from);
+    const sameMode = previous?.mode === controls.mode;
+    const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== void 0 && fromIndex > LAB_STEPS.indexOf("colors");
+    const segmentation = canReuseColors && previous !== null ? previous.segmentation : segmentColorStage(source2, width2, height2, {
+      mode: controls.mode,
+      maxColors: controls.maxColors,
+      snapBlends: controls.snapBlends,
+      speckArea: controls.speckArea,
+      removeBackground: false,
+      opaqueAt: controlsFor(controls.mode).opaqueAt
+    });
+    const colors = segmentation.colors;
+    const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
+    const backdropStage = canReuseBackdrop ? { backdrop: previous.backdrop, punchInput: previous.punchInput } : segmentBackdropStage(source2, width2, height2, segmentation, controls.removeBackground, controls.backdropSpread);
+    const backdrop2 = backdropStage.backdrop;
+    const punchInput = backdropStage.punchInput;
+    const spread2 = segmentation.spread;
+    const paletteSize = segmentation.palette.length;
+    const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
+    if (canReusePunch && previous !== null) return previous;
+    const punched = punchRgba(punchInput, width2, height2, controls.opaqueAt);
+    return {
+      mode: controls.mode,
+      colors,
+      backdrop: backdrop2,
+      punchInput,
+      punch: revealSentinel(punched.rgba, punched.droppedColor),
+      traceInput: punched.rgba,
+      droppedColor: punched.droppedColor,
+      spread: spread2,
+      paletteSize,
+      segmentation
+    };
+  }
+  function fitLabVector(svg2, controls, droppedColor, borderColor) {
+    let fitted = svg2;
+    if (droppedColor !== null) fitted = dropFill(fitted, droppedColor);
+    if (controls.dropPlate) fitted = dropCanvasBackground(fitted, borderColor);
+    if (controls.fitGeometry) fitted = fitShapes(fitted);
+    return fitted;
+  }
+  function fairLabVector(fitted, controls) {
+    const defaults = controlsFor(controls.mode);
+    if ((controls.mode === "logo" || controls.mode === "icon") && controls.smoothness === defaults.smoothness && controls.corner === defaults.corner) {
+      return relaxPaths(fitted, 0.15);
+    }
+    return fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
+  }
+  function sealLabVector(faired, controls) {
+    const sealed = controls.seal ? sealGaps(faired, controls.sealWidth) : faired;
+    return groupPathsByFill(sealed);
+  }
+  function styleLabVectors(svg2, controls, droppedColor, borderColor = null) {
+    const fitted = fitLabVector(svg2, controls, droppedColor, borderColor);
+    if (controls.mode === "logo" || controls.mode === "icon") {
+      return { fitted, faired: fitted, sealed: groupPathsByFill(fitted) };
+    }
+    const faired = fairLabVector(fitted, controls);
+    const sealed = sealLabVector(faired, controls);
+    return { fitted, faired, sealed };
   }
 
   // src/lab-client.ts
@@ -2144,17 +2301,15 @@
       return;
     }
     const started = performance.now();
-    const views = segmentViews(source, width, height, {
-      mode: controls.mode,
-      maxColors: controls.maxColors,
-      removeBackground: controls.removeBackground,
-      snapBlends: controls.snapBlends,
-      speckArea: controls.speckArea,
-      backdropSpread: controls.backdropSpread,
-      opaqueAt: controls.opaqueAt
-    });
-    const punched = punchRgba(views.backdrop, width, height, controls.opaqueAt);
-    const punchShown = revealSentinel(punched.rgba, punched.droppedColor);
+    const rasterStages = buildLabRasterStages(source, width, height, controls);
+    const views = {
+      colors: rasterStages.colors,
+      backdrop: rasterStages.backdrop,
+      spread: rasterStages.spread,
+      paletteSize: rasterStages.paletteSize
+    };
+    const punched = { rgba: rasterStages.traceInput, droppedColor: rasterStages.droppedColor };
+    const punchShown = rasterStages.punch;
     const rasterMs = performance.now() - started;
     paintCanvas("thumb-capture", source);
     paintCanvas("thumb-colors", views.colors);
@@ -2163,7 +2318,7 @@
     const border = cornerColor(source, width, height);
     const request = traceRequest(controls, paletteFromRaster(punched.rgba, punched.droppedColor));
     const key = rasterKey(punched.rgba, request);
-    const styled = svg !== "" ? styleVectors(svg, controls, punched.droppedColor, border) : null;
+    const styled = svg !== "" ? styleLabVectors(svg, controls, punched.droppedColor, border) : null;
     const current = svgKey === key && styled !== null;
     if (current && styled !== null) {
       heldVectors = styled;
@@ -2256,7 +2411,7 @@
       svg = payload.svg;
       svgKey = key;
       traceMs = Math.round(performance.now() - started);
-      const styled = styleVectors(svg, readControls(), droppedColor, cornerColor(source, width, height));
+      const styled = styleLabVectors(svg, readControls(), droppedColor, cornerColor(source, width, height));
       setSvgThumb("thumb-trace", svg);
       setSvgThumb("thumb-fit", styled.fitted);
       setSvgThumb("thumb-fair", styled.faired);

@@ -3,15 +3,13 @@ import {
   colorCount,
   controlsFor,
   paletteFromRaster,
-  styleVectors,
   traceRequest,
   transparentFraction,
   type LabControls
 } from "./lab-model";
 import { cornerColor } from "./flat-trace";
-import { revealSentinel, punchRgba } from "./punch-rgba";
+import { buildLabRasterStages, styleLabVectors } from "./lab-pipeline";
 import { scoreSvg } from "./score";
-import { segmentViews } from "./segment";
 import type { TracePreset, TraceRequest } from "./trace";
 
 type StepId = "capture" | "colors" | "backdrop" | "punch" | "trace" | "fit" | "fair" | "seal";
@@ -71,7 +69,7 @@ let width = 0;
 let height = 0;
 let svg = "";
 let svgKey = "";
-let heldVectors: ReturnType<typeof styleVectors> | null = null;
+let heldVectors: ReturnType<typeof styleLabVectors> | null = null;
 let heldRaw = "";
 let traceMs = 0;
 let frameId = 0;
@@ -148,17 +146,15 @@ function render(): void {
     return;
   }
   const started = performance.now();
-  const views = segmentViews(source, width, height, {
-    mode: controls.mode,
-    maxColors: controls.maxColors,
-    removeBackground: controls.removeBackground,
-    snapBlends: controls.snapBlends,
-    speckArea: controls.speckArea,
-    backdropSpread: controls.backdropSpread,
-    opaqueAt: controls.opaqueAt
-  });
-  const punched = punchRgba(views.backdrop, width, height, controls.opaqueAt);
-  const punchShown = revealSentinel(punched.rgba, punched.droppedColor);
+  const rasterStages = buildLabRasterStages(source, width, height, controls);
+  const views = {
+    colors: rasterStages.colors,
+    backdrop: rasterStages.backdrop,
+    spread: rasterStages.spread,
+    paletteSize: rasterStages.paletteSize
+  };
+  const punched = { rgba: rasterStages.traceInput, droppedColor: rasterStages.droppedColor };
+  const punchShown = rasterStages.punch;
   const rasterMs = performance.now() - started;
   paintCanvas("thumb-capture", source);
   paintCanvas("thumb-colors", views.colors);
@@ -167,7 +163,7 @@ function render(): void {
   const border = cornerColor(source, width, height);
   const request = traceRequest(controls, paletteFromRaster(punched.rgba, punched.droppedColor));
   const key = rasterKey(punched.rgba, request);
-  const styled = svg !== "" ? styleVectors(svg, controls, punched.droppedColor, border) : null;
+  const styled = svg !== "" ? styleLabVectors(svg, controls, punched.droppedColor, border) : null;
   const current = svgKey === key && styled !== null;
   if (current && styled !== null) {
     heldVectors = styled;
@@ -218,7 +214,7 @@ function description(
   backdrop: Uint8Array,
   punchShown: Uint8Array,
   droppedColor: string | null,
-  styled: ReturnType<typeof styleVectors> | null
+  styled: ReturnType<typeof styleLabVectors> | null
 ): string {
   if (step === "capture") return "ภาพถ่าย " + width + "×" + height + " พิกเซล รวมวอลเปเปอร์เบลอ เงา และขอบจางของไอคอน";
   if (step === "colors") {
@@ -272,7 +268,7 @@ async function sendTrace(serial: number, key: string, rgba: Uint8Array, request:
     svg = payload.svg;
     svgKey = key;
     traceMs = Math.round(performance.now() - started);
-    const styled = styleVectors(svg, readControls(), droppedColor, cornerColor(source, width, height));
+    const styled = styleLabVectors(svg, readControls(), droppedColor, cornerColor(source, width, height));
     setSvgThumb("thumb-trace", svg);
     setSvgThumb("thumb-fit", styled.fitted);
     setSvgThumb("thumb-fair", styled.faired);

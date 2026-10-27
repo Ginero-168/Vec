@@ -17,7 +17,21 @@ export type SegmentViews = {
   readonly paletteSize: number;
 };
 
-type RGB = { r: number; g: number; b: number };
+export type RGB = { r: number; g: number; b: number };
+
+export type SegmentColorStage = {
+  readonly colors: Uint8Array;
+  readonly labels: Int16Array;
+  readonly punchLabels: Int16Array;
+  readonly palette: readonly RGB[];
+  readonly opaque: Uint8Array;
+  readonly spread: number;
+};
+
+export type SegmentBackdropStage = {
+  readonly backdrop: Uint8Array;
+  readonly punchInput: Uint8Array;
+};
 
 const MODE_CAP: Readonly<Record<TracePreset, number>> = { logo: 8, icon: 8, photo: 32, poster: 10 };
 const SPECK_AREA: Readonly<Record<TracePreset, number>> = { logo: 18, icon: 12, photo: 6, poster: 28 };
@@ -27,10 +41,18 @@ export function segmentRaster(rgba: Uint8Array, width: number, height: number, o
 }
 
 export function segmentViews(rgba: Uint8Array, width: number, height: number, options: SegmentOptions): SegmentViews {
+  const colors = segmentColorStage(rgba, width, height, options);
+  const backdrop = segmentBackdropStage(rgba, width, height, colors, options.removeBackground, options.backdropSpread ?? 22);
+  return { colors: colors.colors, backdrop: backdrop.backdrop, spread: colors.spread, paletteSize: colors.palette.length };
+}
+
+export function segmentColorStage(rgba: Uint8Array, width: number, height: number, options: SegmentOptions): SegmentColorStage {
   const count = width * height;
   if (width < 2 || height < 2 || rgba.length < count * 4) {
     const copy = rgba.slice();
-    return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
+    const labels = new Int16Array(count);
+    labels.fill(-1);
+    return { colors: copy, labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0 };
   }
   const source = rgba;
   const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
@@ -52,16 +74,42 @@ export function segmentViews(rgba: Uint8Array, width: number, height: number, op
   }
   cleanupEdges(labels, width, height);
   mergeSpecks(labels, width, height, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
+  const punchLabels = new Int16Array(labels);
+  for (let index = 0; index < count; index += 1) {
+    if ((source[index * 4 + 3] ?? 0) > 0 && (punchLabels[index] ?? -1) < 0) punchLabels[index] = nearest(pixelAt(source, index), palette);
+  }
   const opaque = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) opaque[index] = (source[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
   const colors = paintLabels(labels, palette, opaque);
-  const alpha = opaque.slice();
-  if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha, options.backdropSpread ?? 22);
+  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(source, width, height)?.spread ?? 0 };
+}
+
+export function segmentBackdropStage(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  colors: SegmentColorStage,
+  removeBackground: boolean,
+  spreadLimit: number
+): SegmentBackdropStage {
+  if (colors.palette.length === 0) return { backdrop: colors.colors.slice(), punchInput: rgba.slice() };
+  const alpha = colors.opaque.slice();
+  const punchAlpha = new Uint8Array(width * height);
+  for (let index = 0; index < punchAlpha.length; index += 1) {
+    if ((colors.punchLabels[index] ?? -1) >= 0) punchAlpha[index] = rgba[index * 4 + 3] ?? 0;
+  }
+  const cleared = removeBackground ? flatBackdropMask(rgba, colors.labels, width, height, colors.palette, spreadLimit) : null;
+  if (cleared !== null) {
+    for (let index = 0; index < cleared.length; index += 1) {
+      if (cleared[index] !== 0) {
+        alpha[index] = 0;
+        punchAlpha[index] = 0;
+      }
+    }
+  }
   return {
-    colors,
-    backdrop: paintLabels(labels, palette, alpha),
-    spread: borderMeasure(source, width, height)?.spread ?? 0,
-    paletteSize: palette.length
+    backdrop: paintLabels(colors.labels, colors.palette, alpha),
+    punchInput: paintLabelsWithAlpha(colors.punchLabels, colors.palette, punchAlpha)
   };
 }
 
@@ -79,6 +127,21 @@ function paintLabels(labels: Int16Array, palette: readonly RGB[], alpha: Uint8Ar
     next[offset + 1] = color.g;
     next[offset + 2] = color.b;
     next[offset + 3] = 255;
+  }
+  return next;
+}
+
+function paintLabelsWithAlpha(labels: Int16Array, palette: readonly RGB[], alpha: Uint8Array): Uint8Array {
+  const next = new Uint8Array(alpha.length * 4);
+  for (let index = 0; index < alpha.length; index += 1) {
+    const offset = index * 4;
+    const opacity = alpha[index] ?? 0;
+    if (opacity === 0) continue;
+    const color = palette[labels[index] ?? 0] ?? { r: 0, g: 0, b: 0 };
+    next[offset] = color.r;
+    next[offset + 1] = color.g;
+    next[offset + 2] = color.b;
+    next[offset + 3] = opacity;
   }
   return next;
 }
@@ -350,9 +413,9 @@ function borderMeasure(rgba: Uint8Array, width: number, height: number): { reado
   return { mean, spread: spread / border };
 }
 
-function clearFlatBackdrop(rgba: Uint8Array, labels: Int16Array, width: number, height: number, palette: readonly RGB[], alpha: Uint8Array, spreadLimit: number): void {
+function flatBackdropMask(rgba: Uint8Array, labels: Int16Array, width: number, height: number, palette: readonly RGB[], spreadLimit: number): Uint8Array | null {
   const measured = borderMeasure(rgba, width, height);
-  if (measured === null || measured.spread > spreadLimit) return;
+  if (measured === null || measured.spread > spreadLimit) return null;
   const mean = measured.mean;
   const backdrop = nearest(mean, palette);
   const count = width * height;
@@ -388,8 +451,10 @@ function clearFlatBackdrop(rgba: Uint8Array, labels: Int16Array, width: number, 
     }
   }
   const fraction = tail / count;
-  if (fraction < 0.08 || fraction > 0.92) return;
-  for (let index = 0; index < tail; index += 1) alpha[queue[index] ?? 0] = 0;
+  if (fraction < 0.08 || fraction > 0.92) return null;
+  const cleared = new Uint8Array(count);
+  for (let index = 0; index < tail; index += 1) cleared[queue[index] ?? 0] = 1;
+  return cleared;
 }
 
 function pixelAt(rgba: Uint8Array, index: number): RGB {

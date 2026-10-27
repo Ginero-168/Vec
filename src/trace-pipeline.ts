@@ -1,6 +1,7 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
 import { cornerColor, flatPlates } from "./flat-trace.ts";
-import { paletteFromRaster } from "./lab-model.ts";
+import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "./lab-model.ts";
+import { buildLabRasterStages, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId } from "./lab-pipeline.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
 import { segmentRaster } from "./segment.ts";
@@ -27,11 +28,25 @@ export type TracePlan = {
   readonly height: number;
   readonly plates: readonly PlannedPlate[];
   readonly droppedColor: string | null;
+  readonly rasterStages?: LabRasterStages;
 };
 
-export function planTrace(source: Buffer, settings: PipelineSettings): TracePlan | null {
+export function planTrace(
+  source: Buffer,
+  settings: PipelineSettings,
+  controls?: LabControls,
+  previousStages: LabRasterStages | null = null,
+  from: LabStepId = "colors"
+): TracePlan | null {
   const decoded = readRgbaPng(source);
   if (decoded === null) return null;
+  if (controls !== undefined) {
+    if (settings.preset === "logo" || settings.preset === "icon") {
+      return planFlat(decoded.rgba, decoded.width, decoded.height, settings, controls);
+    }
+    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from);
+    return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, rasterStages);
+  }
   if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);
   return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
 }
@@ -51,7 +66,8 @@ export function traceRaster(
   return finishTrace(plan.plates.map((plate) => tracePlate(plate.png, plate.request)), plan, settings);
 }
 
-export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: PipelineSettings): string {
+export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: PipelineSettings, controls?: LabControls): string {
+  if (controls !== undefined) return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls).sealed;
   return assembleTrace(
     svgs,
     plan.plates,
@@ -64,6 +80,50 @@ export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: 
     settings.corner,
     settings.stacking
   );
+}
+
+export function traceRasterWithControls(
+  source: Buffer,
+  controls: LabControls,
+  tracePlate: (png: Buffer, request: TraceRequest) => string
+): string | null {
+  const settings = settingsFromControls(controls);
+  const plan = planTrace(source, settings, controls);
+  if (plan === null) return null;
+  return finishTrace(plan.plates.map((plate) => tracePlate(plate.png, plate.request)), plan, settings, controls);
+}
+
+export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, controls: LabControls) {
+  return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls);
+}
+
+export function settingsFromControls(controls: LabControls): PipelineSettings {
+  return {
+    preset: controls.mode,
+    maxColors: controls.maxColors,
+    smoothness: controls.smoothness,
+    corner: controls.corner,
+    removeBackground: controls.removeBackground,
+    stacking: controls.stacking
+  };
+}
+
+export function replanTracePlan(plan: TracePlan, controls: LabControls): TracePlan {
+  const settings = settingsFromControls(controls);
+  if (controls.mode === "logo" || controls.mode === "icon") {
+    return {
+      ...plan,
+      plates: plan.plates.map((plate) => ({
+        ...plate,
+        request: flatRequestForControls(settings, plate.request.palette ?? [], plate.scale, controls)
+      }))
+    };
+  }
+  const stages = plan.rasterStages;
+  if (stages === undefined) return plan;
+  const palette = cappedPalette(paletteFromRaster(stages.traceInput, stages.droppedColor), stages.droppedColor);
+  const request = { ...traceRequest(controls, palette), removeBackground: settings.removeBackground };
+  return { ...plan, plates: plan.plates.map((plate) => ({ ...plate, request })) };
 }
 
 export function prepareTracePng(source: Buffer, settings: PipelineSettings): { readonly png: Buffer; readonly scale: number; readonly droppedColor: string | null; readonly palette: readonly string[] } {
@@ -86,20 +146,25 @@ export function styledTraceSvg(fitted: string, settings: PipelineSettings): stri
   return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
 }
 
-function planFlat(rgba: Uint8Array, width: number, height: number, settings: PipelineSettings): TracePlan {
-  const plates = flatPlates(rgba, width, height, settings.maxColors);
-  return {
-    width,
-    height,
-    droppedColor: null,
-    plates: plates.map((plate) => ({
+function planFlat(rgba: Uint8Array, width: number, height: number, settings: PipelineSettings, controls?: LabControls): TracePlan {
+  const flat = flatPlates(rgba, width, height, settings.maxColors);
+  const plates = flat.map((plate) => ({
       png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
       scale: plate.scale,
       originX: plate.originX,
       originY: plate.originY,
       borderColor: plate.borderColor,
-      request: flatRequest(settings, plate.palette, plate.scale)
-    }))
+      request: controls === undefined
+        ? flatRequest(settings, plate.palette, plate.scale)
+        : flatRequestForControls(settings, plate.palette, plate.scale, controls)
+    }));
+  const rasterStages = controls === undefined ? undefined : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates(flat, width, height));
+  return {
+    width,
+    height,
+    droppedColor: null,
+    plates,
+    ...(rasterStages === undefined ? {} : { rasterStages })
   };
 }
 
@@ -115,6 +180,23 @@ export function flatRequest(settings: PipelineSettings, palette: readonly string
     filterSpeckle: Math.min(128, Math.floor(Math.sqrt(1.44) * scale)),
     clustering: "off",
     simplify: Math.round(0.3 * scale * 100) / 100
+  };
+}
+
+function flatRequestForControls(settings: PipelineSettings, palette: readonly string[], scale: number, controls: LabControls): TraceRequest {
+  const request = flatRequest(settings, palette, scale);
+  const defaults = controlsFor(controls.mode);
+  const paletteChanged = controls.lockPalette !== defaults.lockPalette || controls.traceColors !== defaults.traceColors;
+  const traceSettings = paletteChanged ? traceRequest(controls, palette) : null;
+  return {
+    ...request,
+    ...(traceSettings === null ? {} : { maxColors: traceSettings.maxColors, palette: traceSettings.palette }),
+    ...(controls.colorPrecision === defaults.colorPrecision ? {} : { colorPrecision: controls.colorPrecision }),
+    ...(controls.filterSpeckle === defaults.filterSpeckle ? {} : { filterSpeckle: controls.filterSpeckle }),
+    ...(controls.clustering === defaults.clustering ? {} : { clustering: controls.clustering }),
+    ...(controls.watershedDetail === defaults.watershedDetail ? {} : { watershedDetail: controls.watershedDetail }),
+    ...(controls.simplify === defaults.simplify ? {} : { simplify: controls.simplify }),
+    stacking: controls.stacking === defaults.stacking ? request.stacking : controls.stacking
   };
 }
 
@@ -159,5 +241,35 @@ function planSegmented(rgba: Uint8Array, width: number, height: number, settings
         }
       }
     ]
+  };
+}
+
+function planSegmentedWithControls(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  settings: PipelineSettings,
+  controls: LabControls,
+  stages: LabRasterStages
+): TracePlan {
+  const png = encodeRgbaPng(width, height, stages.traceInput);
+  const palette = cappedPalette(paletteFromRaster(stages.traceInput, stages.droppedColor), stages.droppedColor);
+  const request = traceRequest(controls, palette);
+  return {
+    width,
+    height,
+    droppedColor: stages.droppedColor,
+    rasterStages: stages,
+    plates: [{
+      png,
+      scale: 1,
+      originX: 0,
+      originY: 0,
+      borderColor: cornerColor(rgba, width, height),
+      request: {
+        ...request,
+        removeBackground: settings.removeBackground
+      }
+    }]
   };
 }

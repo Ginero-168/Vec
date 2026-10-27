@@ -1,5 +1,3 @@
-import { fairPaths } from "./edit.ts";
-import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
 import { presetDefaults, simplifyTolerance, type Stacking, type TracePreset, type TraceRequest } from "./trace.ts";
 
 export type LabControls = {
@@ -94,17 +92,6 @@ export function transparentFraction(rgba: Uint8Array): number {
   const pixels = rgba.length / 4;
   for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 255) === 0) clear += 1;
   return clear / pixels;
-}
-
-export function styleVectors(svg: string, controls: LabControls, droppedColor: string | null, borderColor: string | null = null): { readonly fitted: string; readonly faired: string; readonly sealed: string } {
-  let fitted = svg;
-  if (droppedColor !== null) fitted = dropFill(fitted, droppedColor);
-  if (controls.dropPlate) fitted = dropCanvasBackground(fitted, borderColor);
-  if (controls.fitGeometry) fitted = fitShapes(fitted);
-  const flat = controls.mode === "logo" || controls.mode === "icon";
-  const faired = flat ? fitted : fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
-  const sealed = groupPathsByFill(!flat && controls.seal ? sealGaps(faired, controls.sealWidth) : faired);
-  return { fitted, faired, sealed };
 }
 
 function byte(value: number): string {

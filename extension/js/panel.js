@@ -31,6 +31,7 @@
 
   // src/panel.ts
   var childProcess = __toESM(__require("child_process"));
+  var import_worker_threads = __require("worker_threads");
   var crypto = __toESM(__require("crypto"));
   var fs = __toESM(__require("fs"));
   var os = __toESM(__require("os"));
@@ -226,8 +227,8 @@
   function parseHex(color) {
     const match = /^#([0-9a-f]{6})$/i.exec(color.trim());
     if (match === null) return null;
-    const hex3 = match[1] ?? "";
-    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
+    const hex = match[1] ?? "";
+    return [Number.parseInt(hex.slice(0, 2), 16), Number.parseInt(hex.slice(2, 4), 16), Number.parseInt(hex.slice(4, 6), 16)];
   }
   function readD(tag) {
     const match = /\bd\s*=\s*(["'])([\s\S]*?)\1/i.exec(tag);
@@ -913,49 +914,6 @@
 
   // src/png-alpha.ts
   var zlib = __toESM(__require("zlib"));
-
-  // src/punch-rgba.ts
-  function punchRgba(rgba, width, height, opaqueAt = 128) {
-    const count = width * height;
-    if (rgba.length < count * 4) return { rgba, droppedColor: null };
-    const cutoff = Math.min(255, Math.max(0, opaqueAt));
-    const used = /* @__PURE__ */ new Set();
-    let transparent = 0;
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      const alpha = rgba[offset + 3] ?? 255;
-      if (alpha < cutoff) {
-        transparent += 1;
-        continue;
-      }
-      used.add((rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0));
-    }
-    if (transparent === 0) return { rgba, droppedColor: null };
-    const sentinel = unusedColor(used);
-    const next = new Uint8Array(count * 4);
-    next.set(rgba.subarray(0, count * 4));
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      if ((next[offset + 3] ?? 255) < cutoff) {
-        next[offset] = sentinel >> 16 & 255;
-        next[offset + 1] = sentinel >> 8 & 255;
-        next[offset + 2] = sentinel & 255;
-      }
-      next[offset + 3] = 255;
-    }
-    return { rgba: next, droppedColor: hex(sentinel) };
-  }
-  function unusedColor(used) {
-    const candidates = [16711935, 65280, 16711850, 65535, 16776960];
-    for (const color of candidates) if (!used.has(color)) return color;
-    for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
-    return 16711935;
-  }
-  function hex(color) {
-    return "#" + color.toString(16).padStart(6, "0");
-  }
-
-  // src/png-alpha.ts
   function pngSignature() {
     return Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   }
@@ -964,13 +922,6 @@
     let value = index;
     for (let bit = 0; bit < 8; bit += 1) value = (value & 1) === 1 ? 3988292384 ^ value >>> 1 : value >>> 1;
     CRC_TABLE[index] = value;
-  }
-  function punchTransparency(png, opaqueAt = 128) {
-    const image = readRgbaPng(png);
-    if (image === null) return { png, droppedColor: null };
-    const punched = punchRgba(image.rgba, image.width, image.height, opaqueAt);
-    if (punched.droppedColor === null) return { png, droppedColor: null };
-    return { png: encodeRgbaPng(image.width, image.height, punched.rgba), droppedColor: punched.droppedColor };
   }
   function encodeRgbaPng(width, height, rgba) {
     const stride = width * 4;
@@ -1359,8 +1310,8 @@
   function rgbOf(fill) {
     const match = /^#([0-9a-f]{6})$/i.exec(fill);
     if (match === null) return null;
-    const hex3 = match[1] ?? "";
-    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
+    const hex = match[1] ?? "";
+    return [Number.parseInt(hex.slice(0, 2), 16), Number.parseInt(hex.slice(2, 4), 16), Number.parseInt(hex.slice(4, 6), 16)];
   }
   function dropFill(svg, fill) {
     const target = normalizeFill(fill);
@@ -1717,8 +1668,8 @@
     if (value === "" || value === "none") return null;
     const short = /^#([0-9a-f]{3})$/.exec(value);
     if (short !== null) {
-      const hex3 = short[1] ?? "";
-      return "#" + hex3[0] + hex3[0] + hex3[1] + hex3[1] + hex3[2] + hex3[2];
+      const hex = short[1] ?? "";
+      return "#" + hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
     }
     return value;
   }
@@ -1961,890 +1912,6 @@
     return { value: Number(raw), index: cursor + raw.length };
   }
 
-  // src/color.ts
-  function srgbChannelToLinear(channel) {
-    const value = channel / 255;
-    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-  }
-  function linearChannelToSrgb(channel) {
-    const value = Math.min(1, Math.max(0, channel));
-    const encoded = value <= 31308e-7 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
-    return Math.round(Math.min(1, Math.max(0, encoded)) * 255);
-  }
-  function rgbToOklab(color) {
-    const red = srgbChannelToLinear(color.r);
-    const green = srgbChannelToLinear(color.g);
-    const blue = srgbChannelToLinear(color.b);
-    const l = Math.cbrt(0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue);
-    const m = Math.cbrt(0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue);
-    const s = Math.cbrt(0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue);
-    return {
-      L: 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
-      a: 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
-      b: 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s
-    };
-  }
-  function oklabToRgb(color) {
-    const l = color.L + 0.3963377774 * color.a + 0.2158037573 * color.b;
-    const m = color.L - 0.1055613458 * color.a - 0.0638541728 * color.b;
-    const s = color.L - 0.0894841775 * color.a - 1.291485548 * color.b;
-    const lp = l * l * l;
-    const mp = m * m * m;
-    const sp = s * s * s;
-    return {
-      r: linearChannelToSrgb(4.0767416621 * lp - 3.3077115913 * mp + 0.2309699292 * sp),
-      g: linearChannelToSrgb(-1.2684380046 * lp + 2.6097574011 * mp - 0.3413193965 * sp),
-      b: linearChannelToSrgb(-0.0041960863 * lp - 0.7034186147 * mp + 1.707614701 * sp)
-    };
-  }
-  function labDistance2(left, right) {
-    const dL = left.L - right.L;
-    const da = left.a - right.a;
-    const db = left.b - right.b;
-    return dL * dL + da * da + db * db;
-  }
-
-  // src/flat-trace.ts
-  var UP = 8;
-  var CORE_TAU = 0.035;
-  var REGION_TOLERANCE = 0.06;
-  var COLOR_FLOOR = 0.035;
-  var OWN_COLOR = 0.05;
-  var DILATE_RADIUS = 3;
-  var SPECK_SOURCE = 1.44;
-  var SMOOTH_SOURCE = 0.6;
-  var K_MAX = 16;
-  function identityRaster(rgba, _width, _height) {
-    return rgba;
-  }
-  function flatPlates(rgba, width, height, maxColors, preprocess = identityRaster) {
-    const boxes = subjectBoxes(rgba, width, height);
-    return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess));
-  }
-  function subjectBoxes(rgba, width, height) {
-    const found = enclosedBoxes(rgba, width, height);
-    if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
-    return found;
-  }
-  function plateFor(rgba, width, height, box, maxColors, preprocess) {
-    const cropW = box.width;
-    const cropH = box.height;
-    const crop = new Uint8Array(cropW * cropH * 4);
-    for (let y = 0; y < cropH; y += 1) {
-      const from = ((box.y + y) * width + box.x) * 4;
-      crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
-    }
-    const painted = labelImage(crop, cropW, cropH, maxColors, preprocess);
-    return {
-      rgba: painted.rgba,
-      width: painted.width,
-      height: painted.height,
-      scale: UP,
-      palette: painted.palette,
-      originX: box.x,
-      originY: box.y,
-      sourceWidth: cropW,
-      sourceHeight: cropH,
-      borderColor: cornerColor(crop, cropW, cropH)
-    };
-  }
-  function cornerColor(rgba, width, height) {
-    const points = [
-      [0, 0],
-      [width - 1, 0],
-      [0, height - 1],
-      [width - 1, height - 1]
-    ];
-    const opaque = [];
-    for (const point of points) {
-      const x = point[0] ?? 0;
-      const y = point[1] ?? 0;
-      const offset = (y * width + x) * 4;
-      if ((rgba[offset + 3] ?? 0) < 250) continue;
-      opaque.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
-    }
-    if (opaque.length === 0) return null;
-    const mean = {
-      r: opaque.reduce((sum, color) => sum + color.r, 0) / opaque.length,
-      g: opaque.reduce((sum, color) => sum + color.g, 0) / opaque.length,
-      b: opaque.reduce((sum, color) => sum + color.b, 0) / opaque.length
-    };
-    for (const color of opaque) {
-      if (Math.abs(color.r - mean.r) > 18 || Math.abs(color.g - mean.g) > 18 || Math.abs(color.b - mean.b) > 18) return null;
-    }
-    return hex2(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
-  }
-  function labelImage(rgba, width, height, maxColors, preprocess = identityRaster) {
-    const prepared = preprocess(rgba, width, height);
-    const source = prepared.length === rgba.length ? prepared : rgba;
-    const count = width * height;
-    const lab = new Float64Array(count * 3);
-    const linear = new Float64Array(count * 3);
-    const alpha = new Uint8Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
-      alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
-      const converted = rgbToOklab(color);
-      lab[index * 3] = converted.L;
-      lab[index * 3 + 1] = converted.a;
-      lab[index * 3 + 2] = converted.b;
-      linear[index * 3] = srgbToLinear(color.r);
-      linear[index * 3 + 1] = srgbToLinear(color.g);
-      linear[index * 3 + 2] = srgbToLinear(color.b);
-    }
-    let core = coreMask(lab, alpha, width, height, CORE_TAU);
-    if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08);
-    const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-    const centers = buildPalette(lab, core, width, height, userK);
-    const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
-    const colors = fillColors(source, alpha, core, labels, width, height, centers);
-    return paintLabels(labels, colors, width * UP, height * UP);
-  }
-  function assignLabels(linear, lab, core, alpha, width, height, centers) {
-    const count = width * height;
-    const kCount = centers.length;
-    const coreLabel = new Int16Array(count);
-    coreLabel.fill(-1);
-    for (let index = 0; index < count; index += 1) {
-      if (core[index] !== 1) continue;
-      coreLabel[index] = nearestLab(readLab(lab, index), centers);
-    }
-    const allow = new Uint16Array(count);
-    const disk = diskOffsets(DILATE_RADIUS);
-    for (let index = 0; index < count; index += 1) {
-      const label = coreLabel[index] ?? -1;
-      if (label < 0) continue;
-      const x = index % width;
-      const y = (index - x) / width;
-      for (const offset of disk) {
-        const nx = x + offset.x;
-        const ny = y + offset.y;
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        const at = ny * width + nx;
-        allow[at] = (allow[at] ?? 0) | 1 << label;
-      }
-    }
-    const square = squareOffsets(1);
-    for (let index = 0; index < count; index += 1) {
-      if (alpha[index] === 0) continue;
-      const color = readLab(lab, index);
-      let near = 0;
-      for (let label = 0; label < kCount; label += 1) {
-        const center = centers[label];
-        if (center === void 0) continue;
-        if (Math.sqrt(labDistance2(color, center)) >= OWN_COLOR) continue;
-        near |= 1 << label;
-      }
-      if (near === 0) continue;
-      const x = index % width;
-      const y = (index - x) / width;
-      for (const offset of square) {
-        const nx = x + offset.x;
-        const ny = y + offset.y;
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        const at = ny * width + nx;
-        allow[at] = (allow[at] ?? 0) | near;
-      }
-    }
-    const nearestCore = nearestCoreLabel(coreLabel, width, height);
-    for (let index = 0; index < count; index += 1) {
-      if ((allow[index] ?? 0) !== 0) continue;
-      const label = nearestCore[index] ?? -1;
-      if (label >= 0) allow[index] = 1 << label;
-    }
-    const upW = width * UP;
-    const upH = height * UP;
-    const labels = new Uint8Array(upW * upH);
-    labels.fill(255);
-    const tile = 48;
-    for (let y0 = 0; y0 < height; y0 += tile) {
-      const y1 = Math.min(height, y0 + tile);
-      for (let y = y0; y < y1; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-          if (alpha[y * width + x] === 0) continue;
-          const mask = allow[y * width + x] ?? 0;
-          const bits = bitList(mask, kCount);
-          for (let oy = 0; oy < UP; oy += 1) {
-            for (let ox = 0; ox < UP; ox += 1) {
-              const ux = x * UP + ox;
-              const uy = y * UP + oy;
-              const at = uy * upW + ux;
-              if (bits.length === 0) continue;
-              if (bits.length === 1) {
-                labels[at] = bits[0] ?? 0;
-                continue;
-              }
-              const sample = bicubicLab(linear, width, height, (ux + 0.5) / UP - 0.5, (uy + 0.5) / UP - 0.5);
-              labels[at] = explain(sample, bits, centers);
-            }
-          }
-        }
-      }
-    }
-    cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP));
-    smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP);
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        if (alpha[y * width + x] !== 0) continue;
-        for (let oy = 0; oy < UP; oy += 1) {
-          for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
-        }
-      }
-    }
-    return labels;
-  }
-  function nearestCoreLabel(coreLabel, width, height) {
-    const nearest2 = new Int16Array(coreLabel.length);
-    nearest2.fill(-1);
-    const queue = [];
-    for (let index = 0; index < coreLabel.length; index += 1) {
-      const label = coreLabel[index] ?? -1;
-      if (label < 0) continue;
-      nearest2[index] = label;
-      queue.push(index);
-    }
-    for (let cursor = 0; cursor < queue.length; cursor += 1) {
-      const index = queue[cursor] ?? 0;
-      const label = nearest2[index] ?? -1;
-      const x = index % width;
-      const y = (index - x) / width;
-      const steps = [
-        [x - 1, y],
-        [x + 1, y],
-        [x, y - 1],
-        [x, y + 1]
-      ];
-      for (const step of steps) {
-        const nx = step[0] ?? 0;
-        const ny = step[1] ?? 0;
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        const at = ny * width + nx;
-        if ((nearest2[at] ?? -1) >= 0) continue;
-        nearest2[at] = label;
-        queue.push(at);
-      }
-    }
-    return nearest2;
-  }
-  function explain(sample, bits, centers) {
-    let best = bits[0] ?? 0;
-    let bestDistance = Infinity;
-    for (const label of bits) {
-      const center = centers[label];
-      if (center === void 0) continue;
-      const distance3 = Math.sqrt(labDistance2(sample, center));
-      if (distance3 < bestDistance) {
-        bestDistance = distance3;
-        best = label;
-      }
-    }
-    for (let left = 0; left < bits.length; left += 1) {
-      for (let right = left + 1; right < bits.length; right += 1) {
-        const a = bits[left];
-        const b = bits[right];
-        if (a === void 0 || b === void 0) continue;
-        const first = centers[a];
-        const second = centers[b];
-        if (first === void 0 || second === void 0) continue;
-        const projected = projectLab(sample, first, second);
-        if (projected.distance < bestDistance) {
-          bestDistance = projected.distance;
-          best = projected.t < 0.5 ? a : b;
-        }
-      }
-    }
-    return best;
-  }
-  function fillColors(rgba, alpha, core, labels, width, height, centers) {
-    const sums = centers.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
-    const upW = width * UP;
-    const mid = UP >> 1;
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const index = y * width + x;
-        if (alpha[index] === 0 || core[index] !== 1) continue;
-        const label = labels[(y * UP + mid) * upW + x * UP + mid] ?? 255;
-        const bin = sums[label];
-        if (bin === void 0) continue;
-        const offset = index * 4;
-        bin.r += rgba[offset] ?? 0;
-        bin.g += rgba[offset + 1] ?? 0;
-        bin.b += rgba[offset + 2] ?? 0;
-        bin.n += 1;
-      }
-    }
-    return centers.map((center, index) => {
-      const bin = sums[index];
-      if (bin !== void 0 && bin.n > 4) return { r: Math.round(bin.r / bin.n), g: Math.round(bin.g / bin.n), b: Math.round(bin.b / bin.n) };
-      return oklabToRgb(center);
-    });
-  }
-  function paintLabels(labels, colors, width, height) {
-    const used = /* @__PURE__ */ new Map();
-    const palette = [];
-    const rgba = new Uint8Array(width * height * 4);
-    for (let index = 0; index < labels.length; index += 1) {
-      const label = labels[index] ?? 255;
-      if (label === 255) continue;
-      let slot = used.get(label);
-      if (slot === void 0) {
-        const color2 = colors[label] ?? { r: 0, g: 0, b: 0 };
-        const paint = hex2(color2.r, color2.g, color2.b);
-        slot = palette.indexOf(paint);
-        if (slot < 0) {
-          slot = palette.length;
-          palette.push(paint);
-        }
-        used.set(label, slot);
-      }
-      const color = colors[label] ?? { r: 0, g: 0, b: 0 };
-      const offset = index * 4;
-      rgba[offset] = color.r;
-      rgba[offset + 1] = color.g;
-      rgba[offset + 2] = color.b;
-      rgba[offset + 3] = 255;
-    }
-    return { rgba, width, height, palette };
-  }
-  function buildPalette(lab, core, width, height, userK) {
-    const bins = /* @__PURE__ */ new Map();
-    for (let index = 0; index < core.length; index += 1) {
-      if (core[index] !== 1) continue;
-      const color = readLab(lab, index);
-      const key = Math.round(color.L / 8e-3) + "," + Math.round(color.a / 8e-3) + "," + Math.round(color.b / 8e-3);
-      const bin = bins.get(key) ?? { x: 0, y: 0, z: 0, n: 0 };
-      bin.x += color.L;
-      bin.y += color.a;
-      bin.z += color.b;
-      bin.n += 1;
-      bins.set(key, bin);
-    }
-    const samples = [];
-    const weights = [];
-    for (const bin of bins.values()) {
-      if (bin.n === 0) continue;
-      samples.push({ L: bin.x / bin.n, a: bin.y / bin.n, b: bin.z / bin.n });
-      weights.push(Math.log1p(bin.n));
-    }
-    if (samples.length === 0) return [{ L: 0, a: 0, b: 0 }];
-    const regions = regionMeans(lab, core, width, height);
-    const anchors = distinctAnchors(regions);
-    const floorK = Math.max(2, anchors.length);
-    if (userK > 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(userK, anchors.length)), anchors);
-    if (regions.length === 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(2, Math.min(8, samples.length))));
-    let chosen = wkmeans(samples, weights, Math.min(floorK, samples.length), anchors);
-    for (let k = floorK; k <= Math.min(K_MAX, Math.max(samples.length, anchors.length)); k += 1) {
-      chosen = wkmeans(samples, weights, k, anchors);
-      const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region.mean)) > REGION_TOLERANCE));
-      if (!missed) return chosen;
-    }
-    return chosen;
-  }
-  function distinctAnchors(regions) {
-    const ordered = [...regions].sort((left, right) => right.size - left.size);
-    const kept = [];
-    for (const region of ordered) {
-      if (kept.length >= K_MAX) break;
-      if (kept.every((color) => Math.sqrt(labDistance2(color, region.mean)) > COLOR_FLOOR)) kept.push({ ...region.mean });
-    }
-    return kept;
-  }
-  function regionMeans(lab, core, width, height) {
-    const groups = /* @__PURE__ */ new Map();
-    for (let index = 0; index < core.length; index += 1) {
-      if (core[index] !== 1) continue;
-      const color = readLab(lab, index);
-      const key = (Math.round(color.L / 0.05) + 40) * 1e4 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
-      const list = groups.get(key);
-      if (list === void 0) groups.set(key, [index]);
-      else list.push(index);
-    }
-    const means = [];
-    for (const pixels of groups.values()) {
-      const member = new Uint8Array(core.length);
-      for (const index of pixels) member[index] = 1;
-      const labeled = components(member, width, height);
-      for (let id = 1; id <= labeled.count; id += 1) {
-        const size = labeled.sizes[id] ?? 0;
-        if (size < 12) continue;
-        let l = 0;
-        let a = 0;
-        let b = 0;
-        const values = [];
-        for (let index = 0; index < member.length; index += 1) {
-          if ((labeled.ids[index] ?? 0) !== id) continue;
-          const color = readLab(lab, index);
-          values.push(color);
-          l += color.L;
-          a += color.a;
-          b += color.b;
-        }
-        const n = values.length;
-        if (n === 0) continue;
-        const mean = { L: l / n, a: a / n, b: b / n };
-        let varL = 0;
-        let varA = 0;
-        let varB = 0;
-        for (const color of values) {
-          varL += (color.L - mean.L) ** 2;
-          varA += (color.a - mean.a) ** 2;
-          varB += (color.b - mean.b) ** 2;
-        }
-        const spread = Math.max(Math.sqrt(varL / n), Math.sqrt(varA / n), Math.sqrt(varB / n));
-        if (spread < 0.015) means.push({ mean, size });
-      }
-    }
-    return means;
-  }
-  function wkmeans(samples, weights, kCount, frozen = []) {
-    const count = samples.length;
-    const pinned = Math.min(frozen.length, K_MAX);
-    const k = Math.max(1, Math.min(K_MAX, Math.max(kCount, pinned, count === 0 ? pinned : 1)));
-    const centers = [];
-    for (let index = 0; index < pinned && centers.length < k; index += 1) {
-      const seed = frozen[index] ?? zeroLab();
-      centers.push({ L: seed.L, a: seed.a, b: seed.b });
-    }
-    if (count === 0) return centers.length > 0 ? centers : [{ L: 0, a: 0, b: 0 }];
-    const distance3 = new Float64Array(count);
-    if (centers.length === 0) {
-      let first = 0;
-      let bestWeight = -1;
-      for (let index = 0; index < count; index += 1) {
-        const weight = weights[index] ?? 0;
-        if (weight > bestWeight) {
-          bestWeight = weight;
-          first = index;
-        }
-      }
-      centers.push({ ...samples[first] ?? zeroLab() });
-    }
-    for (let index = 0; index < count; index += 1) {
-      const sample = samples[index] ?? zeroLab();
-      let best = Infinity;
-      for (const center of centers) best = Math.min(best, Math.sqrt(labDistance2(sample, center)));
-      distance3[index] = best;
-    }
-    while (centers.length < k && centers.length < count + pinned) {
-      let at = 0;
-      let score = -1;
-      for (let index = 0; index < count; index += 1) {
-        const next = (distance3[index] ?? 0) * Math.sqrt(weights[index] ?? 0);
-        if (next > score) {
-          score = next;
-          at = index;
-        }
-      }
-      if (score <= 0 && centers.length >= pinned) break;
-      const center = samples[at] ?? zeroLab();
-      centers.push({ L: center.L, a: center.a, b: center.b });
-      for (let index = 0; index < count; index += 1) {
-        distance3[index] = Math.min(distance3[index] ?? 0, Math.sqrt(labDistance2(samples[index] ?? zeroLab(), center)));
-      }
-    }
-    const pinCount = Math.min(pinned, centers.length);
-    for (let round = 0; round < 40; round += 1) {
-      const bins = centers.map(() => ({ L: 0, a: 0, b: 0, w: 0 }));
-      for (let index = 0; index < count; index += 1) {
-        const sample = samples[index] ?? zeroLab();
-        const slot = nearestLab(sample, centers);
-        const bin = bins[slot];
-        const weight = weights[index] ?? 0;
-        if (bin === void 0) continue;
-        bin.L += sample.L * weight;
-        bin.a += sample.a * weight;
-        bin.b += sample.b * weight;
-        bin.w += weight;
-      }
-      for (let index = pinCount; index < centers.length; index += 1) {
-        const bin = bins[index];
-        if (bin === void 0 || bin.w === 0) continue;
-        centers[index] = { L: bin.L / bin.w, a: bin.a / bin.w, b: bin.b / bin.w };
-      }
-    }
-    return centers;
-  }
-  function cleanLabels(labels, width, height, kCount, minArea) {
-    for (let pass = 0; pass < 2; pass += 1) {
-      for (let label = 0; label < kCount; label += 1) {
-        const mask = new Uint8Array(labels.length);
-        for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mask[index] = 1;
-        const labeled = components(mask, width, height);
-        const small = new Uint8Array(labels.length);
-        let any = false;
-        for (let index = 0; index < labels.length; index += 1) {
-          const id = labeled.ids[index] ?? 0;
-          if (id > 0 && (labeled.sizes[id] ?? 0) < minArea) {
-            small[index] = 1;
-            any = true;
-          }
-        }
-        if (!any) continue;
-        const replacement = nearestOutside(labels, small, width, height);
-        for (let index = 0; index < labels.length; index += 1) if (small[index] === 1) labels[index] = replacement[index] ?? label;
-      }
-    }
-  }
-  function nearestOutside(labels, small, width, height) {
-    const nearest2 = new Uint8Array(labels.length);
-    const seen = new Uint8Array(labels.length);
-    const queue = [];
-    for (let index = 0; index < small.length; index += 1) {
-      if (small[index] === 1) continue;
-      seen[index] = 1;
-      nearest2[index] = labels[index] ?? 0;
-      queue.push(index);
-    }
-    for (let cursor = 0; cursor < queue.length; cursor += 1) {
-      const index = queue[cursor] ?? 0;
-      const x = index % width;
-      const y = (index - x) / width;
-      const around = [index - 1, index + 1, index - width, index + width];
-      for (const next of around) {
-        if (next < 0 || next >= labels.length || seen[next] === 1) continue;
-        const nx = next % width;
-        if (Math.abs(nx - x) + Math.abs((next - nx) / width - y) !== 1) continue;
-        seen[next] = 1;
-        nearest2[next] = nearest2[index] ?? 0;
-        queue.push(next);
-      }
-    }
-    return nearest2;
-  }
-  function smoothLabels(labels, width, height, kCount, sigma) {
-    if (!(sigma > 0)) return;
-    const kernel = gaussianKernel(sigma);
-    const best = new Float64Array(labels.length);
-    best.fill(-1);
-    const next = labels.slice();
-    const mask = new Float64Array(labels.length);
-    const blurred = new Float64Array(labels.length);
-    for (let label = 0; label < kCount; label += 1) {
-      for (let index = 0; index < labels.length; index += 1) mask[index] = labels[index] === label ? 1 : 0;
-      blurSeparable(mask, blurred, width, height, kernel);
-      for (let index = 0; index < labels.length; index += 1) {
-        const value = blurred[index] ?? 0;
-        if (value > (best[index] ?? -1)) {
-          best[index] = value;
-          next[index] = label;
-        }
-      }
-    }
-    labels.set(next);
-  }
-  function enclosedBoxes(rgba, width, height) {
-    const count = width * height;
-    if (width < 2 || height < 2 || rgba.length < count * 4) return [];
-    const lab = new Float64Array(count * 3);
-    const opaque = new Uint8Array(count);
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      opaque[index] = (rgba[offset + 3] ?? 0) >= 128 ? 1 : 0;
-      const color = rgbToOklab({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
-      lab[index * 3] = color.L;
-      lab[index * 3 + 1] = color.a;
-      lab[index * 3 + 2] = color.b;
-    }
-    const edge = new Uint8Array(count);
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const index = y * width + x;
-        if (opaque[index] !== 1) continue;
-        const color = readLab(lab, index);
-        let strong = false;
-        for (const step of [-1, 1, -width, width]) {
-          const next = index + step;
-          const nx = x + (step === -1 ? -1 : step === 1 ? 1 : 0);
-          const ny = y + (step === -width ? -1 : step === width ? 1 : 0);
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          if (opaque[next] !== 1) {
-            strong = true;
-            break;
-          }
-          if (Math.sqrt(labDistance2(color, readLab(lab, next))) > COLOR_FLOOR) {
-            strong = true;
-            break;
-          }
-        }
-        if (strong) edge[index] = 1;
-      }
-    }
-    const outside = new Uint8Array(count);
-    const queue = [];
-    for (let x = 0; x < width; x += 1) {
-      seedOutside(0 * width + x, edge, outside, queue);
-      seedOutside((height - 1) * width + x, edge, outside, queue);
-    }
-    for (let y = 0; y < height; y += 1) {
-      seedOutside(y * width, edge, outside, queue);
-      seedOutside(y * width + width - 1, edge, outside, queue);
-    }
-    for (let cursor = 0; cursor < queue.length; cursor += 1) {
-      const index = queue[cursor] ?? 0;
-      const x = index % width;
-      const y = (index - x) / width;
-      const steps = [
-        [x - 1, y],
-        [x + 1, y],
-        [x, y - 1],
-        [x, y + 1]
-      ];
-      for (const step of steps) {
-        const nx = step[0] ?? 0;
-        const ny = step[1] ?? 0;
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        seedOutside(ny * width + nx, edge, outside, queue);
-      }
-    }
-    const object = new Uint8Array(count);
-    for (let index = 0; index < count; index += 1) if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
-    const labeled = components(object, width, height);
-    const boxes = [];
-    for (let id = 1; id <= labeled.count; id += 1) {
-      if ((labeled.sizes[id] ?? 0) < 400) continue;
-      let minX = width;
-      let minY = height;
-      let maxX = 0;
-      let maxY = 0;
-      for (let index = 0; index < count; index += 1) {
-        if ((labeled.ids[index] ?? 0) !== id) continue;
-        const x2 = index % width;
-        const y2 = (index - x2) / width;
-        if (x2 < minX) minX = x2;
-        if (y2 < minY) minY = y2;
-        if (x2 > maxX) maxX = x2;
-        if (y2 > maxY) maxY = y2;
-      }
-      const pad = 2;
-      const x = Math.max(0, minX - pad);
-      const y = Math.max(0, minY - pad);
-      boxes.push({ x, y, width: Math.min(width, maxX + 1 + pad) - x, height: Math.min(height, maxY + 1 + pad) - y });
-    }
-    return mergeBoxes(boxes, 8);
-  }
-  function seedOutside(index, edge, outside, queue) {
-    if (edge[index] === 1 || outside[index] === 1) return;
-    outside[index] = 1;
-    queue.push(index);
-  }
-  function mergeBoxes(boxes, gap) {
-    const open = boxes.map((box) => ({ ...box }));
-    let merged = true;
-    while (merged) {
-      merged = false;
-      for (let left = 0; left < open.length; left += 1) {
-        for (let right = left + 1; right < open.length; right += 1) {
-          const a = open[left];
-          const b = open[right];
-          if (a === void 0 || b === void 0) continue;
-          const apart = a.x > b.x + b.width + gap || b.x > a.x + a.width + gap || a.y > b.y + b.height + gap || b.y > a.y + a.height + gap;
-          if (apart) continue;
-          const x = Math.min(a.x, b.x);
-          const y = Math.min(a.y, b.y);
-          open[left] = { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
-          open.splice(right, 1);
-          merged = true;
-          break;
-        }
-        if (merged) break;
-      }
-    }
-    return open;
-  }
-  function coreMask(lab, alpha, width, height, tau) {
-    const core = new Uint8Array(width * height);
-    const limit = tau * tau;
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const index = y * width + x;
-        if (alpha[index] === 0) continue;
-        const color = readLab(lab, index);
-        let worst = 0;
-        let flat = true;
-        for (let dy = -1; dy <= 1 && flat; dy += 1) {
-          for (let dx = -1; dx <= 1; dx += 1) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = Math.min(width - 1, Math.max(0, x + dx));
-            const ny = Math.min(height - 1, Math.max(0, y + dy));
-            const next = ny * width + nx;
-            if (alpha[next] === 0) {
-              flat = false;
-              break;
-            }
-            worst = Math.max(worst, labDistance2(color, readLab(lab, next)));
-            if (worst >= limit) flat = false;
-          }
-        }
-        if (flat && worst < limit) core[index] = 1;
-      }
-    }
-    return core;
-  }
-  function components(mask, width, height) {
-    const ids = new Int32Array(mask.length);
-    const sizes = [0];
-    const stack = [];
-    for (let start2 = 0; start2 < mask.length; start2 += 1) {
-      if (mask[start2] !== 1 || ids[start2] !== 0) continue;
-      const id = sizes.length;
-      sizes.push(0);
-      stack.push(start2);
-      ids[start2] = id;
-      while (stack.length > 0) {
-        const index = stack.pop() ?? 0;
-        sizes[id] = (sizes[id] ?? 0) + 1;
-        const x = index % width;
-        const y = (index - x) / width;
-        for (let dy = -1; dy <= 1; dy += 1) {
-          for (let dx = -1; dx <= 1; dx += 1) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = x + dx;
-            const ny = y + dy;
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-            const next = ny * width + nx;
-            if (mask[next] !== 1 || ids[next] !== 0) continue;
-            ids[next] = id;
-            stack.push(next);
-          }
-        }
-      }
-    }
-    return { ids, sizes: Int32Array.from(sizes), count: sizes.length - 1 };
-  }
-  function bicubicLab(linear, width, height, sx, sy) {
-    const x0 = Math.floor(sx);
-    const y0 = Math.floor(sy);
-    const fx = sx - x0;
-    const fy = sy - y0;
-    let red = 0;
-    let green = 0;
-    let blue = 0;
-    for (let ky = -1; ky <= 2; ky += 1) {
-      const wy = keys(fy - ky);
-      const y = reflect101(y0 + ky, height);
-      for (let kx = -1; kx <= 2; kx += 1) {
-        const weight = wy * keys(fx - kx);
-        const x = reflect101(x0 + kx, width);
-        const offset = (y * width + x) * 3;
-        red += (linear[offset] ?? 0) * weight;
-        green += (linear[offset + 1] ?? 0) * weight;
-        blue += (linear[offset + 2] ?? 0) * weight;
-      }
-    }
-    return rgbToOklab({ r: linearToSrgb(red), g: linearToSrgb(green), b: linearToSrgb(blue) });
-  }
-  function blurSeparable(source, target, width, height, kernel) {
-    const radius = kernel.length - 1 >> 1;
-    const temp = new Float64Array(source.length);
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        let sum = 0;
-        for (let tap = -radius; tap <= radius; tap += 1) sum += (source[y * width + reflect101(x + tap, width)] ?? 0) * (kernel[tap + radius] ?? 0);
-        temp[y * width + x] = sum;
-      }
-    }
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        let sum = 0;
-        for (let tap = -radius; tap <= radius; tap += 1) sum += (temp[reflect101(y + tap, height) * width + x] ?? 0) * (kernel[tap + radius] ?? 0);
-        target[y * width + x] = sum;
-      }
-    }
-  }
-  function gaussianKernel(sigma) {
-    const radius = Math.max(1, Math.ceil(sigma * 3));
-    const kernel = new Float64Array(radius * 2 + 1);
-    let sum = 0;
-    for (let index = -radius; index <= radius; index += 1) {
-      const weight = Math.exp(-(index * index) / (2 * sigma * sigma));
-      kernel[index + radius] = weight;
-      sum += weight;
-    }
-    for (let index = 0; index < kernel.length; index += 1) kernel[index] = (kernel[index] ?? 0) / sum;
-    return kernel;
-  }
-  function projectLab(color, left, right) {
-    const dL = right.L - left.L;
-    const da = right.a - left.a;
-    const db = right.b - left.b;
-    const length = dL * dL + da * da + db * db;
-    const raw = length === 0 ? 0 : ((color.L - left.L) * dL + (color.a - left.a) * da + (color.b - left.b) * db) / length;
-    const t = Math.min(1, Math.max(0, raw));
-    const mixed = { L: left.L + t * dL, a: left.a + t * da, b: left.b + t * db };
-    return { t, distance: Math.sqrt(labDistance2(color, mixed)) };
-  }
-  function nearestLab(color, centers) {
-    let best = 0;
-    let score = Infinity;
-    for (let index = 0; index < centers.length; index += 1) {
-      const center = centers[index];
-      if (center === void 0) continue;
-      const gap = labDistance2(color, center);
-      if (gap < score) {
-        score = gap;
-        best = index;
-      }
-    }
-    return best;
-  }
-  function bitList(mask, kCount) {
-    const bits = [];
-    for (let label = 0; label < kCount; label += 1) if ((mask & 1 << label) !== 0) bits.push(label);
-    return bits;
-  }
-  function squareOffsets(radius) {
-    const offsets = [];
-    for (let y = -radius; y <= radius; y += 1) {
-      for (let x = -radius; x <= radius; x += 1) offsets.push({ x, y });
-    }
-    return offsets;
-  }
-  function diskOffsets(radius) {
-    const offsets = [];
-    const limit = radius * radius;
-    for (let y = -radius; y <= radius; y += 1) {
-      for (let x = -radius; x <= radius; x += 1) if (x * x + y * y <= limit) offsets.push({ x, y });
-    }
-    return offsets;
-  }
-  function readLab(lab, index) {
-    return { L: lab[index * 3] ?? 0, a: lab[index * 3 + 1] ?? 0, b: lab[index * 3 + 2] ?? 0 };
-  }
-  function countOf(mask) {
-    let count = 0;
-    for (const value of mask) if (value === 1) count += 1;
-    return count;
-  }
-  function zeroLab() {
-    return { L: 0, a: 0, b: 0 };
-  }
-  function reflect101(index, length) {
-    if (length <= 1) return 0;
-    const span = length * 2 - 2;
-    let wrapped = index % span;
-    if (wrapped < 0) wrapped += span;
-    return wrapped >= length ? span - wrapped : wrapped;
-  }
-  function keys(distance3) {
-    const t = Math.abs(distance3);
-    if (t <= 1) return (1.25 * t - 2.25) * t * t + 1;
-    if (t < 2) return ((-0.75 * t + 3.75) * t - 6) * t + 3;
-    return 0;
-  }
-  function srgbToLinear(channel) {
-    const value = channel / 255;
-    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-  }
-  function linearToSrgb(channel) {
-    const value = Math.min(1, Math.max(0, channel));
-    const encoded = value <= 31308e-7 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
-    return Math.round(Math.min(1, Math.max(0, encoded)) * 255);
-  }
-  function hex2(red, green, blue) {
-    return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
-  }
-
   // src/trace.ts
   function presetDefaults(preset) {
     if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
@@ -2891,6 +1958,51 @@
   }
 
   // src/lab-model.ts
+  var SPECK = { logo: 18, icon: 12, photo: 6, poster: 28 };
+  var PRECISION = { logo: 6, icon: 5, photo: 8, poster: 4 };
+  function controlsFor(mode) {
+    const defaults = presetDefaults(mode);
+    const segmentColors = mode === "logo" ? 0 : Math.min(32, Math.max(2, defaults.maxColors || (mode === "photo" ? 32 : mode === "poster" ? 10 : 8)));
+    return {
+      mode,
+      maxColors: segmentColors,
+      snapBlends: mode === "logo" || mode === "icon",
+      speckArea: SPECK[mode],
+      removeBackground: defaults.removeBackground,
+      backdropSpread: 22,
+      opaqueAt: mode === "photo" || mode === "poster" ? 128 : 200,
+      traceColors: defaults.maxColors > 0 ? defaults.maxColors : segmentColors,
+      lockPalette: true,
+      colorPrecision: PRECISION[mode],
+      filterSpeckle: mode === "photo" ? 1 : 0,
+      clustering: mode === "photo" ? "watershed" : "off",
+      watershedDetail: 128,
+      simplify: simplifyTolerance(defaults.smoothness),
+      stacking: defaults.stacking,
+      dropPlate: defaults.removeBackground,
+      fitGeometry: true,
+      smoothness: defaults.smoothness,
+      corner: defaults.corner,
+      seal: mode === "photo" || mode === "poster",
+      sealWidth: defaults.stacking === "cutout" ? 2 : 0.8
+    };
+  }
+  function traceRequest(controls, palette) {
+    const locked = controls.lockPalette && palette.length > 0;
+    return {
+      preset: controls.mode,
+      maxColors: locked ? 0 : controls.traceColors,
+      smoothness: 0,
+      removeBackground: controls.removeBackground,
+      stacking: controls.stacking,
+      palette: locked ? palette.slice(0, 32) : void 0,
+      colorPrecision: controls.colorPrecision,
+      filterSpeckle: controls.filterSpeckle,
+      clustering: controls.clustering,
+      watershedDetail: controls.watershedDetail,
+      simplify: controls.simplify
+    };
+  }
   function paletteFromRaster2(rgba, _ignore) {
     const seen = /* @__PURE__ */ new Set();
     for (let index = 0; index < rgba.length; index += 4) {
@@ -2902,391 +2014,6 @@
   }
   function byte2(value) {
     return value.toString(16).padStart(2, "0");
-  }
-
-  // src/segment.ts
-  var MODE_CAP = { logo: 8, icon: 8, photo: 32, poster: 10 };
-  var SPECK_AREA = { logo: 18, icon: 12, photo: 6, poster: 28 };
-  function segmentRaster(rgba, width, height, options) {
-    return segmentViews(rgba, width, height, options).backdrop;
-  }
-  function segmentViews(rgba, width, height, options) {
-    const count = width * height;
-    if (width < 2 || height < 2 || rgba.length < count * 4) {
-      const copy = rgba.slice();
-      return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
-    }
-    const source = rgba;
-    const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
-    const samples = collectSamples(source, width, height, cutoff);
-    const centroids = cluster(samples, colorCap(options));
-    const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
-    const areas = new Uint32Array(centroids.length);
-    for (let index = 0; index < count; index += 1) {
-      if ((source[index * 4 + 3] ?? 0) < cutoff) continue;
-      const label = nearest(pixelAt(source, index), centroids);
-      areas[label] = (areas[label] ?? 0) + 1;
-    }
-    const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
-    const labels = new Int16Array(count);
-    labels.fill(-1);
-    for (let index = 0; index < count; index += 1) {
-      if ((source[index * 4 + 3] ?? 0) < cutoff) continue;
-      labels[index] = nearest(pixelAt(source, index), palette);
-    }
-    cleanupEdges(labels, width, height);
-    mergeSpecks(labels, width, height, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
-    const opaque = new Uint8Array(count);
-    for (let index = 0; index < count; index += 1) opaque[index] = (source[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
-    const colors = paintLabels2(labels, palette, opaque);
-    const alpha = opaque.slice();
-    if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha, options.backdropSpread ?? 22);
-    return {
-      colors,
-      backdrop: paintLabels2(labels, palette, alpha),
-      spread: borderMeasure(source, width, height)?.spread ?? 0,
-      paletteSize: palette.length
-    };
-  }
-  function paintLabels2(labels, palette, alpha) {
-    const next = new Uint8Array(alpha.length * 4);
-    for (let index = 0; index < alpha.length; index += 1) {
-      const offset = index * 4;
-      if ((alpha[index] ?? 0) === 0) continue;
-      const color = palette[labels[index] ?? 0] ?? { r: 0, g: 0, b: 0 };
-      next[offset] = color.r;
-      next[offset + 1] = color.g;
-      next[offset + 2] = color.b;
-      next[offset + 3] = 255;
-    }
-    return next;
-  }
-  function colorCap(options) {
-    const requested = options.maxColors > 0 ? options.maxColors : MODE_CAP[options.mode];
-    return Math.min(32, Math.max(2, requested));
-  }
-  function collectSamples(rgba, width, height, cutoff) {
-    const target = 8e3;
-    const stride = Math.max(1, Math.floor(Math.sqrt(width * height / target)));
-    const samples = [];
-    for (let y = 0; y < height; y += stride) {
-      for (let x = 0; x < width; x += stride) {
-        const offset = (y * width + x) * 4;
-        if ((rgba[offset + 3] ?? 0) < cutoff) continue;
-        samples.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
-      }
-    }
-    return samples.length > 0 ? samples : [{ r: 0, g: 0, b: 0 }];
-  }
-  function cluster(samples, cap) {
-    const centroids = seedCentroids(samples, cap);
-    for (let round = 0; round < 8; round += 1) {
-      const sums = centroids.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
-      for (const sample of samples) {
-        const index = nearest(sample, centroids);
-        const bin = sums[index];
-        if (bin === void 0) continue;
-        bin.r += sample.r;
-        bin.g += sample.g;
-        bin.b += sample.b;
-        bin.n += 1;
-      }
-      for (let index = 0; index < centroids.length; index += 1) {
-        const bin = sums[index];
-        if (bin === void 0 || bin.n === 0) continue;
-        centroids[index] = { r: Math.round(bin.r / bin.n), g: Math.round(bin.g / bin.n), b: Math.round(bin.b / bin.n) };
-      }
-    }
-    return centroids;
-  }
-  function seedCentroids(samples, cap) {
-    const first = samples[Math.floor(samples.length / 2)] ?? { r: 0, g: 0, b: 0 };
-    const centroids = [{ ...first }];
-    while (centroids.length < cap) {
-      let best = 0;
-      let chosen = first;
-      for (const sample of samples) {
-        const gap = distanceToPalette(sample, centroids);
-        if (gap > best) {
-          best = gap;
-          chosen = sample;
-        }
-      }
-      if (best < 16 * 16) break;
-      centroids.push({ ...chosen });
-    }
-    return centroids;
-  }
-  function foldBlends(centroids, areas) {
-    const map = centroids.map((_, index) => index);
-    for (let index = 0; index < centroids.length; index += 1) {
-      const color = centroids[index];
-      if (color === void 0) continue;
-      let host = -1;
-      for (let left = 0; left < centroids.length; left += 1) {
-        if (left === index) continue;
-        for (let right = left + 1; right < centroids.length; right += 1) {
-          if (right === index) continue;
-          const a = centroids[left];
-          const b = centroids[right];
-          if (a === void 0 || b === void 0 || !onSegment(color, a, b)) continue;
-          const fringe = areas[index] ?? 0;
-          const parent = Math.min(areas[left] ?? 0, areas[right] ?? 0);
-          if (fringe * 5 >= parent) continue;
-          host = distance2(color, a) <= distance2(color, b) ? left : right;
-        }
-      }
-      if (host >= 0) map[index] = host;
-    }
-    const kept = [];
-    const remap = /* @__PURE__ */ new Map();
-    for (let index = 0; index < centroids.length; index += 1) {
-      let cursor = map[index] ?? index;
-      const seen = /* @__PURE__ */ new Set();
-      while ((map[cursor] ?? cursor) !== cursor && !seen.has(cursor)) {
-        seen.add(cursor);
-        cursor = map[cursor] ?? cursor;
-      }
-      const existing = remap.get(cursor);
-      if (existing !== void 0) {
-        remap.set(index, existing);
-        continue;
-      }
-      const color = centroids[cursor];
-      if (color === void 0) continue;
-      remap.set(index, kept.length);
-      remap.set(cursor, kept.length);
-      kept.push(color);
-    }
-    return kept.length > 0 ? kept : centroids.slice();
-  }
-  function onSegment(color, a, b) {
-    const abx = b.r - a.r;
-    const aby = b.g - a.g;
-    const abz = b.b - a.b;
-    const length = abx * abx + aby * aby + abz * abz;
-    if (length < 80 * 80) return false;
-    const t = ((color.r - a.r) * abx + (color.g - a.g) * aby + (color.b - a.b) * abz) / length;
-    if (t < 0.18 || t > 0.82) return false;
-    const projected = { r: a.r + t * abx, g: a.g + t * aby, b: a.b + t * abz };
-    return distance2(color, projected) < 26 * 26 && distance2(color, a) > 18 * 18 && distance2(color, b) > 18 * 18;
-  }
-  function cleanupEdges(labels, width, height) {
-    const original = new Int16Array(labels);
-    for (let pass = 0; pass < 2; pass += 1) {
-      for (let y = 1; y < height - 1; y += 1) {
-        for (let x = 1; x < width - 1; x += 1) {
-          const index = y * width + x;
-          if ((original[index] ?? -1) < 0 || isThin(original, width, index)) continue;
-          const counts = /* @__PURE__ */ new Map();
-          for (let dy = -1; dy <= 1; dy += 1) {
-            for (let dx = -1; dx <= 1; dx += 1) {
-              if (dx === 0 && dy === 0) continue;
-              const label = original[index + dy * width + dx] ?? -1;
-              if (label < 0) continue;
-              counts.set(label, (counts.get(label) ?? 0) + 1);
-            }
-          }
-          let bestLabel = original[index] ?? 0;
-          let bestCount = 0;
-          for (const [label, count] of counts) {
-            if (count > bestCount) {
-              bestCount = count;
-              bestLabel = label;
-            }
-          }
-          if (bestCount >= 5) labels[index] = bestLabel;
-        }
-      }
-      original.set(labels);
-    }
-  }
-  function isThin(labels, width, index) {
-    const label = labels[index] ?? 0;
-    const left = (labels[index - 1] ?? -1) === label;
-    const right = (labels[index + 1] ?? -1) === label;
-    const up = (labels[index - width] ?? -1) === label;
-    const down = (labels[index + width] ?? -1) === label;
-    return left && right && !up && !down || up && down && !left && !right;
-  }
-  function mergeSpecks(labels, width, height, minArea) {
-    const count = width * height;
-    const seen = new Uint8Array(count);
-    const queue = new Int32Array(count);
-    for (let start2 = 0; start2 < count; start2 += 1) {
-      if (seen[start2] === 1) continue;
-      const label = labels[start2] ?? -1;
-      if (label < 0) {
-        seen[start2] = 1;
-        continue;
-      }
-      let head = 0;
-      let tail = 0;
-      queue[tail] = start2;
-      tail += 1;
-      seen[start2] = 1;
-      let minX = start2 % width;
-      let maxX = minX;
-      let minY = Math.floor(start2 / width);
-      let maxY = minY;
-      while (head < tail) {
-        const index = queue[head] ?? 0;
-        head += 1;
-        const x = index % width;
-        const y = Math.floor(index / width);
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        const neighbors = [index - 1, index + 1, index - width, index + width];
-        for (const next of neighbors) {
-          if (next < 0 || next >= count || seen[next] === 1) continue;
-          const nx = next % width;
-          if (Math.abs(nx - x) > 1) continue;
-          if ((labels[next] ?? -1) !== label) continue;
-          seen[next] = 1;
-          queue[tail] = next;
-          tail += 1;
-        }
-      }
-      const area = tail;
-      const spanX = maxX - minX + 1;
-      const spanY = maxY - minY + 1;
-      const thin = Math.max(spanX, spanY) >= 8 && Math.min(spanX, spanY) <= 2 && area >= 6;
-      if (area >= minArea || thin) continue;
-      const around = /* @__PURE__ */ new Map();
-      for (let cursor = 0; cursor < tail; cursor += 1) {
-        const index = queue[cursor] ?? 0;
-        const x = index % width;
-        const y = Math.floor(index / width);
-        const neighbors = [index - 1, index + 1, index - width, index + width];
-        for (const next of neighbors) {
-          if (next < 0 || next >= count) continue;
-          const nx = next % width;
-          const ny = Math.floor(next / width);
-          if (Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
-          const other = labels[next] ?? -1;
-          if (other < 0 || other === label) continue;
-          around.set(other, (around.get(other) ?? 0) + 1);
-        }
-      }
-      let replacement = label;
-      let votes = 0;
-      for (const [other, vote] of around) {
-        if (vote > votes) {
-          votes = vote;
-          replacement = other;
-        }
-      }
-      if (replacement === label) continue;
-      for (let cursor = 0; cursor < tail; cursor += 1) labels[queue[cursor] ?? 0] = replacement;
-    }
-  }
-  function borderMeasure(rgba, width, height) {
-    let red = 0;
-    let green = 0;
-    let blue = 0;
-    let border = 0;
-    const visit = (x, y) => {
-      const offset = (y * width + x) * 4;
-      red += rgba[offset] ?? 0;
-      green += rgba[offset + 1] ?? 0;
-      blue += rgba[offset + 2] ?? 0;
-      border += 1;
-    };
-    for (let x = 0; x < width; x += 1) {
-      visit(x, 0);
-      if (height > 1) visit(x, height - 1);
-    }
-    for (let y = 1; y < height - 1; y += 1) {
-      visit(0, y);
-      if (width > 1) visit(width - 1, y);
-    }
-    if (border === 0) return null;
-    const mean = { r: red / border, g: green / border, b: blue / border };
-    let spread = 0;
-    const revisit = (x, y) => {
-      spread += Math.sqrt(distance2(pixelAt(rgba, y * width + x), mean));
-    };
-    for (let x = 0; x < width; x += 1) {
-      revisit(x, 0);
-      if (height > 1) revisit(x, height - 1);
-    }
-    for (let y = 1; y < height - 1; y += 1) {
-      revisit(0, y);
-      if (width > 1) revisit(width - 1, y);
-    }
-    return { mean, spread: spread / border };
-  }
-  function clearFlatBackdrop(rgba, labels, width, height, palette, alpha, spreadLimit) {
-    const measured = borderMeasure(rgba, width, height);
-    if (measured === null || measured.spread > spreadLimit) return;
-    const mean = measured.mean;
-    const backdrop = nearest(mean, palette);
-    const count = width * height;
-    const queue = new Int32Array(count);
-    const seen = new Uint8Array(count);
-    let tail = 0;
-    const push = (index) => {
-      if (index < 0 || index >= count || seen[index] === 1) return;
-      if ((labels[index] ?? -1) !== backdrop && distance2(pixelAt(rgba, index), mean) > 26 * 26) return;
-      seen[index] = 1;
-      queue[tail] = index;
-      tail += 1;
-    };
-    for (let x = 0; x < width; x += 1) {
-      push(x);
-      push((height - 1) * width + x);
-    }
-    for (let y = 0; y < height; y += 1) {
-      push(y * width);
-      push(y * width + width - 1);
-    }
-    let head = 0;
-    while (head < tail) {
-      const index = queue[head] ?? 0;
-      head += 1;
-      const x = index % width;
-      const neighbors = [index - 1, index + 1, index - width, index + width];
-      for (const next of neighbors) {
-        if (next < 0 || next >= count || seen[next] === 1) continue;
-        const nx = next % width;
-        if (Math.abs(nx - x) > 1) continue;
-        push(next);
-      }
-    }
-    const fraction = tail / count;
-    if (fraction < 0.08 || fraction > 0.92) return;
-    for (let index = 0; index < tail; index += 1) alpha[queue[index] ?? 0] = 0;
-  }
-  function pixelAt(rgba, index) {
-    const offset = index * 4;
-    return { r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 };
-  }
-  function nearest(color, palette) {
-    let best = 0;
-    let score = Infinity;
-    for (let index = 0; index < palette.length; index += 1) {
-      const entry = palette[index];
-      if (entry === void 0) continue;
-      const gap = distance2(color, entry);
-      if (gap < score) {
-        score = gap;
-        best = index;
-      }
-    }
-    return best;
-  }
-  function distanceToPalette(color, palette) {
-    let best = Infinity;
-    for (const entry of palette) best = Math.min(best, distance2(color, entry));
-    return best;
-  }
-  function distance2(a, b) {
-    const dr = a.r - b.r;
-    const dg = a.g - b.g;
-    const db = a.b - b.b;
-    return dr * dr + dg * dg + db * db;
   }
 
   // src/svg-scale.ts
@@ -3363,7 +2090,7 @@
 
   // src/trace-finish.ts
   var SHAPE = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
-  function mergePlates(svgs, plates, width, height, droppedColor, removeBackground) {
+  function mergePlates(svgs, plates, width, height, droppedColor, removeBackground, fitGeometry = true) {
     const drawings = [];
     for (let index = 0; index < svgs.length; index += 1) {
       const plate = plates[index];
@@ -3376,39 +2103,109 @@
       drawings.push((next.match(SHAPE) ?? []).join(""));
     }
     const merged = '<svg xmlns="http://www.w3.org/2000/svg" width="' + String(width) + '" height="' + String(height) + '" viewBox="0 0 ' + String(width) + " " + String(height) + '">' + drawings.join("") + "</svg>";
-    return fitShapes(merged);
+    return fitGeometry ? fitShapes(merged) : merged;
+  }
+
+  // src/lab-pipeline.ts
+  var LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"];
+  var CONTROL_STEPS = [
+    { field: "mode", step: "colors" },
+    { field: "maxColors", step: "colors" },
+    { field: "snapBlends", step: "colors" },
+    { field: "speckArea", step: "colors" },
+    { field: "removeBackground", step: "backdrop" },
+    { field: "backdropSpread", step: "backdrop" },
+    { field: "opaqueAt", step: "punch" },
+    { field: "traceColors", step: "trace" },
+    { field: "lockPalette", step: "trace" },
+    { field: "colorPrecision", step: "trace" },
+    { field: "filterSpeckle", step: "trace" },
+    { field: "clustering", step: "trace" },
+    { field: "watershedDetail", step: "trace" },
+    { field: "simplify", step: "trace" },
+    { field: "stacking", step: "trace" },
+    { field: "dropPlate", step: "fit" },
+    { field: "fitGeometry", step: "fit" },
+    { field: "smoothness", step: "fair" },
+    { field: "corner", step: "fair" },
+    { field: "seal", step: "seal" },
+    { field: "sealWidth", step: "seal" }
+  ];
+  function earliestChangedStep(previous, next) {
+    let earliest = LAB_STEPS.length - 1;
+    for (const control of CONTROL_STEPS) {
+      if (previous[control.field] !== next[control.field]) {
+        const stepIndex = LAB_STEPS.indexOf(control.step);
+        earliest = Math.min(earliest, stepIndex);
+      }
+    }
+    return LAB_STEPS[earliest] ?? "seal";
+  }
+  function fitLabVector(svg, controls, droppedColor, borderColor) {
+    let fitted = svg;
+    if (droppedColor !== null) fitted = dropFill(fitted, droppedColor);
+    if (controls.dropPlate) fitted = dropCanvasBackground(fitted, borderColor);
+    if (controls.fitGeometry) fitted = fitShapes(fitted);
+    return fitted;
+  }
+  function fairLabVector(fitted, controls) {
+    const defaults = controlsFor(controls.mode);
+    if ((controls.mode === "logo" || controls.mode === "icon") && controls.smoothness === defaults.smoothness && controls.corner === defaults.corner) {
+      return relaxPaths(fitted, 0.15);
+    }
+    return fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
+  }
+  function sealLabVector(faired, controls) {
+    const sealed = controls.seal ? sealGaps(faired, controls.sealWidth) : faired;
+    return groupPathsByFill(sealed);
+  }
+  function styleLabVectors(svg, controls, droppedColor, borderColor = null) {
+    const fitted = fitLabVector(svg, controls, droppedColor, borderColor);
+    if (controls.mode === "logo" || controls.mode === "icon") {
+      return { fitted, faired: fitted, sealed: groupPathsByFill(fitted) };
+    }
+    const faired = fairLabVector(fitted, controls);
+    const sealed = sealLabVector(faired, controls);
+    return { fitted, faired, sealed };
+  }
+  function vectorStagesFromPlan(svgs, plates, width, height, droppedColor, controls) {
+    const trace = mergePlates(svgs, plates, width, height, null, false, false);
+    const fitted = mergePlates(svgs, plates, width, height, droppedColor, controls.dropPlate, controls.fitGeometry);
+    const faired = fairLabVector(fitted, controls);
+    const sealed = sealLabVector(faired, controls);
+    return { trace, fitted, faired, sealed };
   }
 
   // src/trace-pipeline.ts
-  function planTrace(source, settings) {
-    const decoded = readRgbaPng(source);
-    if (decoded === null) return null;
-    if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);
-    return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
+  function vectorStagesForPlan(svgs, plan, controls) {
+    return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls);
   }
-  function fittedPlan(svgs, plan, removeBackground) {
-    return mergePlates(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, removeBackground);
-  }
-  function styledTraceSvg(fitted, settings) {
-    if (settings.preset === "logo" || settings.preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
-    const stroke = settings.stacking === "cutout" ? 2 : 0.8;
-    return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
-  }
-  function planFlat(rgba, width, height, settings) {
-    const plates = flatPlates(rgba, width, height, settings.maxColors);
+  function settingsFromControls(controls) {
     return {
-      width,
-      height,
-      droppedColor: null,
-      plates: plates.map((plate) => ({
-        png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
-        scale: plate.scale,
-        originX: plate.originX,
-        originY: plate.originY,
-        borderColor: plate.borderColor,
-        request: flatRequest(settings, plate.palette, plate.scale)
-      }))
+      preset: controls.mode,
+      maxColors: controls.maxColors,
+      smoothness: controls.smoothness,
+      corner: controls.corner,
+      removeBackground: controls.removeBackground,
+      stacking: controls.stacking
     };
+  }
+  function replanTracePlan(plan, controls) {
+    const settings = settingsFromControls(controls);
+    if (controls.mode === "logo" || controls.mode === "icon") {
+      return {
+        ...plan,
+        plates: plan.plates.map((plate) => ({
+          ...plate,
+          request: flatRequestForControls(settings, plate.request.palette ?? [], plate.scale, controls)
+        }))
+      };
+    }
+    const stages = plan.rasterStages;
+    if (stages === void 0) return plan;
+    const palette = cappedPalette(paletteFromRaster2(stages.traceInput, stages.droppedColor), stages.droppedColor);
+    const request = { ...traceRequest(controls, palette), removeBackground: settings.removeBackground };
+    return { ...plan, plates: plan.plates.map((plate) => ({ ...plate, request })) };
   }
   function flatRequest(settings, palette, scale) {
     return {
@@ -3424,46 +2221,28 @@
       simplify: Math.round(0.3 * scale * 100) / 100
     };
   }
+  function flatRequestForControls(settings, palette, scale, controls) {
+    const request = flatRequest(settings, palette, scale);
+    const defaults = controlsFor(controls.mode);
+    const paletteChanged = controls.lockPalette !== defaults.lockPalette || controls.traceColors !== defaults.traceColors;
+    const traceSettings = paletteChanged ? traceRequest(controls, palette) : null;
+    return {
+      ...request,
+      ...traceSettings === null ? {} : { maxColors: traceSettings.maxColors, palette: traceSettings.palette },
+      ...controls.colorPrecision === defaults.colorPrecision ? {} : { colorPrecision: controls.colorPrecision },
+      ...controls.filterSpeckle === defaults.filterSpeckle ? {} : { filterSpeckle: controls.filterSpeckle },
+      ...controls.clustering === defaults.clustering ? {} : { clustering: controls.clustering },
+      ...controls.watershedDetail === defaults.watershedDetail ? {} : { watershedDetail: controls.watershedDetail },
+      ...controls.simplify === defaults.simplify ? {} : { simplify: controls.simplify },
+      stacking: controls.stacking === defaults.stacking ? request.stacking : controls.stacking
+    };
+  }
   function cappedPalette(colors, sentinel) {
     const unique = [...new Set(colors.map((color) => color.toLowerCase()))];
     const mark = sentinel?.trim().toLowerCase() ?? "";
     if (!/^#[0-9a-f]{6}$/.test(mark) || !unique.includes(mark)) return unique.slice(0, 32);
     const rest = unique.filter((color) => color !== mark);
     return [...rest.slice(0, 31), mark];
-  }
-  function planSegmented(rgba, width, height, settings) {
-    const segmented = segmentRaster(rgba, width, height, {
-      mode: settings.preset,
-      maxColors: settings.maxColors,
-      removeBackground: settings.removeBackground,
-      opaqueAt: settings.preset === "photo" || settings.preset === "poster" ? 128 : 200
-    });
-    const punched = punchTransparency(encodeRgbaPng(width, height, segmented), settings.preset === "photo" || settings.preset === "poster" ? 128 : 200);
-    const decoded = readRgbaPng(punched.png);
-    const palette = decoded === null ? [] : cappedPalette(paletteFromRaster2(decoded.rgba, punched.droppedColor), punched.droppedColor);
-    const locked = palette.length > 0;
-    return {
-      width,
-      height,
-      droppedColor: punched.droppedColor,
-      plates: [
-        {
-          png: punched.png,
-          scale: 1,
-          originX: 0,
-          originY: 0,
-          borderColor: cornerColor(rgba, width, height),
-          request: {
-            preset: settings.preset,
-            maxColors: locked ? 0 : settings.maxColors,
-            smoothness: settings.smoothness,
-            removeBackground: settings.removeBackground,
-            stacking: settings.stacking,
-            palette: locked ? palette : void 0
-          }
-        }
-      ]
-    };
   }
 
   // src/panel.ts
@@ -3472,6 +2251,107 @@
       super("Illustrator \u0E44\u0E21\u0E48\u0E15\u0E2D\u0E1A\u0E01\u0E25\u0E31\u0E1A\u0E20\u0E32\u0E22\u0E43\u0E19\u0E40\u0E27\u0E25\u0E32\u0E17\u0E35\u0E48\u0E01\u0E33\u0E2B\u0E19\u0E14");
     }
   };
+  function parsePlanWorkerMessage(value) {
+    if (!isRecord(value)) return null;
+    if (value.kind === "error" && typeof value.error === "string") return { kind: "error", error: value.error };
+    if (value.kind !== "plan") return null;
+    const plan = parseTracePlan(value.plan);
+    if (value.plan !== null && plan === null) return null;
+    return { kind: "plan", plan };
+  }
+  function parseTracePlan(value) {
+    if (!isRecord(value) || !Number.isInteger(value.width) || !Number.isInteger(value.height) || !Array.isArray(value.plates)) return null;
+    if (typeof value.width !== "number" || typeof value.height !== "number") return null;
+    if (value.droppedColor !== null && typeof value.droppedColor !== "string") return null;
+    const plates = [];
+    for (const candidate of value.plates) {
+      const plate = parsePlannedPlate(candidate);
+      if (plate === null) return null;
+      plates.push(plate);
+    }
+    let rasterStages;
+    if (value.rasterStages !== void 0) {
+      rasterStages = parseRasterStages(value.rasterStages) ?? void 0;
+      if (rasterStages === void 0) return null;
+    }
+    return {
+      width: value.width,
+      height: value.height,
+      droppedColor: value.droppedColor,
+      plates,
+      ...rasterStages === void 0 ? {} : { rasterStages }
+    };
+  }
+  function parsePlannedPlate(value) {
+    if (!isRecord(value) || !(value.png instanceof Uint8Array)) return null;
+    if (typeof value.scale !== "number" || typeof value.originX !== "number" || typeof value.originY !== "number") return null;
+    if (value.borderColor !== null && typeof value.borderColor !== "string") return null;
+    const request = parseTraceRequest(value.request);
+    if (request === null) return null;
+    return {
+      png: Buffer.from(value.png),
+      scale: value.scale,
+      originX: value.originX,
+      originY: value.originY,
+      borderColor: value.borderColor,
+      request
+    };
+  }
+  function parseTraceRequest(value) {
+    if (!isRecord(value)) return null;
+    const preset = value.preset;
+    const stacking = value.stacking;
+    if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") return null;
+    if (stacking !== "cutout" && stacking !== "stacked") return null;
+    if (typeof value.maxColors !== "number" || typeof value.smoothness !== "number" || typeof value.removeBackground !== "boolean") return null;
+    const request = { preset, stacking, maxColors: value.maxColors, smoothness: value.smoothness, removeBackground: value.removeBackground };
+    if (value.palette !== void 0) {
+      if (!Array.isArray(value.palette) || !value.palette.every((color) => typeof color === "string")) return null;
+      return {
+        ...request,
+        palette: value.palette,
+        ...optionalRequestFields(value)
+      };
+    }
+    return { ...request, ...optionalRequestFields(value) };
+  }
+  function optionalRequestFields(value) {
+    const result = {};
+    if (typeof value.colorPrecision === "number") result.colorPrecision = value.colorPrecision;
+    if (typeof value.filterSpeckle === "number") result.filterSpeckle = value.filterSpeckle;
+    if (value.clustering === "watershed" || value.clustering === "off") result.clustering = value.clustering;
+    if (typeof value.watershedDetail === "number") result.watershedDetail = value.watershedDetail;
+    if (typeof value.simplify === "number") result.simplify = value.simplify;
+    return result;
+  }
+  function parseRasterStages(value) {
+    if (!isRecord(value) || !(value.colors instanceof Uint8Array) || !(value.backdrop instanceof Uint8Array) || !(value.punchInput instanceof Uint8Array) || !(value.punch instanceof Uint8Array) || !(value.traceInput instanceof Uint8Array)) return null;
+    if (value.mode !== "logo" && value.mode !== "icon" && value.mode !== "photo" && value.mode !== "poster") return null;
+    if (value.droppedColor !== null && typeof value.droppedColor !== "string") return null;
+    if (typeof value.spread !== "number" || typeof value.paletteSize !== "number") return null;
+    const segmentation = parseSegmentColorStage(value.segmentation);
+    if (value.segmentation !== null && segmentation === null) return null;
+    return {
+      mode: value.mode,
+      colors: value.colors,
+      backdrop: value.backdrop,
+      punchInput: value.punchInput,
+      punch: value.punch,
+      traceInput: value.traceInput,
+      droppedColor: value.droppedColor,
+      spread: value.spread,
+      paletteSize: value.paletteSize,
+      segmentation
+    };
+  }
+  function parseSegmentColorStage(value) {
+    if (!isRecord(value) || !(value.colors instanceof Uint8Array) || !(value.labels instanceof Int16Array) || !(value.punchLabels instanceof Int16Array) || !(value.opaque instanceof Uint8Array) || !Array.isArray(value.palette) || typeof value.spread !== "number") return null;
+    if (!value.palette.every((color) => isRecord(color) && typeof color.r === "number" && typeof color.g === "number" && typeof color.b === "number")) return null;
+    return value;
+  }
+  function isRecord(value) {
+    return typeof value === "object" && value !== null;
+  }
   var SVG_NS = "http://www.w3.org/2000/svg";
   var SAFE_ATTRS = ["viewBox", "width", "height", "fill", "stroke", "stroke-width", "stroke-linejoin", "d", "cx", "cy", "r", "rx", "ry", "x", "y", "transform", "opacity", "fill-rule", "id"];
   function getElement(id) {
@@ -3497,12 +2377,14 @@
   function getUi() {
     const preview = getElement("preview");
     const preset = getElement("preset");
-    const stacking = getElement("stacking");
     const brushCanvas = getElement("brush-canvas");
     if (!(preview instanceof HTMLImageElement)) throw new Error("Expected preview image");
     if (!(preset instanceof HTMLSelectElement)) throw new Error("Expected preset selector");
-    if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
     if (!(brushCanvas instanceof HTMLCanvasElement)) throw new Error("Expected brush canvas");
+    const clustering = getElement("clustering");
+    if (!(clustering instanceof HTMLSelectElement)) throw new Error("Expected clustering selector");
+    const stacking = getElement("stacking");
+    if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
     return {
       selection: getElement("selection"),
       status: getElement("status"),
@@ -3517,12 +2399,32 @@
       apply: getButton("apply"),
       batch: getButton("batch"),
       preset,
-      colors: getInput("colors"),
-      colorsValue: getOutput("colors-value"),
-      smooth: getInput("smooth"),
-      smoothValue: getOutput("smooth-value"),
-      corner: getInput("corner"),
-      cornerValue: getOutput("corner-value"),
+      reset: getButton("reset-controls"),
+      stepButtons: Array.from(document.querySelectorAll("#step-tabs button")),
+      stepFields: Array.from(document.querySelectorAll("#step-controls fieldset")),
+      controls: {
+        mode: preset,
+        maxColors: getInput("max-colors"),
+        snapBlends: getInput("snap"),
+        speckArea: getInput("speck"),
+        removeBackground: getInput("backdrop"),
+        backdropSpread: getInput("spread"),
+        opaqueAt: getInput("opaque"),
+        traceColors: getInput("trace-colors"),
+        lockPalette: getInput("lock"),
+        colorPrecision: getInput("precision"),
+        filterSpeckle: getInput("speckle"),
+        clustering,
+        watershedDetail: getInput("watershed"),
+        simplify: getInput("simplify"),
+        stacking,
+        dropPlate: getInput("drop-plate"),
+        fitGeometry: getInput("fit"),
+        smoothness: getInput("smooth"),
+        corner: getInput("corner"),
+        seal: getInput("seal"),
+        sealWidth: getInput("seal-width")
+      },
       facts: getElement("facts"),
       factPaths: getElement("fact-paths"),
       factAnchors: getElement("fact-anchors"),
@@ -3530,8 +2432,6 @@
       factColors: getElement("fact-colors"),
       factNote: getElement("fact-note"),
       palette: getElement("palette"),
-      backdrop: getInput("backdrop"),
-      stacking,
       viewPixels: getButton("view-pixels"),
       viewVectors: getButton("view-vectors"),
       zoomIn: getButton("zoom-in"),
@@ -3614,7 +2514,7 @@
   function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
   }
-  function newJob(settings) {
+  function newJob(settings, controls) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vector-panel-"));
     return {
       id: crypto.randomBytes(8).toString("hex"),
@@ -3622,6 +2522,7 @@
       pngPath: path.join(directory, "source.png"),
       svgPath: path.join(directory, "result.svg"),
       settings,
+      controls,
       cancelled: false
     };
   }
@@ -3665,20 +2566,83 @@
       });
     });
   }
-  function readSettings(ui) {
-    const preset = ui.preset.value;
-    if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") throw new Error("Preset \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    const maxColors = Number(ui.colors.value);
-    const smoothness = Number(ui.smooth.value) / 10;
-    const corner = Number(ui.corner.value);
-    const stacking = ui.stacking.value === "stacked" ? "stacked" : "cutout";
-    if (!Number.isInteger(maxColors) || maxColors < 0 || maxColors > 64) throw new Error("\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    if (!Number.isFinite(smoothness) || smoothness < 0 || smoothness > 3) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E27\u0E32\u0E21\u0E40\u0E23\u0E35\u0E22\u0E1A\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    if (!Number.isInteger(corner) || corner < 0 || corner > 90) throw new Error("\u0E04\u0E48\u0E32\u0E04\u0E21\u0E02\u0E2D\u0E07\u0E21\u0E38\u0E21\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
-    return { preset, maxColors, smoothness, corner, removeBackground: ui.backdrop.checked, stacking };
+  function readControls(ui) {
+    const fields = ui.controls;
+    const mode = fields.mode.value;
+    if (mode !== "logo" && mode !== "icon" && mode !== "photo" && mode !== "poster") throw new Error("Preset \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
+    return {
+      mode,
+      maxColors: Number(fields.maxColors.value),
+      snapBlends: fields.snapBlends.checked,
+      speckArea: Number(fields.speckArea.value),
+      removeBackground: fields.removeBackground.checked,
+      backdropSpread: Number(fields.backdropSpread.value),
+      opaqueAt: Number(fields.opaqueAt.value),
+      traceColors: Number(fields.traceColors.value),
+      lockPalette: fields.lockPalette.checked,
+      colorPrecision: Number(fields.colorPrecision.value),
+      filterSpeckle: Number(fields.filterSpeckle.value),
+      clustering: fields.clustering.value === "watershed" ? "watershed" : "off",
+      watershedDetail: Number(fields.watershedDetail.value),
+      simplify: Number(fields.simplify.value),
+      stacking: fields.stacking.value === "stacked" ? "stacked" : "cutout",
+      dropPlate: fields.dropPlate.checked,
+      fitGeometry: fields.fitGeometry.checked,
+      smoothness: Number(fields.smoothness.value),
+      corner: Number(fields.corner.value),
+      seal: fields.seal.checked,
+      sealWidth: Number(fields.sealWidth.value)
+    };
   }
-  function colorLabel(value) {
-    return value === "0" ? "\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34" : value;
+  function applyControls(ui, controls) {
+    const fields = ui.controls;
+    fields.mode.value = controls.mode;
+    fields.maxColors.value = String(controls.maxColors);
+    fields.snapBlends.checked = controls.snapBlends;
+    fields.speckArea.value = String(controls.speckArea);
+    fields.removeBackground.checked = controls.removeBackground;
+    fields.backdropSpread.value = String(controls.backdropSpread);
+    fields.opaqueAt.value = String(controls.opaqueAt);
+    fields.traceColors.value = String(controls.traceColors);
+    fields.lockPalette.checked = controls.lockPalette;
+    fields.colorPrecision.value = String(controls.colorPrecision);
+    fields.filterSpeckle.value = String(controls.filterSpeckle);
+    fields.clustering.value = controls.clustering;
+    fields.watershedDetail.value = String(controls.watershedDetail);
+    fields.simplify.value = String(controls.simplify);
+    fields.stacking.value = controls.stacking;
+    fields.dropPlate.checked = controls.dropPlate;
+    fields.fitGeometry.checked = controls.fitGeometry;
+    fields.smoothness.value = String(controls.smoothness);
+    fields.corner.value = String(controls.corner);
+    fields.seal.checked = controls.seal;
+    fields.sealWidth.value = String(controls.sealWidth);
+    syncControlOutputs(ui);
+  }
+  function syncControlOutputs(ui) {
+    const fields = ui.controls;
+    const values = {
+      "max-colors": fields.maxColors.value === "0" ? "\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34" : fields.maxColors.value,
+      speck: fields.speckArea.value,
+      spread: fields.backdropSpread.value,
+      opaque: fields.opaqueAt.value,
+      "trace-colors": fields.traceColors.value,
+      precision: fields.colorPrecision.value,
+      speckle: fields.filterSpeckle.value,
+      simplify: Number(fields.simplify.value).toFixed(2),
+      watershed: fields.watershedDetail.value,
+      smooth: Number(fields.smoothness.value).toFixed(1),
+      corner: fields.corner.value + "\xB0",
+      "seal-width": Number(fields.sealWidth.value).toFixed(1)
+    };
+    for (const [id, value] of Object.entries(values)) {
+      const output = getOutput(id + "-value");
+      output.value = value;
+      output.textContent = value;
+    }
+    fields.traceColors.disabled = fields.lockPalette.checked;
+    fields.watershedDetail.disabled = fields.clustering.value !== "watershed";
+    fields.sealWidth.disabled = !fields.seal.checked;
   }
   function svgDataUrl(svg) {
     return "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)));
@@ -3691,6 +2655,9 @@
   }
   function settingsNote(settings) {
     return "preset=" + settings.preset + ";colors=" + settings.maxColors + ";smooth=" + settings.smoothness + ";corner=" + settings.corner + ";stacking=" + settings.stacking + ";background=" + (settings.removeBackground ? "removed" : "kept");
+  }
+  function sameControls(left, right) {
+    return CONTROL_STEPS.every(({ field }) => left[field] === right[field]);
   }
   function showFacts(ui, facts) {
     if (facts === null) {
@@ -3730,6 +2697,7 @@
         return null;
       case "selected":
       case "capturing":
+      case "planning":
       case "tracing":
       case "preview":
       case "applying":
@@ -3793,24 +2761,35 @@
     let batching = false;
     let stopBatch = false;
     let pendingFocus = null;
-    let fittedSvg = null;
     let edited = false;
+    let selectedStep = "colors";
+    let latestPlan = null;
+    let latestSvgs = [];
+    let latestVectors = null;
+    let latestPreview = null;
+    let fixtureControls = null;
+    let retraceTimer = 0;
+    let retraceQueued = false;
+    let liveControls = null;
     const host = illustratorHost();
     const extensionPath = host === null ? "" : host.getSystemPath(SystemPath.EXTENSION);
     function message(value, isError = false) {
       ui.status.textContent = value;
       ui.status.classList.toggle("error", isError);
     }
+    function showStep() {
+      for (const button of ui.stepButtons) button.setAttribute("aria-pressed", button.dataset.step === selectedStep ? "true" : "false");
+      for (const field of ui.stepFields) field.hidden = field.id !== "fields-" + selectedStep;
+    }
     function syncOutputs() {
-      ui.colorsValue.value = colorLabel(ui.colors.value);
-      ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
-      ui.cornerValue.value = ui.corner.value + "\xB0";
+      syncControlOutputs(ui);
     }
     function commitSvg(svgText, focus = null) {
       if (state.kind !== "preview") return;
       pendingFocus = focus;
       if (state.job !== null) fs.writeFileSync(state.job.svgPath, svgText);
       state = { ...state, svgText, facts: scoreSvg(svgText), dataUrl: svgDataUrl(svgText) };
+      latestPreview = state;
       render();
     }
     function showPalette() {
@@ -3958,36 +2937,40 @@
       context.putImageData(image, 0, 0);
     }
     function render() {
+      showStep();
       showSelection(ui, currentSelection(state));
-      const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying";
+      const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying";
       ui.refresh.disabled = busy;
       ui.trace.disabled = busy || state.kind === "empty";
       ui.batch.disabled = busy;
       ui.trace.textContent = currentSelection(state)?.fromResult ? "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48" : "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07";
-      ui.apply.disabled = state.kind !== "preview" || state.job === null;
-      ui.cancel.hidden = state.kind !== "tracing" && !batching;
-      ui.phase.textContent = state.kind === "loading" ? "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E" : state.kind === "capturing" ? "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E" : state.kind === "tracing" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07" : state.kind === "applying" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25" : batching ? "\u0E41\u0E1B\u0E25\u0E07\u0E2B\u0E25\u0E32\u0E22\u0E20\u0E32\u0E1E" : state.kind === "preview" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : "\u0E1E\u0E23\u0E49\u0E2D\u0E21";
-      const showing = state.kind === "preview" || state.kind === "applying";
-      ui.viewPixels.hidden = !showing;
-      ui.viewVectors.hidden = !showing;
+      ui.apply.disabled = state.kind !== "preview" || state.job === null || !sameControls(state.job.controls, readControls(ui));
+      ui.cancel.hidden = state.kind !== "planning" && state.kind !== "tracing" && !batching;
+      ui.phase.textContent = state.kind === "loading" ? "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E" : state.kind === "capturing" ? "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E" : state.kind === "planning" ? "\u0E08\u0E31\u0E14\u0E2A\u0E35" : state.kind === "tracing" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07" : state.kind === "applying" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E43\u0E2A\u0E48\u0E1C\u0E25" : batching ? "\u0E41\u0E1B\u0E25\u0E07\u0E2B\u0E25\u0E32\u0E22\u0E20\u0E32\u0E1E" : state.kind === "preview" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : "\u0E1E\u0E23\u0E49\u0E2D\u0E21";
+      const currentPreview = previewOf(state);
+      const preview = currentPreview ?? (state.kind === "planning" || state.kind === "tracing" ? latestPreview : null);
+      const showing = preview !== null;
+      const outputStep = selectedStep === "seal";
+      ui.viewPixels.hidden = !showing || !outputStep;
+      ui.viewVectors.hidden = !showing || !outputStep;
       ui.zoomIn.hidden = !showing;
       ui.zoomOut.hidden = !showing;
-      ui.editTools.hidden = !showing;
+      ui.editTools.hidden = !showing || !outputStep || state.kind !== "preview";
       ui.viewPixels.setAttribute("aria-pressed", view === "pixels" ? "true" : "false");
       ui.viewVectors.setAttribute("aria-pressed", view === "vector" ? "true" : "false");
       ui.toolDrag.setAttribute("aria-pressed", tool === "drag" ? "true" : "false");
       ui.toolErase.setAttribute("aria-pressed", tool === "erase" ? "true" : "false");
       ui.toolBrush.setAttribute("aria-pressed", tool === "brush" ? "true" : "false");
-      ui.brushTrace.disabled = !showing || brushPixels === null || previewOf(state)?.job == null;
+      ui.brushTrace.disabled = !showing || brushPixels === null || preview?.job == null || state.kind !== "preview";
       ui.preview.classList.toggle("zoom-2", showing && zoom === 2);
       ui.preview.classList.toggle("zoom-4", showing && zoom === 4);
       ui.brushCanvas.classList.toggle("zoom-2", showing && zoom === 2);
       ui.brushCanvas.classList.toggle("zoom-4", showing && zoom === 4);
-      const editingVectors = showing && view === "vector" && (tool === "drag" || tool === "erase");
-      const brushing = showing && tool === "brush";
-      if (state.kind === "preview" || state.kind === "applying") {
+      const editingVectors = showing && outputStep && state.kind === "preview" && view === "vector" && (tool === "drag" || tool === "erase");
+      const brushing = showing && outputStep && state.kind === "preview" && tool === "brush";
+      if (preview !== null) {
         ui.previewEmpty.hidden = true;
-        showFacts(ui, state.facts);
+        showFacts(ui, preview.facts);
         showPalette();
         if (brushing) {
           ui.preview.hidden = true;
@@ -3998,8 +2981,8 @@
           ui.preview.hidden = true;
           ui.brushCanvas.hidden = true;
           ui.stage.hidden = false;
-          const editable = tool === "drag" ? expandPrimitives(state.svgText) : state.svgText;
-          if (tool === "drag" && editable !== state.svgText && state.kind === "preview") {
+          const editable = tool === "drag" ? expandPrimitives(preview.svgText) : preview.svgText;
+          if (tool === "drag" && editable !== preview.svgText && state.kind === "preview") {
             commitSvg(editable);
             return;
           }
@@ -4008,7 +2991,16 @@
           ui.stage.hidden = true;
           ui.brushCanvas.hidden = true;
           ui.preview.hidden = false;
-          ui.preview.src = view === "pixels" ? state.pngUrl : state.dataUrl;
+          if (!outputStep) {
+            const raster = selectedStep === "capture" ? preview.raster?.rgba : latestPlan?.rasterStages?.[selectedStep === "colors" ? "colors" : selectedStep === "backdrop" ? "backdrop" : "punch"];
+            const vector = selectedStep === "trace" ? latestVectors?.trace : selectedStep === "fit" ? latestVectors?.fitted : selectedStep === "fair" ? latestVectors?.faired : null;
+            if (vector !== null && vector !== void 0) ui.preview.src = svgDataUrl(vector);
+            else if (raster !== void 0 && raster !== null && preview.raster !== null) {
+              ui.preview.src = pngDataUrl(encodeRgbaPng(preview.raster.width, preview.raster.height, raster));
+            } else ui.preview.removeAttribute("src");
+          } else {
+            ui.preview.src = view === "pixels" ? preview.pngUrl : preview.dataUrl;
+          }
         }
       } else {
         ui.preview.removeAttribute("src");
@@ -4020,12 +3012,63 @@
         showPalette();
       }
     }
-    async function vectorize(selection, job, palette) {
+    function planInWorker(selection, job, sourcePng, previousPlan, from) {
+      const worker = new import_worker_threads.Worker(path.join(extensionPath, "js", "pipeline-worker.js"));
+      liveControls = job.controls;
+      state = { kind: "planning", selection, job, worker, from };
+      message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E41\u0E25\u0E30\u0E40\u0E15\u0E23\u0E35\u0E22\u0E21\u0E02\u0E31\u0E49\u0E19\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u2026");
+      render();
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (plan) => {
+          if (settled) return;
+          settled = true;
+          void worker.terminate();
+          resolve(plan);
+        };
+        const fail = (error) => {
+          if (settled) return;
+          settled = true;
+          void worker.terminate();
+          reject(error);
+        };
+        worker.once("message", (value) => {
+          if (job.cancelled) {
+            fail(new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27"));
+            return;
+          }
+          const result = parsePlanWorkerMessage(value);
+          if (result === null) {
+            fail(new Error("\u0E1C\u0E25\u0E08\u0E32\u0E01\u0E02\u0E31\u0E49\u0E19\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07"));
+          } else if (result.kind === "error") {
+            fail(new Error(result.error));
+          } else {
+            finish(result.plan);
+          }
+        });
+        worker.once("error", (error) => fail(error));
+        worker.once("exit", (code) => {
+          if (!settled) fail(new Error(job.cancelled ? "\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27" : "\u0E02\u0E31\u0E49\u0E19\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E2B\u0E22\u0E38\u0E14\u0E01\u0E48\u0E2D\u0E19\u0E08\u0E1A (" + String(code) + ")"));
+        });
+        worker.postMessage({
+          sourcePng: new Uint8Array(sourcePng),
+          settings: job.settings,
+          controls: job.controls,
+          previousStages: previousPlan?.rasterStages ?? null,
+          from
+        });
+      });
+    }
+    async function vectorize(selection, job, palette, previousPlan = null, from = "colors") {
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
       const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
       if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer \u0E17\u0E35\u0E48 " + binary);
       const sourcePng = fs.readFileSync(job.pngPath);
-      const plan = planTrace(sourcePng, job.settings);
+      liveControls = job.controls;
+      let plan = previousPlan !== null && from === "trace" ? replanTracePlan(previousPlan, job.controls) : await planInWorker(selection, job, sourcePng, previousPlan, from);
+      const controls = liveControls ?? job.controls;
+      job = { ...job, controls, settings: settingsFromControls(controls) };
+      if (plan !== null) plan = replanTracePlan(plan, controls);
       if (plan === null || plan.plates.length === 0) throw new Error("\u0E2D\u0E48\u0E32\u0E19 PNG \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49");
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E22\u0E01\u0E42\u0E0B\u0E19\u0E2A\u0E35 \u0E41\u0E25\u0E49\u0E27\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");
       const svgs = [];
@@ -4043,9 +3086,13 @@
         });
         svgs.push(fs.readFileSync(svgPath, "utf8"));
       }
+      const finishedControls = liveControls ?? job.controls;
+      job = { ...job, controls: finishedControls, settings: settingsFromControls(finishedControls) };
       edited = false;
-      fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
-      const svgText = styledTraceSvg(fittedSvg, job.settings);
+      latestPlan = plan;
+      latestSvgs = svgs;
+      latestVectors = vectorStagesForPlan(svgs, plan, job.controls);
+      const svgText = latestVectors.sealed;
       fs.writeFileSync(job.svgPath, svgText);
       const decoded = readRgbaPng(sourcePng);
       brushPixels = null;
@@ -4062,6 +3109,9 @@
         raster: decoded === null ? null : { width: decoded.width, height: decoded.height, rgba: decoded.rgba },
         facts: scoreSvg(svgText)
       };
+      selectedStep = "seal";
+      latestPreview = state;
+      liveControls = null;
       message("\u0E40\u0E17\u0E35\u0E22\u0E1A\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25\u0E01\u0E31\u0E1A\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C \u0E41\u0E25\u0E49\u0E27\u0E01\u0E14\u0E43\u0E2A\u0E48\u0E43\u0E19 Illustrator");
       render();
     }
@@ -4070,8 +3120,13 @@
         message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
         return;
       }
-      if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying" || batching) return;
+      if (state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying" || batching) return;
       if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+      latestPlan = null;
+      latestSvgs = [];
+      latestVectors = null;
+      latestPreview = null;
+      liveControls = null;
       state = { kind: "loading" };
       render();
       try {
@@ -4092,22 +3147,56 @@
       if (state.kind !== "selected" && state.kind !== "preview") return;
       const selection = state.selection;
       if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
-      const job = newJob(readSettings(ui));
+      latestPlan = null;
+      latestSvgs = [];
+      latestVectors = null;
+      latestPreview = null;
+      liveControls = null;
+      const controls = readControls(ui);
+      let job = newJob(settingsFromControls(controls), controls);
       try {
         state = { kind: "capturing", selection, job };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator\u2026");
         render();
         await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
-        await vectorize(selection, job);
+        const capturedControls = readControls(ui);
+        job = { ...job, settings: settingsFromControls(capturedControls), controls: capturedControls, cancelled: false };
+        retraceQueued = false;
+        while (true) {
+          try {
+            await vectorize(selection, job);
+            break;
+          } catch (error) {
+            if (!job.cancelled || !retraceQueued) throw error;
+            retraceQueued = false;
+            const currentControls = readControls(ui);
+            job = { ...job, settings: settingsFromControls(currentControls), controls: currentControls, cancelled: false };
+            state = { kind: "capturing", selection, job };
+            message("\u0E43\u0E0A\u0E49\u0E04\u0E48\u0E32\u0E25\u0E48\u0E32\u0E2A\u0E38\u0E14 \u0E41\u0E25\u0E49\u0E27\u0E40\u0E23\u0E34\u0E48\u0E21\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E43\u0E2B\u0E21\u0E48\u2026");
+            render();
+          }
+        }
+        if (retraceQueued) {
+          retraceQueued = false;
+          await retraceFromCapture();
+        }
       } catch (error) {
         cleanJob(job);
         state = { kind: "selected", selection };
+        latestPreview = null;
+        liveControls = null;
         message(errorMessage(error), true);
         render();
       }
     }
     async function apply() {
       if (host === null || state.kind !== "preview" || state.job === null) return false;
+      if (!batching && !sameControls(state.job.controls, readControls(ui))) {
+        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E1B\u0E23\u0E31\u0E1A\u0E1C\u0E25\u0E43\u0E2B\u0E49\u0E15\u0E23\u0E07\u0E01\u0E31\u0E1A\u0E04\u0E48\u0E32\u0E25\u0E48\u0E32\u0E2A\u0E38\u0E14\u2026");
+        scheduleRetrace();
+        render();
+        return false;
+      }
       const preview = state;
       const job = state.job;
       state = { ...preview, kind: "applying" };
@@ -4137,7 +3226,7 @@
         message("\u0E40\u0E1B\u0E34\u0E14 Panel \u0E19\u0E35\u0E49\u0E08\u0E32\u0E01 Adobe Illustrator \u0E40\u0E17\u0E48\u0E32\u0E19\u0E31\u0E49\u0E19", true);
         return;
       }
-      if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
+      if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying") return;
       if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
       batching = true;
       stopBatch = false;
@@ -4160,7 +3249,8 @@
             embedded: item.embedded,
             fromResult: false
           };
-          const job = newJob(readSettings(ui));
+          const controls = readControls(ui);
+          const job = newJob(settingsFromControls(controls), controls);
           message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E " + String(finished + 1) + "/" + String(list.items.length) + " \xB7 " + selection.itemName);
           state = { kind: "capturing", selection, job };
           render();
@@ -4221,57 +3311,129 @@
       message(tool === "none" ? "\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E43\u0E2A\u0E48\u0E1C\u0E25" : note);
       render();
     }
-    let fairTimer = 0;
-    let retraceTimer = 0;
-    let retraceQueued = false;
-    function scheduleFair() {
-      window.clearTimeout(fairTimer);
-      fairTimer = window.setTimeout(() => refair(), 40);
-    }
     function scheduleRetrace() {
       window.clearTimeout(retraceTimer);
       retraceTimer = window.setTimeout(() => {
         void retraceFromCapture();
-      }, 400);
+      }, 150);
     }
-    function refair() {
-      if (state.kind !== "preview" || fittedSvg === null) return;
+    function updateStylePreview(from, controls) {
+      if (state.kind !== "preview" || state.job === null || latestPlan === null || latestVectors === null) return;
       if (edited) {
-        message("\u0E41\u0E01\u0E49\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E1B\u0E23\u0E31\u0E1A\u0E21\u0E38\u0E21\u0E17\u0E31\u0E1A \u0E08\u0E19\u0E01\u0E27\u0E48\u0E32\u0E08\u0E30\u0E41\u0E1B\u0E25\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
+        message("\u0E41\u0E01\u0E49\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E40\u0E02\u0E35\u0E22\u0E19\u0E17\u0E31\u0E1A\u0E01\u0E32\u0E23\u0E41\u0E01\u0E49\u0E44\u0E02 \u0E08\u0E19\u0E01\u0E27\u0E48\u0E32\u0E08\u0E30\u0E41\u0E1B\u0E25\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
         return;
       }
-      const before = state.facts.anchors;
-      const settings = readSettings(ui);
-      const next = styledTraceSvg(fittedSvg, settings);
-      if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
-      commitSvg(next);
-      if (state.kind === "preview" && state.facts.anchors !== before) {
-        message("\u0E1B\u0E23\u0E31\u0E1A\u0E40\u0E2A\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E08\u0E38\u0E14 " + String(before) + " \u2192 " + String(state.facts.anchors));
+      const previous = state;
+      const currentJob = previous.job;
+      if (currentJob === null) return;
+      const job = { ...currentJob, settings: settingsFromControls(controls), controls };
+      let vectors = latestVectors;
+      if (from === "fit") {
+        vectors = vectorStagesForPlan(latestSvgs, latestPlan, controls);
+      } else if (from === "fair") {
+        const faired = fairLabVector(vectors.fitted, controls);
+        vectors = { ...vectors, faired, sealed: sealLabVector(faired, controls) };
+      } else {
+        vectors = { ...vectors, sealed: sealLabVector(vectors.faired, controls) };
       }
+      latestVectors = vectors;
+      fs.writeFileSync(job.svgPath, vectors.sealed);
+      const nextPreview = { ...previous, job, svgText: vectors.sealed, facts: scoreSvg(vectors.sealed), dataUrl: svgDataUrl(vectors.sealed) };
+      state = { kind: "preview", ...nextPreview };
+      latestPreview = nextPreview;
+      message("\u0E1B\u0E23\u0E31\u0E1A\u0E02\u0E31\u0E49\u0E19 " + from + " \u0E41\u0E25\u0E49\u0E27");
+      render();
     }
     async function retraceFromCapture() {
-      if (state.kind === "tracing" || state.kind === "capturing" || state.kind === "applying" || batching) {
+      if (batching) return;
+      if (state.kind === "planning") {
+        const controls2 = readControls(ui);
+        const baseline = liveControls ?? state.job.controls;
+        if (sameControls(baseline, controls2)) return;
+        const changed = earliestChangedStep(baseline, controls2);
+        if (LAB_STEPS.indexOf(changed) > LAB_STEPS.indexOf("punch")) {
+          liveControls = controls2;
+          message("\u0E04\u0E48\u0E32\u0E02\u0E31\u0E49\u0E19\u0E16\u0E31\u0E14\u0E44\u0E1B\u0E08\u0E30\u0E43\u0E0A\u0E49\u0E17\u0E31\u0E19\u0E17\u0E35\u0E17\u0E35\u0E48\u0E01\u0E32\u0E23\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E08\u0E1A");
+          return;
+        }
+        liveControls = controls2;
+        retraceQueued = true;
+        state.job.cancelled = true;
+        void state.worker.terminate();
+        message("\u0E04\u0E48\u0E32\u0E1B\u0E23\u0E31\u0E1A\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E2B\u0E22\u0E38\u0E14\u0E01\u0E32\u0E23\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E40\u0E01\u0E48\u0E32\u2026");
+        return;
+      }
+      if (state.kind === "tracing") {
+        const controls2 = readControls(ui);
+        const baseline = liveControls ?? state.job.controls;
+        if (sameControls(baseline, controls2)) return;
+        const changed = earliestChangedStep(baseline, controls2);
+        if (LAB_STEPS.indexOf(changed) >= LAB_STEPS.indexOf("fit")) {
+          liveControls = controls2;
+          message("\u0E04\u0E48\u0E32\u0E02\u0E31\u0E49\u0E19 " + changed + " \u0E08\u0E30\u0E43\u0E0A\u0E49\u0E2B\u0E25\u0E31\u0E07\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E08\u0E1A");
+          return;
+        }
+        liveControls = controls2;
+        retraceQueued = true;
+        state.job.cancelled = true;
+        state.child.kill();
+        message("\u0E04\u0E48\u0E32\u0E1B\u0E23\u0E31\u0E1A\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E2B\u0E22\u0E38\u0E14\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E01\u0E48\u0E32\u2026");
+        return;
+      }
+      if (state.kind === "capturing") {
         retraceQueued = true;
         return;
       }
-      if (state.kind !== "preview" || state.job === null || !fs.existsSync(state.job.pngPath)) return;
+      if (state.kind === "applying" || batching) return;
+      if (state.kind !== "preview") return;
+      const current = state.job;
+      const controls = readControls(ui);
+      if (current === null) {
+        if (fixtureControls === null || latestVectors === null || sameControls(fixtureControls, controls)) return;
+        if (edited) {
+          message("\u0E41\u0E01\u0E49\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27 \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E40\u0E02\u0E35\u0E22\u0E19\u0E17\u0E31\u0E1A\u0E01\u0E32\u0E23\u0E41\u0E01\u0E49\u0E44\u0E02 \u0E08\u0E19\u0E01\u0E27\u0E48\u0E32\u0E08\u0E30\u0E41\u0E1B\u0E25\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
+          return;
+        }
+        const svg = latestVectors.trace;
+        const styled = styleLabVectors(svg, controls, null, null);
+        latestVectors = { trace: svg, ...styled };
+        fixtureControls = controls;
+        const nextPreview = { ...state, dataUrl: svgDataUrl(styled.sealed), svgText: styled.sealed, facts: scoreSvg(styled.sealed) };
+        state = { kind: "preview", ...nextPreview };
+        latestPreview = nextPreview;
+        render();
+        return;
+      }
+      if (!fs.existsSync(current.pngPath)) return;
       retraceQueued = false;
       const previous = state;
-      const current = previous.job;
-      if (current === null) return;
+      if (sameControls(current.controls, controls)) return;
+      const from = earliestChangedStep(current.controls, controls);
+      if (LAB_STEPS.indexOf(from) >= LAB_STEPS.indexOf("fit")) {
+        updateStylePreview(from, controls);
+        return;
+      }
       const job = {
         id: current.id,
         directory: current.directory,
         pngPath: current.pngPath,
         svgPath: current.svgPath,
-        settings: readSettings(ui),
+        settings: settingsFromControls(controls),
+        controls,
         cancelled: false
       };
       try {
-        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E43\u0E2B\u0E21\u0E48\u0E15\u0E32\u0E21\u0E41\u0E16\u0E1A\u2026");
-        await vectorize(previous.selection, job);
+        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E04\u0E33\u0E19\u0E27\u0E13\u0E02\u0E31\u0E49\u0E19 " + from + " \u0E41\u0E25\u0E49\u0E27\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E43\u0E2B\u0E21\u0E48\u2026");
+        await vectorize(previous.selection, job, void 0, latestPlan, from);
       } catch (error) {
         state = previous;
+        latestPreview = previous;
+        if (job.cancelled && retraceQueued) {
+          retraceQueued = false;
+          await retraceFromCapture();
+          return;
+        }
+        liveControls = null;
         message(errorMessage(error), true);
         render();
       }
@@ -4286,7 +3448,6 @@
       for (let step = 0; step < 14; step += 1) stair += " h1 v1";
       const kink = "M88,78 L98,78 L" + (98 + 10 * Math.cos(radians)).toFixed(2) + "," + (78 - 10 * Math.sin(radians)).toFixed(2);
       const svgText = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="100" viewBox="0 0 160 100"><path fill="#d6363e" d="M8,8 H58 V58 H8 Z"/><path fill="#2e66d6" d="' + stair + '"/><path fill="#f2b830" d="' + kink + '"/></svg>';
-      fittedSvg = svgText;
       edited = false;
       const width = 80;
       const height = 48;
@@ -4312,7 +3473,10 @@
         context.putImageData(image, 0, 0);
         pngUrl = canvas.toDataURL("image/png");
       }
-      const shown = styledTraceSvg(svgText, readSettings(ui));
+      const styled = styleLabVectors(svgText, readControls(ui), null, null);
+      latestVectors = { trace: svgText, ...styled };
+      fixtureControls = readControls(ui);
+      selectedStep = "seal";
       state = {
         kind: "preview",
         selection: {
@@ -4328,12 +3492,13 @@
           fromResult: false
         },
         job: null,
-        dataUrl: svgDataUrl(shown),
+        dataUrl: svgDataUrl(styled.sealed),
         pngUrl,
-        svgText: shown,
+        svgText: styled.sealed,
         raster: { width, height, rgba },
-        facts: scoreSvg(shown)
+        facts: scoreSvg(styled.sealed)
       };
+      latestPreview = state;
       message("\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E43\u0E19\u0E40\u0E1A\u0E23\u0E32\u0E27\u0E4C\u0E40\u0E0B\u0E2D\u0E23\u0E4C: \u0E25\u0E32\u0E01\u0E08\u0E38\u0E14 \u0E25\u0E1A\u0E0A\u0E34\u0E49\u0E19 \u0E2B\u0E23\u0E37\u0E2D\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E2A\u0E35\u0E44\u0E14\u0E49");
       render();
     }
@@ -4354,38 +3519,57 @@
     });
     ui.cancel.addEventListener("click", () => {
       stopBatch = true;
+      if (state.kind === "planning") {
+        retraceQueued = false;
+        window.clearTimeout(retraceTimer);
+        state.job.cancelled = true;
+        void state.worker.terminate();
+        message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
+        return;
+      }
       if (state.kind !== "tracing") return;
+      retraceQueued = false;
+      window.clearTimeout(retraceTimer);
       state.job.cancelled = true;
       state.child.kill();
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u2026");
     });
-    ui.colors.addEventListener("input", () => {
-      syncOutputs();
+    const modeField = ui.controls.mode;
+    for (const field of Object.values(ui.controls)) {
+      if (field === modeField) continue;
+      field.addEventListener("input", () => {
+        if (field === ui.controls.stacking) ui.controls.sealWidth.value = field.value === "cutout" ? "2" : "0.8";
+        syncOutputs();
+        render();
+        scheduleRetrace();
+      });
+      field.addEventListener("change", () => {
+        if (field === ui.controls.stacking) ui.controls.sealWidth.value = field.value === "cutout" ? "2" : "0.8";
+        syncOutputs();
+        render();
+        scheduleRetrace();
+      });
+    }
+    modeField.addEventListener("change", () => {
+      const mode = modeField.value;
+      if (mode !== "logo" && mode !== "icon" && mode !== "photo" && mode !== "poster") return;
+      applyControls(ui, controlsFor(mode));
+      render();
       scheduleRetrace();
     });
-    ui.backdrop.addEventListener("change", () => {
+    ui.reset.addEventListener("click", () => {
+      applyControls(ui, controlsFor(readControls(ui).mode));
+      render();
       scheduleRetrace();
     });
-    ui.smooth.addEventListener("input", () => {
-      syncOutputs();
-      scheduleFair();
-    });
-    ui.corner.addEventListener("input", () => {
-      syncOutputs();
-      scheduleFair();
-    });
-    ui.preset.addEventListener("change", () => {
-      const preset = ui.preset.value;
-      if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") return;
-      const defaults = presetDefaults(preset);
-      ui.colors.value = String(defaults.maxColors);
-      ui.smooth.value = String(Math.round(defaults.smoothness * 10));
-      ui.corner.value = String(defaults.corner);
-      ui.backdrop.checked = defaults.removeBackground;
-      ui.stacking.value = defaults.stacking;
-      syncOutputs();
-      refair();
-    });
+    for (const button of ui.stepButtons) {
+      button.addEventListener("click", () => {
+        const step = LAB_STEPS.find((candidate) => candidate === button.dataset.step);
+        if (step === void 0) return;
+        selectedStep = step;
+        render();
+      });
+    }
     ui.viewPixels.addEventListener("click", () => {
       view = "pixels";
       if (tool === "drag" || tool === "erase") tool = "none";
@@ -4429,8 +3613,13 @@
         state.child.kill();
         cleanJob(state.job);
       }
+      if (state.kind === "planning") {
+        state.job.cancelled = true;
+        void state.worker.terminate();
+        cleanJob(state.job);
+      }
     });
-    syncOutputs();
+    applyControls(ui, controlsFor(readControls(ui).mode));
     if (host !== null) {
       cleanStaleJobs();
       render();

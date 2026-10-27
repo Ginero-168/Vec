@@ -1,5 +1,6 @@
 import type { ChildProcess } from "child_process";
 import * as childProcess from "child_process";
+import { Worker } from "worker_threads";
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
@@ -7,8 +8,11 @@ import * as path from "path";
 import { expandPrimitives, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape } from "./edit";
 import { encodeRgbaPng, readRgbaPng } from "./png-alpha";
 import { holeNote, scoreSvg, shapeNote, type TraceFacts } from "./score";
-import { cappedPalette, fittedPlan, planTrace, styledTraceSvg } from "./trace-pipeline";
-import { presetDefaults, resolveVtracer, vtracerArguments, type Stacking, type TracePreset, type TraceRequest } from "./trace";
+import { controlsFor, type LabControls } from "./lab-model";
+import { CONTROL_STEPS, earliestChangedStep, LAB_STEPS, fairLabVector, sealLabVector, styleLabVectors, type LabRasterStages, type LabStepId } from "./lab-pipeline";
+import type { SegmentColorStage } from "./segment";
+import { cappedPalette, replanTracePlan, settingsFromControls, vectorStagesForPlan, type PipelineSettings, type PlannedPlate, type TracePlan } from "./trace-pipeline";
+import { resolveVtracer, vtracerArguments, type TraceRequest } from "./trace";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -37,21 +41,13 @@ type Selection = {
   readonly fromResult: boolean;
 };
 
-type Settings = {
-  readonly preset: TracePreset;
-  readonly maxColors: number;
-  readonly smoothness: number;
-  readonly corner: number;
-  readonly removeBackground: boolean;
-  readonly stacking: Stacking;
-};
-
 type Job = {
   readonly id: string;
   readonly directory: string;
   readonly pngPath: string;
   readonly svgPath: string;
-  readonly settings: Settings;
+  readonly settings: PipelineSettings;
+  readonly controls: LabControls;
   cancelled: boolean;
 };
 
@@ -67,16 +63,160 @@ type Preview = {
   readonly facts: TraceFacts;
 };
 
+type PlanWorkerMessage =
+  | { readonly kind: "plan"; readonly plan: TracePlan | null }
+  | { readonly kind: "error"; readonly error: string };
+
 type State =
   | { readonly kind: "empty" }
   | { readonly kind: "loading" }
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
+  | { readonly kind: "planning"; readonly selection: Selection; readonly job: Job; readonly worker: Worker; readonly from: LabStepId }
   | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: ChildProcess }
   | ({ readonly kind: "preview" } & Preview)
   | ({ readonly kind: "applying" } & Preview);
 
 type Tool = "none" | "drag" | "erase" | "brush";
+
+type ControlElements = {
+  readonly mode: HTMLSelectElement;
+  readonly maxColors: HTMLInputElement;
+  readonly snapBlends: HTMLInputElement;
+  readonly speckArea: HTMLInputElement;
+  readonly removeBackground: HTMLInputElement;
+  readonly backdropSpread: HTMLInputElement;
+  readonly opaqueAt: HTMLInputElement;
+  readonly traceColors: HTMLInputElement;
+  readonly lockPalette: HTMLInputElement;
+  readonly colorPrecision: HTMLInputElement;
+  readonly filterSpeckle: HTMLInputElement;
+  readonly clustering: HTMLSelectElement;
+  readonly watershedDetail: HTMLInputElement;
+  readonly simplify: HTMLInputElement;
+  readonly stacking: HTMLSelectElement;
+  readonly dropPlate: HTMLInputElement;
+  readonly fitGeometry: HTMLInputElement;
+  readonly smoothness: HTMLInputElement;
+  readonly corner: HTMLInputElement;
+  readonly seal: HTMLInputElement;
+  readonly sealWidth: HTMLInputElement;
+};
+
+function parsePlanWorkerMessage(value: unknown): PlanWorkerMessage | null {
+  if (!isRecord(value)) return null;
+  if (value.kind === "error" && typeof value.error === "string") return { kind: "error", error: value.error };
+  if (value.kind !== "plan") return null;
+  const plan = parseTracePlan(value.plan);
+  if (value.plan !== null && plan === null) return null;
+  return { kind: "plan", plan };
+}
+
+function parseTracePlan(value: unknown): TracePlan | null {
+  if (!isRecord(value) || !Number.isInteger(value.width) || !Number.isInteger(value.height) || !Array.isArray(value.plates)) return null;
+  if (typeof value.width !== "number" || typeof value.height !== "number") return null;
+  if (value.droppedColor !== null && typeof value.droppedColor !== "string") return null;
+  const plates: PlannedPlate[] = [];
+  for (const candidate of value.plates) {
+    const plate = parsePlannedPlate(candidate);
+    if (plate === null) return null;
+    plates.push(plate);
+  }
+  let rasterStages: LabRasterStages | undefined;
+  if (value.rasterStages !== undefined) {
+    rasterStages = parseRasterStages(value.rasterStages) ?? undefined;
+    if (rasterStages === undefined) return null;
+  }
+  return {
+    width: value.width,
+    height: value.height,
+    droppedColor: value.droppedColor,
+    plates,
+    ...(rasterStages === undefined ? {} : { rasterStages })
+  };
+}
+
+function parsePlannedPlate(value: unknown): PlannedPlate | null {
+  if (!isRecord(value) || !(value.png instanceof Uint8Array)) return null;
+  if (typeof value.scale !== "number" || typeof value.originX !== "number" || typeof value.originY !== "number") return null;
+  if (value.borderColor !== null && typeof value.borderColor !== "string") return null;
+  const request = parseTraceRequest(value.request);
+  if (request === null) return null;
+  return {
+    png: Buffer.from(value.png),
+    scale: value.scale,
+    originX: value.originX,
+    originY: value.originY,
+    borderColor: value.borderColor,
+    request
+  };
+}
+
+function parseTraceRequest(value: unknown): TraceRequest | null {
+  if (!isRecord(value)) return null;
+  const preset = value.preset;
+  const stacking = value.stacking;
+  if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") return null;
+  if (stacking !== "cutout" && stacking !== "stacked") return null;
+  if (typeof value.maxColors !== "number" || typeof value.smoothness !== "number" || typeof value.removeBackground !== "boolean") return null;
+  const request: TraceRequest = { preset, stacking, maxColors: value.maxColors, smoothness: value.smoothness, removeBackground: value.removeBackground };
+  if (value.palette !== undefined) {
+    if (!Array.isArray(value.palette) || !value.palette.every((color) => typeof color === "string")) return null;
+    return {
+      ...request,
+      palette: value.palette,
+      ...optionalRequestFields(value)
+    };
+  }
+  return { ...request, ...optionalRequestFields(value) };
+}
+
+function optionalRequestFields(value: Record<string, unknown>): Pick<TraceRequest, "colorPrecision" | "filterSpeckle" | "clustering" | "watershedDetail" | "simplify"> {
+  const result: {
+    colorPrecision?: number;
+    filterSpeckle?: number;
+    clustering?: "watershed" | "off";
+    watershedDetail?: number;
+    simplify?: number;
+  } = {};
+  if (typeof value.colorPrecision === "number") result.colorPrecision = value.colorPrecision;
+  if (typeof value.filterSpeckle === "number") result.filterSpeckle = value.filterSpeckle;
+  if (value.clustering === "watershed" || value.clustering === "off") result.clustering = value.clustering;
+  if (typeof value.watershedDetail === "number") result.watershedDetail = value.watershedDetail;
+  if (typeof value.simplify === "number") result.simplify = value.simplify;
+  return result;
+}
+
+function parseRasterStages(value: unknown): LabRasterStages | null {
+  if (!isRecord(value) || !(value.colors instanceof Uint8Array) || !(value.backdrop instanceof Uint8Array) || !(value.punchInput instanceof Uint8Array) || !(value.punch instanceof Uint8Array) || !(value.traceInput instanceof Uint8Array)) return null;
+  if (value.mode !== "logo" && value.mode !== "icon" && value.mode !== "photo" && value.mode !== "poster") return null;
+  if (value.droppedColor !== null && typeof value.droppedColor !== "string") return null;
+  if (typeof value.spread !== "number" || typeof value.paletteSize !== "number") return null;
+  const segmentation = parseSegmentColorStage(value.segmentation);
+  if (value.segmentation !== null && segmentation === null) return null;
+  return {
+    mode: value.mode,
+    colors: value.colors,
+    backdrop: value.backdrop,
+    punchInput: value.punchInput,
+    punch: value.punch,
+    traceInput: value.traceInput,
+    droppedColor: value.droppedColor,
+    spread: value.spread,
+    paletteSize: value.paletteSize,
+    segmentation
+  };
+}
+
+function parseSegmentColorStage(value: unknown): SegmentColorStage | null {
+  if (!isRecord(value) || !(value.colors instanceof Uint8Array) || !(value.labels instanceof Int16Array) || !(value.punchLabels instanceof Int16Array) || !(value.opaque instanceof Uint8Array) || !Array.isArray(value.palette) || typeof value.spread !== "number") return null;
+  if (!value.palette.every((color) => isRecord(color) && typeof color.r === "number" && typeof color.g === "number" && typeof color.b === "number")) return null;
+  return value as unknown as SegmentColorStage;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 type Ui = {
   readonly selection: HTMLElement;
@@ -92,12 +232,10 @@ type Ui = {
   readonly apply: HTMLButtonElement;
   readonly batch: HTMLButtonElement;
   readonly preset: HTMLSelectElement;
-  readonly colors: HTMLInputElement;
-  readonly colorsValue: HTMLOutputElement;
-  readonly smooth: HTMLInputElement;
-  readonly smoothValue: HTMLOutputElement;
-  readonly corner: HTMLInputElement;
-  readonly cornerValue: HTMLOutputElement;
+  readonly reset: HTMLButtonElement;
+  readonly stepButtons: readonly HTMLButtonElement[];
+  readonly stepFields: readonly HTMLFieldSetElement[];
+  readonly controls: ControlElements;
   readonly facts: HTMLElement;
   readonly factPaths: HTMLElement;
   readonly factAnchors: HTMLElement;
@@ -105,8 +243,6 @@ type Ui = {
   readonly factColors: HTMLElement;
   readonly factNote: HTMLElement;
   readonly palette: HTMLElement;
-  readonly backdrop: HTMLInputElement;
-  readonly stacking: HTMLSelectElement;
   readonly viewPixels: HTMLButtonElement;
   readonly viewVectors: HTMLButtonElement;
   readonly zoomIn: HTMLButtonElement;
@@ -148,12 +284,14 @@ function getOutput(id: string): HTMLOutputElement {
 function getUi(): Ui {
   const preview = getElement("preview");
   const preset = getElement("preset");
-  const stacking = getElement("stacking");
   const brushCanvas = getElement("brush-canvas");
   if (!(preview instanceof HTMLImageElement)) throw new Error("Expected preview image");
   if (!(preset instanceof HTMLSelectElement)) throw new Error("Expected preset selector");
-  if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
   if (!(brushCanvas instanceof HTMLCanvasElement)) throw new Error("Expected brush canvas");
+  const clustering = getElement("clustering");
+  if (!(clustering instanceof HTMLSelectElement)) throw new Error("Expected clustering selector");
+  const stacking = getElement("stacking");
+  if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
   return {
     selection: getElement("selection"),
     status: getElement("status"),
@@ -168,12 +306,32 @@ function getUi(): Ui {
     apply: getButton("apply"),
     batch: getButton("batch"),
     preset,
-    colors: getInput("colors"),
-    colorsValue: getOutput("colors-value"),
-    smooth: getInput("smooth"),
-    smoothValue: getOutput("smooth-value"),
-    corner: getInput("corner"),
-    cornerValue: getOutput("corner-value"),
+    reset: getButton("reset-controls"),
+    stepButtons: Array.from(document.querySelectorAll<HTMLButtonElement>("#step-tabs button")),
+    stepFields: Array.from(document.querySelectorAll<HTMLFieldSetElement>("#step-controls fieldset")),
+    controls: {
+      mode: preset,
+      maxColors: getInput("max-colors"),
+      snapBlends: getInput("snap"),
+      speckArea: getInput("speck"),
+      removeBackground: getInput("backdrop"),
+      backdropSpread: getInput("spread"),
+      opaqueAt: getInput("opaque"),
+      traceColors: getInput("trace-colors"),
+      lockPalette: getInput("lock"),
+      colorPrecision: getInput("precision"),
+      filterSpeckle: getInput("speckle"),
+      clustering,
+      watershedDetail: getInput("watershed"),
+      simplify: getInput("simplify"),
+      stacking,
+      dropPlate: getInput("drop-plate"),
+      fitGeometry: getInput("fit"),
+      smoothness: getInput("smooth"),
+      corner: getInput("corner"),
+      seal: getInput("seal"),
+      sealWidth: getInput("seal-width")
+    },
     facts: getElement("facts"),
     factPaths: getElement("fact-paths"),
     factAnchors: getElement("fact-anchors"),
@@ -181,8 +339,6 @@ function getUi(): Ui {
     factColors: getElement("fact-colors"),
     factNote: getElement("fact-note"),
     palette: getElement("palette"),
-    backdrop: getInput("backdrop"),
-    stacking,
     viewPixels: getButton("view-pixels"),
     viewVectors: getButton("view-vectors"),
     zoomIn: getButton("zoom-in"),
@@ -273,7 +429,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function newJob(settings: Settings): Job {
+function newJob(settings: PipelineSettings, controls: LabControls): Job {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vector-panel-"));
   return {
     id: crypto.randomBytes(8).toString("hex"),
@@ -281,6 +437,7 @@ function newJob(settings: Settings): Job {
     pngPath: path.join(directory, "source.png"),
     svgPath: path.join(directory, "result.svg"),
     settings,
+    controls,
     cancelled: false
   };
 }
@@ -330,21 +487,85 @@ function runVtracer(binary: string, job: Job, inputPath: string, outputPath: str
   });
 }
 
-function readSettings(ui: Ui): Settings {
-  const preset = ui.preset.value;
-  if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") throw new Error("Preset ไม่ถูกต้อง");
-  const maxColors = Number(ui.colors.value);
-  const smoothness = Number(ui.smooth.value) / 10;
-  const corner = Number(ui.corner.value);
-  const stacking = ui.stacking.value === "stacked" ? "stacked" : "cutout";
-  if (!Number.isInteger(maxColors) || maxColors < 0 || maxColors > 64) throw new Error("จำนวนสีไม่ถูกต้อง");
-  if (!Number.isFinite(smoothness) || smoothness < 0 || smoothness > 3) throw new Error("ค่าความเรียบไม่ถูกต้อง");
-  if (!Number.isInteger(corner) || corner < 0 || corner > 90) throw new Error("ค่าคมของมุมไม่ถูกต้อง");
-  return { preset, maxColors, smoothness, corner, removeBackground: ui.backdrop.checked, stacking };
+function readControls(ui: Ui): LabControls {
+  const fields = ui.controls;
+  const mode = fields.mode.value;
+  if (mode !== "logo" && mode !== "icon" && mode !== "photo" && mode !== "poster") throw new Error("Preset ไม่ถูกต้อง");
+  return {
+    mode,
+    maxColors: Number(fields.maxColors.value),
+    snapBlends: fields.snapBlends.checked,
+    speckArea: Number(fields.speckArea.value),
+    removeBackground: fields.removeBackground.checked,
+    backdropSpread: Number(fields.backdropSpread.value),
+    opaqueAt: Number(fields.opaqueAt.value),
+    traceColors: Number(fields.traceColors.value),
+    lockPalette: fields.lockPalette.checked,
+    colorPrecision: Number(fields.colorPrecision.value),
+    filterSpeckle: Number(fields.filterSpeckle.value),
+    clustering: fields.clustering.value === "watershed" ? "watershed" : "off",
+    watershedDetail: Number(fields.watershedDetail.value),
+    simplify: Number(fields.simplify.value),
+    stacking: fields.stacking.value === "stacked" ? "stacked" : "cutout",
+    dropPlate: fields.dropPlate.checked,
+    fitGeometry: fields.fitGeometry.checked,
+    smoothness: Number(fields.smoothness.value),
+    corner: Number(fields.corner.value),
+    seal: fields.seal.checked,
+    sealWidth: Number(fields.sealWidth.value)
+  };
 }
 
-function colorLabel(value: string): string {
-  return value === "0" ? "อัตโนมัติ" : value;
+function applyControls(ui: Ui, controls: LabControls): void {
+  const fields = ui.controls;
+  fields.mode.value = controls.mode;
+  fields.maxColors.value = String(controls.maxColors);
+  fields.snapBlends.checked = controls.snapBlends;
+  fields.speckArea.value = String(controls.speckArea);
+  fields.removeBackground.checked = controls.removeBackground;
+  fields.backdropSpread.value = String(controls.backdropSpread);
+  fields.opaqueAt.value = String(controls.opaqueAt);
+  fields.traceColors.value = String(controls.traceColors);
+  fields.lockPalette.checked = controls.lockPalette;
+  fields.colorPrecision.value = String(controls.colorPrecision);
+  fields.filterSpeckle.value = String(controls.filterSpeckle);
+  fields.clustering.value = controls.clustering;
+  fields.watershedDetail.value = String(controls.watershedDetail);
+  fields.simplify.value = String(controls.simplify);
+  fields.stacking.value = controls.stacking;
+  fields.dropPlate.checked = controls.dropPlate;
+  fields.fitGeometry.checked = controls.fitGeometry;
+  fields.smoothness.value = String(controls.smoothness);
+  fields.corner.value = String(controls.corner);
+  fields.seal.checked = controls.seal;
+  fields.sealWidth.value = String(controls.sealWidth);
+  syncControlOutputs(ui);
+}
+
+function syncControlOutputs(ui: Ui): void {
+  const fields = ui.controls;
+  const values: Readonly<Record<string, string>> = {
+    "max-colors": fields.maxColors.value === "0" ? "อัตโนมัติ" : fields.maxColors.value,
+    speck: fields.speckArea.value,
+    spread: fields.backdropSpread.value,
+    opaque: fields.opaqueAt.value,
+    "trace-colors": fields.traceColors.value,
+    precision: fields.colorPrecision.value,
+    speckle: fields.filterSpeckle.value,
+    simplify: Number(fields.simplify.value).toFixed(2),
+    watershed: fields.watershedDetail.value,
+    smooth: Number(fields.smoothness.value).toFixed(1),
+    corner: fields.corner.value + "°",
+    "seal-width": Number(fields.sealWidth.value).toFixed(1)
+  };
+  for (const [id, value] of Object.entries(values)) {
+    const output = getOutput(id + "-value");
+    output.value = value;
+    output.textContent = value;
+  }
+  fields.traceColors.disabled = fields.lockPalette.checked;
+  fields.watershedDetail.disabled = fields.clustering.value !== "watershed";
+  fields.sealWidth.disabled = !fields.seal.checked;
 }
 
 function svgDataUrl(svg: string): string {
@@ -358,8 +579,12 @@ function pngDataUrl(bytes: Uint8Array): string {
   return "data:image/png;base64," + btoa(binary);
 }
 
-function settingsNote(settings: Settings): string {
+function settingsNote(settings: PipelineSettings): string {
   return "preset=" + settings.preset + ";colors=" + settings.maxColors + ";smooth=" + settings.smoothness + ";corner=" + settings.corner + ";stacking=" + settings.stacking + ";background=" + (settings.removeBackground ? "removed" : "kept");
+}
+
+function sameControls(left: LabControls, right: LabControls): boolean {
+  return CONTROL_STEPS.every(({ field }) => left[field] === right[field]);
 }
 
 function showFacts(ui: Ui, facts: TraceFacts | null): void {
@@ -400,6 +625,7 @@ function currentSelection(state: State): Selection | null {
     case "loading": return null;
     case "selected":
     case "capturing":
+    case "planning":
     case "tracing":
     case "preview":
     case "applying": return state.selection;
@@ -468,8 +694,16 @@ function start(): void {
   let batching = false;
   let stopBatch = false;
   let pendingFocus: { pathIndex: number; anchorIndex: number } | null = null;
-  let fittedSvg: string | null = null;
   let edited = false;
+  let selectedStep: LabStepId = "colors";
+  let latestPlan: TracePlan | null = null;
+  let latestSvgs: string[] = [];
+  let latestVectors: ReturnType<typeof vectorStagesForPlan> | null = null;
+  let latestPreview: Preview | null = null;
+  let fixtureControls: LabControls | null = null;
+  let retraceTimer = 0;
+  let retraceQueued = false;
+  let liveControls: LabControls | null = null;
   const host = illustratorHost();
   const extensionPath = host === null ? "" : host.getSystemPath(SystemPath.EXTENSION);
 
@@ -478,10 +712,13 @@ function start(): void {
     ui.status.classList.toggle("error", isError);
   }
 
+  function showStep(): void {
+    for (const button of ui.stepButtons) button.setAttribute("aria-pressed", button.dataset.step === selectedStep ? "true" : "false");
+    for (const field of ui.stepFields) field.hidden = field.id !== "fields-" + selectedStep;
+  }
+
   function syncOutputs(): void {
-    ui.colorsValue.value = colorLabel(ui.colors.value);
-    ui.smoothValue.value = (Number(ui.smooth.value) / 10).toFixed(1);
-    ui.cornerValue.value = ui.corner.value + "°";
+    syncControlOutputs(ui);
   }
 
   function commitSvg(svgText: string, focus: { pathIndex: number; anchorIndex: number } | null = null): void {
@@ -489,6 +726,7 @@ function start(): void {
     pendingFocus = focus;
     if (state.job !== null) fs.writeFileSync(state.job.svgPath, svgText);
     state = { ...state, svgText, facts: scoreSvg(svgText), dataUrl: svgDataUrl(svgText) };
+    latestPreview = state;
     render();
   }
 
@@ -640,36 +878,40 @@ function start(): void {
   }
 
   function render(): void {
+    showStep();
     showSelection(ui, currentSelection(state));
-    const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying";
+    const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying";
     ui.refresh.disabled = busy;
     ui.trace.disabled = busy || state.kind === "empty";
     ui.batch.disabled = busy;
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
-    ui.apply.disabled = state.kind !== "preview" || state.job === null;
-    ui.cancel.hidden = state.kind !== "tracing" && !batching;
-    ui.phase.textContent = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : batching ? "แปลงหลายภาพ" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
-    const showing = state.kind === "preview" || state.kind === "applying";
-    ui.viewPixels.hidden = !showing;
-    ui.viewVectors.hidden = !showing;
+    ui.apply.disabled = state.kind !== "preview" || state.job === null || !sameControls(state.job.controls, readControls(ui));
+    ui.cancel.hidden = state.kind !== "planning" && state.kind !== "tracing" && !batching;
+    ui.phase.textContent = state.kind === "loading" ? "ตรวจภาพ" : state.kind === "capturing" ? "อ่านภาพ" : state.kind === "planning" ? "จัดสี" : state.kind === "tracing" ? "กำลังแปลง" : state.kind === "applying" ? "กำลังใส่ผล" : batching ? "แปลงหลายภาพ" : state.kind === "preview" ? "พร้อมใส่ผล" : "พร้อม";
+    const currentPreview = previewOf(state);
+    const preview = currentPreview ?? (state.kind === "planning" || state.kind === "tracing" ? latestPreview : null);
+    const showing = preview !== null;
+    const outputStep = selectedStep === "seal";
+    ui.viewPixels.hidden = !showing || !outputStep;
+    ui.viewVectors.hidden = !showing || !outputStep;
     ui.zoomIn.hidden = !showing;
     ui.zoomOut.hidden = !showing;
-    ui.editTools.hidden = !showing;
+    ui.editTools.hidden = !showing || !outputStep || state.kind !== "preview";
     ui.viewPixels.setAttribute("aria-pressed", view === "pixels" ? "true" : "false");
     ui.viewVectors.setAttribute("aria-pressed", view === "vector" ? "true" : "false");
     ui.toolDrag.setAttribute("aria-pressed", tool === "drag" ? "true" : "false");
     ui.toolErase.setAttribute("aria-pressed", tool === "erase" ? "true" : "false");
     ui.toolBrush.setAttribute("aria-pressed", tool === "brush" ? "true" : "false");
-    ui.brushTrace.disabled = !showing || brushPixels === null || previewOf(state)?.job == null;
+    ui.brushTrace.disabled = !showing || brushPixels === null || preview?.job == null || state.kind !== "preview";
     ui.preview.classList.toggle("zoom-2", showing && zoom === 2);
     ui.preview.classList.toggle("zoom-4", showing && zoom === 4);
     ui.brushCanvas.classList.toggle("zoom-2", showing && zoom === 2);
     ui.brushCanvas.classList.toggle("zoom-4", showing && zoom === 4);
-    const editingVectors = showing && view === "vector" && (tool === "drag" || tool === "erase");
-    const brushing = showing && tool === "brush";
-    if (state.kind === "preview" || state.kind === "applying") {
+    const editingVectors = showing && outputStep && state.kind === "preview" && view === "vector" && (tool === "drag" || tool === "erase");
+    const brushing = showing && outputStep && state.kind === "preview" && tool === "brush";
+    if (preview !== null) {
       ui.previewEmpty.hidden = true;
-      showFacts(ui, state.facts);
+      showFacts(ui, preview.facts);
       showPalette();
       if (brushing) {
         ui.preview.hidden = true;
@@ -680,8 +922,8 @@ function start(): void {
         ui.preview.hidden = true;
         ui.brushCanvas.hidden = true;
         ui.stage.hidden = false;
-        const editable = tool === "drag" ? expandPrimitives(state.svgText) : state.svgText;
-        if (tool === "drag" && editable !== state.svgText && state.kind === "preview") {
+        const editable = tool === "drag" ? expandPrimitives(preview.svgText) : preview.svgText;
+        if (tool === "drag" && editable !== preview.svgText && state.kind === "preview") {
           commitSvg(editable);
           return;
         }
@@ -690,7 +932,16 @@ function start(): void {
         ui.stage.hidden = true;
         ui.brushCanvas.hidden = true;
         ui.preview.hidden = false;
-        ui.preview.src = view === "pixels" ? state.pngUrl : state.dataUrl;
+        if (!outputStep) {
+          const raster = selectedStep === "capture" ? preview.raster?.rgba : latestPlan?.rasterStages?.[selectedStep === "colors" ? "colors" : selectedStep === "backdrop" ? "backdrop" : "punch"];
+          const vector = selectedStep === "trace" ? latestVectors?.trace : selectedStep === "fit" ? latestVectors?.fitted : selectedStep === "fair" ? latestVectors?.faired : null;
+          if (vector !== null && vector !== undefined) ui.preview.src = svgDataUrl(vector);
+          else if (raster !== undefined && raster !== null && preview.raster !== null) {
+            ui.preview.src = pngDataUrl(encodeRgbaPng(preview.raster.width, preview.raster.height, raster));
+          } else ui.preview.removeAttribute("src");
+        } else {
+          ui.preview.src = view === "pixels" ? preview.pngUrl : preview.dataUrl;
+        }
       }
     } else {
       ui.preview.removeAttribute("src");
@@ -703,12 +954,78 @@ function start(): void {
     }
   }
 
-  async function vectorize(selection: Selection, job: Job, palette?: readonly string[]): Promise<void> {
+  function planInWorker(
+    selection: Selection,
+    job: Job,
+    sourcePng: Buffer,
+    previousPlan: TracePlan | null,
+    from: LabStepId
+  ): Promise<TracePlan | null> {
+    const worker = new Worker(path.join(extensionPath, "js", "pipeline-worker.js"));
+    liveControls = job.controls;
+    state = { kind: "planning", selection, job, worker, from };
+    message("กำลังจัดสีและเตรียมขั้นลากเส้น…");
+    render();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (plan: TracePlan | null): void => {
+        if (settled) return;
+        settled = true;
+        void worker.terminate();
+        resolve(plan);
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        void worker.terminate();
+        reject(error);
+      };
+      worker.once("message", (value: unknown) => {
+        if (job.cancelled) {
+          fail(new Error("ยกเลิกแล้ว"));
+          return;
+        }
+        const result = parsePlanWorkerMessage(value);
+        if (result === null) {
+          fail(new Error("ผลจากขั้นจัดสีไม่ถูกต้อง"));
+        } else if (result.kind === "error") {
+          fail(new Error(result.error));
+        } else {
+          finish(result.plan);
+        }
+      });
+      worker.once("error", (error) => fail(error));
+      worker.once("exit", (code) => {
+        if (!settled) fail(new Error(job.cancelled ? "ยกเลิกแล้ว" : "ขั้นจัดสีหยุดก่อนจบ (" + String(code) + ")"));
+      });
+      worker.postMessage({
+        sourcePng: new Uint8Array(sourcePng),
+        settings: job.settings,
+        controls: job.controls,
+        previousStages: previousPlan?.rasterStages ?? null,
+        from
+      });
+    });
+  }
+
+  async function vectorize(
+    selection: Selection,
+    job: Job,
+    palette?: readonly string[],
+    previousPlan: TracePlan | null = null,
+    from: LabStepId = "colors"
+  ): Promise<void> {
     if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
     const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
     if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer ที่ " + binary);
     const sourcePng = fs.readFileSync(job.pngPath);
-    const plan = planTrace(sourcePng, job.settings);
+    liveControls = job.controls;
+    let plan = previousPlan !== null && from === "trace"
+      ? replanTracePlan(previousPlan, job.controls)
+      : await planInWorker(selection, job, sourcePng, previousPlan, from);
+    const controls = liveControls ?? job.controls;
+    job = { ...job, controls, settings: settingsFromControls(controls) };
+    if (plan !== null) plan = replanTracePlan(plan, controls);
     if (plan === null || plan.plates.length === 0) throw new Error("อ่าน PNG ไม่ได้");
     message("กำลังแยกโซนสี แล้วสร้างเส้นเวกเตอร์…");
     const svgs: string[] = [];
@@ -726,9 +1043,13 @@ function start(): void {
       });
       svgs.push(fs.readFileSync(svgPath, "utf8"));
     }
+    const finishedControls = liveControls ?? job.controls;
+    job = { ...job, controls: finishedControls, settings: settingsFromControls(finishedControls) };
     edited = false;
-    fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
-    const svgText = styledTraceSvg(fittedSvg, job.settings);
+    latestPlan = plan;
+    latestSvgs = svgs;
+    latestVectors = vectorStagesForPlan(svgs, plan, job.controls);
+    const svgText = latestVectors.sealed;
     fs.writeFileSync(job.svgPath, svgText);
     const decoded = readRgbaPng(sourcePng);
     brushPixels = null;
@@ -745,6 +1066,9 @@ function start(): void {
       raster: decoded === null ? null : { width: decoded.width, height: decoded.height, rgba: decoded.rgba },
       facts: scoreSvg(svgText)
     };
+    selectedStep = "seal";
+    latestPreview = state;
+    liveControls = null;
     message("เทียบพิกเซลกับเวกเตอร์ แล้วกดใส่ใน Illustrator");
     render();
   }
@@ -754,8 +1078,13 @@ function start(): void {
       message("เปิด Panel นี้จาก Adobe Illustrator เท่านั้น", true);
       return;
     }
-    if (state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying" || batching) return;
+    if (state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying" || batching) return;
     if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+    latestPlan = null;
+    latestSvgs = [];
+    latestVectors = null;
+    latestPreview = null;
+    liveControls = null;
     state = { kind: "loading" };
     render();
     try {
@@ -777,16 +1106,44 @@ function start(): void {
     if (state.kind !== "selected" && state.kind !== "preview") return;
     const selection = state.selection;
     if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
-    const job = newJob(readSettings(ui));
+    latestPlan = null;
+    latestSvgs = [];
+    latestVectors = null;
+    latestPreview = null;
+    liveControls = null;
+    const controls = readControls(ui);
+    let job = newJob(settingsFromControls(controls), controls);
     try {
       state = { kind: "capturing", selection, job };
       message("กำลังอ่านภาพจาก Illustrator…");
       render();
       await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
-      await vectorize(selection, job);
+      const capturedControls = readControls(ui);
+      job = { ...job, settings: settingsFromControls(capturedControls), controls: capturedControls, cancelled: false };
+      retraceQueued = false;
+      while (true) {
+        try {
+          await vectorize(selection, job);
+          break;
+        } catch (error) {
+          if (!job.cancelled || !retraceQueued) throw error;
+          retraceQueued = false;
+          const currentControls = readControls(ui);
+          job = { ...job, settings: settingsFromControls(currentControls), controls: currentControls, cancelled: false };
+          state = { kind: "capturing", selection, job };
+          message("ใช้ค่าล่าสุด แล้วเริ่มลากเส้นใหม่…");
+          render();
+        }
+      }
+      if (retraceQueued) {
+        retraceQueued = false;
+        await retraceFromCapture();
+      }
     } catch (error) {
       cleanJob(job);
       state = { kind: "selected", selection };
+      latestPreview = null;
+      liveControls = null;
       message(errorMessage(error), true);
       render();
     }
@@ -794,6 +1151,12 @@ function start(): void {
 
   async function apply(): Promise<boolean> {
     if (host === null || state.kind !== "preview" || state.job === null) return false;
+    if (!batching && !sameControls(state.job.controls, readControls(ui))) {
+      message("กำลังปรับผลให้ตรงกับค่าล่าสุด…");
+      scheduleRetrace();
+      render();
+      return false;
+    }
     const preview = state;
     const job = state.job;
     state = { ...preview, kind: "applying" };
@@ -824,7 +1187,7 @@ function start(): void {
       message("เปิด Panel นี้จาก Adobe Illustrator เท่านั้น", true);
       return;
     }
-    if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "tracing" || state.kind === "applying") return;
+    if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying") return;
     if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
     batching = true;
     stopBatch = false;
@@ -847,7 +1210,8 @@ function start(): void {
           embedded: item.embedded,
           fromResult: false
         };
-        const job = newJob(readSettings(ui));
+        const controls = readControls(ui);
+        const job = newJob(settingsFromControls(controls), controls);
         message("กำลังแปลงภาพ " + String(finished + 1) + "/" + String(list.items.length) + " · " + selection.itemName);
         state = { kind: "capturing", selection, job };
         render();
@@ -912,59 +1276,129 @@ function start(): void {
     render();
   }
 
-  let fairTimer = 0;
-  let retraceTimer = 0;
-  let retraceQueued = false;
-
-  function scheduleFair(): void {
-    window.clearTimeout(fairTimer);
-    fairTimer = window.setTimeout(() => refair(), 40);
-  }
-
   function scheduleRetrace(): void {
     window.clearTimeout(retraceTimer);
-    retraceTimer = window.setTimeout(() => { void retraceFromCapture(); }, 400);
+    retraceTimer = window.setTimeout(() => { void retraceFromCapture(); }, 150);
   }
 
-  function refair(): void {
-    if (state.kind !== "preview" || fittedSvg === null) return;
+  function updateStylePreview(from: LabStepId, controls: LabControls): void {
+    if (state.kind !== "preview" || state.job === null || latestPlan === null || latestVectors === null) return;
     if (edited) {
-      message("แก้ชิ้นแล้ว จึงไม่ปรับมุมทับ จนกว่าจะแปลงใหม่", true);
+      message("แก้ชิ้นแล้ว จึงไม่เขียนทับการแก้ไข จนกว่าจะแปลงใหม่", true);
       return;
     }
-    const before = state.facts.anchors;
-    const settings = readSettings(ui);
-    const next = styledTraceSvg(fittedSvg, settings);
-    if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
-    commitSvg(next);
-    if (state.kind === "preview" && state.facts.anchors !== before) {
-      message("ปรับเส้นแล้ว · จุด " + String(before) + " → " + String(state.facts.anchors));
+    const previous = state;
+    const currentJob = previous.job;
+    if (currentJob === null) return;
+    const job = { ...currentJob, settings: settingsFromControls(controls), controls };
+    let vectors = latestVectors;
+    if (from === "fit") {
+      vectors = vectorStagesForPlan(latestSvgs, latestPlan, controls);
+    } else if (from === "fair") {
+      const faired = fairLabVector(vectors.fitted, controls);
+      vectors = { ...vectors, faired, sealed: sealLabVector(faired, controls) };
+    } else {
+      vectors = { ...vectors, sealed: sealLabVector(vectors.faired, controls) };
     }
+    latestVectors = vectors;
+    fs.writeFileSync(job.svgPath, vectors.sealed);
+    const nextPreview: Preview = { ...previous, job, svgText: vectors.sealed, facts: scoreSvg(vectors.sealed), dataUrl: svgDataUrl(vectors.sealed) };
+    state = { kind: "preview", ...nextPreview };
+    latestPreview = nextPreview;
+    message("ปรับขั้น " + from + " แล้ว");
+    render();
   }
 
   async function retraceFromCapture(): Promise<void> {
-    if (state.kind === "tracing" || state.kind === "capturing" || state.kind === "applying" || batching) {
+    if (batching) return;
+    if (state.kind === "planning") {
+      const controls = readControls(ui);
+      const baseline = liveControls ?? state.job.controls;
+      if (sameControls(baseline, controls)) return;
+      const changed = earliestChangedStep(baseline, controls);
+      if (LAB_STEPS.indexOf(changed) > LAB_STEPS.indexOf("punch")) {
+        liveControls = controls;
+        message("ค่าขั้นถัดไปจะใช้ทันทีที่การจัดสีจบ");
+        return;
+      }
+      liveControls = controls;
+      retraceQueued = true;
+      state.job.cancelled = true;
+      void state.worker.terminate();
+      message("ค่าปรับเปลี่ยนแล้ว · กำลังหยุดการจัดสีเก่า…");
+      return;
+    }
+    if (state.kind === "tracing") {
+      const controls = readControls(ui);
+      const baseline = liveControls ?? state.job.controls;
+      if (sameControls(baseline, controls)) return;
+      const changed = earliestChangedStep(baseline, controls);
+      if (LAB_STEPS.indexOf(changed) >= LAB_STEPS.indexOf("fit")) {
+        liveControls = controls;
+        message("ค่าขั้น " + changed + " จะใช้หลังลากเส้นจบ");
+        return;
+      }
+      liveControls = controls;
+      retraceQueued = true;
+      state.job.cancelled = true;
+      state.child.kill();
+      message("ค่าปรับเปลี่ยนแล้ว · กำลังหยุดเส้นเก่า…");
+      return;
+    }
+    if (state.kind === "capturing") {
       retraceQueued = true;
       return;
     }
-    if (state.kind !== "preview" || state.job === null || !fs.existsSync(state.job.pngPath)) return;
+    if (state.kind === "applying" || batching) return;
+    if (state.kind !== "preview") return;
+    const current = state.job;
+    const controls = readControls(ui);
+    if (current === null) {
+      if (fixtureControls === null || latestVectors === null || sameControls(fixtureControls, controls)) return;
+      if (edited) {
+        message("แก้ชิ้นแล้ว จึงไม่เขียนทับการแก้ไข จนกว่าจะแปลงใหม่", true);
+        return;
+      }
+      const svg = latestVectors.trace;
+      const styled = styleLabVectors(svg, controls, null, null);
+      latestVectors = { trace: svg, ...styled };
+      fixtureControls = controls;
+      const nextPreview: Preview = { ...state, dataUrl: svgDataUrl(styled.sealed), svgText: styled.sealed, facts: scoreSvg(styled.sealed) };
+      state = { kind: "preview", ...nextPreview };
+      latestPreview = nextPreview;
+      render();
+      return;
+    }
+    if (!fs.existsSync(current.pngPath)) return;
     retraceQueued = false;
     const previous = state;
-    const current = previous.job;
-    if (current === null) return;
+    if (sameControls(current.controls, controls)) return;
+    const from = earliestChangedStep(current.controls, controls);
+    if (LAB_STEPS.indexOf(from) >= LAB_STEPS.indexOf("fit")) {
+      updateStylePreview(from, controls);
+      return;
+    }
     const job: Job = {
       id: current.id,
       directory: current.directory,
       pngPath: current.pngPath,
       svgPath: current.svgPath,
-      settings: readSettings(ui),
+      settings: settingsFromControls(controls),
+      controls,
       cancelled: false
     };
     try {
-      message("กำลังจัดสีใหม่ตามแถบ…");
-      await vectorize(previous.selection, job);
+      message("กำลังคำนวณขั้น " + from + " แล้วลากเส้นใหม่…");
+      await vectorize(previous.selection, job, undefined, latestPlan, from);
     } catch (error) {
       state = previous;
+      latestPreview = previous;
+      if (job.cancelled && retraceQueued) {
+        retraceQueued = false;
+        await retraceFromCapture();
+        return;
+      }
+      liveControls = null;
       message(errorMessage(error), true);
       render();
     }
@@ -980,7 +1414,6 @@ function start(): void {
     for (let step = 0; step < 14; step += 1) stair += " h1 v1";
     const kink = "M88,78 L98,78 L" + (98 + 10 * Math.cos(radians)).toFixed(2) + "," + (78 - 10 * Math.sin(radians)).toFixed(2);
     const svgText = '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="100" viewBox="0 0 160 100"><path fill="#d6363e" d="M8,8 H58 V58 H8 Z"/><path fill="#2e66d6" d="' + stair + '"/><path fill="#f2b830" d="' + kink + '"/></svg>';
-    fittedSvg = svgText;
     edited = false;
     const width = 80;
     const height = 48;
@@ -1006,7 +1439,10 @@ function start(): void {
       context.putImageData(image, 0, 0);
       pngUrl = canvas.toDataURL("image/png");
     }
-    const shown = styledTraceSvg(svgText, readSettings(ui));
+    const styled = styleLabVectors(svgText, readControls(ui), null, null);
+    latestVectors = { trace: svgText, ...styled };
+    fixtureControls = readControls(ui);
+    selectedStep = "seal";
     state = {
       kind: "preview",
       selection: {
@@ -1022,12 +1458,13 @@ function start(): void {
         fromResult: false
       },
       job: null,
-      dataUrl: svgDataUrl(shown),
+      dataUrl: svgDataUrl(styled.sealed),
       pngUrl,
-      svgText: shown,
+      svgText: styled.sealed,
       raster: { width, height, rgba },
-      facts: scoreSvg(shown)
+      facts: scoreSvg(styled.sealed)
     };
+    latestPreview = state;
     message("ตัวอย่างในเบราว์เซอร์: ลากจุด ลบชิ้น หรือระบายสีได้");
     render();
   }
@@ -1039,38 +1476,57 @@ function start(): void {
   ui.brushTrace.addEventListener("click", () => { void retraceBrush(); });
   ui.cancel.addEventListener("click", () => {
     stopBatch = true;
+    if (state.kind === "planning") {
+      retraceQueued = false;
+      window.clearTimeout(retraceTimer);
+      state.job.cancelled = true;
+      void state.worker.terminate();
+      message("กำลังยกเลิก…");
+      return;
+    }
     if (state.kind !== "tracing") return;
+    retraceQueued = false;
+    window.clearTimeout(retraceTimer);
     state.job.cancelled = true;
     state.child.kill();
     message("กำลังยกเลิก…");
   });
-  ui.colors.addEventListener("input", () => {
-    syncOutputs();
+  const modeField = ui.controls.mode;
+  for (const field of Object.values(ui.controls)) {
+    if (field === modeField) continue;
+    field.addEventListener("input", () => {
+      if (field === ui.controls.stacking) ui.controls.sealWidth.value = field.value === "cutout" ? "2" : "0.8";
+      syncOutputs();
+      render();
+      scheduleRetrace();
+    });
+    field.addEventListener("change", () => {
+      if (field === ui.controls.stacking) ui.controls.sealWidth.value = field.value === "cutout" ? "2" : "0.8";
+      syncOutputs();
+      render();
+      scheduleRetrace();
+    });
+  }
+  modeField.addEventListener("change", () => {
+    const mode = modeField.value;
+    if (mode !== "logo" && mode !== "icon" && mode !== "photo" && mode !== "poster") return;
+    applyControls(ui, controlsFor(mode));
+    render();
     scheduleRetrace();
   });
-  ui.backdrop.addEventListener("change", () => {
+  ui.reset.addEventListener("click", () => {
+    applyControls(ui, controlsFor(readControls(ui).mode));
+    render();
     scheduleRetrace();
   });
-  ui.smooth.addEventListener("input", () => {
-    syncOutputs();
-    scheduleFair();
-  });
-  ui.corner.addEventListener("input", () => {
-    syncOutputs();
-    scheduleFair();
-  });
-  ui.preset.addEventListener("change", () => {
-    const preset = ui.preset.value;
-    if (preset !== "logo" && preset !== "icon" && preset !== "photo" && preset !== "poster") return;
-    const defaults = presetDefaults(preset);
-    ui.colors.value = String(defaults.maxColors);
-    ui.smooth.value = String(Math.round(defaults.smoothness * 10));
-    ui.corner.value = String(defaults.corner);
-    ui.backdrop.checked = defaults.removeBackground;
-    ui.stacking.value = defaults.stacking;
-    syncOutputs();
-    refair();
-  });
+  for (const button of ui.stepButtons) {
+    button.addEventListener("click", () => {
+      const step = LAB_STEPS.find((candidate) => candidate === button.dataset.step);
+      if (step === undefined) return;
+      selectedStep = step;
+      render();
+    });
+  }
   ui.viewPixels.addEventListener("click", () => {
     view = "pixels";
     if (tool === "drag" || tool === "erase") tool = "none";
@@ -1109,9 +1565,14 @@ function start(): void {
       state.child.kill();
       cleanJob(state.job);
     }
+    if (state.kind === "planning") {
+      state.job.cancelled = true;
+      void state.worker.terminate();
+      cleanJob(state.job);
+    }
   });
 
-  syncOutputs();
+  applyControls(ui, controlsFor(readControls(ui).mode));
   if (host !== null) {
     cleanStaleJobs();
     render();

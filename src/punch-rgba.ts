@@ -18,7 +18,19 @@ export function punchRgba(rgba: Uint8Array, width: number, height: number, opaqu
     }
     used.add(((rgba[offset] ?? 0) << 16) | ((rgba[offset + 1] ?? 0) << 8) | (rgba[offset + 2] ?? 0));
   }
-  if (transparent === 0) return { rgba, droppedColor: null };
+  if (transparent === 0) {
+    let needsFlattening = false;
+    for (let index = 0; index < count; index += 1) {
+      if ((rgba[index * 4 + 3] ?? 255) !== 255) {
+        needsFlattening = true;
+        break;
+      }
+    }
+    if (!needsFlattening) return { rgba, droppedColor: null };
+    const opaque = new Uint8Array(rgba);
+    for (let index = 0; index < count; index += 1) opaque[index * 4 + 3] = 255;
+    return { rgba: opaque, droppedColor: null };
+  }
   const sentinel = unusedColor(used);
   const next = new Uint8Array(count * 4);
   next.set(rgba.subarray(0, count * 4));

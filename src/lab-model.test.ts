@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { listAnchors } from "./edit.ts";
-import { controlsFor, paletteFromRaster, styleVectors, traceRequest } from "./lab-model.ts";
+import { controlsFor, paletteFromRaster, traceRequest } from "./lab-model.ts";
+import { styleLabVectors } from "./lab-pipeline.ts";
 import { vtracerArguments } from "./trace.ts";
 
 test("icon and photo presets expose the cutoffs the panel uses", () => {
@@ -41,8 +42,8 @@ test("a locked palette is what VTracer receives, and an unlocked count is a max-
 test("sealing adds a stroke and leaving it off keeps the path bare", () => {
   const svg = '<svg viewBox="0 0 40 4"><path d="M0,0 H10 V1 H20 V0 H30 V1 H40" fill="#ff0000"/></svg>';
   const rough = controlsFor("photo");
-  const sealed = styleVectors(svg, { ...rough, seal: true, sealWidth: 2, dropPlate: false, fitGeometry: false }, null);
-  const open = styleVectors(svg, { ...rough, seal: false, dropPlate: false, fitGeometry: false }, null);
+  const sealed = styleLabVectors(svg, { ...rough, seal: true, sealWidth: 2, dropPlate: false, fitGeometry: false }, null);
+  const open = styleLabVectors(svg, { ...rough, seal: false, dropPlate: false, fitGeometry: false }, null);
   assert.match(sealed.sealed, /stroke-width="2"/);
   assert.equal(/stroke-width=/.test(open.sealed), false);
 });
@@ -51,7 +52,7 @@ test("logo and icon results are not faired or sealed", () => {
   const stair = "M0,0 h1 v1 h1 v1 h1 v1 h1 v1 h1 v1 h1 v1 h1 v1 h1 v1";
   const svg = '<svg width="20" height="20" viewBox="0 0 20 20"><path d="' + stair + '" fill="#ff0000"/></svg>';
   for (const mode of ["logo", "icon"] as const) {
-    const styled = styleVectors(svg, { ...controlsFor(mode), dropPlate: false, fitGeometry: false, seal: true }, null);
+    const styled = styleLabVectors(svg, { ...controlsFor(mode), dropPlate: false, fitGeometry: false, seal: true }, null);
     assert.equal(/stroke-width=/.test(styled.sealed), false);
     assert.equal(listAnchors(styled.sealed).length, listAnchors(svg).length);
   }
@@ -59,7 +60,7 @@ test("logo and icon results are not faired or sealed", () => {
 
 test("the sentinel fill is removed before fairing", () => {
   const svg = '<svg viewBox="0 0 10 10"><path d="M0,0 H10 V10 H0 Z" fill="#ff00ff"/><path d="M2,2 H6 V6 H2 Z" fill="#ff0000"/></svg>';
-  const styled = styleVectors(svg, { ...controlsFor("logo"), dropPlate: false, fitGeometry: false, seal: false }, "#ff00ff");
+  const styled = styleLabVectors(svg, { ...controlsFor("logo"), dropPlate: false, fitGeometry: false, seal: false }, "#ff00ff");
   assert.equal(styled.fitted.includes("#ff00ff"), false);
   assert.match(styled.fitted, /#ff0000/);
 });
