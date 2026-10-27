@@ -164,7 +164,7 @@ export function fitShapes(svg: string): string {
   let cursor = 0;
   for (const tag of tags) {
     result += svg.slice(cursor, tag.index);
-    result += fittedMarkup(tag) ?? tag.source;
+    result += /\bdata-vec-squircle-fit\s*=\s*["']true["']/i.test(tag.source) ? tag.source : fittedMarkup(tag) ?? tag.source;
     cursor = tag.index + tag.length;
   }
   return result + svg.slice(cursor);

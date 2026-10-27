@@ -727,7 +727,7 @@ function start(): void {
       svgs.push(fs.readFileSync(svgPath, "utf8"));
     }
     edited = false;
-    fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
+    fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground, job.settings.preset);
     const svgText = styledTraceSvg(fittedSvg, job.settings);
     fs.writeFileSync(job.svgPath, svgText);
     const decoded = readRgbaPng(sourcePng);

@@ -5,6 +5,7 @@ import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
 import { segmentRaster } from "./segment.ts";
 import { scaleSvg } from "./svg-scale.ts";
+import { fitAppIconSquircle } from "./squircle.ts";
 import { assembleTrace, mergePlates, type PlacedPlate } from "./trace-finish.ts";
 import { type Stacking, type TracePreset, type TraceRequest } from "./trace.ts";
 
@@ -36,7 +37,11 @@ export function planTrace(source: Buffer, settings: PipelineSettings): TracePlan
   return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
 }
 
-export function fittedPlan(svgs: readonly string[], plan: TracePlan, removeBackground: boolean): string {
+export function fittedPlan(svgs: readonly string[], plan: TracePlan, removeBackground: boolean, preset?: TracePreset): string {
+  if (preset === "icon") {
+    const merged = mergePlates(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, removeBackground, false);
+    return fitShapes(fitAppIconSquircle(merged, { protectFromGeometryFit: true }));
+  }
   return mergePlates(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, removeBackground);
 }
 
@@ -70,9 +75,18 @@ export function fittedTraceSvg(svg: string, scale: number, droppedColor: string 
 }
 
 export function styledTraceSvg(fitted: string, settings: PipelineSettings): string {
-  if (settings.preset === "logo" || settings.preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
+  if (settings.preset === "logo") return clearSquircleMarker(groupPathsByFill(relaxPaths(fitted, 0.15)));
+  if (settings.preset === "icon") {
+    const grouped = groupPathsByFill(relaxPaths(fitted, 0.15));
+    const result = /\bdata-vec-squircle-fit\s*=\s*["']true["']/i.test(grouped) ? grouped : fitAppIconSquircle(grouped);
+    return clearSquircleMarker(result);
+  }
   const stroke = settings.stacking === "cutout" ? 2 : 0.8;
-  return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
+  return clearSquircleMarker(groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke)));
+}
+
+function clearSquircleMarker(svg: string): string {
+  return svg.replace(/\sdata-vec-squircle-fit\s*=\s*["']true["']/gi, "");
 }
 
 function planFlat(rgba: Uint8Array, width: number, height: number, settings: PipelineSettings): TracePlan {

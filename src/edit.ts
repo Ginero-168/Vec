@@ -47,6 +47,7 @@ export function relaxPaths(svg: string, tolerance = 0.15): string {
   const limit = Math.min(0.5, Math.max(0.05, Number.isFinite(tolerance) ? tolerance : 0.15));
   return svg.replace(shapePattern(), (tag) => {
     if (!/^<path\b/i.test(tag)) return tag;
+    if (/\bdata-vec-squircle-fit\s*=\s*["']true["']/i.test(tag)) return tag;
     const quoted = readD(tag);
     if (quoted === null) return tag;
     const parsed = parsePath(quoted.value);
