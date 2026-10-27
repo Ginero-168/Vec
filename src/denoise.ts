@@ -1,6 +1,7 @@
 const JPEG_BLOCK_SIZE = 8;
-const NOISE_RESIDUAL = 2;
-const MIN_NOISY_FRACTION = 0.2;
+const NOISY_SAMPLE_RESIDUAL = 2;
+const MIN_NOISY_FRACTION = 0.075;
+const MIN_MEAN_RESIDUAL = 0.5;
 const FLAT_BLOCK_VARIANCE = 256;
 const RANGE_SIGMA = 14;
 const SPATIAL_SIGMA = 1.35;
@@ -9,11 +10,15 @@ const RADIUS = 2;
 
 /** Remove low-amplitude JPEG-like noise while leaving clean and transparent rasters alone. */
 export function denoiseJpegArtifacts(rgba: Uint8Array, width: number, height: number): Uint8Array {
-  if (!isOpaqueRaster(rgba, width, height) || !hasCompressionNoise(rgba, width, height)) return rgba;
+  if (!wouldDenoise(rgba, width, height)) return rgba;
 
   let current = correctBlockOffsets(rgba, width, height);
   for (let pass = 0; pass < PASSES; pass += 1) current = bilateralPass(current, width, height);
   return current;
+}
+
+export function wouldDenoise(rgba: Uint8Array, width: number, height: number): boolean {
+  return isOpaqueRaster(rgba, width, height) && hasCompressionNoise(rgba, width, height);
 }
 
 function isOpaqueRaster(rgba: Uint8Array, width: number, height: number): boolean {
@@ -50,12 +55,12 @@ function hasCompressionNoise(rgba: Uint8Array, width: number, height: number): b
       residual /= 3;
       residualSum += residual;
       eligibleSamples += 1;
-      if (residual >= NOISE_RESIDUAL) noisySamples += 1;
+      if (residual >= NOISY_SAMPLE_RESIDUAL) noisySamples += 1;
     }
   }
   const residualNoise = eligibleSamples > 0
     && noisySamples / eligibleSamples >= MIN_NOISY_FRACTION
-    && residualSum / eligibleSamples >= NOISE_RESIDUAL;
+    && residualSum / eligibleSamples >= MIN_MEAN_RESIDUAL;
   return residualNoise || hasBlockBoundaryNoise(rgba, width, height);
 }
 

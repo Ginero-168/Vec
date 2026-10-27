@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { denoiseJpegArtifacts } from "./denoise.ts";
+import { denoiseJpegArtifacts, wouldDenoise } from "./denoise.ts";
 
 function image(width: number, height: number, paint: (x: number, y: number) => readonly [number, number, number]): Uint8Array {
   const rgba = new Uint8Array(width * height * 4);
@@ -73,13 +73,34 @@ test("JPEG-like block, chroma, and edge ringing noise is reduced without moving 
   assert.ok(Math.abs(edge(39) - edge(40)) >= 100, `edge contrast stayed sharp: ${edge(39)} -> ${edge(40)}`);
 });
 
+test("subtle 128px JPEG-like block and texture noise is detected", () => {
+  const width = 128;
+  const height = 128;
+  const noisy = image(width, height, () => [180, 180, 180]);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      const blockOffset = ((((Math.floor(x / 8) * 3 + Math.floor(y / 8) * 2) % 5) - 2) * 0.5);
+      const texture = (((x * 17 + y * 29 + x * y * 3) % 7) - 3) * 0.5;
+      const value = Math.max(0, Math.min(255, Math.round(180 + blockOffset + texture)));
+      noisy[offset] = value;
+      noisy[offset + 1] = value;
+      noisy[offset + 2] = value;
+    }
+  }
+
+  assert.equal(wouldDenoise(noisy, width, height), true);
+});
+
 test("clean flat-color shapes are returned unchanged", () => {
   const clean = image(48, 48, (x, y) => x >= 12 && x < 36 && y >= 10 && y < 38 ? [32, 168, 214] : [242, 238, 226]);
+  assert.equal(wouldDenoise(clean, 48, 48), false);
   assert.equal(denoiseJpegArtifacts(clean, 48, 48), clean);
 });
 
 test("transparent rasters are left untouched", () => {
   const transparent = image(16, 16, () => [120, 120, 120]);
   transparent[3] = 0;
+  assert.equal(wouldDenoise(transparent, 16, 16), false);
   assert.equal(denoiseJpegArtifacts(transparent, 16, 16), transparent);
 });
