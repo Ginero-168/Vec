@@ -31,7 +31,7 @@ const PRECISION: Readonly<Record<TracePreset, number>> = { logo: 6, icon: 5, pho
 
 export function controlsFor(mode: TracePreset): LabControls {
   const defaults = presetDefaults(mode);
-  const segmentColors = Math.min(32, Math.max(2, defaults.maxColors || (mode === "photo" ? 32 : mode === "poster" ? 10 : 8)));
+  const segmentColors = mode === "logo" ? 0 : Math.min(32, Math.max(2, defaults.maxColors || (mode === "photo" ? 32 : mode === "poster" ? 10 : 8)));
   return {
     mode,
     maxColors: segmentColors,
@@ -52,7 +52,7 @@ export function controlsFor(mode: TracePreset): LabControls {
     fitGeometry: true,
     smoothness: defaults.smoothness,
     corner: defaults.corner,
-    seal: true,
+    seal: mode === "photo" || mode === "poster",
     sealWidth: defaults.stacking === "cutout" ? 2 : 0.8
   };
 }
@@ -74,12 +74,11 @@ export function traceRequest(controls: LabControls, palette: readonly string[]):
   };
 }
 
-export function paletteFromRaster(rgba: Uint8Array, ignore: string | null): string[] {
+export function paletteFromRaster(rgba: Uint8Array, _ignore: string | null): string[] {
   const seen = new Set<string>();
   for (let index = 0; index < rgba.length; index += 4) {
     if ((rgba[index + 3] ?? 0) < 250) continue;
     const color = "#" + byte(rgba[index] ?? 0) + byte(rgba[index + 1] ?? 0) + byte(rgba[index + 2] ?? 0);
-    if (color === ignore) continue;
     seen.add(color);
   }
   return [...seen].sort();
@@ -97,13 +96,14 @@ export function transparentFraction(rgba: Uint8Array): number {
   return clear / pixels;
 }
 
-export function styleVectors(svg: string, controls: LabControls, droppedColor: string | null): { readonly fitted: string; readonly faired: string; readonly sealed: string } {
+export function styleVectors(svg: string, controls: LabControls, droppedColor: string | null, borderColor: string | null = null): { readonly fitted: string; readonly faired: string; readonly sealed: string } {
   let fitted = svg;
   if (droppedColor !== null) fitted = dropFill(fitted, droppedColor);
-  if (controls.dropPlate) fitted = dropCanvasBackground(fitted);
+  if (controls.dropPlate) fitted = dropCanvasBackground(fitted, borderColor);
   if (controls.fitGeometry) fitted = fitShapes(fitted);
-  const faired = fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
-  const sealed = groupPathsByFill(controls.seal ? sealGaps(faired, controls.sealWidth) : faired);
+  const flat = controls.mode === "logo" || controls.mode === "icon";
+  const faired = flat ? fitted : fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
+  const sealed = groupPathsByFill(!flat && controls.seal ? sealGaps(faired, controls.sealWidth) : faired);
   return { fitted, faired, sealed };
 }
 

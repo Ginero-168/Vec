@@ -26,6 +26,20 @@ function opaqueColors(rgba: Uint8Array): number {
   return seen.size;
 }
 
+test("a one-color logo on a transparent ground stays a logo, not a solid square", () => {
+  const rgba = fill(32, 32, (x, y) => (x >= 12 && x < 20 && y >= 12 && y < 20 ? [30, 215, 96, 255] : [0, 0, 0, 0]));
+  const segmented = segmentRaster(rgba, 32, 32, { mode: "icon", maxColors: 8, removeBackground: false, opaqueAt: 200 });
+  let clear = 0;
+  let green = 0;
+  for (let index = 0; index < segmented.length; index += 4) {
+    if ((segmented[index + 3] ?? 255) === 0) clear += 1;
+    else if ((segmented[index + 1] ?? 0) > 180 && (segmented[index] ?? 255) < 80) green += 1;
+  }
+  assert.equal(clear, 32 * 32 - 64);
+  assert.equal(green, 64);
+  assert.equal(segmented[3], 0);
+});
+
 test("an anti-aliased edge snaps to the two flat colors", () => {
   const rgba = fill(48, 48, (x, y) => {
     const side = x - y;

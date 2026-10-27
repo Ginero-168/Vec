@@ -7,6 +7,7 @@ export type SegmentOptions = {
   readonly snapBlends?: boolean;
   readonly speckArea?: number;
   readonly backdropSpread?: number;
+  readonly opaqueAt?: number;
 };
 
 export type SegmentViews = {
@@ -32,21 +33,27 @@ export function segmentViews(rgba: Uint8Array, width: number, height: number, op
     return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
   }
   const source = options.mode === "poster" ? grayscale(rgba, count) : rgba;
-  const samples = collectSamples(source, width, height);
+  const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
+  const samples = collectSamples(source, width, height, cutoff);
   const centroids = cluster(samples, colorCap(options));
   const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
   const areas = new Uint32Array(centroids.length);
   for (let index = 0; index < count; index += 1) {
+    if ((source[index * 4 + 3] ?? 0) < cutoff) continue;
     const label = nearest(pixelAt(source, index), centroids);
     areas[label] = (areas[label] ?? 0) + 1;
   }
   const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
   const labels = new Int16Array(count);
-  for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source, index), palette);
+  labels.fill(-1);
+  for (let index = 0; index < count; index += 1) {
+    if ((source[index * 4 + 3] ?? 0) < cutoff) continue;
+    labels[index] = nearest(pixelAt(source, index), palette);
+  }
   cleanupEdges(labels, width, height);
   mergeSpecks(labels, width, height, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
   const opaque = new Uint8Array(count);
-  opaque.fill(255);
+  for (let index = 0; index < count; index += 1) opaque[index] = (source[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
   const colors = paintLabels(labels, palette, opaque);
   const alpha = opaque.slice();
   if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha, options.backdropSpread ?? 22);
@@ -94,14 +101,14 @@ function grayscale(rgba: Uint8Array, count: number): Uint8Array {
   return next;
 }
 
-function collectSamples(rgba: Uint8Array, width: number, height: number): RGB[] {
+function collectSamples(rgba: Uint8Array, width: number, height: number, cutoff: number): RGB[] {
   const target = 8000;
   const stride = Math.max(1, Math.floor(Math.sqrt((width * height) / target)));
   const samples: RGB[] = [];
   for (let y = 0; y < height; y += stride) {
     for (let x = 0; x < width; x += stride) {
       const offset = (y * width + x) * 4;
-      if ((rgba[offset + 3] ?? 0) < 128) continue;
+      if ((rgba[offset + 3] ?? 0) < cutoff) continue;
       samples.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
     }
   }
@@ -211,12 +218,13 @@ function cleanupEdges(labels: Int16Array, width: number, height: number): void {
     for (let y = 1; y < height - 1; y += 1) {
       for (let x = 1; x < width - 1; x += 1) {
         const index = y * width + x;
-        if (isThin(original, width, index)) continue;
+        if ((original[index] ?? -1) < 0 || isThin(original, width, index)) continue;
         const counts = new Map<number, number>();
         for (let dy = -1; dy <= 1; dy += 1) {
           for (let dx = -1; dx <= 1; dx += 1) {
             if (dx === 0 && dy === 0) continue;
-            const label = original[index + dy * width + dx] ?? 0;
+            const label = original[index + dy * width + dx] ?? -1;
+            if (label < 0) continue;
             counts.set(label, (counts.get(label) ?? 0) + 1);
           }
         }
@@ -250,7 +258,11 @@ function mergeSpecks(labels: Int16Array, width: number, height: number, minArea:
   const queue = new Int32Array(count);
   for (let start = 0; start < count; start += 1) {
     if (seen[start] === 1) continue;
-    const label = labels[start] ?? 0;
+    const label = labels[start] ?? -1;
+    if (label < 0) {
+      seen[start] = 1;
+      continue;
+    }
     let head = 0;
     let tail = 0;
     queue[tail] = start;
@@ -296,8 +308,8 @@ function mergeSpecks(labels: Int16Array, width: number, height: number, minArea:
         const nx = next % width;
         const ny = Math.floor(next / width);
         if (Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
-        const other = labels[next] ?? label;
-        if (other === label) continue;
+        const other = labels[next] ?? -1;
+        if (other < 0 || other === label) continue;
         around.set(other, (around.get(other) ?? 0) + 1);
       }
     }

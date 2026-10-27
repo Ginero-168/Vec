@@ -88,23 +88,58 @@ function rememberFill(fill: string | null, seen: Set<string>, palette: string[])
   palette.push(fill);
 }
 
-export function dropCanvasBackground(svg: string): string {
+export function dropCanvasBackground(svg: string, borderColor?: string | null): string {
+  if (borderColor === undefined || borderColor === null || borderColor.trim() === "") return svg;
+  const border = normalizeFill(borderColor);
+  if (border === null) return svg;
   const size = canvasSize(svg);
   if (size === null) return svg;
   const matches = pathTags(svg);
   if (matches.length < 2) return svg;
   let chosen: PathTag | null = null;
+  let chosenArea = 0;
   for (const tag of matches) {
     const measured = measureTag(tag);
     if (measured === null) continue;
-    const spanX = measured.maxX - measured.minX;
-    const spanY = measured.maxY - measured.minY;
-    const covers = spanX >= size.width * 0.9 && spanY >= size.height * 0.9;
-    if (!covers) continue;
-    if (chosen === null || measured.area > (measureTag(chosen)?.area ?? 0)) chosen = tag;
+    const fill = normalizeFill(fillOf(tagAttrs(tag.source)));
+    if (fill === null || !samePaint(fill, border)) continue;
+    if (edgesTouched(measured, size.width, size.height) < 3) continue;
+    if (chosen === null || measured.area > chosenArea) {
+      chosen = tag;
+      chosenArea = measured.area;
+    }
   }
   if (chosen === null) return svg;
   return svg.slice(0, chosen.index) + svg.slice(chosen.index + chosen.length);
+}
+
+function edgesTouched(measured: MeasuredPath, width: number, height: number): number {
+  let left = false;
+  let right = false;
+  let top = false;
+  let bottom = false;
+  for (const point of measured.samples) {
+    if (point.x <= 1) left = true;
+    if (point.y <= 1) top = true;
+    if (point.x >= width - 1) right = true;
+    if (point.y >= height - 1) bottom = true;
+  }
+  return Number(left) + Number(right) + Number(top) + Number(bottom);
+}
+
+function samePaint(fill: string, border: string): boolean {
+  if (fill === border) return true;
+  const left = rgbOf(fill);
+  const right = rgbOf(border);
+  if (left === null || right === null) return false;
+  return Math.abs(left[0] - right[0]) <= 18 && Math.abs(left[1] - right[1]) <= 18 && Math.abs(left[2] - right[2]) <= 18;
+}
+
+function rgbOf(fill: string): [number, number, number] | null {
+  const match = /^#([0-9a-f]{6})$/i.exec(fill);
+  if (match === null) return null;
+  const hex = match[1] ?? "";
+  return [Number.parseInt(hex.slice(0, 2), 16), Number.parseInt(hex.slice(2, 4), 16), Number.parseInt(hex.slice(4, 6), 16)];
 }
 
 export function dropFill(svg: string, fill: string): string {
@@ -163,6 +198,8 @@ function fittedMarkup(tag: PathTag): string | null {
   if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
   const ellipse = fitEllipse(measured);
   if (ellipse !== null) return '<ellipse cx="' + fmt(ellipse.cx) + '" cy="' + fmt(ellipse.cy) + '" rx="' + fmt(ellipse.rx) + '" ry="' + fmt(ellipse.ry) + '"' + fillAttr + "/>";
+  const squircle = fitSquircle(measured);
+  if (squircle !== null) return '<path d="' + squircle + '"' + fillAttr + "/>";
   return null;
 }
 
@@ -300,6 +337,101 @@ function fitEllipse(measured: MeasuredPath): { readonly cx: number; readonly cy:
   const expected = Math.PI * rx * ry;
   if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.12) return null;
   return { cx, cy, rx, ry };
+}
+
+function fitSquircle(measured: MeasuredPath): string | null {
+  const width = measured.maxX - measured.minX;
+  const height = measured.maxY - measured.minY;
+  if (!(width >= 8) || !(height >= 8) || measured.samples.length < 16) return null;
+  const cx = (measured.minX + measured.maxX) / 2;
+  const cy = (measured.minY + measured.maxY) / 2;
+  const rx = width / 2;
+  const ry = height / 2;
+  let corners = 0;
+  for (const point of measured.samples) {
+    if ((point.x - cx) * (point.y - cy) !== 0 && Math.abs(point.x - cx) > rx * 0.45 && Math.abs(point.y - cy) > ry * 0.45) corners += 1;
+  }
+  if (corners < 4) return null;
+  let bestN = 0;
+  let bestError = Infinity;
+  for (let n = 3.5; n <= 6.0001; n += 0.25) {
+    const error = squircleError(measured.samples, cx, cy, rx, ry, n);
+    if (error < bestError) {
+      bestError = error;
+      bestN = n;
+    }
+  }
+  if (!(bestError <= 0.5)) return null;
+  const expected = squircleArea(rx, ry, bestN);
+  if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.08) return null;
+  const path = squirclePath(cx, cy, rx, ry, bestN);
+  return pathError(path, cx, cy, rx, ry, bestN) <= 0.2 ? path : null;
+}
+
+function squircleError(samples: readonly Point[], cx: number, cy: number, rx: number, ry: number, n: number): number {
+  let worst = 0;
+  for (const point of samples) {
+    const nx = Math.abs(point.x - cx) / rx;
+    const ny = Math.abs(point.y - cy) / ry;
+    const radial = (nx ** n + ny ** n) ** (1 / n);
+    worst = Math.max(worst, Math.abs(radial - 1) * Math.min(rx, ry));
+  }
+  return worst;
+}
+
+function squircleArea(rx: number, ry: number, n: number): number {
+  let area = 0;
+  const steps = 720;
+  let previous = squirclePoint(0, 0, rx, ry, n, 0);
+  for (let step = 1; step <= steps; step += 1) {
+    const point = squirclePoint(0, 0, rx, ry, n, step / steps);
+    area += previous.x * point.y - point.x * previous.y;
+    previous = point;
+  }
+  return Math.abs(area) / 2;
+}
+
+function squirclePoint(cx: number, cy: number, rx: number, ry: number, n: number, t: number): Point {
+  const angle = t * Math.PI * 2;
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  const power = 2 / n;
+  return {
+    x: cx + rx * Math.sign(cosine) * Math.abs(cosine) ** power,
+    y: cy + ry * Math.sign(sine) * Math.abs(sine) ** power
+  };
+}
+
+function squirclePath(cx: number, cy: number, rx: number, ry: number, n: number): string {
+  const count = 16;
+  const points: Point[] = [];
+  for (let index = 0; index < count; index += 1) points.push(squirclePoint(cx, cy, rx, ry, n, index / count));
+  let path = "M" + fmt(points[0]?.x ?? cx) + "," + fmt(points[0]?.y ?? cy);
+  for (let index = 0; index < count; index += 1) {
+    const p0 = points[(index - 1 + count) % count] ?? { x: cx, y: cy };
+    const p1 = points[index] ?? p0;
+    const p2 = points[(index + 1) % count] ?? p1;
+    const p3 = points[(index + 2) % count] ?? p2;
+    path +=
+      "C" +
+      fmt(p1.x + (p2.x - p0.x) / 6) +
+      "," +
+      fmt(p1.y + (p2.y - p0.y) / 6) +
+      " " +
+      fmt(p2.x - (p3.x - p1.x) / 6) +
+      "," +
+      fmt(p2.y - (p3.y - p1.y) / 6) +
+      " " +
+      fmt(p2.x) +
+      "," +
+      fmt(p2.y);
+  }
+  return path + "Z";
+}
+
+function pathError(path: string, cx: number, cy: number, rx: number, ry: number, n: number): number {
+  const measured = measurePath(path);
+  return squircleError(measured.samples, cx, cy, rx, ry, n);
 }
 
 function fmt(value: number): string {

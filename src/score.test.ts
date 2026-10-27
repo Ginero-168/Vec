@@ -53,7 +53,7 @@ test("the traced logo reports paths, anchors, holes, and colors", () => {
 });
 
 test("a full-canvas plate is removed and the mark is grouped by fill", () => {
-  const cleaned = groupPathsByFill(dropCanvasBackground(tracedLogo));
+  const cleaned = groupPathsByFill(dropCanvasBackground(tracedLogo, "#ffffff"));
   const facts = scoreSvg(cleaned);
   assert.equal(facts.paths, 3);
   assert.equal(facts.holes, 0);
@@ -71,7 +71,26 @@ test("the only path is kept even when it covers the canvas", () => {
 
 test("shapes that do not cover the canvas stay put", () => {
   const svg = '<svg width="100" height="100"><path d="M0,0 H10 V10 H0 Z" fill="#fff"/><path d="M20,20 H30 V30 H20 Z" fill="#000"/></svg>';
-  assert.equal(dropCanvasBackground(svg), svg);
+  assert.equal(dropCanvasBackground(svg, "#ffffff"), svg);
+});
+
+test("a green disc that spans a white canvas is kept and the white plate is removed", () => {
+  const svg = '<svg width="24" height="24"><rect x="0" y="0" width="24" height="24" fill="#ffffff"/><circle cx="12" cy="12" r="12" fill="#1ed760"/></svg>';
+  const dropped = dropCanvasBackground(svg, "#ffffff");
+  assert.equal(dropped.toLowerCase().includes("#ffffff"), false);
+  assert.equal(dropped.toLowerCase().includes("#1ed760"), true);
+  assert.equal(dropCanvasBackground(svg, null), svg);
+});
+
+test("a tight icon body is kept unless it touches several edges in the border color", () => {
+  const body = '<svg width="64" height="64"><path d="M2,2 H62 V62 H2 Z" fill="#b6f27a"/><path d="M20,20 H30 V40 H20 Z" fill="#222222"/></svg>';
+  assert.equal(dropCanvasBackground(body, "#222222"), body);
+  const plate = '<svg width="64" height="64"><path d="M0,0 H64 V64 H0 Z" fill="#222222"/><path d="M20,20 H30 V40 H20 Z" fill="#b6f27a"/></svg>';
+  const dropped = dropCanvasBackground(plate, "#222222");
+  assert.equal(dropped.includes("#222222"), false);
+  assert.equal(dropped.includes("#b6f27a"), true);
+  const fullBleed = '<svg width="64" height="64"><path d="M0,0 H64 V64 H0 Z" fill="#b6f27a"/><path d="M20,20 H30 V40 H20 Z" fill="#111111"/></svg>';
+  assert.equal(dropCanvasBackground(fullBleed, "#222222").includes("#b6f27a"), true);
 });
 
 test("overlapping stacked fills are not regrouped", () => {
