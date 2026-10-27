@@ -209,7 +209,7 @@ function description(
 ): string {
   if (step === "capture") return "ภาพถ่าย " + width + "×" + height + " พิกเซล รวมวอลเปเปอร์เบลอ เงา และขอบจางของไอคอน";
   if (step === "colors") {
-    const blend = controls.snapBlends ? " สีที่อยู่ระหว่างสองสีถูกยุบเข้าหาสีหลัก" : " คงสีกลางไว้";
+    const blend = controls.snapBlends ? " ขอบบางระหว่างสองสีถูกยุบเข้าหาสีหลัก" : " คงสีกลางไว้";
     return "เหลือ " + paletteSize + " สีจากภาพต้นฉบับ" + blend;
   }
   if (step === "backdrop") {

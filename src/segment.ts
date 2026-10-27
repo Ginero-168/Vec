@@ -35,7 +35,12 @@ export function segmentViews(rgba: Uint8Array, width: number, height: number, op
   const samples = collectSamples(source, width, height);
   const centroids = cluster(samples, colorCap(options));
   const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
-  const palette = snapBlends ? foldBlends(centroids) : centroids;
+  const areas = new Uint32Array(centroids.length);
+  for (let index = 0; index < count; index += 1) {
+    const label = nearest(pixelAt(source, index), centroids);
+    areas[label] = (areas[label] ?? 0) + 1;
+  }
+  const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
   const labels = new Int16Array(count);
   for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source, index), palette);
   cleanupEdges(labels, width, height);
@@ -144,7 +149,7 @@ function seedCentroids(samples: readonly RGB[], cap: number): RGB[] {
   return centroids;
 }
 
-function foldBlends(centroids: readonly RGB[]): RGB[] {
+function foldBlends(centroids: readonly RGB[], areas: Uint32Array): RGB[] {
   const map = centroids.map((_, index) => index);
   for (let index = 0; index < centroids.length; index += 1) {
     const color = centroids[index];
@@ -157,6 +162,9 @@ function foldBlends(centroids: readonly RGB[]): RGB[] {
         const a = centroids[left];
         const b = centroids[right];
         if (a === undefined || b === undefined || !onSegment(color, a, b)) continue;
+        const fringe = areas[index] ?? 0;
+        const parent = Math.min(areas[left] ?? 0, areas[right] ?? 0);
+        if (fringe * 5 >= parent) continue;
         host = distance2(color, a) <= distance2(color, b) ? left : right;
       }
     }

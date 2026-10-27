@@ -1474,7 +1474,12 @@
     const samples = collectSamples(source2, width2, height2);
     const centroids = cluster(samples, colorCap(options));
     const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
-    const palette = snapBlends ? foldBlends(centroids) : centroids;
+    const areas = new Uint32Array(centroids.length);
+    for (let index = 0; index < count; index += 1) {
+      const label = nearest(pixelAt(source2, index), centroids);
+      areas[label] = (areas[label] ?? 0) + 1;
+    }
+    const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
     const labels = new Int16Array(count);
     for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source2, index), palette);
     cleanupEdges(labels, width2, height2);
@@ -1572,7 +1577,7 @@
     }
     return centroids;
   }
-  function foldBlends(centroids) {
+  function foldBlends(centroids, areas) {
     const map = centroids.map((_, index) => index);
     for (let index = 0; index < centroids.length; index += 1) {
       const color = centroids[index];
@@ -1585,6 +1590,9 @@
           const a = centroids[left];
           const b = centroids[right];
           if (a === void 0 || b === void 0 || !onSegment(color, a, b)) continue;
+          const fringe = areas[index] ?? 0;
+          const parent = Math.min(areas[left] ?? 0, areas[right] ?? 0);
+          if (fringe * 5 >= parent) continue;
           host = distance2(color, a) <= distance2(color, b) ? left : right;
         }
       }
@@ -2013,7 +2021,7 @@
   function description(step, controls, border, paletteSize, backdrop2, punchShown, droppedColor, styled) {
     if (step === "capture") return "\u0E20\u0E32\u0E1E\u0E16\u0E48\u0E32\u0E22 " + width + "\xD7" + height + " \u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25 \u0E23\u0E27\u0E21\u0E27\u0E2D\u0E25\u0E40\u0E1B\u0E40\u0E1B\u0E2D\u0E23\u0E4C\u0E40\u0E1A\u0E25\u0E2D \u0E40\u0E07\u0E32 \u0E41\u0E25\u0E30\u0E02\u0E2D\u0E1A\u0E08\u0E32\u0E07\u0E02\u0E2D\u0E07\u0E44\u0E2D\u0E04\u0E2D\u0E19";
     if (step === "colors") {
-      const blend = controls.snapBlends ? " \u0E2A\u0E35\u0E17\u0E35\u0E48\u0E2D\u0E22\u0E39\u0E48\u0E23\u0E30\u0E2B\u0E27\u0E48\u0E32\u0E07\u0E2A\u0E2D\u0E07\u0E2A\u0E35\u0E16\u0E39\u0E01\u0E22\u0E38\u0E1A\u0E40\u0E02\u0E49\u0E32\u0E2B\u0E32\u0E2A\u0E35\u0E2B\u0E25\u0E31\u0E01" : " \u0E04\u0E07\u0E2A\u0E35\u0E01\u0E25\u0E32\u0E07\u0E44\u0E27\u0E49";
+      const blend = controls.snapBlends ? " \u0E02\u0E2D\u0E1A\u0E1A\u0E32\u0E07\u0E23\u0E30\u0E2B\u0E27\u0E48\u0E32\u0E07\u0E2A\u0E2D\u0E07\u0E2A\u0E35\u0E16\u0E39\u0E01\u0E22\u0E38\u0E1A\u0E40\u0E02\u0E49\u0E32\u0E2B\u0E32\u0E2A\u0E35\u0E2B\u0E25\u0E31\u0E01" : " \u0E04\u0E07\u0E2A\u0E35\u0E01\u0E25\u0E32\u0E07\u0E44\u0E27\u0E49";
       return "\u0E40\u0E2B\u0E25\u0E37\u0E2D " + paletteSize + " \u0E2A\u0E35\u0E08\u0E32\u0E01\u0E20\u0E32\u0E1E\u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A" + blend;
     }
     if (step === "backdrop") {

@@ -39,6 +39,20 @@ test("an anti-aliased edge snaps to the two flat colors", () => {
   assert.equal(segmented[3], 255);
 });
 
+test("a large gray between white and brown stays gray", () => {
+  const rgba = fill(48, 36, (x) => {
+    if (x < 16) return [245, 245, 245, 255];
+    if (x < 32) return [120, 120, 120, 255];
+    return [40, 20, 15, 255];
+  });
+  const segmented = segmentRaster(rgba, 48, 36, { mode: "logo", maxColors: 6, removeBackground: false, snapBlends: true });
+  const center = (18 * 48 + 24) * 4;
+  const red = segmented[center] ?? 0;
+  const green = segmented[center + 1] ?? 0;
+  const blue = segmented[center + 2] ?? 0;
+  assert.ok(Math.abs(red - 120) < 35 && Math.abs(green - 120) < 35 && Math.abs(blue - 120) < 35);
+});
+
 test("a third solid color stays while blends collapse", () => {
   const rgba = fill(48, 36, (x, y) => {
     if (x < 16) return [214, 54, 62, 255];
