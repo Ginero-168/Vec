@@ -8,6 +8,7 @@ import {
   transparentFraction,
   type LabControls
 } from "./lab-model";
+import { cornerColor } from "./flat-trace";
 import { revealSentinel, punchRgba } from "./punch-rgba";
 import { scoreSvg } from "./score";
 import { segmentViews } from "./segment";
@@ -76,6 +77,12 @@ let traceMs = 0;
 let frameId = 0;
 let traceTimer = 0;
 let traceSerial = 0;
+let flatSvg = "";
+let flatKey = "";
+let flatMs = 0;
+let flatPlates: readonly FlatPlateView[] = [];
+
+type FlatPlateView = { readonly png: string; readonly width: number; readonly height: number; readonly originX: number; readonly originY: number };
 
 form.addEventListener("submit", (event) => event.preventDefault());
 form.addEventListener("input", onEdit);
@@ -136,6 +143,10 @@ async function load(): Promise<void> {
 function render(): void {
   if (source.length === 0) return;
   const controls = readControls();
+  if (controls.mode === "logo" || controls.mode === "icon") {
+    renderFlat(controls);
+    return;
+  }
   const started = performance.now();
   const views = segmentViews(source, width, height, {
     mode: controls.mode,
@@ -143,7 +154,8 @@ function render(): void {
     removeBackground: controls.removeBackground,
     snapBlends: controls.snapBlends,
     speckArea: controls.speckArea,
-    backdropSpread: controls.backdropSpread
+    backdropSpread: controls.backdropSpread,
+    opaqueAt: controls.opaqueAt
   });
   const punched = punchRgba(views.backdrop, width, height, controls.opaqueAt);
   const punchShown = revealSentinel(punched.rgba, punched.droppedColor);
@@ -152,9 +164,10 @@ function render(): void {
   paintCanvas("thumb-colors", views.colors);
   paintCanvas("thumb-backdrop", views.backdrop);
   paintCanvas("thumb-punch", punchShown);
+  const border = cornerColor(source, width, height);
   const request = traceRequest(controls, paletteFromRaster(punched.rgba, punched.droppedColor));
   const key = rasterKey(punched.rgba, request);
-  const styled = svg !== "" ? styleVectors(svg, controls, punched.droppedColor) : null;
+  const styled = svg !== "" ? styleVectors(svg, controls, punched.droppedColor, border) : null;
   const current = svgKey === key && styled !== null;
   if (current && styled !== null) {
     heldVectors = styled;
@@ -259,7 +272,7 @@ async function sendTrace(serial: number, key: string, rgba: Uint8Array, request:
     svg = payload.svg;
     svgKey = key;
     traceMs = Math.round(performance.now() - started);
-    const styled = styleVectors(svg, readControls(), droppedColor);
+    const styled = styleVectors(svg, readControls(), droppedColor, cornerColor(source, width, height));
     setSvgThumb("thumb-trace", svg);
     setSvgThumb("thumb-fit", styled.fitted);
     setSvgThumb("thumb-fair", styled.faired);
@@ -386,7 +399,7 @@ function apply(controls: LabControls): void {
 }
 
 function syncOutputs(): void {
-  setOutput(maxColors, maxColors.value);
+  setOutput(maxColors, maxColors.value === "0" ? "อัตโนมัติ" : maxColors.value);
   setOutput(speck, speck.value);
   setOutput(spread, spread.value);
   setOutput(opaque, opaque.value);
@@ -401,6 +414,125 @@ function syncOutputs(): void {
   const tolerance = 0.4 + Number(smooth.value) * 2.2;
   smoothHint.textContent = "ระยะยอม " + tolerance.toFixed(1) + " px ช่วงที่ยาวถูกยืดเป็นเส้นตรง";
   cornerHint.textContent = "เก็บมุมที่เลี้ยวอย่างน้อย " + String(Math.max(0, 90 - Number(corner.value))) + "° และด้านยาวกว่า 3 px";
+}
+
+function renderFlat(controls: LabControls): void {
+  paintCanvas("thumb-capture", source);
+  const key = rasterKey(source, {
+    preset: controls.mode,
+    maxColors: controls.maxColors,
+    smoothness: controls.smoothness,
+    removeBackground: controls.removeBackground,
+    stacking: controls.stacking,
+    simplify: controls.corner
+  });
+  const ready = flatKey === key && flatSvg !== "";
+  paintCanvas("thumb-colors", source);
+  paintCanvas("thumb-backdrop", source);
+  paintCanvas("thumb-punch", source);
+  if (ready) {
+    setSvgThumb("thumb-trace", flatSvg);
+    setSvgThumb("thumb-fit", flatSvg);
+    setSvgThumb("thumb-fair", flatSvg);
+    setSvgThumb("thumb-seal", flatSvg);
+    paintFlatPlates();
+  }
+  showChrome();
+  const vectorStep = selected === "trace" || selected === "fit" || selected === "fair" || selected === "seal";
+  if (!vectorStep) {
+    sourcePhoto.hidden = true;
+    stageVector.hidden = true;
+    stageRaster.hidden = false;
+    if (selected === "capture" || !ready) paintCanvasElement(stageRaster, source);
+    else paintFlatPlates(stageRaster);
+  } else {
+    sourcePhoto.hidden = true;
+    stageRaster.hidden = true;
+    stageVector.hidden = false;
+    if (ready) stageVector.innerHTML = sizedSvg(flatSvg);
+  }
+  frame.classList.toggle("waiting", !ready && selected !== "capture");
+  const facts = ready ? scoreSvg(flatSvg) : null;
+  metricColors.textContent = facts === null ? "–" : String(facts.colors);
+  metricAnchors.textContent = facts === null ? "–" : String(listAnchors(flatSvg).length);
+  metricTime.textContent = ready ? flatMs + " ms" : "…";
+  explain.textContent = flatDescription(selected, controls, facts);
+  spreadNow.textContent = "โหมดโลโก้และไอคอนแยกจานสีต่อชิ้น จึงไม่ใช้เกณฑ์กระจายของพื้น";
+  paintChips(facts?.palette ?? []);
+  status.textContent = ready ? "ลากเส้นแบน " + String(flatMs) + " ms" : "กำลังจัดสีต่อชิ้นแล้วลากเส้น";
+  if (!ready) queueFlat(key, controls);
+}
+
+function flatDescription(step: StepId, controls: LabControls, facts: ReturnType<typeof scoreSvg> | null): string {
+  const colors = controls.maxColors <= 0 ? "จำนวนสีอัตโนมัติ" : "เพดาน " + String(controls.maxColors) + " สี";
+  if (step === "capture") return "ภาพต้นฉบับ " + String(width) + "×" + String(height) + " พิกเซล";
+  if (step === "colors" || step === "backdrop" || step === "punch") return "จานสี OKLab ต่อชิ้น ขยาย 8 เท่า แล้วระบายสีแบน · " + colors;
+  if (facts === null) return "กำลังลากเส้นจากภาพสีแบน";
+  if (step === "trace" || step === "fit") return "VTracer ตามสีที่ล็อก ย่อกลับ 1/8 แล้วจับรูป · " + String(facts.colors) + " สี";
+  return "เกลาเส้นเบา ๆ เหลือ " + String(facts.anchors) + " จุด โดยไม่ถมรอยทับ";
+}
+
+function queueFlat(key: string, controls: LabControls): void {
+  window.clearTimeout(traceTimer);
+  const serial = ++traceSerial;
+  traceTimer = window.setTimeout(() => {
+    void sendFlat(serial, key, controls);
+  }, 120);
+}
+
+async function sendFlat(serial: number, key: string, controls: LabControls): Promise<void> {
+  const started = performance.now();
+  try {
+    const response = await fetch("/api/pipeline", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        png: await pngBase64(source),
+        settings: {
+          preset: controls.mode,
+          maxColors: controls.maxColors,
+          smoothness: controls.smoothness,
+          corner: controls.corner,
+          removeBackground: controls.removeBackground,
+          stacking: controls.stacking
+        }
+      })
+    });
+    if (serial !== traceSerial) return;
+    const payload = (await response.json()) as { readonly svg?: string; readonly plates?: readonly FlatPlateView[]; readonly error?: string; readonly cancelled?: boolean };
+    if (serial !== traceSerial || payload.cancelled === true) return;
+    if (!response.ok || payload.svg === undefined) {
+      status.textContent = payload.error ?? "ลากเส้นไม่สำเร็จ";
+      return;
+    }
+    flatSvg = payload.svg;
+    flatPlates = payload.plates ?? [];
+    flatKey = key;
+    flatMs = Math.round(performance.now() - started);
+    render();
+  } catch (error) {
+    if (serial !== traceSerial) return;
+    status.textContent = error instanceof Error ? error.message : "ลากเส้นไม่สำเร็จ";
+  }
+}
+
+function paintFlatPlates(target?: HTMLCanvasElement): void {
+  const canvases = target === undefined ? [byId<HTMLCanvasElement>("thumb-colors"), byId<HTMLCanvasElement>("thumb-backdrop"), byId<HTMLCanvasElement>("thumb-punch")] : [target];
+  const plates = flatPlates;
+  for (const canvas of canvases) {
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (context === null) continue;
+    context.clearRect(0, 0, width, height);
+    for (const plate of plates) {
+      const image = new Image();
+      image.onload = () => {
+        context.drawImage(image, plate.originX, plate.originY, plate.width / 8, plate.height / 8);
+      };
+      image.src = "data:image/png;base64," + plate.png;
+    }
+  }
 }
 
 function setOutput(input: HTMLInputElement, text: string): void {

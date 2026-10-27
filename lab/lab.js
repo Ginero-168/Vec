@@ -10,7 +10,7 @@
     return Math.round((0.4 + clamped * 2.2) * 100) / 100;
   }
   function fairPaths(svg2, options) {
-    const tolerance = fairTolerance(options.smoothness);
+    const tolerance = options.tolerance ?? fairTolerance(options.smoothness);
     const minTurn = 90 - Math.min(90, Math.max(0, Number.isFinite(options.cornerDegrees) ? options.cornerDegrees : 0));
     return svg2.replace(shapePattern(), (tag) => {
       if (!/^<path\b/i.test(tag)) return tag;
@@ -697,23 +697,55 @@
     seen.add(fill);
     palette.push(fill);
   }
-  function dropCanvasBackground(svg2) {
+  function dropCanvasBackground(svg2, borderColor) {
+    if (borderColor === void 0 || borderColor === null || borderColor.trim() === "") return svg2;
+    const border = normalizeFill(borderColor);
+    if (border === null) return svg2;
     const size = canvasSize(svg2);
     if (size === null) return svg2;
     const matches = pathTags(svg2);
     if (matches.length < 2) return svg2;
     let chosen = null;
+    let chosenArea = 0;
     for (const tag of matches) {
       const measured = measureTag(tag);
       if (measured === null) continue;
-      const spanX = measured.maxX - measured.minX;
-      const spanY = measured.maxY - measured.minY;
-      const covers = spanX >= size.width * 0.9 && spanY >= size.height * 0.9;
-      if (!covers) continue;
-      if (chosen === null || measured.area > (measureTag(chosen)?.area ?? 0)) chosen = tag;
+      const fill = normalizeFill(fillOf(tagAttrs(tag.source)));
+      if (fill === null || !samePaint(fill, border)) continue;
+      if (edgesTouched(measured, size.width, size.height) < 3) continue;
+      if (chosen === null || measured.area > chosenArea) {
+        chosen = tag;
+        chosenArea = measured.area;
+      }
     }
     if (chosen === null) return svg2;
     return svg2.slice(0, chosen.index) + svg2.slice(chosen.index + chosen.length);
+  }
+  function edgesTouched(measured, width2, height2) {
+    let left = false;
+    let right = false;
+    let top = false;
+    let bottom = false;
+    for (const point of measured.samples) {
+      if (point.x <= 1) left = true;
+      if (point.y <= 1) top = true;
+      if (point.x >= width2 - 1) right = true;
+      if (point.y >= height2 - 1) bottom = true;
+    }
+    return Number(left) + Number(right) + Number(top) + Number(bottom);
+  }
+  function samePaint(fill, border) {
+    if (fill === border) return true;
+    const left = rgbOf(fill);
+    const right = rgbOf(border);
+    if (left === null || right === null) return false;
+    return Math.abs(left[0] - right[0]) <= 18 && Math.abs(left[1] - right[1]) <= 18 && Math.abs(left[2] - right[2]) <= 18;
+  }
+  function rgbOf(fill) {
+    const match = /^#([0-9a-f]{6})$/i.exec(fill);
+    if (match === null) return null;
+    const hex3 = match[1] ?? "";
+    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
   }
   function dropFill(svg2, fill) {
     const target = normalizeFill(fill);
@@ -768,6 +800,8 @@
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
+    const squircle = fitSquircle(measured);
+    if (squircle !== null) return '<path d="' + squircle + '"' + fillAttr + "/>";
     return null;
   }
   function fitRect(measured) {
@@ -900,6 +934,83 @@
     const expected = Math.PI * rx * ry;
     if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.12) return null;
     return { cx, cy, rx, ry };
+  }
+  function fitSquircle(measured) {
+    const width2 = measured.maxX - measured.minX;
+    const height2 = measured.maxY - measured.minY;
+    if (!(width2 >= 8) || !(height2 >= 8) || measured.samples.length < 16) return null;
+    const cx = (measured.minX + measured.maxX) / 2;
+    const cy = (measured.minY + measured.maxY) / 2;
+    const rx = width2 / 2;
+    const ry = height2 / 2;
+    let corners = 0;
+    for (const point of measured.samples) {
+      if ((point.x - cx) * (point.y - cy) !== 0 && Math.abs(point.x - cx) > rx * 0.45 && Math.abs(point.y - cy) > ry * 0.45) corners += 1;
+    }
+    if (corners < 4) return null;
+    let bestN = 0;
+    let bestError = Infinity;
+    for (let n = 3.5; n <= 6.0001; n += 0.25) {
+      const error = squircleError(measured.samples, cx, cy, rx, ry, n);
+      if (error < bestError) {
+        bestError = error;
+        bestN = n;
+      }
+    }
+    if (!(bestError <= 0.5)) return null;
+    const expected = squircleArea(rx, ry, bestN);
+    if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.08) return null;
+    const path = squirclePath(cx, cy, rx, ry, bestN);
+    return pathError(path, cx, cy, rx, ry, bestN) <= 0.2 ? path : null;
+  }
+  function squircleError(samples, cx, cy, rx, ry, n) {
+    let worst = 0;
+    for (const point of samples) {
+      const nx = Math.abs(point.x - cx) / rx;
+      const ny = Math.abs(point.y - cy) / ry;
+      const radial = (nx ** n + ny ** n) ** (1 / n);
+      worst = Math.max(worst, Math.abs(radial - 1) * Math.min(rx, ry));
+    }
+    return worst;
+  }
+  function squircleArea(rx, ry, n) {
+    let area = 0;
+    const steps = 720;
+    let previous = squirclePoint(0, 0, rx, ry, n, 0);
+    for (let step = 1; step <= steps; step += 1) {
+      const point = squirclePoint(0, 0, rx, ry, n, step / steps);
+      area += previous.x * point.y - point.x * previous.y;
+      previous = point;
+    }
+    return Math.abs(area) / 2;
+  }
+  function squirclePoint(cx, cy, rx, ry, n, t) {
+    const angle = t * Math.PI * 2;
+    const cosine = Math.cos(angle);
+    const sine = Math.sin(angle);
+    const power = 2 / n;
+    return {
+      x: cx + rx * Math.sign(cosine) * Math.abs(cosine) ** power,
+      y: cy + ry * Math.sign(sine) * Math.abs(sine) ** power
+    };
+  }
+  function squirclePath(cx, cy, rx, ry, n) {
+    const count = 16;
+    const points = [];
+    for (let index = 0; index < count; index += 1) points.push(squirclePoint(cx, cy, rx, ry, n, index / count));
+    let path = "M" + fmt2(points[0]?.x ?? cx) + "," + fmt2(points[0]?.y ?? cy);
+    for (let index = 0; index < count; index += 1) {
+      const p0 = points[(index - 1 + count) % count] ?? { x: cx, y: cy };
+      const p1 = points[index] ?? p0;
+      const p2 = points[(index + 1) % count] ?? p1;
+      const p3 = points[(index + 2) % count] ?? p2;
+      path += "C" + fmt2(p1.x + (p2.x - p0.x) / 6) + "," + fmt2(p1.y + (p2.y - p0.y) / 6) + " " + fmt2(p2.x - (p3.x - p1.x) / 6) + "," + fmt2(p2.y - (p3.y - p1.y) / 6) + " " + fmt2(p2.x) + "," + fmt2(p2.y);
+    }
+    return path + "Z";
+  }
+  function pathError(path, cx, cy, rx, ry, n) {
+    const measured = measurePath(path);
+    return squircleError(measured.samples, cx, cy, rx, ry, n);
   }
   function fmt2(value) {
     return String(Math.round(value * 100) / 100);
@@ -1070,8 +1181,8 @@
     if (value === "" || value === "none") return null;
     const short = /^#([0-9a-f]{3})$/.exec(value);
     if (short !== null) {
-      const hex2 = short[1] ?? "";
-      return "#" + hex2[0] + hex2[0] + hex2[1] + hex2[1] + hex2[2] + hex2[2];
+      const hex3 = short[1] ?? "";
+      return "#" + hex3[0] + hex3[0] + hex3[1] + hex3[1] + hex3[2] + hex3[2];
     }
     return value;
   }
@@ -1332,7 +1443,7 @@
   var PRECISION = { logo: 6, icon: 5, photo: 8, poster: 4 };
   function controlsFor(mode2) {
     const defaults = presetDefaults(mode2);
-    const segmentColors = Math.min(32, Math.max(2, defaults.maxColors || (mode2 === "photo" ? 32 : mode2 === "poster" ? 10 : 8)));
+    const segmentColors = mode2 === "logo" ? 0 : Math.min(32, Math.max(2, defaults.maxColors || (mode2 === "photo" ? 32 : mode2 === "poster" ? 10 : 8)));
     return {
       mode: mode2,
       maxColors: segmentColors,
@@ -1353,7 +1464,7 @@
       fitGeometry: true,
       smoothness: defaults.smoothness,
       corner: defaults.corner,
-      seal: true,
+      seal: mode2 === "photo" || mode2 === "poster",
       sealWidth: defaults.stacking === "cutout" ? 2 : 0.8
     };
   }
@@ -1373,12 +1484,11 @@
       simplify: controls.simplify
     };
   }
-  function paletteFromRaster(rgba, ignore) {
+  function paletteFromRaster(rgba, _ignore) {
     const seen = /* @__PURE__ */ new Set();
     for (let index = 0; index < rgba.length; index += 4) {
       if ((rgba[index + 3] ?? 0) < 250) continue;
       const color = "#" + byte(rgba[index] ?? 0) + byte(rgba[index + 1] ?? 0) + byte(rgba[index + 2] ?? 0);
-      if (color === ignore) continue;
       seen.add(color);
     }
     return [...seen].sort();
@@ -1393,17 +1503,49 @@
     for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 255) === 0) clear += 1;
     return clear / pixels2;
   }
-  function styleVectors(svg2, controls, droppedColor) {
+  function styleVectors(svg2, controls, droppedColor, borderColor = null) {
     let fitted = svg2;
     if (droppedColor !== null) fitted = dropFill(fitted, droppedColor);
-    if (controls.dropPlate) fitted = dropCanvasBackground(fitted);
+    if (controls.dropPlate) fitted = dropCanvasBackground(fitted, borderColor);
     if (controls.fitGeometry) fitted = fitShapes(fitted);
-    const faired = fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
-    const sealed = groupPathsByFill(controls.seal ? sealGaps(faired, controls.sealWidth) : faired);
+    const flat = controls.mode === "logo" || controls.mode === "icon";
+    const faired = flat ? fitted : fairPaths(fitted, { smoothness: controls.smoothness, cornerDegrees: controls.corner });
+    const sealed = groupPathsByFill(!flat && controls.seal ? sealGaps(faired, controls.sealWidth) : faired);
     return { fitted, faired, sealed };
   }
   function byte(value) {
     return value.toString(16).padStart(2, "0");
+  }
+
+  // src/flat-trace.ts
+  function cornerColor(rgba, width2, height2) {
+    const points = [
+      [0, 0],
+      [width2 - 1, 0],
+      [0, height2 - 1],
+      [width2 - 1, height2 - 1]
+    ];
+    const opaque2 = [];
+    for (const point of points) {
+      const x = point[0] ?? 0;
+      const y = point[1] ?? 0;
+      const offset = (y * width2 + x) * 4;
+      if ((rgba[offset + 3] ?? 0) < 250) continue;
+      opaque2.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
+    }
+    if (opaque2.length === 0) return null;
+    const mean = {
+      r: opaque2.reduce((sum, color) => sum + color.r, 0) / opaque2.length,
+      g: opaque2.reduce((sum, color) => sum + color.g, 0) / opaque2.length,
+      b: opaque2.reduce((sum, color) => sum + color.b, 0) / opaque2.length
+    };
+    for (const color of opaque2) {
+      if (Math.abs(color.r - mean.r) > 18 || Math.abs(color.g - mean.g) > 18 || Math.abs(color.b - mean.b) > 18) return null;
+    }
+    return hex(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
+  }
+  function hex(red, green, blue) {
+    return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
   }
 
   // src/punch-rgba.ts
@@ -1435,7 +1577,7 @@
       }
       next[offset + 3] = 255;
     }
-    return { rgba: next, droppedColor: hex(sentinel) };
+    return { rgba: next, droppedColor: hex2(sentinel) };
   }
   function revealSentinel(rgba, droppedColor) {
     if (droppedColor === null) return rgba;
@@ -1457,7 +1599,7 @@
     for (let color = 0; color < 16777216; color += 97) if (!used.has(color)) return color;
     return 16711935;
   }
-  function hex(color) {
+  function hex2(color) {
     return "#" + color.toString(16).padStart(6, "0");
   }
 
@@ -1471,21 +1613,27 @@
       return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
     }
     const source2 = options.mode === "poster" ? grayscale(rgba, count) : rgba;
-    const samples = collectSamples(source2, width2, height2);
+    const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
+    const samples = collectSamples(source2, width2, height2, cutoff);
     const centroids = cluster(samples, colorCap(options));
     const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
     const areas = new Uint32Array(centroids.length);
     for (let index = 0; index < count; index += 1) {
+      if ((source2[index * 4 + 3] ?? 0) < cutoff) continue;
       const label = nearest(pixelAt(source2, index), centroids);
       areas[label] = (areas[label] ?? 0) + 1;
     }
     const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
     const labels = new Int16Array(count);
-    for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source2, index), palette);
+    labels.fill(-1);
+    for (let index = 0; index < count; index += 1) {
+      if ((source2[index * 4 + 3] ?? 0) < cutoff) continue;
+      labels[index] = nearest(pixelAt(source2, index), palette);
+    }
     cleanupEdges(labels, width2, height2);
     mergeSpecks(labels, width2, height2, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
     const opaque2 = new Uint8Array(count);
-    opaque2.fill(255);
+    for (let index = 0; index < count; index += 1) opaque2[index] = (source2[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
     const colors = paintLabels(labels, palette, opaque2);
     const alpha = opaque2.slice();
     if (options.removeBackground) clearFlatBackdrop(source2, labels, width2, height2, palette, alpha, options.backdropSpread ?? 22);
@@ -1525,14 +1673,14 @@
     }
     return next;
   }
-  function collectSamples(rgba, width2, height2) {
+  function collectSamples(rgba, width2, height2, cutoff) {
     const target = 8e3;
     const stride = Math.max(1, Math.floor(Math.sqrt(width2 * height2 / target)));
     const samples = [];
     for (let y = 0; y < height2; y += stride) {
       for (let x = 0; x < width2; x += stride) {
         const offset = (y * width2 + x) * 4;
-        if ((rgba[offset + 3] ?? 0) < 128) continue;
+        if ((rgba[offset + 3] ?? 0) < cutoff) continue;
         samples.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
       }
     }
@@ -1637,12 +1785,13 @@
       for (let y = 1; y < height2 - 1; y += 1) {
         for (let x = 1; x < width2 - 1; x += 1) {
           const index = y * width2 + x;
-          if (isThin(original, width2, index)) continue;
+          if ((original[index] ?? -1) < 0 || isThin(original, width2, index)) continue;
           const counts = /* @__PURE__ */ new Map();
           for (let dy = -1; dy <= 1; dy += 1) {
             for (let dx = -1; dx <= 1; dx += 1) {
               if (dx === 0 && dy === 0) continue;
-              const label = original[index + dy * width2 + dx] ?? 0;
+              const label = original[index + dy * width2 + dx] ?? -1;
+              if (label < 0) continue;
               counts.set(label, (counts.get(label) ?? 0) + 1);
             }
           }
@@ -1674,7 +1823,11 @@
     const queue = new Int32Array(count);
     for (let start = 0; start < count; start += 1) {
       if (seen[start] === 1) continue;
-      const label = labels[start] ?? 0;
+      const label = labels[start] ?? -1;
+      if (label < 0) {
+        seen[start] = 1;
+        continue;
+      }
       let head = 0;
       let tail = 0;
       queue[tail] = start;
@@ -1720,8 +1873,8 @@
           const nx = next % width2;
           const ny = Math.floor(next / width2);
           if (Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
-          const other = labels[next] ?? label;
-          if (other === label) continue;
+          const other = labels[next] ?? -1;
+          if (other < 0 || other === label) continue;
           around.set(other, (around.get(other) ?? 0) + 1);
         }
       }
@@ -1904,6 +2057,10 @@
   var frameId = 0;
   var traceTimer = 0;
   var traceSerial = 0;
+  var flatSvg = "";
+  var flatKey = "";
+  var flatMs = 0;
+  var flatPlates = [];
   form.addEventListener("submit", (event) => event.preventDefault());
   form.addEventListener("input", onEdit);
   form.addEventListener("change", onEdit);
@@ -1958,6 +2115,10 @@
   function render() {
     if (source.length === 0) return;
     const controls = readControls();
+    if (controls.mode === "logo" || controls.mode === "icon") {
+      renderFlat(controls);
+      return;
+    }
     const started = performance.now();
     const views = segmentViews(source, width, height, {
       mode: controls.mode,
@@ -1965,7 +2126,8 @@
       removeBackground: controls.removeBackground,
       snapBlends: controls.snapBlends,
       speckArea: controls.speckArea,
-      backdropSpread: controls.backdropSpread
+      backdropSpread: controls.backdropSpread,
+      opaqueAt: controls.opaqueAt
     });
     const punched = punchRgba(views.backdrop, width, height, controls.opaqueAt);
     const punchShown = revealSentinel(punched.rgba, punched.droppedColor);
@@ -1974,9 +2136,10 @@
     paintCanvas("thumb-colors", views.colors);
     paintCanvas("thumb-backdrop", views.backdrop);
     paintCanvas("thumb-punch", punchShown);
+    const border = cornerColor(source, width, height);
     const request = traceRequest(controls, paletteFromRaster(punched.rgba, punched.droppedColor));
     const key = rasterKey(punched.rgba, request);
-    const styled = svg !== "" ? styleVectors(svg, controls, punched.droppedColor) : null;
+    const styled = svg !== "" ? styleVectors(svg, controls, punched.droppedColor, border) : null;
     const current = svgKey === key && styled !== null;
     if (current && styled !== null) {
       heldVectors = styled;
@@ -2069,7 +2232,7 @@
       svg = payload.svg;
       svgKey = key;
       traceMs = Math.round(performance.now() - started);
-      const styled = styleVectors(svg, readControls(), droppedColor);
+      const styled = styleVectors(svg, readControls(), droppedColor, cornerColor(source, width, height));
       setSvgThumb("thumb-trace", svg);
       setSvgThumb("thumb-fit", styled.fitted);
       setSvgThumb("thumb-fair", styled.faired);
@@ -2185,7 +2348,7 @@
     syncOutputs();
   }
   function syncOutputs() {
-    setOutput(maxColors, maxColors.value);
+    setOutput(maxColors, maxColors.value === "0" ? "\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34" : maxColors.value);
     setOutput(speck, speck.value);
     setOutput(spread, spread.value);
     setOutput(opaque, opaque.value);
@@ -2200,6 +2363,120 @@
     const tolerance = 0.4 + Number(smooth.value) * 2.2;
     smoothHint.textContent = "\u0E23\u0E30\u0E22\u0E30\u0E22\u0E2D\u0E21 " + tolerance.toFixed(1) + " px \u0E0A\u0E48\u0E27\u0E07\u0E17\u0E35\u0E48\u0E22\u0E32\u0E27\u0E16\u0E39\u0E01\u0E22\u0E37\u0E14\u0E40\u0E1B\u0E47\u0E19\u0E40\u0E2A\u0E49\u0E19\u0E15\u0E23\u0E07";
     cornerHint.textContent = "\u0E40\u0E01\u0E47\u0E1A\u0E21\u0E38\u0E21\u0E17\u0E35\u0E48\u0E40\u0E25\u0E35\u0E49\u0E22\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E19\u0E49\u0E2D\u0E22 " + String(Math.max(0, 90 - Number(corner.value))) + "\xB0 \u0E41\u0E25\u0E30\u0E14\u0E49\u0E32\u0E19\u0E22\u0E32\u0E27\u0E01\u0E27\u0E48\u0E32 3 px";
+  }
+  function renderFlat(controls) {
+    paintCanvas("thumb-capture", source);
+    const key = rasterKey(source, {
+      preset: controls.mode,
+      maxColors: controls.maxColors,
+      smoothness: controls.smoothness,
+      removeBackground: controls.removeBackground,
+      stacking: controls.stacking,
+      simplify: controls.corner
+    });
+    const ready = flatKey === key && flatSvg !== "";
+    paintCanvas("thumb-colors", source);
+    paintCanvas("thumb-backdrop", source);
+    paintCanvas("thumb-punch", source);
+    if (ready) {
+      setSvgThumb("thumb-trace", flatSvg);
+      setSvgThumb("thumb-fit", flatSvg);
+      setSvgThumb("thumb-fair", flatSvg);
+      setSvgThumb("thumb-seal", flatSvg);
+      paintFlatPlates();
+    }
+    showChrome();
+    const vectorStep = selected === "trace" || selected === "fit" || selected === "fair" || selected === "seal";
+    if (!vectorStep) {
+      sourcePhoto.hidden = true;
+      stageVector.hidden = true;
+      stageRaster.hidden = false;
+      if (selected === "capture" || !ready) paintCanvasElement(stageRaster, source);
+      else paintFlatPlates(stageRaster);
+    } else {
+      sourcePhoto.hidden = true;
+      stageRaster.hidden = true;
+      stageVector.hidden = false;
+      if (ready) stageVector.innerHTML = sizedSvg(flatSvg);
+    }
+    frame.classList.toggle("waiting", !ready && selected !== "capture");
+    const facts = ready ? scoreSvg(flatSvg) : null;
+    metricColors.textContent = facts === null ? "\u2013" : String(facts.colors);
+    metricAnchors.textContent = facts === null ? "\u2013" : String(listAnchors(flatSvg).length);
+    metricTime.textContent = ready ? flatMs + " ms" : "\u2026";
+    explain.textContent = flatDescription(selected, controls, facts);
+    spreadNow.textContent = "\u0E42\u0E2B\u0E21\u0E14\u0E42\u0E25\u0E42\u0E01\u0E49\u0E41\u0E25\u0E30\u0E44\u0E2D\u0E04\u0E2D\u0E19\u0E41\u0E22\u0E01\u0E08\u0E32\u0E19\u0E2A\u0E35\u0E15\u0E48\u0E2D\u0E0A\u0E34\u0E49\u0E19 \u0E08\u0E36\u0E07\u0E44\u0E21\u0E48\u0E43\u0E0A\u0E49\u0E40\u0E01\u0E13\u0E11\u0E4C\u0E01\u0E23\u0E30\u0E08\u0E32\u0E22\u0E02\u0E2D\u0E07\u0E1E\u0E37\u0E49\u0E19";
+    paintChips(facts?.palette ?? []);
+    status.textContent = ready ? "\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E41\u0E1A\u0E19 " + String(flatMs) + " ms" : "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E08\u0E31\u0E14\u0E2A\u0E35\u0E15\u0E48\u0E2D\u0E0A\u0E34\u0E49\u0E19\u0E41\u0E25\u0E49\u0E27\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19";
+    if (!ready) queueFlat(key, controls);
+  }
+  function flatDescription(step, controls, facts) {
+    const colors = controls.maxColors <= 0 ? "\u0E08\u0E33\u0E19\u0E27\u0E19\u0E2A\u0E35\u0E2D\u0E31\u0E15\u0E42\u0E19\u0E21\u0E31\u0E15\u0E34" : "\u0E40\u0E1E\u0E14\u0E32\u0E19 " + String(controls.maxColors) + " \u0E2A\u0E35";
+    if (step === "capture") return "\u0E20\u0E32\u0E1E\u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A " + String(width) + "\xD7" + String(height) + " \u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25";
+    if (step === "colors" || step === "backdrop" || step === "punch") return "\u0E08\u0E32\u0E19\u0E2A\u0E35 OKLab \u0E15\u0E48\u0E2D\u0E0A\u0E34\u0E49\u0E19 \u0E02\u0E22\u0E32\u0E22 8 \u0E40\u0E17\u0E48\u0E32 \u0E41\u0E25\u0E49\u0E27\u0E23\u0E30\u0E1A\u0E32\u0E22\u0E2A\u0E35\u0E41\u0E1A\u0E19 \xB7 " + colors;
+    if (facts === null) return "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E08\u0E32\u0E01\u0E20\u0E32\u0E1E\u0E2A\u0E35\u0E41\u0E1A\u0E19";
+    if (step === "trace" || step === "fit") return "VTracer \u0E15\u0E32\u0E21\u0E2A\u0E35\u0E17\u0E35\u0E48\u0E25\u0E47\u0E2D\u0E01 \u0E22\u0E48\u0E2D\u0E01\u0E25\u0E31\u0E1A 1/8 \u0E41\u0E25\u0E49\u0E27\u0E08\u0E31\u0E1A\u0E23\u0E39\u0E1B \xB7 " + String(facts.colors) + " \u0E2A\u0E35";
+    return "\u0E40\u0E01\u0E25\u0E32\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E1A\u0E32 \u0E46 \u0E40\u0E2B\u0E25\u0E37\u0E2D " + String(facts.anchors) + " \u0E08\u0E38\u0E14 \u0E42\u0E14\u0E22\u0E44\u0E21\u0E48\u0E16\u0E21\u0E23\u0E2D\u0E22\u0E17\u0E31\u0E1A";
+  }
+  function queueFlat(key, controls) {
+    window.clearTimeout(traceTimer);
+    const serial = ++traceSerial;
+    traceTimer = window.setTimeout(() => {
+      void sendFlat(serial, key, controls);
+    }, 120);
+  }
+  async function sendFlat(serial, key, controls) {
+    const started = performance.now();
+    try {
+      const response = await fetch("/api/pipeline", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          png: await pngBase64(source),
+          settings: {
+            preset: controls.mode,
+            maxColors: controls.maxColors,
+            smoothness: controls.smoothness,
+            corner: controls.corner,
+            removeBackground: controls.removeBackground,
+            stacking: controls.stacking
+          }
+        })
+      });
+      if (serial !== traceSerial) return;
+      const payload = await response.json();
+      if (serial !== traceSerial || payload.cancelled === true) return;
+      if (!response.ok || payload.svg === void 0) {
+        status.textContent = payload.error ?? "\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08";
+        return;
+      }
+      flatSvg = payload.svg;
+      flatPlates = payload.plates ?? [];
+      flatKey = key;
+      flatMs = Math.round(performance.now() - started);
+      render();
+    } catch (error) {
+      if (serial !== traceSerial) return;
+      status.textContent = error instanceof Error ? error.message : "\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08";
+    }
+  }
+  function paintFlatPlates(target) {
+    const canvases = target === void 0 ? [byId("thumb-colors"), byId("thumb-backdrop"), byId("thumb-punch")] : [target];
+    const plates = flatPlates;
+    for (const canvas of canvases) {
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (context === null) continue;
+      context.clearRect(0, 0, width, height);
+      for (const plate of plates) {
+        const image = new Image();
+        image.onload = () => {
+          context.drawImage(image, plate.originX, plate.originY, plate.width / 8, plate.height / 8);
+        };
+        image.src = "data:image/png;base64," + plate.png;
+      }
+    }
   }
   function setOutput(input, text) {
     const output = document.querySelector("output[for='" + input.id + "']");

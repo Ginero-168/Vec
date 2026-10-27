@@ -45,8 +45,46 @@
     const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
     return Math.round((0.4 + clamped * 2.2) * 100) / 100;
   }
+  function relaxPaths(svg, tolerance = 0.15) {
+    const limit = Math.min(0.5, Math.max(0.05, Number.isFinite(tolerance) ? tolerance : 0.15));
+    return svg.replace(shapePattern(), (tag) => {
+      if (!/^<path\b/i.test(tag)) return tag;
+      const quoted = readD(tag);
+      if (quoted === null) return tag;
+      const parsed = parsePath(quoted.value);
+      if (parsed === null || parsed.length === 0) return tag;
+      const relaxed = parsed.map((subpath) => relaxSubpath(subpath, limit));
+      const next = serialize(relaxed);
+      if (next === quoted.value) return tag;
+      return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+    });
+  }
+  function relaxSubpath(subpath, tolerance) {
+    const cubics = subpath.cubics.slice();
+    let guard = cubics.length;
+    let merged = true;
+    while (merged && cubics.length > 1 && guard > 0) {
+      merged = false;
+      guard -= 1;
+      const last = subpath.closed ? cubics.length : cubics.length - 1;
+      for (let index = 0; index < last; index += 1) {
+        const nextIndex = (index + 1) % cubics.length;
+        if (nextIndex === 0) continue;
+        const first = cubics[index];
+        const second = cubics[nextIndex];
+        if (first === void 0 || second === void 0) continue;
+        const fitted = fitSamples(sampleChain([first, second]), tolerance, outgoing(first), incoming(second), 0);
+        const replacement = fitted?.[0];
+        if (fitted === null || fitted.length !== 1 || replacement === void 0) continue;
+        cubics.splice(index, 2, replacement);
+        merged = true;
+        break;
+      }
+    }
+    return { cubics, closed: subpath.closed };
+  }
   function fairPaths(svg, options) {
-    const tolerance = fairTolerance(options.smoothness);
+    const tolerance = options.tolerance ?? fairTolerance(options.smoothness);
     const minTurn = 90 - Math.min(90, Math.max(0, Number.isFinite(options.cornerDegrees) ? options.cornerDegrees : 0));
     return svg.replace(shapePattern(), (tag) => {
       if (!/^<path\b/i.test(tag)) return tag;
@@ -188,8 +226,8 @@
   function parseHex(color) {
     const match = /^#([0-9a-f]{6})$/i.exec(color.trim());
     if (match === null) return null;
-    const hex2 = match[1] ?? "";
-    return [Number.parseInt(hex2.slice(0, 2), 16), Number.parseInt(hex2.slice(2, 4), 16), Number.parseInt(hex2.slice(4, 6), 16)];
+    const hex3 = match[1] ?? "";
+    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
   }
   function readD(tag) {
     const match = /\bd\s*=\s*(["'])([\s\S]*?)\1/i.exec(tag);
@@ -1077,7 +1115,7 @@
   }
   function crc32(data) {
     let crc = 4294967295;
-    for (const byte2 of data) crc = (CRC_TABLE[(crc ^ byte2) & 255] ?? 0) ^ crc >>> 8;
+    for (const byte3 of data) crc = (CRC_TABLE[(crc ^ byte3) & 255] ?? 0) ^ crc >>> 8;
     return (crc ^ 4294967295) >>> 0;
   }
   function chunk(type, data) {
@@ -1159,23 +1197,55 @@
     seen.add(fill);
     palette.push(fill);
   }
-  function dropCanvasBackground(svg) {
+  function dropCanvasBackground(svg, borderColor) {
+    if (borderColor === void 0 || borderColor === null || borderColor.trim() === "") return svg;
+    const border = normalizeFill(borderColor);
+    if (border === null) return svg;
     const size = canvasSize(svg);
     if (size === null) return svg;
     const matches = pathTags(svg);
     if (matches.length < 2) return svg;
     let chosen = null;
+    let chosenArea = 0;
     for (const tag of matches) {
       const measured = measureTag(tag);
       if (measured === null) continue;
-      const spanX = measured.maxX - measured.minX;
-      const spanY = measured.maxY - measured.minY;
-      const covers = spanX >= size.width * 0.9 && spanY >= size.height * 0.9;
-      if (!covers) continue;
-      if (chosen === null || measured.area > (measureTag(chosen)?.area ?? 0)) chosen = tag;
+      const fill = normalizeFill(fillOf(tagAttrs(tag.source)));
+      if (fill === null || !samePaint(fill, border)) continue;
+      if (edgesTouched(measured, size.width, size.height) < 3) continue;
+      if (chosen === null || measured.area > chosenArea) {
+        chosen = tag;
+        chosenArea = measured.area;
+      }
     }
     if (chosen === null) return svg;
     return svg.slice(0, chosen.index) + svg.slice(chosen.index + chosen.length);
+  }
+  function edgesTouched(measured, width, height) {
+    let left = false;
+    let right = false;
+    let top = false;
+    let bottom = false;
+    for (const point of measured.samples) {
+      if (point.x <= 1) left = true;
+      if (point.y <= 1) top = true;
+      if (point.x >= width - 1) right = true;
+      if (point.y >= height - 1) bottom = true;
+    }
+    return Number(left) + Number(right) + Number(top) + Number(bottom);
+  }
+  function samePaint(fill, border) {
+    if (fill === border) return true;
+    const left = rgbOf(fill);
+    const right = rgbOf(border);
+    if (left === null || right === null) return false;
+    return Math.abs(left[0] - right[0]) <= 18 && Math.abs(left[1] - right[1]) <= 18 && Math.abs(left[2] - right[2]) <= 18;
+  }
+  function rgbOf(fill) {
+    const match = /^#([0-9a-f]{6})$/i.exec(fill);
+    if (match === null) return null;
+    const hex3 = match[1] ?? "";
+    return [Number.parseInt(hex3.slice(0, 2), 16), Number.parseInt(hex3.slice(2, 4), 16), Number.parseInt(hex3.slice(4, 6), 16)];
   }
   function dropFill(svg, fill) {
     const target = normalizeFill(fill);
@@ -1230,6 +1300,8 @@
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
+    const squircle = fitSquircle(measured);
+    if (squircle !== null) return '<path d="' + squircle + '"' + fillAttr + "/>";
     return null;
   }
   function fitRect(measured) {
@@ -1362,6 +1434,83 @@
     const expected = Math.PI * rx * ry;
     if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.12) return null;
     return { cx, cy, rx, ry };
+  }
+  function fitSquircle(measured) {
+    const width = measured.maxX - measured.minX;
+    const height = measured.maxY - measured.minY;
+    if (!(width >= 8) || !(height >= 8) || measured.samples.length < 16) return null;
+    const cx = (measured.minX + measured.maxX) / 2;
+    const cy = (measured.minY + measured.maxY) / 2;
+    const rx = width / 2;
+    const ry = height / 2;
+    let corners = 0;
+    for (const point of measured.samples) {
+      if ((point.x - cx) * (point.y - cy) !== 0 && Math.abs(point.x - cx) > rx * 0.45 && Math.abs(point.y - cy) > ry * 0.45) corners += 1;
+    }
+    if (corners < 4) return null;
+    let bestN = 0;
+    let bestError = Infinity;
+    for (let n = 3.5; n <= 6.0001; n += 0.25) {
+      const error = squircleError(measured.samples, cx, cy, rx, ry, n);
+      if (error < bestError) {
+        bestError = error;
+        bestN = n;
+      }
+    }
+    if (!(bestError <= 0.5)) return null;
+    const expected = squircleArea(rx, ry, bestN);
+    if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.08) return null;
+    const path2 = squirclePath(cx, cy, rx, ry, bestN);
+    return pathError(path2, cx, cy, rx, ry, bestN) <= 0.2 ? path2 : null;
+  }
+  function squircleError(samples, cx, cy, rx, ry, n) {
+    let worst = 0;
+    for (const point of samples) {
+      const nx = Math.abs(point.x - cx) / rx;
+      const ny = Math.abs(point.y - cy) / ry;
+      const radial = (nx ** n + ny ** n) ** (1 / n);
+      worst = Math.max(worst, Math.abs(radial - 1) * Math.min(rx, ry));
+    }
+    return worst;
+  }
+  function squircleArea(rx, ry, n) {
+    let area = 0;
+    const steps = 720;
+    let previous = squirclePoint(0, 0, rx, ry, n, 0);
+    for (let step = 1; step <= steps; step += 1) {
+      const point = squirclePoint(0, 0, rx, ry, n, step / steps);
+      area += previous.x * point.y - point.x * previous.y;
+      previous = point;
+    }
+    return Math.abs(area) / 2;
+  }
+  function squirclePoint(cx, cy, rx, ry, n, t) {
+    const angle = t * Math.PI * 2;
+    const cosine = Math.cos(angle);
+    const sine = Math.sin(angle);
+    const power = 2 / n;
+    return {
+      x: cx + rx * Math.sign(cosine) * Math.abs(cosine) ** power,
+      y: cy + ry * Math.sign(sine) * Math.abs(sine) ** power
+    };
+  }
+  function squirclePath(cx, cy, rx, ry, n) {
+    const count = 16;
+    const points = [];
+    for (let index = 0; index < count; index += 1) points.push(squirclePoint(cx, cy, rx, ry, n, index / count));
+    let path2 = "M" + fmt2(points[0]?.x ?? cx) + "," + fmt2(points[0]?.y ?? cy);
+    for (let index = 0; index < count; index += 1) {
+      const p0 = points[(index - 1 + count) % count] ?? { x: cx, y: cy };
+      const p1 = points[index] ?? p0;
+      const p2 = points[(index + 1) % count] ?? p1;
+      const p3 = points[(index + 2) % count] ?? p2;
+      path2 += "C" + fmt2(p1.x + (p2.x - p0.x) / 6) + "," + fmt2(p1.y + (p2.y - p0.y) / 6) + " " + fmt2(p2.x - (p3.x - p1.x) / 6) + "," + fmt2(p2.y - (p3.y - p1.y) / 6) + " " + fmt2(p2.x) + "," + fmt2(p2.y);
+    }
+    return path2 + "Z";
+  }
+  function pathError(path2, cx, cy, rx, ry, n) {
+    const measured = measurePath(path2);
+    return squircleError(measured.samples, cx, cy, rx, ry, n);
   }
   function fmt2(value) {
     return String(Math.round(value * 100) / 100);
@@ -1532,8 +1681,8 @@
     if (value === "" || value === "none") return null;
     const short = /^#([0-9a-f]{3})$/.exec(value);
     if (short !== null) {
-      const hex2 = short[1] ?? "";
-      return "#" + hex2[0] + hex2[0] + hex2[1] + hex2[1] + hex2[2] + hex2[2];
+      const hex3 = short[1] ?? "";
+      return "#" + hex3[0] + hex3[0] + hex3[1] + hex3[1] + hex3[2] + hex3[2];
     }
     return value;
   }
@@ -1776,6 +1925,879 @@
     return { value: Number(raw), index: cursor + raw.length };
   }
 
+  // src/color.ts
+  function srgbChannelToLinear(channel) {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  }
+  function linearChannelToSrgb(channel) {
+    const value = Math.min(1, Math.max(0, channel));
+    const encoded = value <= 31308e-7 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
+    return Math.round(Math.min(1, Math.max(0, encoded)) * 255);
+  }
+  function rgbToOklab(color) {
+    const red = srgbChannelToLinear(color.r);
+    const green = srgbChannelToLinear(color.g);
+    const blue = srgbChannelToLinear(color.b);
+    const l = Math.cbrt(0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue);
+    const m = Math.cbrt(0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue);
+    const s = Math.cbrt(0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue);
+    return {
+      L: 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+      a: 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+      b: 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s
+    };
+  }
+  function oklabToRgb(color) {
+    const l = color.L + 0.3963377774 * color.a + 0.2158037573 * color.b;
+    const m = color.L - 0.1055613458 * color.a - 0.0638541728 * color.b;
+    const s = color.L - 0.0894841775 * color.a - 1.291485548 * color.b;
+    const lp = l * l * l;
+    const mp = m * m * m;
+    const sp = s * s * s;
+    return {
+      r: linearChannelToSrgb(4.0767416621 * lp - 3.3077115913 * mp + 0.2309699292 * sp),
+      g: linearChannelToSrgb(-1.2684380046 * lp + 2.6097574011 * mp - 0.3413193965 * sp),
+      b: linearChannelToSrgb(-0.0041960863 * lp - 0.7034186147 * mp + 1.707614701 * sp)
+    };
+  }
+  function labDistance2(left, right) {
+    const dL = left.L - right.L;
+    const da = left.a - right.a;
+    const db = left.b - right.b;
+    return dL * dL + da * da + db * db;
+  }
+
+  // src/flat-trace.ts
+  var UP = 8;
+  var CORE_TAU = 0.035;
+  var REGION_TOLERANCE = 0.06;
+  var OWN_COLOR = 0.05;
+  var DILATE_RADIUS = 3;
+  var SPECK_SOURCE = 1.44;
+  var SMOOTH_SOURCE = 0.6;
+  var K_MAX = 16;
+  function flatPlates(rgba, width, height, maxColors) {
+    const boxes = subjectBoxes(rgba, width, height);
+    return boxes.map((box) => plateFor(rgba, width, height, box, maxColors));
+  }
+  function subjectBoxes(rgba, width, height) {
+    const found = enclosedBoxes(rgba, width, height);
+    if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
+    return found;
+  }
+  function plateFor(rgba, width, height, box, maxColors) {
+    const cropW = box.width;
+    const cropH = box.height;
+    const crop = new Uint8Array(cropW * cropH * 4);
+    for (let y = 0; y < cropH; y += 1) {
+      const from = ((box.y + y) * width + box.x) * 4;
+      crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
+    }
+    const painted = labelImage(crop, cropW, cropH, maxColors);
+    return {
+      rgba: painted.rgba,
+      width: painted.width,
+      height: painted.height,
+      scale: UP,
+      palette: painted.palette,
+      originX: box.x,
+      originY: box.y,
+      sourceWidth: cropW,
+      sourceHeight: cropH,
+      borderColor: cornerColor(crop, cropW, cropH)
+    };
+  }
+  function cornerColor(rgba, width, height) {
+    const points = [
+      [0, 0],
+      [width - 1, 0],
+      [0, height - 1],
+      [width - 1, height - 1]
+    ];
+    const opaque = [];
+    for (const point of points) {
+      const x = point[0] ?? 0;
+      const y = point[1] ?? 0;
+      const offset = (y * width + x) * 4;
+      if ((rgba[offset + 3] ?? 0) < 250) continue;
+      opaque.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
+    }
+    if (opaque.length === 0) return null;
+    const mean = {
+      r: opaque.reduce((sum, color) => sum + color.r, 0) / opaque.length,
+      g: opaque.reduce((sum, color) => sum + color.g, 0) / opaque.length,
+      b: opaque.reduce((sum, color) => sum + color.b, 0) / opaque.length
+    };
+    for (const color of opaque) {
+      if (Math.abs(color.r - mean.r) > 18 || Math.abs(color.g - mean.g) > 18 || Math.abs(color.b - mean.b) > 18) return null;
+    }
+    return hex2(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
+  }
+  function labelImage(rgba, width, height, maxColors) {
+    const count = width * height;
+    const lab = new Float64Array(count * 3);
+    const linear = new Float64Array(count * 3);
+    const alpha = new Uint8Array(count);
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * 4;
+      const color = { r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 };
+      alpha[index] = (rgba[offset + 3] ?? 0) >= 128 ? 255 : 0;
+      const converted = rgbToOklab(color);
+      lab[index * 3] = converted.L;
+      lab[index * 3 + 1] = converted.a;
+      lab[index * 3 + 2] = converted.b;
+      linear[index * 3] = srgbToLinear(color.r);
+      linear[index * 3 + 1] = srgbToLinear(color.g);
+      linear[index * 3 + 2] = srgbToLinear(color.b);
+    }
+    let core = coreMask(lab, alpha, width, height, CORE_TAU);
+    if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08);
+    const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
+    const centers = buildPalette(lab, core, width, height, userK);
+    const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
+    const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
+    return paintLabels(labels, colors, width * UP, height * UP);
+  }
+  function assignLabels(linear, lab, core, alpha, width, height, centers) {
+    const count = width * height;
+    const kCount = centers.length;
+    const coreLabel = new Int16Array(count);
+    coreLabel.fill(-1);
+    for (let index = 0; index < count; index += 1) {
+      if (core[index] !== 1) continue;
+      coreLabel[index] = nearestLab(readLab(lab, index), centers);
+    }
+    const allow = new Uint16Array(count);
+    const disk = diskOffsets(DILATE_RADIUS);
+    for (let index = 0; index < count; index += 1) {
+      const label = coreLabel[index] ?? -1;
+      if (label < 0) continue;
+      const x = index % width;
+      const y = (index - x) / width;
+      for (const offset of disk) {
+        const nx = x + offset.x;
+        const ny = y + offset.y;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const at = ny * width + nx;
+        allow[at] = (allow[at] ?? 0) | 1 << label;
+      }
+    }
+    const square = squareOffsets(1);
+    for (let index = 0; index < count; index += 1) {
+      if (alpha[index] === 0) continue;
+      const color = readLab(lab, index);
+      let near = 0;
+      for (let label = 0; label < kCount; label += 1) {
+        const center = centers[label];
+        if (center === void 0) continue;
+        if (Math.sqrt(labDistance2(color, center)) >= OWN_COLOR) continue;
+        near |= 1 << label;
+      }
+      if (near === 0) continue;
+      const x = index % width;
+      const y = (index - x) / width;
+      for (const offset of square) {
+        const nx = x + offset.x;
+        const ny = y + offset.y;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const at = ny * width + nx;
+        allow[at] = (allow[at] ?? 0) | near;
+      }
+    }
+    const all = (1 << kCount) - 1;
+    for (let index = 0; index < count; index += 1) if ((allow[index] ?? 0) === 0) allow[index] = all;
+    const upW = width * UP;
+    const upH = height * UP;
+    const labels = new Uint8Array(upW * upH);
+    labels.fill(255);
+    const tile = 48;
+    for (let y0 = 0; y0 < height; y0 += tile) {
+      const y1 = Math.min(height, y0 + tile);
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          if (alpha[y * width + x] === 0) continue;
+          const mask = allow[y * width + x] ?? all;
+          const bits = bitList(mask, kCount);
+          for (let oy = 0; oy < UP; oy += 1) {
+            for (let ox = 0; ox < UP; ox += 1) {
+              const ux = x * UP + ox;
+              const uy = y * UP + oy;
+              const at = uy * upW + ux;
+              if (bits.length === 1) {
+                labels[at] = bits[0] ?? 0;
+                continue;
+              }
+              const sample = bicubicLab(linear, width, height, (ux + 0.5) / UP - 0.5, (uy + 0.5) / UP - 0.5);
+              labels[at] = explain(sample, bits, centers);
+            }
+          }
+        }
+      }
+    }
+    cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP));
+    smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (alpha[y * width + x] !== 0) continue;
+        for (let oy = 0; oy < UP; oy += 1) {
+          for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
+        }
+      }
+    }
+    return labels;
+  }
+  function explain(sample, bits, centers) {
+    let best = bits[0] ?? 0;
+    let bestDistance = Infinity;
+    for (const label of bits) {
+      const center = centers[label];
+      if (center === void 0) continue;
+      const distance3 = Math.sqrt(labDistance2(sample, center));
+      if (distance3 < bestDistance) {
+        bestDistance = distance3;
+        best = label;
+      }
+    }
+    for (let left = 0; left < bits.length; left += 1) {
+      for (let right = left + 1; right < bits.length; right += 1) {
+        const a = bits[left];
+        const b = bits[right];
+        if (a === void 0 || b === void 0) continue;
+        const first = centers[a];
+        const second = centers[b];
+        if (first === void 0 || second === void 0) continue;
+        const projected = projectLab(sample, first, second);
+        if (projected.distance < bestDistance) {
+          bestDistance = projected.distance;
+          best = projected.t < 0.5 ? a : b;
+        }
+      }
+    }
+    return best;
+  }
+  function fillColors(rgba, alpha, core, labels, width, height, centers) {
+    const sums = centers.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
+    const upW = width * UP;
+    const mid = UP >> 1;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (alpha[index] === 0 || core[index] !== 1) continue;
+        const label = labels[(y * UP + mid) * upW + x * UP + mid] ?? 255;
+        const bin = sums[label];
+        if (bin === void 0) continue;
+        const offset = index * 4;
+        bin.r += rgba[offset] ?? 0;
+        bin.g += rgba[offset + 1] ?? 0;
+        bin.b += rgba[offset + 2] ?? 0;
+        bin.n += 1;
+      }
+    }
+    return centers.map((center, index) => {
+      const bin = sums[index];
+      if (bin !== void 0 && bin.n > 4) return { r: Math.round(bin.r / bin.n), g: Math.round(bin.g / bin.n), b: Math.round(bin.b / bin.n) };
+      return oklabToRgb(center);
+    });
+  }
+  function paintLabels(labels, colors, width, height) {
+    const used = /* @__PURE__ */ new Map();
+    const palette = [];
+    const rgba = new Uint8Array(width * height * 4);
+    for (let index = 0; index < labels.length; index += 1) {
+      const label = labels[index] ?? 255;
+      if (label === 255) continue;
+      let slot = used.get(label);
+      if (slot === void 0) {
+        const color2 = colors[label] ?? { r: 0, g: 0, b: 0 };
+        const paint = hex2(color2.r, color2.g, color2.b);
+        slot = palette.indexOf(paint);
+        if (slot < 0) {
+          slot = palette.length;
+          palette.push(paint);
+        }
+        used.set(label, slot);
+      }
+      const color = colors[label] ?? { r: 0, g: 0, b: 0 };
+      const offset = index * 4;
+      rgba[offset] = color.r;
+      rgba[offset + 1] = color.g;
+      rgba[offset + 2] = color.b;
+      rgba[offset + 3] = 255;
+    }
+    return { rgba, width, height, palette };
+  }
+  function buildPalette(lab, core, width, height, userK) {
+    const bins = /* @__PURE__ */ new Map();
+    for (let index = 0; index < core.length; index += 1) {
+      if (core[index] !== 1) continue;
+      const color = readLab(lab, index);
+      const key = Math.round(color.L / 8e-3) + "," + Math.round(color.a / 8e-3) + "," + Math.round(color.b / 8e-3);
+      const bin = bins.get(key) ?? { x: 0, y: 0, z: 0, n: 0 };
+      bin.x += color.L;
+      bin.y += color.a;
+      bin.z += color.b;
+      bin.n += 1;
+      bins.set(key, bin);
+    }
+    const samples = [];
+    const weights = [];
+    for (const bin of bins.values()) {
+      if (bin.n === 0) continue;
+      samples.push({ L: bin.x / bin.n, a: bin.y / bin.n, b: bin.z / bin.n });
+      weights.push(Math.log1p(bin.n));
+    }
+    if (samples.length === 0) return [{ L: 0, a: 0, b: 0 }];
+    const regions = regionMeans(lab, core, width, height);
+    if (userK > 0) return wkmeans(samples, weights, Math.min(userK, samples.length));
+    let chosen = wkmeans(samples, weights, Math.min(2, samples.length));
+    if (regions.length === 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(2, Math.min(8, samples.length))));
+    for (let k = 2; k <= Math.min(K_MAX, samples.length); k += 1) {
+      chosen = wkmeans(samples, weights, k);
+      const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region)) > REGION_TOLERANCE));
+      if (!missed) return chosen;
+    }
+    return chosen;
+  }
+  function regionMeans(lab, core, width, height) {
+    const groups = /* @__PURE__ */ new Map();
+    for (let index = 0; index < core.length; index += 1) {
+      if (core[index] !== 1) continue;
+      const color = readLab(lab, index);
+      const key = (Math.round(color.L / 0.05) + 40) * 1e4 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
+      const list = groups.get(key);
+      if (list === void 0) groups.set(key, [index]);
+      else list.push(index);
+    }
+    const means = [];
+    for (const pixels of groups.values()) {
+      const member = new Uint8Array(core.length);
+      for (const index of pixels) member[index] = 1;
+      const labeled = components(member, width, height);
+      for (let id = 1; id <= labeled.count; id += 1) {
+        const size = labeled.sizes[id] ?? 0;
+        if (size < 12) continue;
+        let l = 0;
+        let a = 0;
+        let b = 0;
+        const values = [];
+        for (let index = 0; index < member.length; index += 1) {
+          if ((labeled.ids[index] ?? 0) !== id) continue;
+          const color = readLab(lab, index);
+          values.push(color);
+          l += color.L;
+          a += color.a;
+          b += color.b;
+        }
+        const n = values.length;
+        if (n === 0) continue;
+        const mean = { L: l / n, a: a / n, b: b / n };
+        let varL = 0;
+        let varA = 0;
+        let varB = 0;
+        for (const color of values) {
+          varL += (color.L - mean.L) ** 2;
+          varA += (color.a - mean.a) ** 2;
+          varB += (color.b - mean.b) ** 2;
+        }
+        const spread = Math.max(Math.sqrt(varL / n), Math.sqrt(varA / n), Math.sqrt(varB / n));
+        if (spread < 0.015) means.push(mean);
+      }
+    }
+    return means;
+  }
+  function wkmeans(samples, weights, kCount) {
+    const count = samples.length;
+    const k = Math.max(1, Math.min(kCount, count));
+    let first = 0;
+    let bestWeight = -1;
+    for (let index = 0; index < count; index += 1) {
+      const weight = weights[index] ?? 0;
+      if (weight > bestWeight) {
+        bestWeight = weight;
+        first = index;
+      }
+    }
+    const chosen = [first];
+    const distance3 = new Float64Array(count);
+    for (let index = 0; index < count; index += 1) distance3[index] = Math.sqrt(labDistance2(samples[index] ?? zeroLab(), samples[first] ?? zeroLab()));
+    while (chosen.length < k) {
+      let at = 0;
+      let score = -1;
+      for (let index = 0; index < count; index += 1) {
+        const next = (distance3[index] ?? 0) * Math.sqrt(weights[index] ?? 0);
+        if (next > score) {
+          score = next;
+          at = index;
+        }
+      }
+      chosen.push(at);
+      const center = samples[at] ?? zeroLab();
+      for (let index = 0; index < count; index += 1) {
+        distance3[index] = Math.min(distance3[index] ?? 0, Math.sqrt(labDistance2(samples[index] ?? zeroLab(), center)));
+      }
+    }
+    const centers = chosen.map((index) => ({ ...samples[index] ?? zeroLab() }));
+    for (let round = 0; round < 40; round += 1) {
+      const bins = centers.map(() => ({ L: 0, a: 0, b: 0, w: 0 }));
+      for (let index = 0; index < count; index += 1) {
+        const sample = samples[index] ?? zeroLab();
+        const slot = nearestLab(sample, centers);
+        const bin = bins[slot];
+        const weight = weights[index] ?? 0;
+        if (bin === void 0) continue;
+        bin.L += sample.L * weight;
+        bin.a += sample.a * weight;
+        bin.b += sample.b * weight;
+        bin.w += weight;
+      }
+      for (let index = 0; index < centers.length; index += 1) {
+        const bin = bins[index];
+        if (bin === void 0 || bin.w === 0) continue;
+        centers[index] = { L: bin.L / bin.w, a: bin.a / bin.w, b: bin.b / bin.w };
+      }
+    }
+    return centers;
+  }
+  function cleanLabels(labels, width, height, kCount, minArea) {
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (let label = 0; label < kCount; label += 1) {
+        const mask = new Uint8Array(labels.length);
+        for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mask[index] = 1;
+        const labeled = components(mask, width, height);
+        const small = new Uint8Array(labels.length);
+        let any = false;
+        for (let index = 0; index < labels.length; index += 1) {
+          const id = labeled.ids[index] ?? 0;
+          if (id > 0 && (labeled.sizes[id] ?? 0) < minArea) {
+            small[index] = 1;
+            any = true;
+          }
+        }
+        if (!any) continue;
+        const replacement = nearestOutside(labels, small, width, height);
+        for (let index = 0; index < labels.length; index += 1) if (small[index] === 1) labels[index] = replacement[index] ?? label;
+      }
+    }
+  }
+  function nearestOutside(labels, small, width, height) {
+    const nearest2 = new Uint8Array(labels.length);
+    const seen = new Uint8Array(labels.length);
+    const queue = [];
+    for (let index = 0; index < small.length; index += 1) {
+      if (small[index] === 1) continue;
+      seen[index] = 1;
+      nearest2[index] = labels[index] ?? 0;
+      queue.push(index);
+    }
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const index = queue[cursor] ?? 0;
+      const x = index % width;
+      const y = (index - x) / width;
+      const around = [index - 1, index + 1, index - width, index + width];
+      for (const next of around) {
+        if (next < 0 || next >= labels.length || seen[next] === 1) continue;
+        const nx = next % width;
+        if (Math.abs(nx - x) + Math.abs((next - nx) / width - y) !== 1) continue;
+        seen[next] = 1;
+        nearest2[next] = nearest2[index] ?? 0;
+        queue.push(next);
+      }
+    }
+    return nearest2;
+  }
+  function smoothLabels(labels, width, height, kCount, sigma) {
+    if (!(sigma > 0)) return;
+    const kernel = gaussianKernel(sigma);
+    const best = new Float64Array(labels.length);
+    best.fill(-1);
+    const next = labels.slice();
+    const mask = new Float64Array(labels.length);
+    const blurred = new Float64Array(labels.length);
+    for (let label = 0; label < kCount; label += 1) {
+      for (let index = 0; index < labels.length; index += 1) mask[index] = labels[index] === label ? 1 : 0;
+      blurSeparable(mask, blurred, width, height, kernel);
+      for (let index = 0; index < labels.length; index += 1) {
+        const value = blurred[index] ?? 0;
+        if (value > (best[index] ?? -1)) {
+          best[index] = value;
+          next[index] = label;
+        }
+      }
+    }
+    labels.set(next);
+  }
+  function enclosedBoxes(rgba, width, height) {
+    const count = width * height;
+    if (width < 2 || height < 2 || rgba.length < count * 4) return [];
+    const lab = new Float64Array(count * 3);
+    const opaque = new Uint8Array(count);
+    for (let index = 0; index < count; index += 1) {
+      const offset = index * 4;
+      opaque[index] = (rgba[offset + 3] ?? 0) >= 128 ? 1 : 0;
+      const color = rgbToOklab({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
+      lab[index * 3] = color.L;
+      lab[index * 3 + 1] = color.a;
+      lab[index * 3 + 2] = color.b;
+    }
+    const edge = new Uint8Array(count);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (opaque[index] !== 1) continue;
+        const color = readLab(lab, index);
+        let strong = false;
+        for (const step of [-1, 1, -width, width]) {
+          const next = index + step;
+          const nx = x + (step === -1 ? -1 : step === 1 ? 1 : 0);
+          const ny = y + (step === -width ? -1 : step === width ? 1 : 0);
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          if (opaque[next] !== 1) {
+            strong = true;
+            break;
+          }
+          if (Math.sqrt(labDistance2(color, readLab(lab, next))) > 0.06) {
+            strong = true;
+            break;
+          }
+        }
+        if (strong) edge[index] = 1;
+      }
+    }
+    const outside = new Uint8Array(count);
+    const queue = [];
+    for (let x = 0; x < width; x += 1) {
+      seedOutside(0 * width + x, edge, outside, queue);
+      seedOutside((height - 1) * width + x, edge, outside, queue);
+    }
+    for (let y = 0; y < height; y += 1) {
+      seedOutside(y * width, edge, outside, queue);
+      seedOutside(y * width + width - 1, edge, outside, queue);
+    }
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const index = queue[cursor] ?? 0;
+      const x = index % width;
+      const y = (index - x) / width;
+      const steps = [
+        [x - 1, y],
+        [x + 1, y],
+        [x, y - 1],
+        [x, y + 1]
+      ];
+      for (const step of steps) {
+        const nx = step[0] ?? 0;
+        const ny = step[1] ?? 0;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        seedOutside(ny * width + nx, edge, outside, queue);
+      }
+    }
+    const object = new Uint8Array(count);
+    for (let index = 0; index < count; index += 1) if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
+    const labeled = components(object, width, height);
+    const boxes = [];
+    for (let id = 1; id <= labeled.count; id += 1) {
+      if ((labeled.sizes[id] ?? 0) < 400) continue;
+      let minX = width;
+      let minY = height;
+      let maxX = 0;
+      let maxY = 0;
+      for (let index = 0; index < count; index += 1) {
+        if ((labeled.ids[index] ?? 0) !== id) continue;
+        const x2 = index % width;
+        const y2 = (index - x2) / width;
+        if (x2 < minX) minX = x2;
+        if (y2 < minY) minY = y2;
+        if (x2 > maxX) maxX = x2;
+        if (y2 > maxY) maxY = y2;
+      }
+      const pad = 2;
+      const x = Math.max(0, minX - pad);
+      const y = Math.max(0, minY - pad);
+      boxes.push({ x, y, width: Math.min(width, maxX + 1 + pad) - x, height: Math.min(height, maxY + 1 + pad) - y });
+    }
+    return mergeBoxes(boxes, 8);
+  }
+  function seedOutside(index, edge, outside, queue) {
+    if (edge[index] === 1 || outside[index] === 1) return;
+    outside[index] = 1;
+    queue.push(index);
+  }
+  function mergeBoxes(boxes, gap) {
+    const open = boxes.map((box) => ({ ...box }));
+    let merged = true;
+    while (merged) {
+      merged = false;
+      for (let left = 0; left < open.length; left += 1) {
+        for (let right = left + 1; right < open.length; right += 1) {
+          const a = open[left];
+          const b = open[right];
+          if (a === void 0 || b === void 0) continue;
+          const apart = a.x > b.x + b.width + gap || b.x > a.x + a.width + gap || a.y > b.y + b.height + gap || b.y > a.y + a.height + gap;
+          if (apart) continue;
+          const x = Math.min(a.x, b.x);
+          const y = Math.min(a.y, b.y);
+          open[left] = { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
+          open.splice(right, 1);
+          merged = true;
+          break;
+        }
+        if (merged) break;
+      }
+    }
+    return open;
+  }
+  function coreMask(lab, alpha, width, height, tau) {
+    const core = new Uint8Array(width * height);
+    const limit = tau * tau;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (alpha[index] === 0) continue;
+        const color = readLab(lab, index);
+        let worst = 0;
+        let flat = true;
+        for (let dy = -1; dy <= 1 && flat; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = Math.min(width - 1, Math.max(0, x + dx));
+            const ny = Math.min(height - 1, Math.max(0, y + dy));
+            const next = ny * width + nx;
+            if (alpha[next] === 0) {
+              flat = false;
+              break;
+            }
+            worst = Math.max(worst, labDistance2(color, readLab(lab, next)));
+            if (worst >= limit) flat = false;
+          }
+        }
+        if (flat && worst < limit) core[index] = 1;
+      }
+    }
+    return core;
+  }
+  function components(mask, width, height) {
+    const ids = new Int32Array(mask.length);
+    const sizes = [0];
+    const stack = [];
+    for (let start2 = 0; start2 < mask.length; start2 += 1) {
+      if (mask[start2] !== 1 || ids[start2] !== 0) continue;
+      const id = sizes.length;
+      sizes.push(0);
+      stack.push(start2);
+      ids[start2] = id;
+      while (stack.length > 0) {
+        const index = stack.pop() ?? 0;
+        sizes[id] = (sizes[id] ?? 0) + 1;
+        const x = index % width;
+        const y = (index - x) / width;
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const next = ny * width + nx;
+            if (mask[next] !== 1 || ids[next] !== 0) continue;
+            ids[next] = id;
+            stack.push(next);
+          }
+        }
+      }
+    }
+    return { ids, sizes: Int32Array.from(sizes), count: sizes.length - 1 };
+  }
+  function bicubicLab(linear, width, height, sx, sy) {
+    const x0 = Math.floor(sx);
+    const y0 = Math.floor(sy);
+    const fx = sx - x0;
+    const fy = sy - y0;
+    let red = 0;
+    let green = 0;
+    let blue = 0;
+    for (let ky = -1; ky <= 2; ky += 1) {
+      const wy = keys(fy - ky);
+      const y = reflect101(y0 + ky, height);
+      for (let kx = -1; kx <= 2; kx += 1) {
+        const weight = wy * keys(fx - kx);
+        const x = reflect101(x0 + kx, width);
+        const offset = (y * width + x) * 3;
+        red += (linear[offset] ?? 0) * weight;
+        green += (linear[offset + 1] ?? 0) * weight;
+        blue += (linear[offset + 2] ?? 0) * weight;
+      }
+    }
+    return rgbToOklab({ r: linearToSrgb(red), g: linearToSrgb(green), b: linearToSrgb(blue) });
+  }
+  function blurSeparable(source, target, width, height, kernel) {
+    const radius = kernel.length - 1 >> 1;
+    const temp = new Float64Array(source.length);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        let sum = 0;
+        for (let tap = -radius; tap <= radius; tap += 1) sum += (source[y * width + reflect101(x + tap, width)] ?? 0) * (kernel[tap + radius] ?? 0);
+        temp[y * width + x] = sum;
+      }
+    }
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        let sum = 0;
+        for (let tap = -radius; tap <= radius; tap += 1) sum += (temp[reflect101(y + tap, height) * width + x] ?? 0) * (kernel[tap + radius] ?? 0);
+        target[y * width + x] = sum;
+      }
+    }
+  }
+  function gaussianKernel(sigma) {
+    const radius = Math.max(1, Math.ceil(sigma * 3));
+    const kernel = new Float64Array(radius * 2 + 1);
+    let sum = 0;
+    for (let index = -radius; index <= radius; index += 1) {
+      const weight = Math.exp(-(index * index) / (2 * sigma * sigma));
+      kernel[index + radius] = weight;
+      sum += weight;
+    }
+    for (let index = 0; index < kernel.length; index += 1) kernel[index] = (kernel[index] ?? 0) / sum;
+    return kernel;
+  }
+  function projectLab(color, left, right) {
+    const dL = right.L - left.L;
+    const da = right.a - left.a;
+    const db = right.b - left.b;
+    const length = dL * dL + da * da + db * db;
+    const raw = length === 0 ? 0 : ((color.L - left.L) * dL + (color.a - left.a) * da + (color.b - left.b) * db) / length;
+    const t = Math.min(1, Math.max(0, raw));
+    const mixed = { L: left.L + t * dL, a: left.a + t * da, b: left.b + t * db };
+    return { t, distance: Math.sqrt(labDistance2(color, mixed)) };
+  }
+  function nearestLab(color, centers) {
+    let best = 0;
+    let score = Infinity;
+    for (let index = 0; index < centers.length; index += 1) {
+      const center = centers[index];
+      if (center === void 0) continue;
+      const gap = labDistance2(color, center);
+      if (gap < score) {
+        score = gap;
+        best = index;
+      }
+    }
+    return best;
+  }
+  function bitList(mask, kCount) {
+    const bits = [];
+    for (let label = 0; label < kCount; label += 1) if ((mask & 1 << label) !== 0) bits.push(label);
+    return bits;
+  }
+  function squareOffsets(radius) {
+    const offsets = [];
+    for (let y = -radius; y <= radius; y += 1) {
+      for (let x = -radius; x <= radius; x += 1) offsets.push({ x, y });
+    }
+    return offsets;
+  }
+  function diskOffsets(radius) {
+    const offsets = [];
+    const limit = radius * radius;
+    for (let y = -radius; y <= radius; y += 1) {
+      for (let x = -radius; x <= radius; x += 1) if (x * x + y * y <= limit) offsets.push({ x, y });
+    }
+    return offsets;
+  }
+  function readLab(lab, index) {
+    return { L: lab[index * 3] ?? 0, a: lab[index * 3 + 1] ?? 0, b: lab[index * 3 + 2] ?? 0 };
+  }
+  function countOf(mask) {
+    let count = 0;
+    for (const value of mask) if (value === 1) count += 1;
+    return count;
+  }
+  function zeroLab() {
+    return { L: 0, a: 0, b: 0 };
+  }
+  function reflect101(index, length) {
+    if (length <= 1) return 0;
+    const span = length * 2 - 2;
+    let wrapped = index % span;
+    if (wrapped < 0) wrapped += span;
+    return wrapped >= length ? span - wrapped : wrapped;
+  }
+  function keys(distance3) {
+    const t = Math.abs(distance3);
+    if (t <= 1) return (1.25 * t - 2.25) * t * t + 1;
+    if (t < 2) return ((-0.75 * t + 3.75) * t - 6) * t + 3;
+    return 0;
+  }
+  function srgbToLinear(channel) {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  }
+  function linearToSrgb(channel) {
+    const value = Math.min(1, Math.max(0, channel));
+    const encoded = value <= 31308e-7 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
+    return Math.round(Math.min(1, Math.max(0, encoded)) * 255);
+  }
+  function hex2(red, green, blue) {
+    return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
+  }
+
+  // src/trace.ts
+  function presetDefaults(preset) {
+    if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
+    if (preset === "poster") return { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" };
+    if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
+    return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
+  }
+  function simplifyTolerance(smoothness) {
+    const clamped = Math.min(3, Math.max(0, smoothness));
+    const tolerance = 2.2 - clamped * 0.75;
+    return Math.round(Math.max(0.15, tolerance) * 100) / 100;
+  }
+  function resolveVtracer(fallback) {
+    const override = process.env.VTRACER_BIN?.trim();
+    return override ? override : fallback;
+  }
+  function clampInt(value, min, max) {
+    return Math.min(max, Math.max(min, Math.round(value)));
+  }
+  function vtracerArguments(input, output, request) {
+    const simplify = request.simplify ?? simplifyTolerance(request.smoothness);
+    const args = [
+      input,
+      output,
+      "--mode",
+      "spline",
+      "--optimize",
+      "1",
+      "--hierarchical",
+      request.stacking,
+      "--simplify",
+      Math.min(2.5, Math.max(0.15, simplify)).toFixed(2)
+    ];
+    if (request.maxColors > 0) args.push("--max-colors", String(Math.round(request.maxColors)));
+    if (request.palette !== void 0 && request.palette.length > 0 && request.palette.length <= 32) {
+      args.push("--palette", request.palette.join(","));
+    }
+    const precision = request.colorPrecision ?? (request.preset === "photo" ? 8 : request.preset === "poster" ? 4 : request.preset === "icon" ? 5 : 6);
+    const speckle = request.filterSpeckle ?? (request.preset === "photo" ? 1 : 0);
+    args.push("--preset", request.preset === "photo" ? "photo" : "poster", "--color-precision", String(clampInt(precision, 1, 8)), "--filter-speckle", String(clampInt(speckle, 0, 128)));
+    const watershed = request.clustering === "watershed" || request.clustering === void 0 && request.preset === "photo";
+    if (watershed) args.push("--clustering", "watershed", "--watershed-detail", String(clampInt(request.watershedDetail ?? 128, 1, 512)));
+    return args;
+  }
+
+  // src/lab-model.ts
+  function paletteFromRaster2(rgba, _ignore) {
+    const seen = /* @__PURE__ */ new Set();
+    for (let index = 0; index < rgba.length; index += 4) {
+      if ((rgba[index + 3] ?? 0) < 250) continue;
+      const color = "#" + byte2(rgba[index] ?? 0) + byte2(rgba[index + 1] ?? 0) + byte2(rgba[index + 2] ?? 0);
+      seen.add(color);
+    }
+    return [...seen].sort();
+  }
+  function byte2(value) {
+    return value.toString(16).padStart(2, "0");
+  }
+
   // src/segment.ts
   var MODE_CAP = { logo: 8, icon: 8, photo: 32, poster: 10 };
   var SPECK_AREA = { logo: 18, icon: 12, photo: 6, poster: 28 };
@@ -1789,32 +2811,38 @@
       return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
     }
     const source = options.mode === "poster" ? grayscale(rgba, count) : rgba;
-    const samples = collectSamples(source, width, height);
+    const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
+    const samples = collectSamples(source, width, height, cutoff);
     const centroids = cluster(samples, colorCap(options));
     const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
     const areas = new Uint32Array(centroids.length);
     for (let index = 0; index < count; index += 1) {
+      if ((source[index * 4 + 3] ?? 0) < cutoff) continue;
       const label = nearest(pixelAt(source, index), centroids);
       areas[label] = (areas[label] ?? 0) + 1;
     }
     const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
     const labels = new Int16Array(count);
-    for (let index = 0; index < count; index += 1) labels[index] = nearest(pixelAt(source, index), palette);
+    labels.fill(-1);
+    for (let index = 0; index < count; index += 1) {
+      if ((source[index * 4 + 3] ?? 0) < cutoff) continue;
+      labels[index] = nearest(pixelAt(source, index), palette);
+    }
     cleanupEdges(labels, width, height);
     mergeSpecks(labels, width, height, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
     const opaque = new Uint8Array(count);
-    opaque.fill(255);
-    const colors = paintLabels(labels, palette, opaque);
+    for (let index = 0; index < count; index += 1) opaque[index] = (source[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
+    const colors = paintLabels2(labels, palette, opaque);
     const alpha = opaque.slice();
     if (options.removeBackground) clearFlatBackdrop(source, labels, width, height, palette, alpha, options.backdropSpread ?? 22);
     return {
       colors,
-      backdrop: paintLabels(labels, palette, alpha),
+      backdrop: paintLabels2(labels, palette, alpha),
       spread: borderMeasure(source, width, height)?.spread ?? 0,
       paletteSize: palette.length
     };
   }
-  function paintLabels(labels, palette, alpha) {
+  function paintLabels2(labels, palette, alpha) {
     const next = new Uint8Array(alpha.length * 4);
     for (let index = 0; index < alpha.length; index += 1) {
       const offset = index * 4;
@@ -1843,14 +2871,14 @@
     }
     return next;
   }
-  function collectSamples(rgba, width, height) {
+  function collectSamples(rgba, width, height, cutoff) {
     const target = 8e3;
     const stride = Math.max(1, Math.floor(Math.sqrt(width * height / target)));
     const samples = [];
     for (let y = 0; y < height; y += stride) {
       for (let x = 0; x < width; x += stride) {
         const offset = (y * width + x) * 4;
-        if ((rgba[offset + 3] ?? 0) < 128) continue;
+        if ((rgba[offset + 3] ?? 0) < cutoff) continue;
         samples.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
       }
     }
@@ -1955,12 +2983,13 @@
       for (let y = 1; y < height - 1; y += 1) {
         for (let x = 1; x < width - 1; x += 1) {
           const index = y * width + x;
-          if (isThin(original, width, index)) continue;
+          if ((original[index] ?? -1) < 0 || isThin(original, width, index)) continue;
           const counts = /* @__PURE__ */ new Map();
           for (let dy = -1; dy <= 1; dy += 1) {
             for (let dx = -1; dx <= 1; dx += 1) {
               if (dx === 0 && dy === 0) continue;
-              const label = original[index + dy * width + dx] ?? 0;
+              const label = original[index + dy * width + dx] ?? -1;
+              if (label < 0) continue;
               counts.set(label, (counts.get(label) ?? 0) + 1);
             }
           }
@@ -1992,7 +3021,11 @@
     const queue = new Int32Array(count);
     for (let start2 = 0; start2 < count; start2 += 1) {
       if (seen[start2] === 1) continue;
-      const label = labels[start2] ?? 0;
+      const label = labels[start2] ?? -1;
+      if (label < 0) {
+        seen[start2] = 1;
+        continue;
+      }
       let head = 0;
       let tail = 0;
       queue[tail] = start2;
@@ -2038,8 +3071,8 @@
           const nx = next % width;
           const ny = Math.floor(next / width);
           if (Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
-          const other = labels[next] ?? label;
-          if (other === label) continue;
+          const other = labels[next] ?? -1;
+          if (other < 0 || other === label) continue;
           around.set(other, (around.get(other) ?? 0) + 1);
         }
       }
@@ -2162,45 +3195,181 @@
     return dr * dr + dg * dg + db * db;
   }
 
-  // src/trace.ts
-  function presetDefaults(preset) {
-    if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
-    if (preset === "poster") return { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" };
-    if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
-    return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
+  // src/svg-scale.ts
+  var COMMAND = /([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)/g;
+  var NUMBER = /[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?/g;
+  function translateSvg(svg, dx, dy) {
+    if (dx === 0 && dy === 0) return svg;
+    return svg.replace(/\bd="([^"]*)"/g, (_full, data) => 'd="' + translatePath(data, dx, dy) + '"');
   }
-  function simplifyTolerance(smoothness) {
-    const clamped = Math.min(3, Math.max(0, smoothness));
-    const tolerance = 2.2 - clamped * 0.75;
-    return Math.round(Math.max(0.15, tolerance) * 100) / 100;
+  function translatePath(data, dx, dy) {
+    return data.replace(COMMAND, (_full, command, rest) => {
+      const numbers = rest.match(NUMBER);
+      if (numbers === null || command === command.toLowerCase()) return command + rest;
+      const kind = command.toLowerCase();
+      if (kind === "z") return command;
+      if (kind === "h") return command + numbers.map((value) => format(Number(value) + dx)).join(" ");
+      if (kind === "v") return command + numbers.map((value) => format(Number(value) + dy)).join(" ");
+      if (kind === "a") {
+        const moved2 = [];
+        for (let index = 0; index + 6 < numbers.length; index += 7) {
+          moved2.push(
+            numbers[index] ?? "0",
+            numbers[index + 1] ?? "0",
+            numbers[index + 2] ?? "0",
+            numbers[index + 3] ?? "0",
+            numbers[index + 4] ?? "0",
+            format(Number(numbers[index + 5]) + dx),
+            format(Number(numbers[index + 6]) + dy)
+          );
+        }
+        return command + moved2.join(" ");
+      }
+      const moved = [];
+      for (let index = 0; index < numbers.length; index += 2) {
+        moved.push(format(Number(numbers[index]) + dx), format(Number(numbers[index + 1]) + dy));
+      }
+      return command + moved.join(" ");
+    });
   }
-  function clampInt(value, min, max) {
-    return Math.min(max, Math.max(min, Math.round(value)));
+  function scaleSvg(svg, factor) {
+    if (factor === 1) return svg;
+    const sized = svg.replace(/\b(width|height)="([0-9.]+)"/g, (_full, name, value) => name + '="' + format(Number(value) * factor) + '"').replace(/viewBox="([^"]+)"/g, (_full, value) => 'viewBox="' + value.trim().split(/[\s,]+/).map((part) => format(Number(part) * factor)).join(" ") + '"');
+    return sized.replace(/\bd="([^"]*)"/g, (_full, data) => 'd="' + scalePath(data, factor) + '"');
   }
-  function vtracerArguments(input, output, request) {
-    const simplify = request.simplify ?? simplifyTolerance(request.smoothness);
-    const args = [
-      input,
-      output,
-      "--mode",
-      "spline",
-      "--optimize",
-      "1",
-      "--hierarchical",
-      request.stacking,
-      "--simplify",
-      Math.min(2.2, Math.max(0.15, simplify)).toFixed(2)
-    ];
-    if (request.maxColors > 0) args.push("--max-colors", String(Math.round(request.maxColors)));
-    if (request.palette !== void 0 && request.palette.length > 0 && request.palette.length <= 32) {
-      args.push("--palette", request.palette.join(","));
+  function scalePath(data, factor) {
+    return data.replace(COMMAND, (_full, command, rest) => {
+      const numbers = rest.match(NUMBER);
+      if (numbers === null) return command;
+      const kind = command.toLowerCase();
+      if (kind === "z") return command;
+      if (kind === "a") {
+        const scaled = [];
+        for (let index = 0; index + 6 < numbers.length; index += 7) {
+          scaled.push(
+            format(Number(numbers[index]) * factor),
+            format(Number(numbers[index + 1]) * factor),
+            numbers[index + 2] ?? "0",
+            numbers[index + 3] ?? "0",
+            numbers[index + 4] ?? "0",
+            format(Number(numbers[index + 5]) * factor),
+            format(Number(numbers[index + 6]) * factor)
+          );
+        }
+        return command + scaled.join(" ");
+      }
+      return command + numbers.map((value) => format(Number(value) * factor)).join(" ");
+    });
+  }
+  function format(value) {
+    if (!Number.isFinite(value)) return "0";
+    const rounded = Math.round(value * 1e3) / 1e3;
+    return String(rounded);
+  }
+
+  // src/trace-finish.ts
+  var SHAPE = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
+  function mergePlates(svgs, plates, width, height, droppedColor, removeBackground) {
+    const drawings = [];
+    for (let index = 0; index < svgs.length; index += 1) {
+      const plate = plates[index];
+      const svg = svgs[index];
+      if (plate === void 0 || svg === void 0) continue;
+      let next = scaleSvg(svg, 1 / plate.scale);
+      if (droppedColor !== null) next = dropFill(next, droppedColor);
+      if (removeBackground) next = dropCanvasBackground(next, plate.borderColor);
+      next = translateSvg(next, plate.originX, plate.originY);
+      drawings.push((next.match(SHAPE) ?? []).join(""));
     }
-    const precision = request.colorPrecision ?? (request.preset === "photo" ? 8 : request.preset === "poster" ? 4 : request.preset === "icon" ? 5 : 6);
-    const speckle = request.filterSpeckle ?? (request.preset === "photo" ? 1 : 0);
-    args.push("--preset", request.preset === "photo" ? "photo" : "poster", "--color-precision", String(clampInt(precision, 1, 8)), "--filter-speckle", String(clampInt(speckle, 0, 128)));
-    const watershed = request.clustering === "watershed" || request.clustering === void 0 && request.preset === "photo";
-    if (watershed) args.push("--clustering", "watershed", "--watershed-detail", String(clampInt(request.watershedDetail ?? 128, 1, 512)));
-    return args;
+    const merged = '<svg xmlns="http://www.w3.org/2000/svg" width="' + String(width) + '" height="' + String(height) + '" viewBox="0 0 ' + String(width) + " " + String(height) + '">' + drawings.join("") + "</svg>";
+    return fitShapes(merged);
+  }
+
+  // src/trace-pipeline.ts
+  function planTrace(source, settings) {
+    const decoded = readRgbaPng(source);
+    if (decoded === null) return null;
+    if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);
+    return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
+  }
+  function fittedPlan(svgs, plan, removeBackground) {
+    return mergePlates(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, removeBackground);
+  }
+  function styledTraceSvg(fitted, settings) {
+    if (settings.preset === "logo" || settings.preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
+    const stroke = settings.stacking === "cutout" ? 2 : 0.8;
+    return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
+  }
+  function planFlat(rgba, width, height, settings) {
+    const plates = flatPlates(rgba, width, height, settings.maxColors);
+    return {
+      width,
+      height,
+      droppedColor: null,
+      plates: plates.map((plate) => ({
+        png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
+        scale: plate.scale,
+        originX: plate.originX,
+        originY: plate.originY,
+        borderColor: plate.borderColor,
+        request: flatRequest(settings, plate.palette, plate.scale)
+      }))
+    };
+  }
+  function flatRequest(settings, palette, scale) {
+    return {
+      preset: settings.preset,
+      maxColors: 0,
+      smoothness: 0,
+      removeBackground: settings.removeBackground,
+      stacking: "stacked",
+      palette: palette.slice(0, 32),
+      colorPrecision: 8,
+      filterSpeckle: Math.min(128, Math.floor(Math.sqrt(1.44) * scale)),
+      clustering: "off",
+      simplify: Math.round(0.3 * scale * 100) / 100
+    };
+  }
+  function cappedPalette(colors, sentinel) {
+    const unique = [...new Set(colors.map((color) => color.toLowerCase()))];
+    const mark = sentinel?.trim().toLowerCase() ?? "";
+    if (!/^#[0-9a-f]{6}$/.test(mark) || !unique.includes(mark)) return unique.slice(0, 32);
+    const rest = unique.filter((color) => color !== mark);
+    return [...rest.slice(0, 31), mark];
+  }
+  function planSegmented(rgba, width, height, settings) {
+    const segmented = segmentRaster(rgba, width, height, {
+      mode: settings.preset,
+      maxColors: settings.maxColors,
+      removeBackground: settings.removeBackground,
+      opaqueAt: settings.preset === "photo" || settings.preset === "poster" ? 128 : 200
+    });
+    const punched = punchTransparency(encodeRgbaPng(width, height, segmented), settings.preset === "photo" || settings.preset === "poster" ? 128 : 200);
+    const decoded = readRgbaPng(punched.png);
+    const palette = decoded === null ? [] : cappedPalette(paletteFromRaster2(decoded.rgba, punched.droppedColor), punched.droppedColor);
+    const locked = palette.length > 0;
+    return {
+      width,
+      height,
+      droppedColor: punched.droppedColor,
+      plates: [
+        {
+          png: punched.png,
+          scale: 1,
+          originX: 0,
+          originY: 0,
+          borderColor: cornerColor(rgba, width, height),
+          request: {
+            preset: settings.preset,
+            maxColors: locked ? 0 : settings.maxColors,
+            smoothness: settings.smoothness,
+            removeBackground: settings.removeBackground,
+            stacking: settings.stacking,
+            palette: locked ? palette : void 0
+          }
+        }
+      ]
+    };
   }
 
   // src/panel.ts
@@ -2382,20 +3551,9 @@
     } catch (_) {
     }
   }
-  function fittedSource(svg, droppedColor, settings) {
-    let next = svg;
-    if (droppedColor !== null) next = dropFill(next, droppedColor);
-    if (settings.removeBackground) next = dropCanvasBackground(next);
-    return fitShapes(next);
-  }
-  function styledSvg(fitted, settings) {
-    const strokeWidth = settings.stacking === "cutout" ? 2 : 0.8;
-    return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), strokeWidth));
-  }
-  function runVtracer(binary, job, inputPath, palette, onStart) {
-    const request = palette === void 0 ? job.settings : { ...job.settings, palette };
+  function runVtracer(binary, job, inputPath, outputPath, request, onStart) {
     return new Promise((resolve, reject) => {
-      const child = childProcess.spawn(binary, vtracerArguments(inputPath, job.svgPath, request), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+      const child = childProcess.spawn(binary, vtracerArguments(inputPath, outputPath, request), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
       onStart(child);
       let stderr = "";
       child.stderr?.on("data", (chunk2) => {
@@ -2405,7 +3563,7 @@
       child.once("close", (code) => {
         if (job.cancelled) {
           reject(new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27"));
-        } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
+        } else if (code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
           resolve();
         } else {
           reject(new Error("VTracer \u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E\u0E44\u0E21\u0E48\u0E2A\u0E33\u0E40\u0E23\u0E47\u0E08" + (stderr ? ": " + stderr.trim() : "")));
@@ -2770,26 +3928,30 @@
     }
     async function vectorize(selection, job, palette) {
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
-      const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
-      if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer binary \u0E43\u0E19 extension/bin");
+      const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
+      if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer \u0E17\u0E35\u0E48 " + binary);
       const sourcePng = fs.readFileSync(job.pngPath);
-      const decodedSource = readRgbaPng(sourcePng);
-      const prepared = decodedSource === null ? sourcePng : encodeRgbaPng(decodedSource.width, decodedSource.height, segmentRaster(decodedSource.rgba, decodedSource.width, decodedSource.height, {
-        mode: job.settings.preset,
-        maxColors: job.settings.maxColors,
-        removeBackground: job.settings.removeBackground
-      }));
-      const punched = punchTransparency(prepared, job.settings.preset === "photo" || job.settings.preset === "poster" ? 128 : 200);
-      const traceInput = path.join(job.directory, "trace.png");
-      fs.writeFileSync(traceInput, punched.png);
+      const plan = planTrace(sourcePng, job.settings);
+      if (plan === null || plan.plates.length === 0) throw new Error("\u0E2D\u0E48\u0E32\u0E19 PNG \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49");
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E22\u0E01\u0E42\u0E0B\u0E19\u0E2A\u0E35 \u0E41\u0E25\u0E49\u0E27\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E2A\u0E49\u0E19\u0E40\u0E27\u0E01\u0E40\u0E15\u0E2D\u0E23\u0E4C\u2026");
-      await runVtracer(binary, job, traceInput, palette, (child) => {
-        state = { kind: "tracing", selection, job, child };
-        render();
-      });
-      fittedSvg = fittedSource(fs.readFileSync(job.svgPath, "utf8"), punched.droppedColor, job.settings);
+      const svgs = [];
+      for (let index = 0; index < plan.plates.length; index += 1) {
+        const plate = plan.plates[index];
+        if (plate === void 0) continue;
+        const pngPath = path.join(job.directory, "trace-" + String(index) + ".png");
+        const svgPath = path.join(job.directory, "trace-" + String(index) + ".svg");
+        fs.writeFileSync(pngPath, plate.png);
+        const brushed = palette !== void 0 && job.settings.preset !== "logo" && job.settings.preset !== "icon";
+        const request = brushed ? { ...plate.request, maxColors: 0, palette: cappedPalette(palette, "#ff00ff") } : plate.request;
+        await runVtracer(binary, job, pngPath, svgPath, request, (child) => {
+          state = { kind: "tracing", selection, job, child };
+          render();
+        });
+        svgs.push(fs.readFileSync(svgPath, "utf8"));
+      }
       edited = false;
-      const svgText = styledSvg(fittedSvg, job.settings);
+      fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
+      const svgText = styledTraceSvg(fittedSvg, job.settings);
       fs.writeFileSync(job.svgPath, svgText);
       const decoded = readRgbaPng(sourcePng);
       brushPixels = null;
@@ -2938,8 +4100,9 @@
       const job = state.job;
       try {
         fs.writeFileSync(job.pngPath, encodeRgbaPng(state.raster.width, state.raster.height, brushPixels));
-        message(palette === null ? "\u0E2A\u0E35\u0E21\u0E32\u0E01\u0E01\u0E27\u0E48\u0E32 32 \u0E2A\u0E35 \u0E08\u0E36\u0E07\u0E43\u0E2B\u0E49 VTracer \u0E08\u0E31\u0E14\u0E01\u0E25\u0E38\u0E48\u0E21\u0E2A\u0E35\u0E40\u0E2D\u0E07" : "\u0E43\u0E0A\u0E49\u0E2A\u0E35\u0E08\u0E32\u0E01\u0E41\u0E1B\u0E23\u0E07 " + String(palette.length) + " \u0E2A\u0E35");
-        await vectorize(selection, job, palette ?? void 0);
+        const flat = job.settings.preset === "logo" || job.settings.preset === "icon";
+        message(flat ? "\u0E41\u0E1B\u0E25\u0E07\u0E43\u0E2B\u0E21\u0E48\u0E08\u0E32\u0E01\u0E1E\u0E34\u0E01\u0E40\u0E0B\u0E25\u0E17\u0E35\u0E48\u0E23\u0E30\u0E1A\u0E32\u0E22" : palette === null ? "\u0E2A\u0E35\u0E21\u0E32\u0E01\u0E01\u0E27\u0E48\u0E32 32 \u0E2A\u0E35 \u0E08\u0E36\u0E07\u0E43\u0E2B\u0E49 VTracer \u0E08\u0E31\u0E14\u0E01\u0E25\u0E38\u0E48\u0E21\u0E2A\u0E35\u0E40\u0E2D\u0E07" : "\u0E43\u0E0A\u0E49\u0E2A\u0E35\u0E08\u0E32\u0E01\u0E41\u0E1B\u0E23\u0E07 " + String(palette.length) + " \u0E2A\u0E35");
+        await vectorize(selection, job, flat ? void 0 : palette ?? void 0);
       } catch (error) {
         message(errorMessage(error), true);
         render();
@@ -2985,7 +4148,7 @@
       }
       const before = state.facts.anchors;
       const settings = readSettings(ui);
-      const next = styledSvg(fittedSvg, settings);
+      const next = styledTraceSvg(fittedSvg, settings);
       if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
       commitSvg(next);
       if (state.kind === "preview" && state.facts.anchors !== before) {
@@ -3055,7 +4218,7 @@
         context.putImageData(image, 0, 0);
         pngUrl = canvas.toDataURL("image/png");
       }
-      const shown = styledSvg(svgText, readSettings(ui));
+      const shown = styledTraceSvg(svgText, readSettings(ui));
       state = {
         kind: "preview",
         selection: {

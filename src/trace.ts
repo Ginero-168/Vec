@@ -34,6 +34,12 @@ export function simplifyTolerance(smoothness: number): number {
   return Math.round(Math.max(0.15, tolerance) * 100) / 100;
 }
 
+/** VTRACER_BIN overrides the bundled binary so Linux CI can point at its own build. */
+export function resolveVtracer(fallback: string): string {
+  const override = process.env.VTRACER_BIN?.trim();
+  return override ? override : fallback;
+}
+
 function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
@@ -50,7 +56,7 @@ export function vtracerArguments(input: string, output: string, request: TraceRe
     "--hierarchical",
     request.stacking,
     "--simplify",
-    Math.min(2.2, Math.max(0.15, simplify)).toFixed(2)
+    Math.min(2.5, Math.max(0.15, simplify)).toFixed(2)
   ];
   if (request.maxColors > 0) args.push("--max-colors", String(Math.round(request.maxColors)));
   if (request.palette !== undefined && request.palette.length > 0 && request.palette.length <= 32) {

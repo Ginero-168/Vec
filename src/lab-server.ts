@@ -4,8 +4,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { finishTrace, planTrace, type PipelineSettings } from "./trace-pipeline.ts";
 import type { Stacking, TracePreset, TraceRequest } from "./trace.ts";
-import { vtracerArguments } from "./trace.ts";
+import { resolveVtracer, vtracerArguments } from "./trace.ts";
 
 const root = process.cwd();
 const port = 4191;
@@ -22,8 +23,9 @@ const files: Readonly<Record<string, { readonly file: string; readonly type: str
 };
 
 function binary(): string {
-  if (process.platform === "linux" && existsSync("/tmp/vtracer-linux")) return "/tmp/vtracer-linux";
-  return path.join(root, "extension", "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
+  const bundled = path.join(root, "extension", "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
+  const fallback = process.platform === "linux" && existsSync("/tmp/vtracer-linux") ? "/tmp/vtracer-linux" : bundled;
+  return resolveVtracer(fallback);
 }
 
 function send(response: ServerResponse, status: number, body: string, type = "application/json; charset=utf-8"): void {
@@ -82,6 +84,44 @@ function requestFrom(body: unknown): TraceRequest | null {
     watershedDetail: asNumber(record.watershedDetail, 128),
     simplify: asNumber(record.simplify, 0.4)
   };
+}
+
+function settingsFrom(value: unknown): PipelineSettings | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const preset = asPreset(record.preset);
+  const stacking = asStacking(record.stacking);
+  if (preset === null || stacking === null) return null;
+  const maxColors = asNumber(record.maxColors, 0);
+  const smoothness = asNumber(record.smoothness, 2);
+  const corner = asNumber(record.corner, 35);
+  if (maxColors < 0 || maxColors > 64 || smoothness < 0 || smoothness > 3 || corner < 0 || corner > 90) return null;
+  return { preset, maxColors, smoothness, corner, removeBackground: record.removeBackground === true, stacking };
+}
+
+async function pipeline(png: Buffer, settings: PipelineSettings, ticket: number): Promise<{ readonly svg: string; readonly plates: readonly { readonly png: string; readonly width: number; readonly height: number; readonly originX: number; readonly originY: number }[] }> {
+  const plan = planTrace(png, settings);
+  if (plan === null || plan.plates.length === 0) throw new Error("อ่าน PNG ไม่ได้");
+  const svgs: string[] = [];
+  for (const plate of plan.plates) {
+    if (ticket !== generation) throw new Error("cancelled");
+    svgs.push(await trace(plate.png, plate.request, ticket));
+  }
+  return {
+    svg: finishTrace(svgs, plan, settings),
+    plates: plan.plates.map((plate) => ({
+      png: plate.png.toString("base64"),
+      width: plate.png.length > 0 ? plateImageSize(plate.png).width : 0,
+      height: plate.png.length > 0 ? plateImageSize(plate.png).height : 0,
+      originX: plate.originX,
+      originY: plate.originY
+    }))
+  };
+}
+
+function plateImageSize(png: Buffer): { readonly width: number; readonly height: number } {
+  if (png.length < 24) return { width: 0, height: 0 };
+  return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
 }
 
 function trace(png: Buffer, request: TraceRequest, ticket: number): Promise<string> {
@@ -153,6 +193,39 @@ const server = createServer((request, response) => {
           return;
         }
         send(response, 200, JSON.stringify({ svg }));
+      })
+      .catch((error: unknown) => {
+        if (response.headersSent) return;
+        const message = error instanceof Error ? error.message : "ลากเส้นไม่สำเร็จ";
+        if (message === "cancelled" || ticket !== generation) {
+          send(response, 409, JSON.stringify({ cancelled: true }));
+          return;
+        }
+        send(response, 500, JSON.stringify({ error: message }));
+      });
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/pipeline") {
+    const ticket = ++generation;
+    void readBody(request)
+      .then(async (raw) => {
+        const parsed = JSON.parse(raw.toString("utf8")) as { readonly png?: unknown; readonly settings?: unknown };
+        const settings = settingsFrom(parsed.settings);
+        if (typeof parsed.png !== "string" || settings === null) {
+          send(response, 400, JSON.stringify({ error: "คำขอไม่ครบ" }));
+          return;
+        }
+        const png = Buffer.from(parsed.png, "base64");
+        if (png.length < 8 || png[0] !== 137) {
+          send(response, 400, JSON.stringify({ error: "ไฟล์ที่ส่งมาไม่ใช่ PNG" }));
+          return;
+        }
+        const result = await pipeline(png, settings, ticket);
+        if (ticket !== generation) {
+          if (!response.headersSent) send(response, 409, JSON.stringify({ cancelled: true }));
+          return;
+        }
+        send(response, 200, JSON.stringify(result));
       })
       .catch((error: unknown) => {
         if (response.headersSent) return;

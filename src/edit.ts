@@ -36,8 +36,55 @@ export function fairTolerance(smoothness: number): number {
   return Math.round((0.4 + clamped * 2.2) * 100) / 100;
 }
 
-export function fairPaths(svg: string, options: { readonly smoothness: number; readonly cornerDegrees: number }): string {
-  const tolerance = fairTolerance(options.smoothness);
+/** Fit tolerance in original pixels. The slider still moves it, and it stays under half a pixel. */
+export function geometryTolerance(smoothness: number): number {
+  const clamped = Math.min(3, Math.max(0, Number.isFinite(smoothness) ? smoothness : 0));
+  return Math.round((0.12 + clamped * 0.08) * 100) / 100;
+}
+
+/** Drop anchors whose cubic can be merged without leaving the curve by more than `tolerance` source pixels. */
+export function relaxPaths(svg: string, tolerance = 0.15): string {
+  const limit = Math.min(0.5, Math.max(0.05, Number.isFinite(tolerance) ? tolerance : 0.15));
+  return svg.replace(shapePattern(), (tag) => {
+    if (!/^<path\b/i.test(tag)) return tag;
+    const quoted = readD(tag);
+    if (quoted === null) return tag;
+    const parsed = parsePath(quoted.value);
+    if (parsed === null || parsed.length === 0) return tag;
+    const relaxed = parsed.map((subpath) => relaxSubpath(subpath, limit));
+    const next = serialize(relaxed);
+    if (next === quoted.value) return tag;
+    return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+  });
+}
+
+function relaxSubpath(subpath: Subpath, tolerance: number): Subpath {
+  const cubics = subpath.cubics.slice();
+  let guard = cubics.length;
+  let merged = true;
+  while (merged && cubics.length > 1 && guard > 0) {
+    merged = false;
+    guard -= 1;
+    const last = subpath.closed ? cubics.length : cubics.length - 1;
+    for (let index = 0; index < last; index += 1) {
+      const nextIndex = (index + 1) % cubics.length;
+      if (nextIndex === 0) continue;
+      const first = cubics[index];
+      const second = cubics[nextIndex];
+      if (first === undefined || second === undefined) continue;
+      const fitted = fitSamples(sampleChain([first, second]), tolerance, outgoing(first), incoming(second), 0);
+      const replacement = fitted?.[0];
+      if (fitted === null || fitted.length !== 1 || replacement === undefined) continue;
+      cubics.splice(index, 2, replacement);
+      merged = true;
+      break;
+    }
+  }
+  return { cubics, closed: subpath.closed };
+}
+
+export function fairPaths(svg: string, options: { readonly smoothness: number; readonly cornerDegrees: number; readonly tolerance?: number }): string {
+  const tolerance = options.tolerance ?? fairTolerance(options.smoothness);
   const minTurn = 90 - Math.min(90, Math.max(0, Number.isFinite(options.cornerDegrees) ? options.cornerDegrees : 0));
   return svg.replace(shapePattern(), (tag) => {
     if (!/^<path\b/i.test(tag)) return tag;

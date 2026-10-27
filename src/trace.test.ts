@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { presetDefaults, simplifyTolerance, vtracerArguments } from "./trace.ts";
+import { presetDefaults, resolveVtracer, simplifyTolerance, vtracerArguments } from "./trace.ts";
 
 test("a higher smoothness uses a tighter curve tolerance", () => {
   assert.equal(simplifyTolerance(0), 2.2);
@@ -87,4 +87,22 @@ test("every preset fits splines and the icon preset is not forced to polygons", 
   assert.equal(tuned[tuned.indexOf("--filter-speckle") + 1], "4");
   assert.equal(tuned[tuned.indexOf("--simplify") + 1], "1.25");
   assert.equal(tuned.includes("--clustering"), false);
+  const scaled = vtracerArguments("in.png", "out.svg", {
+    preset: "logo",
+    maxColors: 0,
+    smoothness: 0,
+    removeBackground: false,
+    stacking: "stacked",
+    simplify: 2.4
+  });
+  assert.equal(scaled[scaled.indexOf("--simplify") + 1], "2.40");
+});
+
+test("VTRACER_BIN overrides the bundled binary", () => {
+  const previous = process.env.VTRACER_BIN;
+  process.env.VTRACER_BIN = "/opt/vtracer";
+  assert.equal(resolveVtracer("/usr/bin/vtracer"), "/opt/vtracer");
+  delete process.env.VTRACER_BIN;
+  assert.equal(resolveVtracer("/usr/bin/vtracer"), "/usr/bin/vtracer");
+  if (previous !== undefined) process.env.VTRACER_BIN = previous;
 });

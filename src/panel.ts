@@ -4,11 +4,11 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { expandPrimitives, fairPaths, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape } from "./edit";
-import { readRgbaPng, encodeRgbaPng, punchTransparency } from "./png-alpha";
-import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, holeNote, scoreSvg, sealGaps, shapeNote, type TraceFacts } from "./score";
-import { segmentRaster } from "./segment";
-import { presetDefaults, vtracerArguments, type Stacking, type TracePreset } from "./trace";
+import { expandPrimitives, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape } from "./edit";
+import { encodeRgbaPng, readRgbaPng } from "./png-alpha";
+import { holeNote, scoreSvg, shapeNote, type TraceFacts } from "./score";
+import { cappedPalette, fittedPlan, planTrace, styledTraceSvg } from "./trace-pipeline";
+import { presetDefaults, resolveVtracer, vtracerArguments, type Stacking, type TracePreset, type TraceRequest } from "./trace";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -309,22 +309,9 @@ function cleanStaleJobs(): void {
   }
 }
 
-function fittedSource(svg: string, droppedColor: string | null, settings: Settings): string {
-  let next = svg;
-  if (droppedColor !== null) next = dropFill(next, droppedColor);
-  if (settings.removeBackground) next = dropCanvasBackground(next);
-  return fitShapes(next);
-}
-
-function styledSvg(fitted: string, settings: Settings): string {
-  const strokeWidth = settings.stacking === "cutout" ? 2 : 0.8;
-  return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), strokeWidth));
-}
-
-function runVtracer(binary: string, job: Job, inputPath: string, palette: readonly string[] | undefined, onStart: (child: ChildProcess) => void): Promise<void> {
-  const request = palette === undefined ? job.settings : { ...job.settings, palette };
+function runVtracer(binary: string, job: Job, inputPath: string, outputPath: string, request: TraceRequest, onStart: (child: ChildProcess) => void): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(binary, vtracerArguments(inputPath, job.svgPath, request), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+    const child = childProcess.spawn(binary, vtracerArguments(inputPath, outputPath, request), { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
     onStart(child);
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -334,7 +321,7 @@ function runVtracer(binary: string, job: Job, inputPath: string, palette: readon
     child.once("close", (code) => {
       if (job.cancelled) {
         reject(new Error("ยกเลิกแล้ว"));
-      } else if (code === 0 && fs.existsSync(job.svgPath) && fs.statSync(job.svgPath).size > 0) {
+      } else if (code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
         resolve();
       } else {
         reject(new Error("VTracer แปลงภาพไม่สำเร็จ" + (stderr ? ": " + stderr.trim() : "")));
@@ -718,26 +705,30 @@ function start(): void {
 
   async function vectorize(selection: Selection, job: Job, palette?: readonly string[]): Promise<void> {
     if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
-    const binary = path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer");
-    if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer binary ใน extension/bin");
+    const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
+    if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer ที่ " + binary);
     const sourcePng = fs.readFileSync(job.pngPath);
-    const decodedSource = readRgbaPng(sourcePng);
-    const prepared = decodedSource === null ? sourcePng : encodeRgbaPng(decodedSource.width, decodedSource.height, segmentRaster(decodedSource.rgba, decodedSource.width, decodedSource.height, {
-      mode: job.settings.preset,
-      maxColors: job.settings.maxColors,
-      removeBackground: job.settings.removeBackground
-    }));
-    const punched = punchTransparency(prepared, job.settings.preset === "photo" || job.settings.preset === "poster" ? 128 : 200);
-    const traceInput = path.join(job.directory, "trace.png");
-    fs.writeFileSync(traceInput, punched.png);
+    const plan = planTrace(sourcePng, job.settings);
+    if (plan === null || plan.plates.length === 0) throw new Error("อ่าน PNG ไม่ได้");
     message("กำลังแยกโซนสี แล้วสร้างเส้นเวกเตอร์…");
-    await runVtracer(binary, job, traceInput, palette, (child) => {
-      state = { kind: "tracing", selection, job, child };
-      render();
-    });
-    fittedSvg = fittedSource(fs.readFileSync(job.svgPath, "utf8"), punched.droppedColor, job.settings);
+    const svgs: string[] = [];
+    for (let index = 0; index < plan.plates.length; index += 1) {
+      const plate = plan.plates[index];
+      if (plate === undefined) continue;
+      const pngPath = path.join(job.directory, "trace-" + String(index) + ".png");
+      const svgPath = path.join(job.directory, "trace-" + String(index) + ".svg");
+      fs.writeFileSync(pngPath, plate.png);
+      const brushed = palette !== undefined && job.settings.preset !== "logo" && job.settings.preset !== "icon";
+      const request = brushed ? { ...plate.request, maxColors: 0, palette: cappedPalette(palette, "#ff00ff") } : plate.request;
+      await runVtracer(binary, job, pngPath, svgPath, request, (child) => {
+        state = { kind: "tracing", selection, job, child };
+        render();
+      });
+      svgs.push(fs.readFileSync(svgPath, "utf8"));
+    }
     edited = false;
-    const svgText = styledSvg(fittedSvg, job.settings);
+    fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
+    const svgText = styledTraceSvg(fittedSvg, job.settings);
     fs.writeFileSync(job.svgPath, svgText);
     const decoded = readRgbaPng(sourcePng);
     brushPixels = null;
@@ -891,8 +882,9 @@ function start(): void {
     const job = state.job;
     try {
       fs.writeFileSync(job.pngPath, encodeRgbaPng(state.raster.width, state.raster.height, brushPixels));
-      message(palette === null ? "สีมากกว่า 32 สี จึงให้ VTracer จัดกลุ่มสีเอง" : "ใช้สีจากแปรง " + String(palette.length) + " สี");
-      await vectorize(selection, job, palette ?? undefined);
+      const flat = job.settings.preset === "logo" || job.settings.preset === "icon";
+      message(flat ? "แปลงใหม่จากพิกเซลที่ระบาย" : palette === null ? "สีมากกว่า 32 สี จึงให้ VTracer จัดกลุ่มสีเอง" : "ใช้สีจากแปรง " + String(palette.length) + " สี");
+      await vectorize(selection, job, flat ? undefined : palette ?? undefined);
     } catch (error) {
       message(errorMessage(error), true);
       render();
@@ -942,7 +934,7 @@ function start(): void {
     }
     const before = state.facts.anchors;
     const settings = readSettings(ui);
-    const next = styledSvg(fittedSvg, settings);
+    const next = styledTraceSvg(fittedSvg, settings);
     if (state.job !== null) state = { ...state, job: { ...state.job, settings } };
     commitSvg(next);
     if (state.kind === "preview" && state.facts.anchors !== before) {
@@ -1014,7 +1006,7 @@ function start(): void {
       context.putImageData(image, 0, 0);
       pngUrl = canvas.toDataURL("image/png");
     }
-    const shown = styledSvg(svgText, readSettings(ui));
+    const shown = styledTraceSvg(svgText, readSettings(ui));
     state = {
       kind: "preview",
       selection: {
