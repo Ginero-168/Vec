@@ -705,16 +705,21 @@ function start(): void {
 
   async function vectorize(selection: Selection, job: Job, palette?: readonly string[]): Promise<void> {
     if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
-    const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
-    if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer ที่ " + binary);
     const sourcePng = fs.readFileSync(job.pngPath);
     const plan = planTrace(sourcePng, job.settings);
     if (plan === null || plan.plates.length === 0) throw new Error("อ่าน PNG ไม่ได้");
+    const sharedOnly = plan.plates.every((plate) => plate.sharedSvg !== undefined);
+    const binary = sharedOnly ? "" : resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
+    if (!sharedOnly && !fs.existsSync(binary)) throw new Error("ไม่พบ VTracer ที่ " + binary);
     message("กำลังแยกโซนสี แล้วสร้างเส้นเวกเตอร์…");
     const svgs: string[] = [];
     for (let index = 0; index < plan.plates.length; index += 1) {
       const plate = plan.plates[index];
       if (plate === undefined) continue;
+      if (plate.sharedSvg !== undefined) {
+        svgs.push(plate.sharedSvg);
+        continue;
+      }
       const pngPath = path.join(job.directory, "trace-" + String(index) + ".png");
       const svgPath = path.join(job.directory, "trace-" + String(index) + ".svg");
       fs.writeFileSync(pngPath, plate.png);
@@ -728,7 +733,7 @@ function start(): void {
     }
     edited = false;
     fittedSvg = fittedPlan(svgs, plan, job.settings.removeBackground);
-    const svgText = styledTraceSvg(fittedSvg, job.settings);
+    const svgText = styledTraceSvg(fittedSvg, job.settings, plan.plates.some((plate) => plate.preservePaths === true));
     fs.writeFileSync(job.svgPath, svgText);
     const decoded = readRgbaPng(sourcePng);
     brushPixels = null;

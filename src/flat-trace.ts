@@ -11,6 +11,9 @@ export type FlatPlate = {
   readonly sourceWidth: number;
   readonly sourceHeight: number;
   readonly borderColor: string | null;
+  readonly labels: Uint8Array;
+  readonly colors: readonly RGB[];
+  readonly source: Uint8Array;
 };
 
 export type SubjectBox = { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
@@ -22,7 +25,7 @@ const COLOR_FLOOR = 0.035;
 const OWN_COLOR = 0.05;
 const DILATE_RADIUS = 3;
 const SPECK_SOURCE = 1.44;
-const SMOOTH_SOURCE = 0.6;
+export const SMOOTH_SOURCE = 0.6;
 const K_MAX = 16;
 
 /**
@@ -42,10 +45,12 @@ export function flatPlates(
   width: number,
   height: number,
   maxColors: number,
-  preprocess: RasterPreprocess = identityRaster
+  preprocess: RasterPreprocess = identityRaster,
+  smoothSigma = SMOOTH_SOURCE,
+  recoverSoft = true
 ): FlatPlate[] {
   const boxes = subjectBoxes(rgba, width, height);
-  return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess));
+  return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess, smoothSigma, recoverSoft));
 }
 
 export function subjectBoxes(rgba: Uint8Array, width: number, height: number): SubjectBox[] {
@@ -60,7 +65,9 @@ function plateFor(
   height: number,
   box: SubjectBox,
   maxColors: number,
-  preprocess: RasterPreprocess
+  preprocess: RasterPreprocess,
+  smoothSigma: number,
+  recoverSoft: boolean
 ): FlatPlate {
   const cropW = box.width;
   const cropH = box.height;
@@ -69,7 +76,7 @@ function plateFor(
     const from = ((box.y + y) * width + box.x) * 4;
     crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
   }
-  const painted = labelImage(crop, cropW, cropH, maxColors, preprocess);
+  const painted = labelImage(crop, cropW, cropH, maxColors, preprocess, smoothSigma, recoverSoft);
   return {
     rgba: painted.rgba,
     width: painted.width,
@@ -80,7 +87,10 @@ function plateFor(
     originY: box.y,
     sourceWidth: cropW,
     sourceHeight: cropH,
-    borderColor: cornerColor(crop, cropW, cropH)
+    borderColor: cornerColor(crop, cropW, cropH),
+    labels: painted.labels,
+    colors: painted.colors,
+    source: crop
   };
 }
 
@@ -111,7 +121,14 @@ export function cornerColor(rgba: Uint8Array, width: number, height: number): st
   return hex(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
 }
 
-type Painted = { readonly rgba: Uint8Array; readonly width: number; readonly height: number; readonly palette: readonly string[] };
+type Painted = {
+  readonly rgba: Uint8Array;
+  readonly width: number;
+  readonly height: number;
+  readonly palette: readonly string[];
+  readonly labels: Uint8Array;
+  readonly colors: readonly RGB[];
+};
 
 /** Sub-pixel flat label map. `maxColors` <= 0 picks the smallest K that keeps every flat region. */
 export function labelImage(
@@ -119,7 +136,9 @@ export function labelImage(
   width: number,
   height: number,
   maxColors: number,
-  preprocess: RasterPreprocess = identityRaster
+  preprocess: RasterPreprocess = identityRaster,
+  smoothSigma = SMOOTH_SOURCE,
+  recoverSoft = true
 ): Painted {
   const prepared = preprocess(rgba, width, height);
   const source = prepared.length === rgba.length ? prepared : rgba;
@@ -142,13 +161,14 @@ export function labelImage(
   let core = coreMask(lab, alpha, width, height, CORE_TAU);
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08);
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = buildPalette(lab, core, width, height, userK);
-  const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
+  const built = buildPalette(lab, core, width, height, userK);
+  const centers = recoverSoft ? coverResiduals(lab, alpha, width, height, built, userK) : built;
+  const labels = assignLabels(linear, lab, core, alpha, width, height, centers, smoothSigma);
   const colors = fillColors(source, alpha, core, labels, width, height, centers);
   return paintLabels(labels, colors, width * UP, height * UP);
 }
 
-function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, width: number, height: number, centers: Lab[]): Uint8Array {
+function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, width: number, height: number, centers: Lab[], smoothSigma: number): Uint8Array {
   const count = width * height;
   const kCount = centers.length;
   const coreLabel = new Int16Array(count);
@@ -230,7 +250,7 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
     }
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP));
-  smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP);
+  smoothLabels(labels, upW, upH, kCount, smoothSigma * UP);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       if (alpha[y * width + x] !== 0) continue;
@@ -356,7 +376,7 @@ function paintLabels(labels: Uint8Array, colors: readonly RGB[], width: number, 
     rgba[offset + 2] = color.b;
     rgba[offset + 3] = 255;
   }
-  return { rgba, width, height, palette };
+  return { rgba, width, height, palette, labels, colors };
 }
 
 function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height: number, userK: number): Lab[] {
@@ -521,6 +541,79 @@ function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: nu
   return centers;
 }
 
+/** Flat cores miss thin or soft bands. Fill unused K slots with those tight residual colors. */
+function coverResiduals(lab: Float64Array, alpha: Uint8Array, width: number, height: number, centers: readonly Lab[], userK: number): Lab[] {
+  const kept = uniqueCenters(centers);
+  const limit = Math.min(K_MAX, userK > 0 ? Math.max(userK, kept.length) : K_MAX);
+  const minCount = Math.max(24, Math.floor(width * height * 0.004));
+  const next = kept.slice();
+  for (let round = 0; round < K_MAX && next.length < limit; round += 1) {
+    const residual = largestResidual(lab, alpha, width, height, next, minCount);
+    if (residual === null) break;
+    next.push(residual);
+  }
+  return next;
+}
+
+function uniqueCenters(centers: readonly Lab[]): Lab[] {
+  const kept: Lab[] = [];
+  for (const center of centers) {
+    if (kept.every((other) => Math.sqrt(labDistance2(other, center)) > COLOR_FLOOR)) kept.push({ L: center.L, a: center.a, b: center.b });
+  }
+  return kept.length > 0 ? kept : [{ L: 0, a: 0, b: 0 }];
+}
+
+function largestResidual(lab: Float64Array, alpha: Uint8Array, width: number, height: number, centers: readonly Lab[], minCount: number): Lab | null {
+  const bins = new Map<string, { L: number; a: number; b: number; n: number; vL: number; vA: number; vB: number }>();
+  for (let index = 0; index < width * height; index += 1) {
+    if (alpha[index] === 0) continue;
+    const color = readLab(lab, index);
+    let nearest = Infinity;
+    for (const center of centers) nearest = Math.min(nearest, Math.sqrt(labDistance2(color, center)));
+    if (nearest <= COLOR_FLOOR) continue;
+    const key = Math.round(color.L / 0.04) + "," + Math.round(color.a / 0.04) + "," + Math.round(color.b / 0.04);
+    const bin = bins.get(key) ?? { L: 0, a: 0, b: 0, n: 0, vL: 0, vA: 0, vB: 0 };
+    bin.L += color.L;
+    bin.a += color.a;
+    bin.b += color.b;
+    bin.n += 1;
+    bin.vL += color.L * color.L;
+    bin.vA += color.a * color.a;
+    bin.vB += color.b * color.b;
+    bins.set(key, bin);
+  }
+  let best: Lab | null = null;
+  let bestCount = minCount - 1;
+  for (const bin of bins.values()) {
+    if (bin.n < minCount || bin.n <= bestCount) continue;
+    const mean = { L: bin.L / bin.n, a: bin.a / bin.n, b: bin.b / bin.n };
+    const spread = Math.max(
+      Math.sqrt(Math.max(0, bin.vL / bin.n - mean.L * mean.L)),
+      Math.sqrt(Math.max(0, bin.vA / bin.n - mean.a * mean.a)),
+      Math.sqrt(Math.max(0, bin.vB / bin.n - mean.b * mean.b))
+    );
+    if (spread > 0.02) continue;
+    if (centers.some((center) => Math.sqrt(labDistance2(center, mean)) <= COLOR_FLOOR)) continue;
+    if (blendOf(mean, centers)) continue;
+    best = mean;
+    bestCount = bin.n;
+  }
+  return best;
+}
+
+function blendOf(color: Lab, centers: readonly Lab[]): boolean {
+  for (let left = 0; left < centers.length; left += 1) {
+    for (let right = left + 1; right < centers.length; right += 1) {
+      const first = centers[left];
+      const second = centers[right];
+      if (first === undefined || second === undefined) continue;
+      const projected = projectLab(color, first, second);
+      if (projected.t > 0.04 && projected.t < 0.96 && projected.distance <= 0.02) return true;
+    }
+  }
+  return false;
+}
+
 function cleanLabels(labels: Uint8Array, width: number, height: number, kCount: number, minArea: number): void {
   for (let pass = 0; pass < 2; pass += 1) {
     for (let label = 0; label < kCount; label += 1) {
@@ -680,7 +773,36 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number): Subject
     const y = Math.max(0, minY - pad);
     boxes.push({ x, y, width: Math.min(width, maxX + 1 + pad) - x, height: Math.min(height, maxY + 1 + pad) - y });
   }
-  return mergeBoxes(boxes, 8);
+  return mergeStackedFragments(mergeBoxes(boxes, 8));
+}
+
+function mergeStackedFragments(boxes: readonly SubjectBox[]): SubjectBox[] {
+  const open = boxes.map((box) => ({ ...box }));
+  let merged = true;
+  while (merged) {
+    merged = false;
+    for (let left = 0; left < open.length && !merged; left += 1) {
+      for (let right = left + 1; right < open.length; right += 1) {
+        const a = open[left];
+        const b = open[right];
+        if (a === undefined || b === undefined) continue;
+        const upper = a.y <= b.y ? a : b;
+        const lower = a.y <= b.y ? b : a;
+        const yGap = lower.y - (upper.y + upper.height);
+        const overlap = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+        const ratio = Math.max(a.width, b.width) / Math.max(1, Math.min(a.width, b.width));
+        const gapLimit = Math.max(upper.height, lower.height) * 1.2;
+        if (yGap < 0 || yGap > gapLimit || overlap < 0.7 * Math.min(a.width, b.width) || ratio > 1.4) continue;
+        const x = Math.min(a.x, b.x);
+        const y = Math.min(a.y, b.y);
+        open[left] = { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
+        open.splice(right, 1);
+        merged = true;
+        break;
+      }
+    }
+  }
+  return open;
 }
 
 function seedOutside(index: number, edge: Uint8Array, outside: Uint8Array, queue: number[]): void {

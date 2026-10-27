@@ -1,5 +1,6 @@
-import { fairPaths, relaxPaths } from "./edit.ts";
-import { cornerColor, flatPlates } from "./flat-trace.ts";
+import { fairPaths, geometryTolerance, relaxPaths } from "./edit.ts";
+import { cornerColor, flatPlates, identityRaster, SMOOTH_SOURCE, subjectBoxes } from "./flat-trace.ts";
+import { traceSharedBoundary } from "./shared-boundary.ts";
 import { paletteFromRaster } from "./lab-model.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
@@ -20,6 +21,7 @@ export type PipelineSettings = {
 export type PlannedPlate = PlacedPlate & {
   readonly png: Buffer;
   readonly request: TraceRequest;
+  readonly sharedSvg?: string;
 };
 
 export type TracePlan = {
@@ -48,7 +50,7 @@ export function traceRaster(
 ): string | null {
   const plan = planTrace(source, settings);
   if (plan === null) return null;
-  return finishTrace(plan.plates.map((plate) => tracePlate(plate.png, plate.request)), plan, settings);
+  return finishTrace(plan.plates.map((plate) => plate.sharedSvg ?? tracePlate(plate.png, plate.request)), plan, settings);
 }
 
 export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: PipelineSettings): string {
@@ -80,24 +82,44 @@ export function fittedTraceSvg(svg: string, scale: number, droppedColor: string 
   return fitShapes(next);
 }
 
-export function styledTraceSvg(fitted: string, settings: PipelineSettings): string {
-  if (settings.preset === "logo" || settings.preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
+export function styledTraceSvg(fitted: string, settings: PipelineSettings, preservePaths = false): string {
+  if (settings.preset === "logo" || settings.preset === "icon") {
+    if (preservePaths) return groupPathsByFill(fitted);
+    return groupPathsByFill(relaxPaths(fitted, 0.15));
+  }
   const stroke = settings.stacking === "cutout" ? 2 : 0.8;
   return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
 }
 
 function planFlat(rgba: Uint8Array, width: number, height: number, settings: PipelineSettings): TracePlan {
-  const plates = flatPlates(rgba, width, height, settings.maxColors);
+  const separateMarks = subjectBoxes(rgba, width, height).length > 1;
+  const plates = flatPlates(rgba, width, height, settings.maxColors, identityRaster, separateMarks ? SMOOTH_SOURCE : 0, !separateMarks);
   return {
     width,
     height,
     droppedColor: null,
     plates: plates.map((plate) => ({
       png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
-      scale: plate.scale,
+      scale: separateMarks ? plate.scale : 1,
       originX: plate.originX,
       originY: plate.originY,
       borderColor: plate.borderColor,
+      preservePaths: !separateMarks,
+      sharedSvg: separateMarks
+        ? undefined
+        : traceSharedBoundary({
+            labels: plate.labels,
+            labelWidth: plate.width,
+            labelHeight: plate.height,
+            colors: plate.colors,
+            source: plate.source,
+            sourceWidth: plate.sourceWidth,
+            sourceHeight: plate.sourceHeight,
+            scale: plate.scale,
+            omitFill: settings.removeBackground ? plate.borderColor : null,
+            tolerance: Math.min(0.1, geometryTolerance(settings.smoothness) * 0.45),
+            cornerDegrees: settings.corner
+          }),
       request: flatRequest(settings, plate.palette, plate.scale)
     }))
   };
