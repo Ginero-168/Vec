@@ -45,6 +45,31 @@ test("a hard color split lands within half a pixel of the middle", () => {
   assert.ok(Math.abs(cross / 8 - 16) <= 0.5);
 });
 
+test("a forced single color still keeps a dark red flat off brown", () => {
+  const image = fill(36, 36, 83, 70, 59, 255);
+  paint(image, 36, 8, 8, 20, 20, 46, 4, 2);
+  const painted = labelImage(image.rgba, 36, 36, 1);
+  const red = pixel(painted.rgba, painted.width, 18 * 8, 18 * 8);
+  assert.ok(red.r > red.g + 20 && red.g < 40);
+  assert.ok(painted.palette.some((color) => channel(color, 0) > 60 && channel(color, 1) > 40));
+});
+
+test("preprocess runs before the palette is read", () => {
+  const image = fill(16, 16, 20, 40, 220, 255);
+  const painted = labelImage(image.rgba, 16, 16, 2, (rgba) => {
+    const next = new Uint8Array(rgba.length);
+    for (let index = 0; index < rgba.length; index += 4) {
+      next[index] = 220;
+      next[index + 1] = 30;
+      next[index + 2] = 40;
+      next[index + 3] = 255;
+    }
+    return next;
+  });
+  const center = pixel(painted.rgba, painted.width, 8 * 8, 8 * 8);
+  assert.ok(center.r > center.b);
+});
+
 test("a small red flat stays in the palette and gray is not painted green", () => {
   const image = fill(48, 48, 150, 150, 150, 255);
   paint(image, 48, 4, 4, 8, 8, 220, 16, 16);

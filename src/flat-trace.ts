@@ -18,16 +18,34 @@ export type SubjectBox = { readonly x: number; readonly y: number; readonly widt
 const UP = 8;
 const CORE_TAU = 0.035;
 const REGION_TOLERANCE = 0.06;
+const COLOR_FLOOR = 0.035;
 const OWN_COLOR = 0.05;
 const DILATE_RADIUS = 3;
 const SPECK_SOURCE = 1.44;
 const SMOOTH_SOURCE = 0.6;
 const K_MAX = 16;
 
+/**
+ * Raster hook immediately before palette extraction.
+ * The default returns the same pixels. Another module can denoise or reshape
+ * the raster here; flat-region cores and the palette are measured on the result.
+ */
+export type RasterPreprocess = (rgba: Uint8Array, width: number, height: number) => Uint8Array;
+
+export function identityRaster(rgba: Uint8Array, _width: number, _height: number): Uint8Array {
+  return rgba;
+}
+
 /** One plate per separated logo. A single subject keeps the whole frame so its backdrop stays in the palette. */
-export function flatPlates(rgba: Uint8Array, width: number, height: number, maxColors: number): FlatPlate[] {
+export function flatPlates(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  maxColors: number,
+  preprocess: RasterPreprocess = identityRaster
+): FlatPlate[] {
   const boxes = subjectBoxes(rgba, width, height);
-  return boxes.map((box) => plateFor(rgba, width, height, box, maxColors));
+  return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess));
 }
 
 export function subjectBoxes(rgba: Uint8Array, width: number, height: number): SubjectBox[] {
@@ -36,7 +54,14 @@ export function subjectBoxes(rgba: Uint8Array, width: number, height: number): S
   return found;
 }
 
-function plateFor(rgba: Uint8Array, width: number, height: number, box: SubjectBox, maxColors: number): FlatPlate {
+function plateFor(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  box: SubjectBox,
+  maxColors: number,
+  preprocess: RasterPreprocess
+): FlatPlate {
   const cropW = box.width;
   const cropH = box.height;
   const crop = new Uint8Array(cropW * cropH * 4);
@@ -44,7 +69,7 @@ function plateFor(rgba: Uint8Array, width: number, height: number, box: SubjectB
     const from = ((box.y + y) * width + box.x) * 4;
     crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
   }
-  const painted = labelImage(crop, cropW, cropH, maxColors);
+  const painted = labelImage(crop, cropW, cropH, maxColors, preprocess);
   return {
     rgba: painted.rgba,
     width: painted.width,
@@ -89,15 +114,23 @@ export function cornerColor(rgba: Uint8Array, width: number, height: number): st
 type Painted = { readonly rgba: Uint8Array; readonly width: number; readonly height: number; readonly palette: readonly string[] };
 
 /** Sub-pixel flat label map. `maxColors` <= 0 picks the smallest K that keeps every flat region. */
-export function labelImage(rgba: Uint8Array, width: number, height: number, maxColors: number): Painted {
+export function labelImage(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  maxColors: number,
+  preprocess: RasterPreprocess = identityRaster
+): Painted {
+  const prepared = preprocess(rgba, width, height);
+  const source = prepared.length === rgba.length ? prepared : rgba;
   const count = width * height;
   const lab = new Float64Array(count * 3);
   const linear = new Float64Array(count * 3);
   const alpha = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) {
     const offset = index * 4;
-    const color = { r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 };
-    alpha[index] = (rgba[offset + 3] ?? 0) >= 128 ? 255 : 0;
+    const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
+    alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
     const converted = rgbToOklab(color);
     lab[index * 3] = converted.L;
     lab[index * 3 + 1] = converted.a;
@@ -111,7 +144,7 @@ export function labelImage(rgba: Uint8Array, width: number, height: number, maxC
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
   const centers = buildPalette(lab, core, width, height, userK);
   const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
-  const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
+  const colors = fillColors(source, alpha, core, labels, width, height, centers);
   return paintLabels(labels, colors, width * UP, height * UP);
 }
 
@@ -161,8 +194,12 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
       allow[at] = (allow[at] ?? 0) | near;
     }
   }
-  const all = (1 << kCount) - 1;
-  for (let index = 0; index < count; index += 1) if ((allow[index] ?? 0) === 0) allow[index] = all;
+  const nearestCore = nearestCoreLabel(coreLabel, width, height);
+  for (let index = 0; index < count; index += 1) {
+    if ((allow[index] ?? 0) !== 0) continue;
+    const label = nearestCore[index] ?? -1;
+    if (label >= 0) allow[index] = 1 << label;
+  }
   const upW = width * UP;
   const upH = height * UP;
   const labels = new Uint8Array(upW * upH);
@@ -173,13 +210,14 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
     for (let y = y0; y < y1; y += 1) {
       for (let x = 0; x < width; x += 1) {
         if (alpha[y * width + x] === 0) continue;
-        const mask = allow[y * width + x] ?? all;
+        const mask = allow[y * width + x] ?? 0;
         const bits = bitList(mask, kCount);
         for (let oy = 0; oy < UP; oy += 1) {
           for (let ox = 0; ox < UP; ox += 1) {
             const ux = x * UP + ox;
             const uy = y * UP + oy;
             const at = uy * upW + ux;
+            if (bits.length === 0) continue;
             if (bits.length === 1) {
               labels[at] = bits[0] ?? 0;
               continue;
@@ -202,6 +240,40 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
     }
   }
   return labels;
+}
+
+function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number): Int16Array {
+  const nearest = new Int16Array(coreLabel.length);
+  nearest.fill(-1);
+  const queue: number[] = [];
+  for (let index = 0; index < coreLabel.length; index += 1) {
+    const label = coreLabel[index] ?? -1;
+    if (label < 0) continue;
+    nearest[index] = label;
+    queue.push(index);
+  }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const index = queue[cursor] ?? 0;
+    const label = nearest[index] ?? -1;
+    const x = index % width;
+    const y = (index - x) / width;
+    const steps = [
+      [x - 1, y],
+      [x + 1, y],
+      [x, y - 1],
+      [x, y + 1]
+    ];
+    for (const step of steps) {
+      const nx = step[0] ?? 0;
+      const ny = step[1] ?? 0;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const at = ny * width + nx;
+      if ((nearest[at] ?? -1) >= 0) continue;
+      nearest[at] = label;
+      queue.push(at);
+    }
+  }
+  return nearest;
 }
 
 function explain(sample: Lab, bits: readonly number[], centers: readonly Lab[]): number {
@@ -309,18 +381,30 @@ function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height
   }
   if (samples.length === 0) return [{ L: 0, a: 0, b: 0 }];
   const regions = regionMeans(lab, core, width, height);
-  if (userK > 0) return wkmeans(samples, weights, Math.min(userK, samples.length));
-  let chosen = wkmeans(samples, weights, Math.min(2, samples.length));
+  const anchors = distinctAnchors(regions);
+  const floorK = Math.max(2, anchors.length);
+  if (userK > 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(userK, anchors.length)), anchors);
   if (regions.length === 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(2, Math.min(8, samples.length))));
-  for (let k = 2; k <= Math.min(K_MAX, samples.length); k += 1) {
-    chosen = wkmeans(samples, weights, k);
-    const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region)) > REGION_TOLERANCE));
+  let chosen = wkmeans(samples, weights, Math.min(floorK, samples.length), anchors);
+  for (let k = floorK; k <= Math.min(K_MAX, Math.max(samples.length, anchors.length)); k += 1) {
+    chosen = wkmeans(samples, weights, k, anchors);
+    const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region.mean)) > REGION_TOLERANCE));
     if (!missed) return chosen;
   }
   return chosen;
 }
 
-function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height: number): Lab[] {
+function distinctAnchors(regions: readonly { readonly mean: Lab; readonly size: number }[]): Lab[] {
+  const ordered = [...regions].sort((left, right) => right.size - left.size);
+  const kept: Lab[] = [];
+  for (const region of ordered) {
+    if (kept.length >= K_MAX) break;
+    if (kept.every((color) => Math.sqrt(labDistance2(color, region.mean)) > COLOR_FLOOR)) kept.push({ ...region.mean });
+  }
+  return kept;
+}
+
+function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height: number): { mean: Lab; size: number }[] {
   const groups = new Map<number, number[]>();
   for (let index = 0; index < core.length; index += 1) {
     if (core[index] !== 1) continue;
@@ -330,7 +414,7 @@ function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height:
     if (list === undefined) groups.set(key, [index]);
     else list.push(index);
   }
-  const means: Lab[] = [];
+  const means: { mean: Lab; size: number }[] = [];
   for (const pixels of groups.values()) {
     const member = new Uint8Array(core.length);
     for (const index of pixels) member[index] = 1;
@@ -362,28 +446,42 @@ function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height:
         varB += (color.b - mean.b) ** 2;
       }
       const spread = Math.max(Math.sqrt(varL / n), Math.sqrt(varA / n), Math.sqrt(varB / n));
-      if (spread < 0.015) means.push(mean);
+      if (spread < 0.015) means.push({ mean, size });
     }
   }
   return means;
 }
 
-function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: number): Lab[] {
+function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: number, frozen: readonly Lab[] = []): Lab[] {
   const count = samples.length;
-  const k = Math.max(1, Math.min(kCount, count));
-  let first = 0;
-  let bestWeight = -1;
-  for (let index = 0; index < count; index += 1) {
-    const weight = weights[index] ?? 0;
-    if (weight > bestWeight) {
-      bestWeight = weight;
-      first = index;
-    }
+  const pinned = Math.min(frozen.length, K_MAX);
+  const k = Math.max(1, Math.min(K_MAX, Math.max(kCount, pinned, count === 0 ? pinned : 1)));
+  const centers: Lab[] = [];
+  for (let index = 0; index < pinned && centers.length < k; index += 1) {
+    const seed = frozen[index] ?? zeroLab();
+    centers.push({ L: seed.L, a: seed.a, b: seed.b });
   }
-  const chosen = [first];
+  if (count === 0) return centers.length > 0 ? centers : [{ L: 0, a: 0, b: 0 }];
   const distance = new Float64Array(count);
-  for (let index = 0; index < count; index += 1) distance[index] = Math.sqrt(labDistance2(samples[index] ?? zeroLab(), samples[first] ?? zeroLab()));
-  while (chosen.length < k) {
+  if (centers.length === 0) {
+    let first = 0;
+    let bestWeight = -1;
+    for (let index = 0; index < count; index += 1) {
+      const weight = weights[index] ?? 0;
+      if (weight > bestWeight) {
+        bestWeight = weight;
+        first = index;
+      }
+    }
+    centers.push({ ...(samples[first] ?? zeroLab()) });
+  }
+  for (let index = 0; index < count; index += 1) {
+    const sample = samples[index] ?? zeroLab();
+    let best = Infinity;
+    for (const center of centers) best = Math.min(best, Math.sqrt(labDistance2(sample, center)));
+    distance[index] = best;
+  }
+  while (centers.length < k && centers.length < count + pinned) {
     let at = 0;
     let score = -1;
     for (let index = 0; index < count; index += 1) {
@@ -393,13 +491,14 @@ function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: nu
         at = index;
       }
     }
-    chosen.push(at);
+    if (score <= 0 && centers.length >= pinned) break;
     const center = samples[at] ?? zeroLab();
+    centers.push({ L: center.L, a: center.a, b: center.b });
     for (let index = 0; index < count; index += 1) {
       distance[index] = Math.min(distance[index] ?? 0, Math.sqrt(labDistance2(samples[index] ?? zeroLab(), center)));
     }
   }
-  const centers = chosen.map((index) => ({ ...(samples[index] ?? zeroLab()) }));
+  const pinCount = Math.min(pinned, centers.length);
   for (let round = 0; round < 40; round += 1) {
     const bins = centers.map(() => ({ L: 0, a: 0, b: 0, w: 0 }));
     for (let index = 0; index < count; index += 1) {
@@ -413,7 +512,7 @@ function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: nu
       bin.b += sample.b * weight;
       bin.w += weight;
     }
-    for (let index = 0; index < centers.length; index += 1) {
+    for (let index = pinCount; index < centers.length; index += 1) {
       const bin = bins[index];
       if (bin === undefined || bin.w === 0) continue;
       centers[index] = { L: bin.L / bin.w, a: bin.a / bin.w, b: bin.b / bin.w };
@@ -522,7 +621,7 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number): Subject
           strong = true;
           break;
         }
-        if (Math.sqrt(labDistance2(color, readLab(lab, next))) > 0.06) {
+        if (Math.sqrt(labDistance2(color, readLab(lab, next))) > COLOR_FLOOR) {
           strong = true;
           break;
         }

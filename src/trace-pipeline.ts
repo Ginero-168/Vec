@@ -45,6 +45,17 @@ export function fittedPlan(svgs: readonly string[], plan: TracePlan, removeBackg
   return mergePlates(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, removeBackground);
 }
 
+/** Plan, trace each plate, then fit and style. Poster runs segment → vtracer → fit → fair → seal. */
+export function traceRaster(
+  source: Buffer,
+  settings: PipelineSettings,
+  tracePlate: (png: Buffer, request: TraceRequest) => string
+): string | null {
+  const plan = planTrace(source, settings);
+  if (plan === null) return null;
+  return finishTrace(plan.plates.map((plate) => tracePlate(plate.png, plate.request)), plan, settings);
+}
+
 export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: PipelineSettings): string {
   return assembleTrace(
     svgs,
