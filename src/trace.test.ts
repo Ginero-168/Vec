@@ -1,0 +1,108 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { presetDefaults, resolveVtracer, simplifyTolerance, vtracerArguments } from "./trace.ts";
+
+test("a higher smoothness uses a tighter curve tolerance", () => {
+  assert.equal(simplifyTolerance(0), 2.2);
+  assert.equal(simplifyTolerance(2.4), 0.4);
+  assert.equal(simplifyTolerance(3), 0.15);
+  assert.equal(simplifyTolerance(9), 0.15);
+});
+
+test("every preset fits splines and the icon preset is not forced to polygons", () => {
+  const icon = vtracerArguments("in.png", "out.svg", {
+    preset: "icon",
+    maxColors: 8,
+    smoothness: 2,
+    removeBackground: true,
+    stacking: "cutout"
+  });
+  assert.deepEqual(icon.slice(0, 2), ["in.png", "out.svg"]);
+  assert.equal(icon.includes("polygon"), false);
+  assert.equal(icon.includes("spline"), true);
+  assert.ok(icon.includes("--color-precision"));
+  assert.equal(icon[icon.indexOf("--color-precision") + 1], "5");
+  assert.equal(icon[icon.indexOf("--simplify") + 1], "0.70");
+  assert.equal(icon[icon.indexOf("--max-colors") + 1], "8");
+  assert.equal(icon[icon.indexOf("--hierarchical") + 1], "cutout");
+
+  const photo = vtracerArguments("in.png", "out.svg", {
+    preset: "photo",
+    maxColors: 36,
+    smoothness: 1.6,
+    removeBackground: false,
+    stacking: "stacked"
+  });
+  assert.equal(photo.includes("cutout"), false);
+  assert.equal(photo[photo.indexOf("--preset") + 1], "photo");
+  assert.equal(photo[photo.indexOf("--hierarchical") + 1], "stacked");
+  assert.equal(photo[photo.indexOf("--simplify") + 1], "1.00");
+  assert.equal(photo[photo.indexOf("--color-precision") + 1], "8");
+  assert.equal(photo[photo.indexOf("--filter-speckle") + 1], "1");
+  assert.equal(photo[photo.indexOf("--clustering") + 1], "watershed");
+  assert.equal(photo[photo.indexOf("--watershed-detail") + 1], "128");
+  assert.deepEqual(presetDefaults("photo"), { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" });
+  assert.deepEqual(presetDefaults("poster"), { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" });
+  const poster = vtracerArguments("in.png", "out.svg", {
+    preset: "poster",
+    maxColors: 10,
+    smoothness: 2.2,
+    removeBackground: false,
+    stacking: "stacked"
+  });
+  assert.equal(poster[poster.indexOf("--filter-speckle") + 1], "0");
+  assert.equal(poster[poster.indexOf("--hierarchical") + 1], "stacked");
+  const fixed = vtracerArguments("in.png", "out.svg", {
+    preset: "logo",
+    maxColors: 2,
+    smoothness: 2,
+    removeBackground: true,
+    stacking: "cutout",
+    palette: ["#112233", "#445566"]
+  });
+  assert.equal(fixed[fixed.indexOf("--palette") + 1], "#112233,#445566");
+
+  const auto = vtracerArguments("in.png", "out.svg", {
+    preset: "logo",
+    maxColors: 0,
+    smoothness: 2.4,
+    removeBackground: true,
+    stacking: "cutout"
+  });
+  assert.equal(auto.includes("--max-colors"), false);
+  assert.equal(auto[auto.indexOf("--simplify") + 1], "0.40");
+
+  const tuned = vtracerArguments("in.png", "out.svg", {
+    preset: "photo",
+    maxColors: 12,
+    smoothness: 2,
+    removeBackground: false,
+    stacking: "stacked",
+    colorPrecision: 3,
+    filterSpeckle: 4,
+    clustering: "off",
+    simplify: 1.25
+  });
+  assert.equal(tuned[tuned.indexOf("--color-precision") + 1], "3");
+  assert.equal(tuned[tuned.indexOf("--filter-speckle") + 1], "4");
+  assert.equal(tuned[tuned.indexOf("--simplify") + 1], "1.25");
+  assert.equal(tuned.includes("--clustering"), false);
+  const scaled = vtracerArguments("in.png", "out.svg", {
+    preset: "logo",
+    maxColors: 0,
+    smoothness: 0,
+    removeBackground: false,
+    stacking: "stacked",
+    simplify: 2.4
+  });
+  assert.equal(scaled[scaled.indexOf("--simplify") + 1], "2.40");
+});
+
+test("VTRACER_BIN overrides the bundled binary", () => {
+  const previous = process.env.VTRACER_BIN;
+  process.env.VTRACER_BIN = "/opt/vtracer";
+  assert.equal(resolveVtracer("/usr/bin/vtracer"), "/opt/vtracer");
+  delete process.env.VTRACER_BIN;
+  assert.equal(resolveVtracer("/usr/bin/vtracer"), "/usr/bin/vtracer");
+  if (previous !== undefined) process.env.VTRACER_BIN = previous;
+});
