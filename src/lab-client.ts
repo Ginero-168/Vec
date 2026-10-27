@@ -9,6 +9,7 @@ import {
   type LabControls
 } from "./lab-model";
 import { cornerColor } from "./flat-trace";
+import { denoiseJpegArtifacts } from "./denoise";
 import { revealSentinel, punchRgba } from "./punch-rgba";
 import { scoreSvg } from "./score";
 import { segmentViews } from "./segment";
@@ -148,7 +149,10 @@ function render(): void {
     return;
   }
   const started = performance.now();
-  const views = segmentViews(source, width, height, {
+  const segmentationSource = controls.mode === "photo" || controls.mode === "poster"
+    ? denoiseJpegArtifacts(source, width, height)
+    : source;
+  const views = segmentViews(segmentationSource, width, height, {
     mode: controls.mode,
     maxColors: controls.maxColors,
     removeBackground: controls.removeBackground,

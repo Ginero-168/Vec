@@ -1,5 +1,6 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
 import { cornerColor, flatPlates } from "./flat-trace.ts";
+import { denoiseJpegArtifacts } from "./denoise.ts";
 import { paletteFromRaster } from "./lab-model.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
@@ -117,7 +118,10 @@ export function cappedPalette(colors: readonly string[], sentinel: string | null
 }
 
 function planSegmented(rgba: Uint8Array, width: number, height: number, settings: PipelineSettings): TracePlan {
-  const segmented = segmentRaster(rgba, width, height, {
+  const segmentationSource = settings.preset === "photo" || settings.preset === "poster"
+    ? denoiseJpegArtifacts(rgba, width, height)
+    : rgba;
+  const segmented = segmentRaster(segmentationSource, width, height, {
     mode: settings.preset,
     maxColors: settings.maxColors,
     removeBackground: settings.removeBackground,
