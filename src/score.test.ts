@@ -85,6 +85,12 @@ test("a green disc that spans a white canvas is kept and the white plate is remo
   assert.equal(kept.toLowerCase().includes("#1ed760"), true);
   assert.match(kept, /M28 28/);
   assert.equal(kept.includes("M0 0"), false);
+  const stacked = '<svg width="64" height="64"><path d="M0,0 H64 V64 H0 Z" fill="#2b2b2b"/><path d="M0,0 H64 V64 H0 Z M20,20 V40 H40 V20 H20 Z" fill="#ffffff"/></svg>';
+  const gear = dropCanvasBackground(stacked, "#ffffff");
+  assert.equal(gear.toLowerCase().includes("#ffffff"), false);
+  assert.equal(gear.toLowerCase().includes("#2b2b2b"), true);
+  assert.match(gear, /M20 20/);
+  assert.equal(gear.includes("M0,0 H64"), false);
 });
 
 test("a tight icon body is kept unless it touches several edges in the border color", () => {

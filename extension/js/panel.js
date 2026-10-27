@@ -1205,47 +1205,81 @@
     if (size === null) return svg;
     const matches = pathTags(svg);
     if (matches.length < 2) return svg;
+    const sources = matches.map((tag) => tag.source);
+    for (let index = sources.length - 1; index >= 0; index -= 1) {
+      const split = borderSplit(sources[index] ?? "", border, size.width, size.height);
+      if (split === null) continue;
+      sources[index] = split.kept;
+      if (split.holes.length === 0) continue;
+      const under = canvasPlateBelow(sources, index, size.width, size.height, border);
+      if (under < 0) continue;
+      sources[under] = shapeWithData(sources[under] ?? "", split.holes.join(" "));
+    }
     let result = svg;
     for (let index = matches.length - 1; index >= 0; index -= 1) {
       const tag = matches[index];
-      if (tag === void 0) continue;
-      const next = withoutBorderPlate(tag, border, size.width, size.height);
-      if (next === tag.source) continue;
-      result = result.slice(0, tag.index) + (next ?? "") + result.slice(tag.index + tag.length);
+      const next = sources[index] ?? "";
+      if (tag === void 0 || next === tag.source) continue;
+      result = result.slice(0, tag.index) + next + result.slice(tag.index + tag.length);
     }
     return result;
   }
-  function withoutBorderPlate(tag, border, width, height) {
-    const attrs = tagAttrs(tag.source);
+  function borderSplit(source, border, width, height) {
+    const attrs = tagAttrs(source);
     const fill = normalizeFill(fillOf(attrs));
-    if (fill === null || !samePaint(fill, border)) return tag.source;
-    if (elementName(tag.source) !== "path") {
-      const measured = measureTag(tag);
-      if (measured === null || edgesTouched(measured, width, height) < 3) return tag.source;
-      return null;
+    if (fill === null || !samePaint(fill, border)) return null;
+    if (elementName(source) !== "path") {
+      const measured = measureTag({ index: 0, length: source.length, source });
+      if (measured === null || edgesTouched(measured, width, height) < 3) return null;
+      return { kept: "", holes: [] };
     }
     const data = readAttr2(attrs, "d");
-    if (data === null) return tag.source;
+    if (data === null) return null;
     const parts = pathSubpaths(data);
     const pieces = parts.map((part) => ({ part, measured: measurePath(part) }));
     const shells = pieces.filter((piece) => edgesTouched(piece.measured, width, height) >= 3);
-    if (shells.length === 0) return tag.source;
+    if (shells.length === 0) return null;
+    const holes = [];
     const kept = pieces.filter((piece) => {
       if (shells.includes(piece)) return false;
       const sign = winding(piece.measured.samples);
       const center = centroid(piece.measured.samples);
       for (const shell of shells) {
         if (winding(shell.measured.samples) === sign) continue;
-        if (pointInPoly(center, shell.measured.samples)) return false;
+        if (pointInPoly(center, shell.measured.samples)) {
+          holes.push(piece.part);
+          return false;
+        }
       }
       return true;
     });
-    if (kept.length === 0) return null;
-    if (kept.length === pieces.length) return tag.source;
+    if (kept.length === pieces.length) return null;
+    if (kept.length === 0) return { kept: "", holes };
     const quoted = '"' + data + '"';
-    const at = tag.source.indexOf(quoted);
-    if (at < 0) return tag.source;
-    return tag.source.slice(0, at + 1) + kept.map((piece) => piece.part).join(" ") + tag.source.slice(at + quoted.length - 1);
+    const at = source.indexOf(quoted);
+    if (at < 0) return { kept: "", holes };
+    return { kept: source.slice(0, at + 1) + kept.map((piece) => piece.part).join(" ") + source.slice(at + quoted.length - 1), holes };
+  }
+  function canvasPlateBelow(sources, before, width, height, border) {
+    for (let index = before - 1; index >= 0; index -= 1) {
+      const source = sources[index] ?? "";
+      if (source === "") continue;
+      const fill = normalizeFill(fillOf(tagAttrs(source)));
+      if (fill === null || samePaint(fill, border)) continue;
+      const data = readAttr2(tagAttrs(source), "d");
+      if (data !== null) {
+        if (pathSubpaths(data).some((part) => edgesTouched(measurePath(part), width, height) >= 3)) return index;
+        continue;
+      }
+      const measured = measureTag({ index: 0, length: source.length, source });
+      if (measured !== null && edgesTouched(measured, width, height) >= 3) return index;
+    }
+    return -1;
+  }
+  function shapeWithData(tag, data) {
+    if (elementName(tag) === "path" && /\bd="/.test(tag)) return tag.replace(/\bd="[^"]*"/, 'd="' + data + '"');
+    const fill = fillOf(tagAttrs(tag)) ?? "#000";
+    return '<path d="' + data + '" fill="' + fill.replace(/"/g, "") + '"/>';
   }
   function pathSubpaths(data) {
     const commands = tokenize2(data);
