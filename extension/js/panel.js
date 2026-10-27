@@ -1205,21 +1205,102 @@
     if (size === null) return svg;
     const matches = pathTags(svg);
     if (matches.length < 2) return svg;
-    let chosen = null;
-    let chosenArea = 0;
-    for (const tag of matches) {
+    let result = svg;
+    for (let index = matches.length - 1; index >= 0; index -= 1) {
+      const tag = matches[index];
+      if (tag === void 0) continue;
+      const next = withoutBorderPlate(tag, border, size.width, size.height);
+      if (next === tag.source) continue;
+      result = result.slice(0, tag.index) + (next ?? "") + result.slice(tag.index + tag.length);
+    }
+    return result;
+  }
+  function withoutBorderPlate(tag, border, width, height) {
+    const attrs = tagAttrs(tag.source);
+    const fill = normalizeFill(fillOf(attrs));
+    if (fill === null || !samePaint(fill, border)) return tag.source;
+    if (elementName(tag.source) !== "path") {
       const measured = measureTag(tag);
-      if (measured === null) continue;
-      const fill = normalizeFill(fillOf(tagAttrs(tag.source)));
-      if (fill === null || !samePaint(fill, border)) continue;
-      if (edgesTouched(measured, size.width, size.height) < 3) continue;
-      if (chosen === null || measured.area > chosenArea) {
-        chosen = tag;
-        chosenArea = measured.area;
+      if (measured === null || edgesTouched(measured, width, height) < 3) return tag.source;
+      return null;
+    }
+    const data = readAttr2(attrs, "d");
+    if (data === null) return tag.source;
+    const parts = pathSubpaths(data);
+    const pieces = parts.map((part) => ({ part, measured: measurePath(part) }));
+    const shells = pieces.filter((piece) => edgesTouched(piece.measured, width, height) >= 3);
+    if (shells.length === 0) return tag.source;
+    const kept = pieces.filter((piece) => {
+      if (shells.includes(piece)) return false;
+      const sign = winding(piece.measured.samples);
+      const center = centroid(piece.measured.samples);
+      for (const shell of shells) {
+        if (winding(shell.measured.samples) === sign) continue;
+        if (pointInPoly(center, shell.measured.samples)) return false;
+      }
+      return true;
+    });
+    if (kept.length === 0) return null;
+    if (kept.length === pieces.length) return tag.source;
+    const quoted = '"' + data + '"';
+    const at = tag.source.indexOf(quoted);
+    if (at < 0) return tag.source;
+    return tag.source.slice(0, at + 1) + kept.map((piece) => piece.part).join(" ") + tag.source.slice(at + quoted.length - 1);
+  }
+  function pathSubpaths(data) {
+    const commands = tokenize2(data);
+    const groups = [];
+    let current = "";
+    let x = 0;
+    let y = 0;
+    let startX = 0;
+    let startY = 0;
+    const text = (value) => String(Math.round(value * 100) / 100);
+    for (const command of commands) {
+      const op = command.cmd.toLowerCase();
+      const relative = command.cmd === op;
+      const args = command.args;
+      const at = (index, base) => relative ? base + (args[index] ?? 0) : args[index] ?? 0;
+      if (op === "m") {
+        if (current !== "") groups.push(current);
+        x = at(0, x);
+        y = at(1, y);
+        startX = x;
+        startY = y;
+        current = "M" + text(x) + " " + text(y);
+      } else if (op === "l") {
+        x = at(0, x);
+        y = at(1, y);
+        current += "L" + text(x) + " " + text(y);
+      } else if (op === "h") {
+        x = at(0, x);
+        current += "H" + text(x);
+      } else if (op === "v") {
+        y = at(0, y);
+        current += "V" + text(y);
+      } else if (op === "c") {
+        const curve = [at(0, x), at(1, y), at(2, x), at(3, y), at(4, x), at(5, y)];
+        x = curve[4] ?? x;
+        y = curve[5] ?? y;
+        current += "C" + curve.map((value) => text(value)).join(" ");
+      } else if (op === "z") {
+        x = startX;
+        y = startY;
+        current += "Z";
       }
     }
-    if (chosen === null) return svg;
-    return svg.slice(0, chosen.index) + svg.slice(chosen.index + chosen.length);
+    if (current !== "") groups.push(current);
+    return groups;
+  }
+  function winding(samples) {
+    let sum = 0;
+    for (let index = 0; index < samples.length; index += 1) {
+      const current = samples[index];
+      const next = samples[(index + 1) % samples.length];
+      if (current === void 0 || next === void 0) continue;
+      sum += current.x * next.y - next.x * current.y;
+    }
+    return Math.sign(sum);
   }
   function edgesTouched(measured, width, height) {
     let left = false;
@@ -1300,8 +1381,6 @@
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
-    const squircle = fitSquircle(measured);
-    if (squircle !== null) return '<path d="' + squircle + '"' + fillAttr + "/>";
     return null;
   }
   function fitRect(measured) {
@@ -1434,83 +1513,6 @@
     const expected = Math.PI * rx * ry;
     if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.12) return null;
     return { cx, cy, rx, ry };
-  }
-  function fitSquircle(measured) {
-    const width = measured.maxX - measured.minX;
-    const height = measured.maxY - measured.minY;
-    if (!(width >= 8) || !(height >= 8) || measured.samples.length < 16) return null;
-    const cx = (measured.minX + measured.maxX) / 2;
-    const cy = (measured.minY + measured.maxY) / 2;
-    const rx = width / 2;
-    const ry = height / 2;
-    let corners = 0;
-    for (const point of measured.samples) {
-      if ((point.x - cx) * (point.y - cy) !== 0 && Math.abs(point.x - cx) > rx * 0.45 && Math.abs(point.y - cy) > ry * 0.45) corners += 1;
-    }
-    if (corners < 4) return null;
-    let bestN = 0;
-    let bestError = Infinity;
-    for (let n = 3.5; n <= 6.0001; n += 0.25) {
-      const error = squircleError(measured.samples, cx, cy, rx, ry, n);
-      if (error < bestError) {
-        bestError = error;
-        bestN = n;
-      }
-    }
-    if (!(bestError <= 0.5)) return null;
-    const expected = squircleArea(rx, ry, bestN);
-    if (!(expected > 0) || Math.abs(measured.area - expected) / expected > 0.08) return null;
-    const path2 = squirclePath(cx, cy, rx, ry, bestN);
-    return pathError(path2, cx, cy, rx, ry, bestN) <= 0.2 ? path2 : null;
-  }
-  function squircleError(samples, cx, cy, rx, ry, n) {
-    let worst = 0;
-    for (const point of samples) {
-      const nx = Math.abs(point.x - cx) / rx;
-      const ny = Math.abs(point.y - cy) / ry;
-      const radial = (nx ** n + ny ** n) ** (1 / n);
-      worst = Math.max(worst, Math.abs(radial - 1) * Math.min(rx, ry));
-    }
-    return worst;
-  }
-  function squircleArea(rx, ry, n) {
-    let area = 0;
-    const steps = 720;
-    let previous = squirclePoint(0, 0, rx, ry, n, 0);
-    for (let step = 1; step <= steps; step += 1) {
-      const point = squirclePoint(0, 0, rx, ry, n, step / steps);
-      area += previous.x * point.y - point.x * previous.y;
-      previous = point;
-    }
-    return Math.abs(area) / 2;
-  }
-  function squirclePoint(cx, cy, rx, ry, n, t) {
-    const angle = t * Math.PI * 2;
-    const cosine = Math.cos(angle);
-    const sine = Math.sin(angle);
-    const power = 2 / n;
-    return {
-      x: cx + rx * Math.sign(cosine) * Math.abs(cosine) ** power,
-      y: cy + ry * Math.sign(sine) * Math.abs(sine) ** power
-    };
-  }
-  function squirclePath(cx, cy, rx, ry, n) {
-    const count = 16;
-    const points = [];
-    for (let index = 0; index < count; index += 1) points.push(squirclePoint(cx, cy, rx, ry, n, index / count));
-    let path2 = "M" + fmt2(points[0]?.x ?? cx) + "," + fmt2(points[0]?.y ?? cy);
-    for (let index = 0; index < count; index += 1) {
-      const p0 = points[(index - 1 + count) % count] ?? { x: cx, y: cy };
-      const p1 = points[index] ?? p0;
-      const p2 = points[(index + 1) % count] ?? p1;
-      const p3 = points[(index + 2) % count] ?? p2;
-      path2 += "C" + fmt2(p1.x + (p2.x - p0.x) / 6) + "," + fmt2(p1.y + (p2.y - p0.y) / 6) + " " + fmt2(p2.x - (p3.x - p1.x) / 6) + "," + fmt2(p2.y - (p3.y - p1.y) / 6) + " " + fmt2(p2.x) + "," + fmt2(p2.y);
-    }
-    return path2 + "Z";
-  }
-  function pathError(path2, cx, cy, rx, ry, n) {
-    const measured = measurePath(path2);
-    return squircleError(measured.samples, cx, cy, rx, ry, n);
   }
   function fmt2(value) {
     return String(Math.round(value * 100) / 100);
@@ -2810,7 +2812,7 @@
       const copy = rgba.slice();
       return { colors: copy, backdrop: copy.slice(), spread: 0, paletteSize: 0 };
     }
-    const source = options.mode === "poster" ? grayscale(rgba, count) : rgba;
+    const source = rgba;
     const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
     const samples = collectSamples(source, width, height, cutoff);
     const centroids = cluster(samples, colorCap(options));
@@ -2858,18 +2860,6 @@
   function colorCap(options) {
     const requested = options.maxColors > 0 ? options.maxColors : MODE_CAP[options.mode];
     return Math.min(32, Math.max(2, requested));
-  }
-  function grayscale(rgba, count) {
-    const next = new Uint8Array(rgba.length);
-    for (let index = 0; index < count; index += 1) {
-      const offset = index * 4;
-      const y = Math.round(0.2126 * (rgba[offset] ?? 0) + 0.7152 * (rgba[offset + 1] ?? 0) + 0.0722 * (rgba[offset + 2] ?? 0));
-      next[offset] = y;
-      next[offset + 1] = y;
-      next[offset + 2] = y;
-      next[offset + 3] = rgba[offset + 3] ?? 255;
-    }
-    return next;
   }
   function collectSamples(rgba, width, height, cutoff) {
     const target = 8e3;
