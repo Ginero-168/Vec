@@ -224,10 +224,7 @@ const BACKDROP_TOLERANCE = 24;
  */
 export function punchBorderBackdrop(rgba: Uint8Array, width: number, height: number, sourceBorder: string | null): Uint8Array {
   // Gate on the SOURCE corners (plate.borderColor): the painted label map is opaque even where the input was transparent.
-  // All four painted corners must be opaque: cornerColor() skips transparent corners, so a half-transparent
-  // alpha input (tw-rainbow) would otherwise get a subject colour as its "backdrop".
-  const corners = [0, width - 1, (height - 1) * width, height * width - 1];
-  if (sourceBorder === null || corners.some((pixel) => (rgba[pixel * 4 + 3] ?? 0) < 250)) return rgba;
+  if (sourceBorder === null) return rgba;
   const corner = cornerColor(rgba, width, height);
   if (corner === null) return rgba;
   const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);

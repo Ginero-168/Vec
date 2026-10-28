@@ -3535,7 +3535,7 @@
       const x = point2[0] ?? 0;
       const y = point2[1] ?? 0;
       const offset = (y * width + x) * 4;
-      if ((rgba[offset + 3] ?? 0) < 250) continue;
+      if ((rgba[offset + 3] ?? 0) < 250) return null;
       opaque.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
     }
     if (opaque.length === 0) return null;
@@ -3572,7 +3572,7 @@
     let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
     if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-    const centers = buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08));
+    const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
     const labels = assignLabels(linear, lab, core, alpha, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
     const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
     const painted = paintLabels2(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -3607,7 +3607,7 @@
     if (countOf(core) < 8) core = await coreMaskAsync(lab, alpha, width, height, 0.08, context);
     onProgress(0.14);
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-    const centers = buildPalette(lab, core, width, height, userK);
+    const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
     onProgress(0.26);
     const labels = await assignLabelsAsync(linear, lab, core, alpha, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
     const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
@@ -4170,6 +4170,49 @@
     onProgress?.(1);
     return { rgba, width, height, palette };
   }
+  var THIN_TAU = 0.07;
+  var THIN_MIN = 3;
+  var BLEND_TOLERANCE = 0.03;
+  var THIN_DISTANCE = 0.1;
+  function recoverThinColors(lab, alpha, core, width, height, centers) {
+    const limit = THIN_TAU * THIN_TAU;
+    const groups = /* @__PURE__ */ new Map();
+    const axes = [[1, 0], [0, 1], [1, 1], [1, -1]];
+    for (let y = 1; y < height - 1; y += 1) {
+      for (let x = 1; x < width - 1; x += 1) {
+        const index = y * width + x;
+        if (alpha[index] === 0 || core[index] === 1) continue;
+        const color = readLab(lab, index);
+        const alongStroke = axes.some(([dx, dy]) => {
+          const before = (y - (dy ?? 0)) * width + x - (dx ?? 0);
+          const after = (y + (dy ?? 0)) * width + x + (dx ?? 0);
+          if (alpha[before] === 0 || alpha[after] === 0 || labDistance2(color, readLab(lab, before)) >= limit || labDistance2(color, readLab(lab, after)) >= limit) return false;
+          const side = (y + (dx ?? 0)) * width + x - (dy ?? 0);
+          const other = (y - (dx ?? 0)) * width + x + (dy ?? 0);
+          if (alpha[side] === 0 || alpha[other] === 0) return true;
+          const across = projectLab(color, readLab(lab, side), readLab(lab, other));
+          return !(across.t > 0.15 && across.t < 0.85 && across.distance <= BLEND_TOLERANCE);
+        });
+        if (!alongStroke) continue;
+        const key = (Math.round(color.L / 0.05) + 40) * 1e4 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
+        const list = groups.get(key);
+        if (list === void 0) groups.set(key, [color]);
+        else list.push(color);
+      }
+    }
+    const result = [...centers];
+    const explained = (color) => result.some((center) => Math.sqrt(labDistance2(color, center)) <= THIN_DISTANCE);
+    const ordered = [...groups.values()].filter((list) => list.length >= THIN_MIN).sort((left, right) => right.length - left.length);
+    for (const list of ordered) {
+      if (result.length >= K_MAX) break;
+      const kept = list.filter((color) => !explained(color));
+      if (kept.length < THIN_MIN) continue;
+      const mean = kept.reduce((sum, color) => ({ L: sum.L + color.L / kept.length, a: sum.a + color.a / kept.length, b: sum.b + color.b / kept.length }), zeroLab());
+      if (explained(mean)) continue;
+      result.push(mean);
+    }
+    return result;
+  }
   function buildPalette(lab, core, width, height, userK, onProgress) {
     const bins = /* @__PURE__ */ new Map();
     for (let index = 0; index < core.length; index += 1) {
@@ -4405,6 +4448,21 @@
     }
     labels.set(next);
   }
+  var BACKDROP_LAB = 0.1;
+  var SUBJECT_ON_BORDER = 16;
+  function outsideHoldsSubject(rgba, lab, opaque, outside, width, height) {
+    const corner = cornerColor(rgba, width, height);
+    const backdrop = corner === null ? null : rgbToOklab({ r: parseInt(corner.slice(1, 3), 16), g: parseInt(corner.slice(3, 5), 16), b: parseInt(corner.slice(5, 7), 16) });
+    if (backdrop === null && !opaque.some((value, index) => value === 0 && outside[index] === 1)) return false;
+    let subject = 0;
+    for (let index = 0; index < outside.length; index += 1) {
+      if (outside[index] !== 1 || opaque[index] !== 1) continue;
+      if (backdrop !== null && Math.sqrt(labDistance2(readLab(lab, index), backdrop)) <= BACKDROP_LAB) continue;
+      subject += 1;
+      if (subject > SUBJECT_ON_BORDER) return true;
+    }
+    return false;
+  }
   function enclosedBoxes(rgba, width, height, onProgress) {
     const count = width * height;
     if (width < 2 || height < 2 || rgba.length < count * 4) return [];
@@ -4472,6 +4530,7 @@
       }
       if (cursor % 16384 === 0) onProgress?.(0.4 + 0.2 * cursor / Math.max(1, queue.length));
     }
+    if (outsideHoldsSubject(rgba, lab, opaque, outside, width, height)) return [];
     const object = new Uint8Array(count);
     for (let index = 0; index < count; index += 1) {
       if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
@@ -4572,6 +4631,7 @@
         await cooperate(context);
       }
     }
+    if (outsideHoldsSubject(rgba, lab, opaque, outside, width, height)) return [];
     const object = new Uint8Array(count);
     for (let index = 0; index < count; index += 1) {
       if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
@@ -4937,8 +4997,7 @@
   }
   var BACKDROP_TOLERANCE = 24;
   function punchBorderBackdrop(rgba, width, height, sourceBorder) {
-    const corners = [0, width - 1, (height - 1) * width, height * width - 1];
-    if (sourceBorder === null || corners.some((pixel) => (rgba[pixel * 4 + 3] ?? 0) < 250)) return rgba;
+    if (sourceBorder === null) return rgba;
     const corner = cornerColor(rgba, width, height);
     if (corner === null) return rgba;
     const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);

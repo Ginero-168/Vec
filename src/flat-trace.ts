@@ -169,7 +169,8 @@ export function cornerColor(rgba: Uint8Array, width: number, height: number): st
     const x = point[0] ?? 0;
     const y = point[1] ?? 0;
     const offset = (y * width + x) * 4;
-    if ((rgba[offset + 3] ?? 0) < 250) continue;
+    // A transparent corner means the backdrop is already transparent; an opaque corner then belongs to the subject.
+    if ((rgba[offset + 3] ?? 0) < 250) return null;
     opaque.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
   }
   if (opaque.length === 0) return null;
@@ -217,7 +218,7 @@ export function labelImage(
   let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08));
+  const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
   const labels = assignLabels(linear, lab, core, alpha, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -261,7 +262,7 @@ async function labelImageAsync(
   if (countOf(core) < 8) core = await coreMaskAsync(lab, alpha, width, height, 0.08, context);
   onProgress(0.14);
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = buildPalette(lab, core, width, height, userK);
+  const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
   onProgress(0.26);
   const labels = await assignLabelsAsync(linear, lab, core, alpha, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
   const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
@@ -849,6 +850,61 @@ function paintLabels(labels: Uint8Array, colors: readonly RGB[], width: number, 
   return { rgba, width, height, palette };
 }
 
+const THIN_TAU = 0.07;
+const THIN_MIN = 3;
+const BLEND_TOLERANCE = 0.03;
+const THIN_DISTANCE = 0.1;
+
+/**
+ * buildPalette samples only core pixels (all 8 neighbours within CORE_TAU), so a colour that only appears in strokes
+ * one or two source pixels wide never gets a centre: gl-microsoft's white gutters at 32/64 px, om-gear's black outline
+ * and grey ring, the rainbow bands and airbnb outline at 32 px, tw-apple's stem. Those pixels are still flat along the
+ * stroke. Collect opaque non-core pixels whose two neighbours on one axis (horizontal, vertical or a diagonal) match
+ * them and that are not a mix of their two neighbours across that axis (anti-aliased edge), group them by colour, and
+ * add each group of at least THIN_MIN pixels that is more than THIN_DISTANCE from every centre, largest first.
+ * THIN_DISTANCE is wider than REGION_TOLERANCE so JPEG ringing around a known colour does not become a centre.
+ */
+function recoverThinColors(lab: Float64Array, alpha: Uint8Array, core: Uint8Array, width: number, height: number, centers: Lab[]): Lab[] {
+  const limit = THIN_TAU * THIN_TAU;
+  const groups = new Map<number, Lab[]>();
+  const axes = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = y * width + x;
+      if (alpha[index] === 0 || core[index] === 1) continue;
+      const color = readLab(lab, index);
+      const alongStroke = axes.some(([dx, dy]) => {
+        const before = (y - (dy ?? 0)) * width + x - (dx ?? 0);
+        const after = (y + (dy ?? 0)) * width + x + (dx ?? 0);
+        if (alpha[before] === 0 || alpha[after] === 0 || labDistance2(color, readLab(lab, before)) >= limit || labDistance2(color, readLab(lab, after)) >= limit) return false;
+        // Across the stroke: an anti-aliased edge pixel is a mix of the two sides, a real stroke is not.
+        const side = (y + (dx ?? 0)) * width + x - (dy ?? 0);
+        const other = (y - (dx ?? 0)) * width + x + (dy ?? 0);
+        if (alpha[side] === 0 || alpha[other] === 0) return true;
+        const across = projectLab(color, readLab(lab, side), readLab(lab, other));
+        return !(across.t > 0.15 && across.t < 0.85 && across.distance <= BLEND_TOLERANCE);
+      });
+      if (!alongStroke) continue;
+      const key = (Math.round(color.L / 0.05) + 40) * 10000 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
+      const list = groups.get(key);
+      if (list === undefined) groups.set(key, [color]);
+      else list.push(color);
+    }
+  }
+  const result = [...centers];
+  const explained = (color: Lab) => result.some((center) => Math.sqrt(labDistance2(color, center)) <= THIN_DISTANCE);
+  const ordered = [...groups.values()].filter((list) => list.length >= THIN_MIN).sort((left, right) => right.length - left.length);
+  for (const list of ordered) {
+    if (result.length >= K_MAX) break;
+    const kept = list.filter((color) => !explained(color));
+    if (kept.length < THIN_MIN) continue;
+    const mean = kept.reduce((sum, color) => ({ L: sum.L + color.L / kept.length, a: sum.a + color.a / kept.length, b: sum.b + color.b / kept.length }), zeroLab());
+    if (explained(mean)) continue;
+    result.push(mean);
+  }
+  return result;
+}
+
 function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height: number, userK: number, onProgress?: (fraction: number) => void): Lab[] {
   const bins = new Map<string, { x: number; y: number; z: number; n: number }>();
   for (let index = 0; index < core.length; index += 1) {
@@ -1091,6 +1147,31 @@ function smoothLabels(labels: Uint8Array, width: number, height: number, kCount:
   labels.set(next);
 }
 
+const BACKDROP_LAB = 0.1;
+const SUBJECT_ON_BORDER = 16;
+
+/**
+ * The outside flood starts at the frame and walks every pixel that is not a colour edge, so a subject that touches
+ * the frame (gl-slack's left pills, si-ubuntu's left dot) is flooded as "outside" and left out of every box.
+ * When the backdrop is known (transparent or one corner colour) and the flood holds more than a few pixels that
+ * are neither transparent nor that colour,
+ * the subjects cannot be boxed apart: return true so subjectBoxes keeps the whole frame.
+ */
+function outsideHoldsSubject(rgba: Uint8Array, lab: Float64Array, opaque: Uint8Array, outside: Uint8Array, width: number, height: number): boolean {
+  const corner = cornerColor(rgba, width, height);
+  const backdrop = corner === null ? null : rgbToOklab({ r: parseInt(corner.slice(1, 3), 16), g: parseInt(corner.slice(3, 5), 16), b: parseInt(corner.slice(5, 7), 16) });
+  // No uniform corner colour and no transparency (a photo backdrop such as the dock wallpaper): nothing to compare to.
+  if (backdrop === null && !opaque.some((value, index) => value === 0 && outside[index] === 1)) return false;
+  let subject = 0;
+  for (let index = 0; index < outside.length; index += 1) {
+    if (outside[index] !== 1 || opaque[index] !== 1) continue;
+    if (backdrop !== null && Math.sqrt(labDistance2(readLab(lab, index), backdrop)) <= BACKDROP_LAB) continue;
+    subject += 1;
+    if (subject > SUBJECT_ON_BORDER) return true;
+  }
+  return false;
+}
+
 function enclosedBoxes(rgba: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): SubjectBox[] {
   const count = width * height;
   if (width < 2 || height < 2 || rgba.length < count * 4) return [];
@@ -1158,6 +1239,7 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number, onProgre
     }
     if (cursor % 16384 === 0) onProgress?.(0.4 + 0.2 * cursor / Math.max(1, queue.length));
   }
+  if (outsideHoldsSubject(rgba, lab, opaque, outside, width, height)) return [];
   const object = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) {
     if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
@@ -1265,6 +1347,7 @@ async function enclosedBoxesAsync(
       await cooperate(context);
     }
   }
+  if (outsideHoldsSubject(rgba, lab, opaque, outside, width, height)) return [];
   const object = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) {
     if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;

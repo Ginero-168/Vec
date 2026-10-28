@@ -773,7 +773,7 @@
       const x = point[0] ?? 0;
       const y = point[1] ?? 0;
       const offset = (y * width2 + x) * 4;
-      if ((rgba[offset + 3] ?? 0) < 250) continue;
+      if ((rgba[offset + 3] ?? 0) < 250) return null;
       opaque2.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
     }
     if (opaque2.length === 0) return null;

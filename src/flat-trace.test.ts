@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { labelImage, subjectBoxes } from "./flat-trace.ts";
+import { cornerColor, labelImage, subjectBoxes } from "./flat-trace.ts";
 import { encodeRgbaPng } from "./png-alpha.ts";
 import { cappedPalette, planTrace } from "./trace-pipeline.ts";
 
@@ -112,6 +112,34 @@ test("a logo plan is one 8x plate with the prototype trace settings", () => {
 });
 
 type Image = { rgba: Uint8Array };
+
+test("a transparent corner means no backdrop colour", () => {
+  const image = fill(20, 20, 235, 32, 39, 255);
+  assert.equal(cornerColor(image.rgba, 20, 20), "#eb2027");
+  setPixel(image, 20, 0, 0, 0, 0, 0, 0);
+  assert.equal(cornerColor(image.rgba, 20, 20), null);
+});
+
+test("a subject touching the frame keeps the whole frame instead of being dropped", () => {
+  const marks = fill(160, 70, 0, 0, 0, 0);
+  paint(marks, 160, 0, 16, 28, 28, 54, 197, 240);
+  paint(marks, 160, 60, 16, 28, 28, 224, 30, 90);
+  paint(marks, 160, 120, 16, 28, 28, 46, 182, 125);
+  assert.deepEqual(subjectBoxes(marks.rgba, 160, 70), [{ x: 0, y: 0, width: 160, height: 70 }]);
+});
+
+test("a two-pixel stroke gets its own palette colour but a one-pixel anti-aliased rim does not", () => {
+  const image = fill(40, 40, 255, 255, 255, 255);
+  paint(image, 40, 4, 4, 20, 20, 221, 46, 68);
+  paint(image, 40, 3, 3, 22, 1, 238, 150, 161);
+  paint(image, 40, 3, 24, 22, 1, 238, 150, 161);
+  paint(image, 40, 3, 3, 1, 22, 238, 150, 161);
+  paint(image, 40, 24, 3, 1, 22, 238, 150, 161);
+  paint(image, 40, 31, 4, 2, 30, 0, 0, 0);
+  const painted = labelImage(image.rgba, 40, 40, 8);
+  assert.ok(painted.palette.some((color) => channel(color, 0) < 40 && channel(color, 1) < 40 && channel(color, 2) < 40), painted.palette.join(","));
+  assert.ok(!painted.palette.some((color) => channel(color, 0) > 225 && channel(color, 1) > 120 && channel(color, 1) < 180), painted.palette.join(","));
+});
 
 function fill(width: number, height: number, red: number, green: number, blue: number, alpha: number): Image {
   const rgba = new Uint8Array(width * height * 4);
