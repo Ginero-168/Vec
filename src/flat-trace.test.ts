@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { cornerColor, labelImage, subjectBoxes } from "./flat-trace.ts";
 import { encodeRgbaPng } from "./png-alpha.ts";
-import { cappedPalette, planTrace } from "./trace-pipeline.ts";
+import { cappedPalette, planTrace, punchBorderBackdrop } from "./trace-pipeline.ts";
 
 test("a full palette keeps the sentinel in the last slot", () => {
   const colors = ["#ff00ff"];
@@ -139,6 +139,46 @@ test("a two-pixel stroke gets its own palette colour but a one-pixel anti-aliase
   const painted = labelImage(image.rgba, 40, 40, 8);
   assert.ok(painted.palette.some((color) => channel(color, 0) < 40 && channel(color, 1) < 40 && channel(color, 2) < 40), painted.palette.join(","));
   assert.ok(!painted.palette.some((color) => channel(color, 0) > 225 && channel(color, 1) > 120 && channel(color, 1) < 180), painted.palette.join(","));
+});
+
+test("a two-pixel anti-aliased ring between two flats does not become its own colour", () => {
+  // JPEG and soft edges leave a ring that is wider than one pixel; it is still a mix of the colours on either side.
+  const image = fill(40, 40, 255, 255, 255, 255);
+  paint(image, 40, 8, 8, 24, 24, 143, 235, 176);
+  paint(image, 40, 10, 10, 20, 20, 30, 215, 96);
+  const painted = labelImage(image.rgba, 40, 40, 8);
+  assert.ok(!painted.palette.some((color) => channel(color, 0) > 110 && channel(color, 0) < 200 && channel(color, 1) > 200), painted.palette.join(","));
+});
+
+test("a soft transparent edge is cut at its sub-pixel contour, not on the pixel grid", () => {
+  const image = fill(16, 16, 0, 0, 0, 0);
+  for (let y = 0; y < 16; y += 1) {
+    setPixel(image, 16, 5, y, 220, 30, 40, 64);
+    for (let x = 6; x < 16; x += 1) setPixel(image, 16, x, y, 220, 30, 40, 255);
+  }
+  const painted = labelImage(image.rgba, 16, 16, 8);
+  const row = 8 * 8 + 4;
+  let first = -1;
+  for (let x = 0; x < painted.width; x += 1) {
+    if ((painted.rgba[(row * painted.width + x) * 4 + 3] ?? 0) > 0) { first = x; break; }
+  }
+  // The 50% opacity crossing lies between the 64 and 255 pixel centres, a third of the way in: 8 * 5.84 = 46.7.
+  assert.equal(first, 47);
+});
+
+test("the backdrop punch peels a pale anti-aliasing halo but keeps pale content beyond one source pixel", () => {
+  const width = 96;
+  const image = fill(width, width, 255, 255, 255, 255);
+  paint(image, width, 20, 20, 40, 40, 255, 235, 220);
+  paint(image, width, 24, 24, 32, 32, 233, 84, 32);
+  paint(image, width, 64, 20, 28, 40, 255, 235, 220);
+  const out = punchBorderBackdrop(image.rgba, width, width, "#ffffff", 8);
+  const alpha = (x: number, y: number) => out[(y * width + x) * 4 + 3];
+  assert.equal(alpha(1, 1), 0);
+  assert.equal(alpha(22, 40), 0, "4px halo ring around the subject");
+  assert.equal(alpha(40, 40), 255, "subject");
+  assert.equal(alpha(66, 40), 0, "edge of the pale block");
+  assert.equal(alpha(78, 40), 255, "pale block interior, 14px from the backdrop");
 });
 
 function fill(width: number, height: number, red: number, green: number, blue: number, alpha: number): Image {

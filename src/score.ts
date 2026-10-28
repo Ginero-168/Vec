@@ -436,7 +436,8 @@ function fitCircle(measured: MeasuredPath): { readonly cx: number; readonly cy: 
   if (maxError > Math.max(1.25, radius * 0.04)) return null;
   const expected = Math.PI * radius * radius;
   if (Math.abs(measured.area - expected) / expected > 0.12) return null;
-  return { cx, cy, r: radius };
+  const areaRadius = Math.sqrt(measured.area / Math.PI);
+  return { cx, cy, r: Math.abs(areaRadius - radius) <= radius * 0.006 ? areaRadius : radius };
 }
 
 function fitEllipse(measured: MeasuredPath): { readonly cx: number; readonly cy: number; readonly rx: number; readonly ry: number } | null {

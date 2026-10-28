@@ -146,10 +146,12 @@ function labelImage(rgba, width, height, maxColors, preprocess = identityRaster,
   const lab = new Float64Array(count * 3);
   const linear = new Float64Array(count * 3);
   const alpha = new Uint8Array(count);
+  const opacity = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) {
     const offset = index * 4;
     const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
-    alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
+    opacity[index] = source[offset + 3] ?? 0;
+    alpha[index] = (opacity[index] ?? 0) >= 128 ? 255 : 0;
     const converted = rgbToOklab(color);
     lab[index * 3] = converted.L;
     lab[index * 3 + 1] = converted.a;
@@ -163,13 +165,13 @@ function labelImage(rgba, width, height, maxColors, preprocess = identityRaster,
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
   const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
-  const labels = assignLabels(linear, lab, core, alpha, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
+  const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
   return painted;
 }
-function assignLabels(linear, lab, core, alpha, width, height, centers, onProgress) {
+function assignLabels(linear, lab, core, alpha, opacity, width, height, centers, onProgress) {
   const count = width * height;
   const kCount = centers.length;
   const coreLabel = new Int16Array(count);
@@ -257,16 +259,45 @@ function assignLabels(linear, lab, core, alpha, width, height, centers, onProgre
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
   smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (alpha[y * width + x] !== 0) continue;
-      for (let oy = 0; oy < UP; oy += 1) {
-        for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
-      }
-    }
-    onProgress?.(0.96 + 0.04 * (y + 1) / height);
-  }
+  cutTransparent(labels, opacity, width, height);
+  onProgress?.(1);
   return labels;
+}
+function cutTransparent(labels, opacity, width, height) {
+  if (opacity.every((value) => value === 255)) return;
+  const upW = width * UP;
+  const upH = height * UP;
+  const read = (x, y) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+  let pending = [];
+  for (let uy = 0; uy < upH; uy += 1) {
+    const sy = (uy + 0.5) / UP - 0.5;
+    const y0 = Math.floor(sy);
+    const fy = sy - y0;
+    for (let ux = 0; ux < upW; ux += 1) {
+      const sx = (ux + 0.5) / UP - 0.5;
+      const x0 = Math.floor(sx);
+      const fx = sx - x0;
+      const top = read(x0, y0) * (1 - fx) + read(x0 + 1, y0) * fx;
+      const bottom = read(x0, y0 + 1) * (1 - fx) + read(x0 + 1, y0 + 1) * fx;
+      const at = uy * upW + ux;
+      if (top * (1 - fy) + bottom * fy < 128) labels[at] = 255;
+      else if (labels[at] === 255) pending.push(at);
+    }
+  }
+  while (pending.length > 0) {
+    const assigned = [];
+    const waiting = [];
+    for (const at of pending) {
+      const x = at % upW;
+      const neighbours = [x > 0 ? at - 1 : -1, x < upW - 1 ? at + 1 : -1, at - upW, at + upW];
+      const from = neighbours.find((next) => next >= 0 && next < labels.length && labels[next] !== 255);
+      if (from === void 0) waiting.push(at);
+      else assigned.push(at, labels[from] ?? 0);
+    }
+    if (assigned.length === 0) break;
+    for (let index = 0; index < assigned.length; index += 2) labels[assigned[index] ?? 0] = assigned[index + 1] ?? 0;
+    pending = waiting;
+  }
 }
 function nearestCoreLabel(coreLabel, width, height, onProgress) {
   const nearest2 = new Int16Array(coreLabel.length);
@@ -391,10 +422,25 @@ var THIN_TAU = 0.07;
 var THIN_MIN = 3;
 var BLEND_TOLERANCE = 0.03;
 var THIN_DISTANCE = 0.1;
+var EDGE_BLEND = 0.06;
 function recoverThinColors(lab, alpha, core, width, height, centers) {
   const limit = THIN_TAU * THIN_TAU;
   const groups = /* @__PURE__ */ new Map();
   const axes = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  const betweenCenters = (color, x, y, px, py) => {
+    for (let reach = 1; reach <= 2; reach += 1) {
+      const ax = x + px * reach, ay = y + py * reach, bx = x - px * reach, by = y - py * reach;
+      if (ax < 0 || ay < 0 || bx < 0 || by < 0 || ax >= width || bx >= width || ay >= height || by >= height) continue;
+      const a = ay * width + ax, b = by * width + bx;
+      if (alpha[a] === 0 || alpha[b] === 0) continue;
+      const left = centers[nearestLab(readLab(lab, a), centers)] ?? zeroLab();
+      const right = centers[nearestLab(readLab(lab, b), centers)] ?? zeroLab();
+      if (labDistance2(left, right) === 0) continue;
+      const mix = projectLab(color, left, right);
+      if (mix.t > 0.1 && mix.t < 0.9 && mix.distance <= EDGE_BLEND) return true;
+    }
+    return false;
+  };
   for (let y = 1; y < height - 1; y += 1) {
     for (let x = 1; x < width - 1; x += 1) {
       const index = y * width + x;
@@ -408,7 +454,8 @@ function recoverThinColors(lab, alpha, core, width, height, centers) {
         const other = (y - (dx ?? 0)) * width + x + (dy ?? 0);
         if (alpha[side] === 0 || alpha[other] === 0) return true;
         const across = projectLab(color, readLab(lab, side), readLab(lab, other));
-        return !(across.t > 0.15 && across.t < 0.85 && across.distance <= BLEND_TOLERANCE);
+        if (across.t > 0.15 && across.t < 0.85 && across.distance <= BLEND_TOLERANCE) return false;
+        return !betweenCenters(color, x, y, dy ?? 0, -(dx ?? 0));
       });
       if (!alongStroke) continue;
       const key = (Math.round(color.L / 0.05) + 40) * 1e4 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
@@ -1905,7 +1952,7 @@ function planTrace(source, settings, controls, previousStages = null, from = "co
 function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, void 0, onProgress);
   const plates = flat.map((plate) => ({
-    png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor) : plate.rgba),
+    png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : plate.rgba),
     scale: plate.scale,
     originX: plate.originX,
     originY: plate.originY,
@@ -1922,12 +1969,16 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
   };
 }
 var BACKDROP_TOLERANCE = 24;
-function punchBorderBackdrop(rgba, width, height, sourceBorder) {
+var HALO_MIX = 0.35;
+var HALO_RESIDUAL = 16;
+function punchBorderBackdrop(rgba, width, height, sourceBorder, haloReach = 8) {
   if (sourceBorder === null) return rgba;
   const corner = cornerColor(rgba, width, height);
   if (corner === null) return rgba;
   const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);
+  const halo = haloColors(rgba, [tr, tg, tb]);
   const near = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
+  const isHalo = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && halo.has((rgba[pixel * 4] ?? 0) << 16 | (rgba[pixel * 4 + 1] ?? 0) << 8 | (rgba[pixel * 4 + 2] ?? 0));
   const out = new Uint8Array(rgba);
   const seen = new Uint8Array(width * height);
   const stack = [];
@@ -1955,7 +2006,61 @@ function punchBorderBackdrop(rgba, width, height, sourceBorder) {
     if (pixel >= width) push(pixel - width);
     if (pixel < (height - 1) * width) push(pixel + width);
   }
-  return punched === width * height ? rgba : out;
+  if (punched === width * height) return rgba;
+  if (halo.size > 0) {
+    let frontier = [];
+    for (let pixel = 0; pixel < width * height; pixel += 1) if (seen[pixel] === 1) frontier.push(pixel);
+    for (let depth = 0; depth < haloReach && frontier.length > 0; depth += 1) {
+      const next = [];
+      for (const pixel of frontier) {
+        const x = pixel % width;
+        for (const step of [x > 0 ? pixel - 1 : -1, x < width - 1 ? pixel + 1 : -1, pixel - width, pixel + width]) {
+          if (step < 0 || step >= width * height || seen[step] === 1 || !isHalo(step)) continue;
+          seen[step] = 1;
+          out[step * 4 + 3] = 0;
+          next.push(step);
+        }
+      }
+      frontier = next;
+    }
+  }
+  return out;
+}
+function haloColors(rgba, backdrop) {
+  const counts = /* @__PURE__ */ new Map();
+  for (let offset = 0; offset < rgba.length; offset += 4) {
+    if ((rgba[offset + 3] ?? 0) < 250) continue;
+    const key = (rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (counts.size > 64) return /* @__PURE__ */ new Set();
+  }
+  const colors = [...counts.keys()].map((key) => [key >> 16 & 255, key >> 8 & 255, key & 255]);
+  const result = /* @__PURE__ */ new Set();
+  for (const color of colors) {
+    for (const other of colors) {
+      if (other === color) continue;
+      let dot = 0;
+      let length = 0;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const span = (other[channel] ?? 0) - (backdrop[channel] ?? 0);
+        dot += ((color[channel] ?? 0) - (backdrop[channel] ?? 0)) * span;
+        length += span * span;
+      }
+      if (length < 64 * 64) continue;
+      const t = dot / length;
+      if (t <= 0 || t > HALO_MIX) continue;
+      let residual = 0;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const mixed = (backdrop[channel] ?? 0) + t * ((other[channel] ?? 0) - (backdrop[channel] ?? 0));
+        residual += ((color[channel] ?? 0) - mixed) ** 2;
+      }
+      if (Math.sqrt(residual) <= HALO_RESIDUAL) {
+        result.add((color[0] ?? 0) << 16 | (color[1] ?? 0) << 8 | (color[2] ?? 0));
+        break;
+      }
+    }
+  }
+  return result;
 }
 function flatRequest(settings, palette, scale) {
   return {

@@ -1261,7 +1261,8 @@
     if (maxError > Math.max(1.25, radius * 0.04)) return null;
     const expected = Math.PI * radius * radius;
     if (Math.abs(measured.area - expected) / expected > 0.12) return null;
-    return { cx, cy, r: radius };
+    const areaRadius = Math.sqrt(measured.area / Math.PI);
+    return { cx, cy, r: Math.abs(areaRadius - radius) <= radius * 6e-3 ? areaRadius : radius };
   }
   function fitEllipse(measured) {
     const rx = (measured.maxX - measured.minX) / 2;

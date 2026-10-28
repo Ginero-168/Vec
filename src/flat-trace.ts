@@ -202,10 +202,12 @@ export function labelImage(
   const lab = new Float64Array(count * 3);
   const linear = new Float64Array(count * 3);
   const alpha = new Uint8Array(count);
+  const opacity = new Uint8Array(count);
   for (let index = 0; index < count; index += 1) {
     const offset = index * 4;
     const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
-    alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
+    opacity[index] = source[offset + 3] ?? 0;
+    alpha[index] = (opacity[index] ?? 0) >= 128 ? 255 : 0;
     const converted = rgbToOklab(color);
     lab[index * 3] = converted.L;
     lab[index * 3 + 1] = converted.a;
@@ -219,7 +221,7 @@ export function labelImage(
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
   const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
-  const labels = assignLabels(linear, lab, core, alpha, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
+  const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
@@ -241,12 +243,14 @@ async function labelImageAsync(
   const lab = new Float64Array(count * 3);
   const linear = new Float64Array(count * 3);
   const alpha = new Uint8Array(count);
+  const opacity = new Uint8Array(count);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
       const offset = index * 4;
       const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
-      alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
+      opacity[index] = source[offset + 3] ?? 0;
+      alpha[index] = (opacity[index] ?? 0) >= 128 ? 255 : 0;
       const converted = rgbToOklab(color);
       lab[index * 3] = converted.L;
       lab[index * 3 + 1] = converted.a;
@@ -264,7 +268,7 @@ async function labelImageAsync(
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
   const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
   onProgress(0.26);
-  const labels = await assignLabelsAsync(linear, lab, core, alpha, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
+  const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
   const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
   onProgress(0.94);
   const painted = await paintLabelsAsync(labels, colors, width * UP, height * UP, context, (fraction) => onProgress(0.94 + fraction * 0.06));
@@ -308,6 +312,7 @@ async function assignLabelsAsync(
   lab: Float64Array,
   core: Uint8Array,
   alpha: Uint8Array,
+  opacity: Uint8Array,
   width: number,
   height: number,
   centers: Lab[],
@@ -405,16 +410,8 @@ async function assignLabelsAsync(
   }
   await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
   await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (alpha[y * width + x] !== 0) continue;
-      for (let oy = 0; oy < UP; oy += 1) {
-        for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
-      }
-    }
-    onProgress(0.91 + 0.09 * (y + 1) / height);
-    await cooperate(context);
-  }
+  cutTransparent(labels, opacity, width, height);
+  onProgress(1);
   return labels;
 }
 
@@ -627,7 +624,7 @@ async function paintLabelsAsync(labels: Uint8Array, colors: readonly RGB[], widt
   return { rgba, width, height, palette };
 }
 
-function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, width: number, height: number, centers: Lab[], onProgress?: (fraction: number) => void): Uint8Array {
+function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, opacity: Uint8Array, width: number, height: number, centers: Lab[], onProgress?: (fraction: number) => void): Uint8Array {
   const count = width * height;
   const kCount = centers.length;
   const coreLabel = new Int16Array(count);
@@ -715,16 +712,49 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
   smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (alpha[y * width + x] !== 0) continue;
-      for (let oy = 0; oy < UP; oy += 1) {
-        for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
-      }
-    }
-    onProgress?.(0.96 + 0.04 * (y + 1) / height);
-  }
+  cutTransparent(labels, opacity, width, height);
+  onProgress?.(1);
   return labels;
+}
+
+// Cut the transparent area out of the 8x label map along the bilinear 50% opacity contour. Clearing whole source
+// pixels left a one-source-pixel staircase on every transparent edge; VTracer traced each step, and the notches
+// rendered as slivers and seams. Opaque sub-pixels the per-pixel labelling skipped take a neighbouring label.
+function cutTransparent(labels: Uint8Array, opacity: Uint8Array, width: number, height: number): void {
+  if (opacity.every((value) => value === 255)) return;
+  const upW = width * UP;
+  const upH = height * UP;
+  const read = (x: number, y: number) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+  let pending: number[] = [];
+  for (let uy = 0; uy < upH; uy += 1) {
+    const sy = (uy + 0.5) / UP - 0.5;
+    const y0 = Math.floor(sy);
+    const fy = sy - y0;
+    for (let ux = 0; ux < upW; ux += 1) {
+      const sx = (ux + 0.5) / UP - 0.5;
+      const x0 = Math.floor(sx);
+      const fx = sx - x0;
+      const top = read(x0, y0) * (1 - fx) + read(x0 + 1, y0) * fx;
+      const bottom = read(x0, y0 + 1) * (1 - fx) + read(x0 + 1, y0 + 1) * fx;
+      const at = uy * upW + ux;
+      if (top * (1 - fy) + bottom * fy < 128) labels[at] = 255;
+      else if (labels[at] === 255) pending.push(at);
+    }
+  }
+  while (pending.length > 0) {
+    const assigned: number[] = [];
+    const waiting: number[] = [];
+    for (const at of pending) {
+      const x = at % upW;
+      const neighbours = [x > 0 ? at - 1 : -1, x < upW - 1 ? at + 1 : -1, at - upW, at + upW];
+      const from = neighbours.find((next) => next >= 0 && next < labels.length && labels[next] !== 255);
+      if (from === undefined) waiting.push(at);
+      else assigned.push(at, labels[from] ?? 0);
+    }
+    if (assigned.length === 0) break;
+    for (let index = 0; index < assigned.length; index += 2) labels[assigned[index] ?? 0] = assigned[index + 1] ?? 0;
+    pending = waiting;
+  }
 }
 
 function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number, onProgress?: (fraction: number) => void): Int16Array {
@@ -854,6 +884,7 @@ const THIN_TAU = 0.07;
 const THIN_MIN = 3;
 const BLEND_TOLERANCE = 0.03;
 const THIN_DISTANCE = 0.1;
+const EDGE_BLEND = 0.06;
 
 /**
  * buildPalette samples only core pixels (all 8 neighbours within CORE_TAU), so a colour that only appears in strokes
@@ -868,6 +899,22 @@ function recoverThinColors(lab: Float64Array, alpha: Uint8Array, core: Uint8Arra
   const limit = THIN_TAU * THIN_TAU;
   const groups = new Map<number, Lab[]>();
   const axes = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  // JPEG ringing and soft edges defeat the pixel test above. Look one and two pixels out on each side, snap those to
+  // the core palette, and call the pixel an edge blend when the sides are two different centres it lies between.
+  const betweenCenters = (color: Lab, x: number, y: number, px: number, py: number): boolean => {
+    for (let reach = 1; reach <= 2; reach += 1) {
+      const ax = x + px * reach, ay = y + py * reach, bx = x - px * reach, by = y - py * reach;
+      if (ax < 0 || ay < 0 || bx < 0 || by < 0 || ax >= width || bx >= width || ay >= height || by >= height) continue;
+      const a = ay * width + ax, b = by * width + bx;
+      if (alpha[a] === 0 || alpha[b] === 0) continue;
+      const left = centers[nearestLab(readLab(lab, a), centers)] ?? zeroLab();
+      const right = centers[nearestLab(readLab(lab, b), centers)] ?? zeroLab();
+      if (labDistance2(left, right) === 0) continue;
+      const mix = projectLab(color, left, right);
+      if (mix.t > 0.1 && mix.t < 0.9 && mix.distance <= EDGE_BLEND) return true;
+    }
+    return false;
+  };
   for (let y = 1; y < height - 1; y += 1) {
     for (let x = 1; x < width - 1; x += 1) {
       const index = y * width + x;
@@ -882,7 +929,8 @@ function recoverThinColors(lab: Float64Array, alpha: Uint8Array, core: Uint8Arra
         const other = (y - (dx ?? 0)) * width + x + (dy ?? 0);
         if (alpha[side] === 0 || alpha[other] === 0) return true;
         const across = projectLab(color, readLab(lab, side), readLab(lab, other));
-        return !(across.t > 0.15 && across.t < 0.85 && across.distance <= BLEND_TOLERANCE);
+        if (across.t > 0.15 && across.t < 0.85 && across.distance <= BLEND_TOLERANCE) return false;
+        return !betweenCenters(color, x, y, dy ?? 0, -(dx ?? 0));
       });
       if (!alongStroke) continue;
       const key = (Math.round(color.L / 0.05) + 40) * 10000 + (Math.round(color.a / 0.05) + 40) * 100 + (Math.round(color.b / 0.05) + 40);
