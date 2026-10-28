@@ -1,4 +1,5 @@
 import { labDistance2, oklabToRgb, rgbToOklab, type Lab, type RGB } from "./color.ts";
+import { wouldDenoise } from "./denoise.ts";
 import { mergeNearCenters } from "./jpeg-clean.ts";
 
 export type FlatPlate = {
@@ -237,7 +238,7 @@ export function labelImage(
   const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
   // A preprocess that returned new pixels cleaned a lossy raster: fold the near-duplicate centres its noise split.
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-  const edges = source !== rgba ? lossyEdges(source, count, centers) : undefined;
+  const edges = edgeRule(rgba, source, width, height, centers);
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -289,7 +290,7 @@ async function labelImageAsync(
   const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   onProgress(0.26);
-  const edges = source !== rgba ? lossyEdges(source, count, centers) : undefined;
+  const edges = edgeRule(rgba, source, width, height, centers);
   const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers);
   onProgress(0.94);
@@ -447,7 +448,7 @@ async function assignLabelsAsync(
     }
   }
   await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
-  await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
+  if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
   cutTransparent(labels, opacity, width, height);
   onProgress(1);
   return labels;
@@ -800,7 +801,7 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
     }
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
-  smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
+  if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
   return labels;
@@ -1132,19 +1133,49 @@ function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number, 
 // saturated ink 0.1-0.2 px into white (gl-figma-128-q60's blue circle +0.18 px). The split weighs sRGB and OKLab equally (0.5):
 // q60 also quantises luma, and on long straight ink/white edges that pulls the sRGB 50% point up to 0.2 px into the
 // ink; the pure sRGB split grew gl-microsoft-128-q60's white gap 10% (worst IoU 0.984 -> 0.906). Weights 0.5-0.8 keep
-// that gap at IoU 0.95-0.98; 0.85 and up do not. 0.5 is the neutral point of that band, not a bench optimum. Clean rasters keep the linear/OKLab rule.
+// that gap at IoU 0.95-0.98; 0.85 and up do not. 0.5 is the neutral point of that 0.5-0.8 passing band (equal say for
+// both midpoints), not a bench optimum. Clean rasters split at the pure sRGB midpoint (see edgeRule).
 const LOSSY_SRGB_WEIGHT = 0.5;
 
-type LossyEdges = { readonly srgb: Float64Array; readonly centers: readonly RGB[] };
+/**
+ * How a sub-pixel between two inks is decided. Every rasteriser mixes an edge pixel in gamma-encoded sRGB (resvg, the
+ * bench's renderer, as well), so a pixel half covered by ink is the sRGB midpoint of the two inks, and the edge is
+ * where the sRGB-interpolated colour passes that midpoint. A clean raster is split there exactly (weight 1). The old
+ * rule, linear-light interpolation and the OKLab midpoint, put the switch away from 50 % coverage by an amount that
+ * depends on the two colours: the 8x plate sat up to 1.5 plate px outside (si-spotify) or 1.6 px inside (si-ubuntu)
+ * the ground truth. A lossy raster that was cleaned keeps LOSSY_SRGB_WEIGHT; one too small to clean (< 96 px) keeps
+ * the old rule, since its luma quantisation was never measured against the sRGB split; so does a raster with
+ * transparency (below), which also keeps alpha output unchanged.
+ */
+function edgeRule(rgba: Uint8Array, source: Uint8Array, width: number, height: number, centers: readonly Lab[]): LossyEdges | undefined {
+  if (source !== rgba) return lossyEdges(source, width * height, centers);
+  if (wouldDenoise(rgba, width, height)) return undefined;
+  // A raster with transparency keeps the old rule: the sRGB split reads colour alone, and a pixel's coverage of the
+  // transparent backdrop lives in its alpha (a lone 39 % stroke has the same colour as the clear pixels around it).
+  for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return undefined;
+  return lossyEdges(source, width * height, centers, 1);
+}
 
-function lossyEdges(source: Uint8Array, count: number, centers: readonly Lab[]): LossyEdges {
+/**
+ * The label smoothing (a Gaussian-weighted majority vote, sigma SMOOTH_SOURCE) is for edges decided from noisy
+ * pixels. On a clean raster the sRGB split already follows the smooth 50 % isoline of the bicubic interpolant, and the
+ * vote only moves it: a majority filter pulls a boundary toward its centre of curvature and thins narrow features
+ * (si-spotify's white arcs lost 1.5 plate px; tw-apple-64's ink offset +0.71 -> +0.02 plate px without it).
+ */
+function smoothsLabels(edges: LossyEdges | undefined): boolean {
+  return edges === undefined || edges.weight !== 1;
+}
+
+type LossyEdges = { readonly srgb: Float64Array; readonly centers: readonly RGB[]; readonly weight: number };
+
+function lossyEdges(source: Uint8Array, count: number, centers: readonly Lab[], weight = LOSSY_SRGB_WEIGHT): LossyEdges {
   const srgb = new Float64Array(count * 3);
   for (let index = 0; index < count; index += 1) {
     srgb[index * 3] = source[index * 4] ?? 0;
     srgb[index * 3 + 1] = source[index * 4 + 1] ?? 0;
     srgb[index * 3 + 2] = source[index * 4 + 2] ?? 0;
   }
-  return { srgb, centers: centers.map((center) => oklabToRgb(center)) };
+  return { srgb, centers: centers.map((center) => oklabToRgb(center)), weight };
 }
 
 function explainLossy(edges: LossyEdges, width: number, table: BicubicTable, x: number, y: number, bits: readonly number[], centers: readonly Lab[]): number {
@@ -1171,7 +1202,7 @@ function explainLossy(edges: LossyEdges, width: number, table: BicubicTable, x: 
     const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
     const length = dr * dr + dg * dg + db * db;
     const srgb = length === 0 ? oklab : ((rgb.r - from.r) * dr + (rgb.g - from.g) * dg + (rgb.b - from.b) * db) / length;
-    return LOSSY_SRGB_WEIGHT * srgb + (1 - LOSSY_SRGB_WEIGHT) * oklab;
+    return edges.weight * srgb + (1 - edges.weight) * oklab;
   });
 }
 

@@ -464,6 +464,30 @@ test("a lossy edge splits a half-covered pixel at its sRGB midpoint, not the OKL
   };
   const lossy = blueRun(labelImage(image.rgba, 32, 16, 2, (rgba) => rgba.slice()));
   assert.ok(Math.abs(lossy - 16.5) < 1 / 16, `lossy edge at ${lossy}`);
-  // The clean rule (linear interpolation, OKLab midpoint) keeps its own split: blue takes 5/8 of the column.
-  assert.equal(blueRun(labelImage(image.rgba, 32, 16, 2)), 16.625);
+  // A clean raster is mixed the same way by its rasteriser, so it splits there too (the old linear/OKLab rule gave
+  // blue 5/8 of the column).
+  const clean = blueRun(labelImage(image.rgba, 32, 16, 2));
+  assert.ok(Math.abs(clean - 16.5) < 1 / 16, `clean edge at ${clean}`);
+});
+
+test("a clean anti-aliased disc keeps its area on the plate", () => {
+  // A disc rendered the way resvg renders it: coverage from 16x16 supersampling, mixed in sRGB. Without label smoothing
+  // the plate follows the 50 % isoline; the majority vote pulled a boundary toward its centre of curvature.
+  const size = 40, radius = 9.5, centre = 20.25;
+  const image = fill(size, size, 255, 255, 255, 255);
+  const ink = [220, 40, 60] as const;
+  for (let y = 0; y < size; y += 1) for (let x = 0; x < size; x += 1) {
+    let inside = 0;
+    for (let sy = 0; sy < 16; sy += 1) for (let sx = 0; sx < 16; sx += 1) {
+      if (Math.hypot(x + (sx + 0.5) / 16 - centre, y + (sy + 0.5) / 16 - centre) <= radius) inside += 1;
+    }
+    const t = inside / 256;
+    setPixel(image, size, x, y, Math.round(255 + (ink[0] - 255) * t), Math.round(255 + (ink[1] - 255) * t), Math.round(255 + (ink[2] - 255) * t), 255);
+  }
+  const painted = labelImage(image.rgba, size, size, 2);
+  let cells = 0;
+  for (let at = 0; at < painted.rgba.length; at += 4) if ((painted.rgba[at + 1] ?? 255) < 150) cells += 1;
+  const area = cells / 64;
+  const expected = Math.PI * radius * radius;
+  assert.ok(Math.abs(area - expected) / expected < 0.01, `plate area ${area.toFixed(2)} vs ${expected.toFixed(2)}`);
 });
