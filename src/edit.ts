@@ -978,3 +978,153 @@ function readAttr(attrs: string, name: string): string | null {
   if (match === null) return null;
   return match[1] ?? match[2] ?? "";
 }
+
+/**
+ * Classify each short corner segment as sharp or round. VTracer rounds a hard corner into a tiny cubic between two
+ * long runs; when that cubic is shorter than `fillet` source pixels, turns the path by at least `minTurn` degrees, and
+ * the neighbouring tangents meet next to it, the corner is sharp: the tiny cubic is removed and both neighbours end at
+ * the tangent intersection. Longer bends are real rounded corners and stay.
+ */
+export function sharpenCorners(svg: string, fillet = 1.25, minTurn = 35, curl = fillet): string {
+  return svg.replace(shapePattern(), (tag) => {
+    if (!/^<path\b/i.test(tag)) return tag;
+    const quoted = readD(tag);
+    if (quoted === null) return tag;
+    const parsed = parsePath(quoted.value);
+    if (parsed === null || parsed.length === 0) return tag;
+    const sharpened = parsed.map((subpath) => sharpenSubpath(subpath, fillet, minTurn, curl));
+    const next = serialize(sharpened);
+    if (next === quoted.value) return tag;
+    return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+  });
+}
+
+function sharpenSubpath(subpath: Subpath, fillet: number, minTurn: number, curl: number): Subpath {
+  if (!subpath.closed || subpath.cubics.length < 4) return subpath;
+  const cubics = subpath.cubics.map((cubic) => ({ p0: { ...cubic.p0 }, p1: { ...cubic.p1 }, p2: { ...cubic.p2 }, p3: { ...cubic.p3 } }));
+  const turnLimit = (minTurn * Math.PI) / 180;
+  let index = 0;
+  while (index < cubics.length && cubics.length >= 4) {
+    // The rounded corner may be one tiny cubic or a run of them; try the shortest run first.
+    let replaced = false;
+    let run = 0;
+    let length = 0;
+    while (!replaced && run < 4 && cubics.length - run >= 3) {
+      const piece = cubics[(index + run) % cubics.length];
+      if (piece === undefined) break;
+      length += distance(piece.p0, piece.p3);
+      run += 1;
+      if (length > fillet) break;
+      const before = cubics[(index - 1 + cubics.length) % cubics.length];
+      const after = cubics[(index + run) % cubics.length];
+      if (before === undefined || after === undefined || before === after) break;
+      const into = incoming(before);
+      const out = outgoing(after);
+      if (angleBetween(into, out) < turnLimit) continue;
+      if (distance(before.p0, before.p3) < 2 * length || distance(after.p0, after.p3) < 2 * length) continue;
+      const meet = intersectLines(before.p3, into, after.p0, out);
+      if (meet === null || distance(meet, before.p3) > 2 * fillet || distance(meet, after.p0) > 2 * fillet) continue;
+      before.p2 = { x: before.p2.x + meet.x - before.p3.x, y: before.p2.y + meet.y - before.p3.y };
+      before.p3 = { ...meet };
+      after.p1 = { x: after.p1.x + meet.x - after.p0.x, y: after.p1.y + meet.y - after.p0.y };
+      after.p0 = { ...meet };
+      for (let removed = 0; removed < run; removed += 1) {
+        const at = index % cubics.length;
+        cubics.splice(at, 1);
+        if (at < index) index -= 1;
+      }
+      replaced = true;
+    }
+    if (!replaced) index += 1;
+  }
+  if (curl > 0) for (let joint = 0; joint < cubics.length; joint += 1) sharpenJoint(cubics, joint, curl, turnLimit);
+  return { cubics, closed: subpath.closed };
+}
+
+const STRAIGHT_TOLERANCE = 0.15;
+
+/**
+ * The other way VTracer rounds a hard corner: no tiny cubic, but both long cubics meeting there curl over their last
+ * pixel or two. When each has a straight body that turns by at least `turnLimit` into the other, and the bodies'
+ * lines meet within `fillet` of the joint, the curls are cut off and both bodies run straight to the meeting point.
+ */
+function sharpenJoint(cubics: Cubic[], joint: number, fillet: number, turnLimit: number): void {
+  const before = cubics[(joint - 1 + cubics.length) % cubics.length];
+  const after = cubics[joint];
+  if (before === undefined || after === undefined || before === after) return;
+  const tail = straightBody(reverseCubic(before));
+  const head = straightBody(after);
+  if (tail === null || head === null) return;
+  const corner = after.p0;
+  const from = bezier(before, 1 - tail.t);
+  const to = bezier(after, head.t);
+  if (distance(from, corner) + distance(corner, to) < 0.05) return;
+  const into = { x: -tail.direction.x, y: -tail.direction.y };
+  if (angleBetween(into, head.direction) < turnLimit) return;
+  // Each straight body must be long (a round cap of a thin bar is short cubics that look straight in their middle)
+  // and longer than the curl it replaces; the meeting point's offset from the traced joint is the size of the
+  // rounding, which must stay within `fillet`.
+  const reach = 3 * fillet;
+  if (tail.length < Math.max(reach, 2 * distance(from, corner)) || head.length < Math.max(reach, 2 * distance(corner, to))) return;
+  const meet = intersectLines(from, into, to, head.direction);
+  if (meet === null || distance(meet, corner) > fillet) return;
+  if ((meet.x - from.x) * into.x + (meet.y - from.y) * into.y < -0.05) return;
+  if ((to.x - meet.x) * head.direction.x + (to.y - meet.y) * head.direction.y < -0.05) return;
+  const kept = splitCubic(before, 1 - tail.t)[0];
+  const rest = splitCubic(after, head.t)[1];
+  before.p0 = kept.p0;
+  before.p1 = kept.p1;
+  before.p2 = { x: kept.p2.x + meet.x - kept.p3.x, y: kept.p2.y + meet.y - kept.p3.y };
+  before.p3 = { ...meet };
+  after.p0 = { ...meet };
+  after.p1 = { x: rest.p1.x + meet.x - rest.p0.x, y: rest.p1.y + meet.y - rest.p0.y };
+  after.p2 = rest.p2;
+  after.p3 = rest.p3;
+}
+
+/** The straight start of a cubic: how far (parameter t) it stays on the line through its early points, and that line. */
+function straightBody(cubic: Cubic): { readonly t: number; readonly direction: Point; readonly length: number } | null {
+  const end = bezier(cubic, 1);
+  // The far end may curl into the next corner, so the body line is taken from the middle of the cubic.
+  const anchor = bezier(cubic, 0.75);
+  const aim = bezier(cubic, 0.45);
+  const span = { x: aim.x - anchor.x, y: aim.y - anchor.y };
+  const size = lengthOf(span);
+  if (size < 0.5) return null;
+  const unit = { x: span.x / size, y: span.y / size };
+  const off = (point: Point) => Math.abs((point.x - anchor.x) * unit.y - (point.y - anchor.y) * unit.x);
+  for (let step = 16; step >= 8; step -= 1) if (off(bezier(cubic, step / 20)) > STRAIGHT_TOLERANCE) return null;
+  let t = 0.4;
+  for (let step = 39; step >= 0; step -= 1) {
+    const at = step / 100;
+    if (off(bezier(cubic, at)) > STRAIGHT_TOLERANCE) break;
+    t = at;
+  }
+  // Measured from the far end: the body runs from t = 1 back to `t`; the curl is 0..t. Return the curl length as t.
+  return { t, direction: { x: -unit.x, y: -unit.y }, length: distance(bezier(cubic, t), end) };
+}
+
+function reverseCubic(cubic: Cubic): Cubic {
+  return { p0: cubic.p3, p1: cubic.p2, p2: cubic.p1, p3: cubic.p0 };
+}
+
+function splitCubic(cubic: Cubic, t: number): [Cubic, Cubic] {
+  const mix = (a: Point, b: Point) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+  const a = mix(cubic.p0, cubic.p1), b = mix(cubic.p1, cubic.p2), c = mix(cubic.p2, cubic.p3);
+  const d = mix(a, b), e = mix(b, c), f = mix(d, e);
+  return [{ p0: cubic.p0, p1: a, p2: d, p3: f }, { p0: f, p1: e, p2: c, p3: cubic.p3 }];
+}
+
+function angleBetween(left: Point, right: Point): number {
+  const dot = left.x * right.x + left.y * right.y;
+  const scale = lengthOf(left) * lengthOf(right);
+  if (!(scale > 0)) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, dot / scale)));
+}
+
+function intersectLines(a: Point, da: Point, b: Point, db: Point): Point | null {
+  const cross = da.x * db.y - da.y * db.x;
+  if (Math.abs(cross) < 1e-9) return null;
+  const t = ((b.x - a.x) * db.y - (b.y - a.y) * db.x) / cross;
+  return { x: a.x + da.x * t, y: a.y + da.y * t };
+}

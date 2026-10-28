@@ -787,6 +787,10 @@
     }
     return hex(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
   }
+  var AXIS_SNAP = 20 * Math.PI / 180;
+  var AXIS_SNAP_NEAR = 30 * Math.PI / 180;
+  var AXIS_FLAT = 3 * Math.PI / 180;
+  var CORNER_TILT = 20 * Math.PI / 180;
   function hex(red, green, blue) {
     return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
   }
@@ -1111,11 +1115,21 @@
   function fitShapes(svg2) {
     const tags = pathTags(svg2);
     if (tags.length === 0) return svg2;
+    const box = /viewBox="\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg2);
+    const canvas = box === null ? null : { x: Number(box[1]), y: Number(box[2]), width: Number(box[3]), height: Number(box[4]) };
+    const touching = canvas === null ? [] : tags.map((tag) => {
+      const data = elementName(tag.source) === "path" ? readAttr(tagAttrs(tag.source), "d") : null;
+      if (data === null) return false;
+      const measured = measurePath(data);
+      if (measured.area < 0.02 * canvas.width * canvas.height) return false;
+      return measured.minX <= canvas.x + 0.05 || measured.minY <= canvas.y + 0.05 || measured.maxX >= canvas.x + canvas.width - 0.05 || measured.maxY >= canvas.y + canvas.height - 0.05;
+    });
+    const touchCount = touching.filter(Boolean).length;
     let result = "";
     let cursor = 0;
-    for (const tag of tags) {
+    for (const [index, tag] of tags.entries()) {
       result += svg2.slice(cursor, tag.index);
-      result += fittedMarkup(tag) ?? tag.source;
+      result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
       cursor = tag.index + tag.length;
     }
     return result + svg2.slice(cursor);
@@ -1130,7 +1144,7 @@
       return "<" + name + attrs + ' stroke="' + fill.replace(/"/g, "") + '" stroke-width="' + String(width2) + '" stroke-linejoin="round"' + (slash === "/" ? "/" : "") + ">";
     });
   }
-  function fittedMarkup(tag) {
+  function fittedMarkup(tag, canvas = null) {
     if (elementName(tag.source) !== "path") return null;
     const attrs = tagAttrs(tag.source);
     const data = readAttr(attrs, "d");
@@ -1143,7 +1157,7 @@
     if (rect !== null) return '<rect x="' + fmt2(rect.x) + '" y="' + fmt2(rect.y) + '" width="' + fmt2(rect.width) + '" height="' + fmt2(rect.height) + '"' + fillAttr + "/>";
     const round = fitRoundRect(measured);
     if (round !== null) return '<rect x="' + fmt2(round.x) + '" y="' + fmt2(round.y) + '" width="' + fmt2(round.width) + '" height="' + fmt2(round.height) + '" rx="' + fmt2(round.r) + '" ry="' + fmt2(round.r) + '"' + fillAttr + "/>";
-    const circle = fitCircle(measured);
+    const circle = fitCircle(measured, canvas);
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
@@ -1215,7 +1229,7 @@
     }
     return arc && side ? maxError : null;
   }
-  function fitCircle(measured) {
+  function fitCircle(measured, canvas = null) {
     const points = measured.samples;
     if (points.length < 8) return null;
     let sumX = 0;
@@ -1262,7 +1276,20 @@
     const expected = Math.PI * radius * radius;
     if (Math.abs(measured.area - expected) / expected > 0.12) return null;
     const areaRadius = Math.sqrt(measured.area / Math.PI);
-    return { cx, cy, r: Math.abs(areaRadius - radius) <= radius * 6e-3 ? areaRadius : radius };
+    let chosen = Math.abs(areaRadius - radius) <= radius * 6e-3 ? areaRadius : radius;
+    let centreX = cx, centreY = cy;
+    if (canvas !== null) {
+      const edge = 0.05;
+      const left = measured.minX <= canvas.x + edge, right = measured.maxX >= canvas.x + canvas.width - edge;
+      const top = measured.minY <= canvas.y + edge, bottom = measured.maxY >= canvas.y + canvas.height - edge;
+      if (left && right) centreX = canvas.x + canvas.width / 2;
+      if (top && bottom) centreY = canvas.y + canvas.height / 2;
+      if (left) chosen = Math.max(chosen, centreX - canvas.x);
+      if (top) chosen = Math.max(chosen, centreY - canvas.y);
+      if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
+      if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+    }
+    return { cx: centreX, cy: centreY, r: chosen };
   }
   function fitEllipse(measured) {
     const rx = (measured.maxX - measured.minX) / 2;

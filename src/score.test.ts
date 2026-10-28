@@ -206,3 +206,14 @@ test("gap strokes use the shape fill and a punched color can be removed", () => 
   assert.equal(dropped.includes("#ff00ff"), false);
   assert.equal(dropped.includes("<circle"), true);
 });
+
+test("a disc traced edge to edge is centred on the canvas so it reaches both sides", () => {
+  // The trace is a hair off-centre (63.97) yet touches both sides; growing it about its own centre would overshoot one.
+  const svg = '<svg width="128" height="128" viewBox="0 0 128 128"><path d="' + circlePath(63.97, 64, 64.02) + '" fill="#1ed760"/></svg>';
+  const fitted = fitShapes(svg);
+  const circle = /<circle cx="([^"]+)" cy="([^"]+)" r="([^"]+)"/.exec(fitted);
+  assert.ok(circle !== null, fitted);
+  assert.equal(Number(circle[1]), 64);
+  assert.equal(Number(circle[2]), 64);
+  assert.ok(Math.abs(Number(circle[3]) - 64) < 0.05, circle[3]);
+});

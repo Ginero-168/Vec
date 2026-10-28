@@ -280,15 +280,68 @@ export function dropFill(svg: string, fill: string): string {
 export function fitShapes(svg: string): string {
   const tags = pathTags(svg);
   if (tags.length === 0) return svg;
+  const box = /viewBox="\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg);
+  const canvas = box === null ? null : { x: Number(box[1]), y: Number(box[2]), width: Number(box[3]), height: Number(box[4]) };
+  // Only a disc that alone reaches the canvas edge may be grown to it: when other shapes stacked on it reach the edge
+  // too, their traced outline is the silhouette and a grown disc would show as crescents outside it.
+  const touching = canvas === null ? [] : tags.map((tag) => {
+    const data = elementName(tag.source) === "path" ? readAttr(tagAttrs(tag.source), "d") : null;
+    if (data === null) return false;
+    const measured = measurePath(data);
+    // Thin anti-aliasing fringes along the edge do not define the silhouette.
+    if (measured.area < 0.02 * canvas.width * canvas.height) return false;
+    return measured.minX <= canvas.x + 0.05 || measured.minY <= canvas.y + 0.05 || measured.maxX >= canvas.x + canvas.width - 0.05 || measured.maxY >= canvas.y + canvas.height - 0.05;
+  });
+  const touchCount = touching.filter(Boolean).length;
   let result = "";
   let cursor = 0;
-  for (const tag of tags) {
+  for (const [index, tag] of tags.entries()) {
     result += svg.slice(cursor, tag.index);
-    result += fittedMarkup(tag) ?? tag.source;
+    result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
     cursor = tag.index + tag.length;
   }
   return result + svg.slice(cursor);
 }
+
+/**
+ * Give fills that differ by at most NEAR_FILL per channel the colour of the larger one. A plate's anti-aliasing fringe
+ * can win its own palette slot one step away from the fill it rims; when VTracer then colours a small part (the dot of
+ * a glyph) with the fringe slot, the same ink is exported as two near-identical swatches.
+ */
+export function unifyNearFills(svg: string): string {
+  const tags = pathTags(svg);
+  const area = new Map<string, number>();
+  const fills = tags.map((tag) => {
+    const attrs = tagAttrs(tag.source);
+    const fill = readAttr(attrs, "fill");
+    const data = readAttr(attrs, "d");
+    if (fill === null || !/^#[0-9a-f]{6}$/i.test(fill) || data === null) return null;
+    const key = fill.toUpperCase();
+    area.set(key, (area.get(key) ?? 0) + Math.abs(measurePath(data).area));
+    return key;
+  });
+  if (area.size < 2) return svg;
+  const rgb = (hex: string) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16));
+  const target = new Map<string, string>();
+  const ranked = [...area.entries()].sort((a, b) => b[1] - a[1]).map(([key]) => key);
+  for (const [rank, key] of ranked.entries()) {
+    const own = rgb(key);
+    const into = ranked.slice(0, rank).find((other) => target.get(other) === undefined && rgb(other).every((value, channel) => Math.abs(value - (own[channel] ?? 0)) <= NEAR_FILL));
+    if (into !== undefined) target.set(key, into);
+  }
+  if (target.size === 0) return svg;
+  let result = "";
+  let cursor = 0;
+  for (const [index, tag] of tags.entries()) {
+    const into = fills[index] === null ? undefined : target.get(fills[index] ?? "");
+    result += svg.slice(cursor, tag.index);
+    result += into === undefined ? tag.source : tag.source.replace(/fill="[^"]*"/i, 'fill="' + into + '"');
+    cursor = tag.index + tag.length;
+  }
+  return result + svg.slice(cursor);
+}
+
+const NEAR_FILL = 2;
 
 export function sealGaps(svg: string, strokeWidth = 0.8): string {
   const width = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;
@@ -301,7 +354,9 @@ export function sealGaps(svg: string, strokeWidth = 0.8): string {
   });
 }
 
-function fittedMarkup(tag: PathTag): string | null {
+type Canvas = { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
+
+function fittedMarkup(tag: PathTag, canvas: Canvas | null = null): string | null {
   if (elementName(tag.source) !== "path") return null;
   const attrs = tagAttrs(tag.source);
   const data = readAttr(attrs, "d");
@@ -314,7 +369,7 @@ function fittedMarkup(tag: PathTag): string | null {
   if (rect !== null) return '<rect x="' + fmt(rect.x) + '" y="' + fmt(rect.y) + '" width="' + fmt(rect.width) + '" height="' + fmt(rect.height) + '"' + fillAttr + "/>";
   const round = fitRoundRect(measured);
   if (round !== null) return '<rect x="' + fmt(round.x) + '" y="' + fmt(round.y) + '" width="' + fmt(round.width) + '" height="' + fmt(round.height) + '" rx="' + fmt(round.r) + '" ry="' + fmt(round.r) + '"' + fillAttr + "/>";
-  const circle = fitCircle(measured);
+  const circle = fitCircle(measured, canvas);
   if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
   const ellipse = fitEllipse(measured);
   if (ellipse !== null) return '<ellipse cx="' + fmt(ellipse.cx) + '" cy="' + fmt(ellipse.cy) + '" rx="' + fmt(ellipse.rx) + '" ry="' + fmt(ellipse.ry) + '"' + fillAttr + "/>";
@@ -390,7 +445,7 @@ function roundRectError(measured: MeasuredPath, radius: number): number | null {
   return arc && side ? maxError : null;
 }
 
-function fitCircle(measured: MeasuredPath): { readonly cx: number; readonly cy: number; readonly r: number } | null {
+function fitCircle(measured: MeasuredPath, canvas: Canvas | null = null): { readonly cx: number; readonly cy: number; readonly r: number } | null {
   const points = measured.samples;
   if (points.length < 8) return null;
   let sumX = 0;
@@ -436,9 +491,26 @@ function fitCircle(measured: MeasuredPath): { readonly cx: number; readonly cy: 
   if (maxError > Math.max(1.25, radius * 0.04)) return null;
   const expected = Math.PI * radius * radius;
   if (Math.abs(measured.area - expected) / expected > 0.12) return null;
+  // Area-matched radius: the traced outline of a convex disc sits a little outside it.
   const areaRadius = Math.sqrt(measured.area / Math.PI);
-  return { cx, cy, r: Math.abs(areaRadius - radius) <= radius * 0.006 ? areaRadius : radius };
+  let chosen = Math.abs(areaRadius - radius) <= radius * 0.006 ? areaRadius : radius;
+  // A disc whose trace reaches the canvas edge keeps reaching it; a smaller fit leaves slivers of backdrop there. A disc
+  // reaching two opposite edges is centred between them, so it reaches both without overshooting either.
+  let centreX = cx, centreY = cy;
+  if (canvas !== null) {
+    const edge = 0.05;
+    const left = measured.minX <= canvas.x + edge, right = measured.maxX >= canvas.x + canvas.width - edge;
+    const top = measured.minY <= canvas.y + edge, bottom = measured.maxY >= canvas.y + canvas.height - edge;
+    if (left && right) centreX = canvas.x + canvas.width / 2;
+    if (top && bottom) centreY = canvas.y + canvas.height / 2;
+    if (left) chosen = Math.max(chosen, centreX - canvas.x);
+    if (top) chosen = Math.max(chosen, centreY - canvas.y);
+    if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
+    if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+  }
+  return { cx: centreX, cy: centreY, r: chosen };
 }
+
 
 function fitEllipse(measured: MeasuredPath): { readonly cx: number; readonly cy: number; readonly rx: number; readonly ry: number } | null {
   const rx = (measured.maxX - measured.minX) / 2;

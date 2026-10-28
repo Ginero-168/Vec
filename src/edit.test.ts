@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { expandPrimitives, fairPaths, fairTolerance, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape } from "./edit.ts";
+import { expandPrimitives, fairPaths, fairTolerance, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape, sharpenCorners } from "./edit.ts";
 
 function pathData(svg: string): string {
   const match = /\bd="([^"]*)"/.exec(svg);
@@ -134,4 +134,13 @@ test("a batch list accepts at most twelve rasters", () => {
   assert.equal(list.items[0]?.uuid, "abc");
   assert.deepEqual(list.items[0]?.bounds, [0, 40, 20, 0]);
   assert.throws(() => parseBatchFields(["Poster", "file:/tmp/a.ai", "13"]), /12/);
+});
+
+test("sharpenCorners turns a traced fillet into a sharp corner but keeps a real round corner", () => {
+  const fillet = '<svg viewBox="0 0 20 20"><path d="M0,0L9.6,0C9.85,0 10,0.15 10,0.4L10,10L0,10Z" fill="#000"/></svg>';
+  const sharp = pathData(sharpenCorners(fillet));
+  assert.ok(!sharp.includes("9.6,0") && !sharp.includes("10,0.4"), sharp);
+  assert.ok(/(^|[^\d.])10,0([^.\d]|$)/.test(sharp), "the sides meet at the vertex: " + sharp);
+  const round = '<svg viewBox="0 0 20 20"><path d="M0,0L6,0C8.2,0 10,1.8 10,4L10,10L0,10Z" fill="#000"/></svg>';
+  assert.ok(pathData(sharpenCorners(round)).includes("C8.2,0 10,1.8 10,4"), "a 4px round corner stays round");
 });

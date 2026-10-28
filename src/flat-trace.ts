@@ -11,6 +11,8 @@ export type FlatPlate = {
   readonly sourceWidth: number;
   readonly sourceHeight: number;
   readonly borderColor: string | null;
+  /** The source crop has see-through pixels: its outline comes from the transparent cut, not from a backdrop. */
+  readonly cutOut: boolean;
 };
 
 export type SubjectBox = { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
@@ -94,7 +96,8 @@ export async function flatPlatesAsync(
       originY: box.y,
       sourceWidth: cropW,
       sourceHeight: cropH,
-      borderColor: cornerColor(crop, cropW, cropH)
+      borderColor: cornerColor(crop, cropW, cropH),
+      cutOut: hasClearPixel(crop)
     });
   }
   onProgress?.(1);
@@ -153,8 +156,15 @@ function plateFor(
     originY: box.y,
     sourceWidth: cropW,
     sourceHeight: cropH,
-    borderColor: cornerColor(crop, cropW, cropH)
+    borderColor: cornerColor(crop, cropW, cropH),
+    cutOut: hasClearPixel(crop)
   };
+}
+
+/** Whether any pixel is (almost) fully transparent, i.e. the image is a cut-out rather than art on a backdrop. */
+export function hasClearPixel(rgba: Uint8Array): boolean {
+  for (let offset = 3; offset < rgba.length; offset += 4) if ((rgba[offset] ?? 0) <= CLEAR_OPACITY) return true;
+  return false;
 }
 
 export function cornerColor(rgba: Uint8Array, width: number, height: number): string | null {
@@ -720,11 +730,239 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
 // Cut the transparent area out of the 8x label map along the bilinear 50% opacity contour. Clearing whole source
 // pixels left a one-source-pixel staircase on every transparent edge; VTracer traced each step, and the notches
 // rendered as slivers and seams. Opaque sub-pixels the per-pixel labelling skipped take a neighbouring label.
+const SOLID_OPACITY = 250;
+const CLEAR_OPACITY = 5;
+const THIN_BEND = 64;
+const AXIS_SNAP = (20 * Math.PI) / 180;
+// Next to a junction (a cross or T where two cut-outs meet) the 3x3 gradient tilts further; up to this angle a normal
+// still snaps when the pixel right beside it on the edge is flat.
+const AXIS_SNAP_NEAR = (30 * Math.PI) / 180;
+const AXIS_FLAT = (3 * Math.PI) / 180;
+const CORNER_SLACK = 0.1;
+const CORNER_TILT = (20 * Math.PI) / 180;
+
+// Sub-pixel masks for partially covered pixels. A pixel's own edge line (gradient normal, coverage offset) is exact on
+// straight edges but tilts where two edges meet. There, a neighbour's line extended into the pixel, or the
+// intersection (convex) or union (concave) of two neighbour lines, matches the pixel's coverage better and keeps the
+// corner square. The candidate whose coverage is closest to the pixel's alpha wins; the pixel's own line wins ties.
+// Offset t of the half-plane n.p >= t (p relative to the pixel centre) that covers `area` of the unit pixel.
+function planeOffset(nx: number, ny: number, area: number): number {
+  const steps = 16;
+  const covered = (limit: number) => {
+    let count = 0;
+    for (let j = 0; j < steps; j += 1) {
+      for (let i = 0; i < steps; i += 1) if (nx * ((i + 0.5) / steps - 0.5) + ny * ((j + 0.5) / steps - 0.5) >= limit) count += 1;
+    }
+    return count / (steps * steps);
+  };
+  let low = -1;
+  let high = 1;
+  for (let iteration = 0; iteration < 14; iteration += 1) {
+    const middle = (low + high) / 2;
+    if (covered(middle) > area) low = middle;
+    else high = middle;
+  }
+  return (low + high) / 2;
+}
+
+// A partially covered pixel that is not on a one-sided edge: a ridge (thin opaque part) keeps a centred strip as wide
+// as its coverage, a valley (thin gap or hole) keeps a centred gap as wide as its missing coverage, across the axis
+// that bends most. Anything flatter keeps the whole-pixel decision. Either way thin parts and small holes survive,
+// where the bilinear contour dropped thin parts below 50% and filled holes surrounded by opaque pixels.
+function thinShape(level: number, bendX: number, bendY: number): Uint8Array {
+  const mask = new Uint8Array(UP * UP);
+  const alongX = Math.abs(bendX) >= Math.abs(bendY);
+  const bend = alongX ? bendX : bendY;
+  const coverage = level / 255;
+  for (let cell = 0; cell < mask.length; cell += 1) {
+    const across = Math.abs(((alongX ? cell % UP : Math.floor(cell / UP)) + 0.5) / UP - 0.5);
+    // Mostly covered pixels stay whole: a shallow valley is the anti-aliased seam where two shapes touch.
+    if (level >= 128) mask[cell] = 1;
+    else if (bend < -THIN_BEND) mask[cell] = across <= coverage / 2 ? 1 : 0;
+    else if (bend > THIN_BEND) mask[cell] = across >= (1 - coverage) / 2 ? 1 : 0;
+    else mask[cell] = 0;
+  }
+  return mask;
+}
+
+function edgeShapes(opacity: Uint8Array, width: number, height: number, normalX: Float64Array, normalY: Float64Array): Map<number, Uint8Array> {
+  const partial = (index: number) => (opacity[index] ?? 0) > CLEAR_OPACITY && (opacity[index] ?? 0) < SOLID_OPACITY && ((normalX[index] ?? 0) !== 0 || (normalY[index] ?? 0) !== 0);
+  const offsets = new Map<number, number>();
+  const offset = (index: number) => {
+    const known = offsets.get(index);
+    if (known !== undefined) return known;
+    const value = planeOffset(normalX[index] ?? 0, normalY[index] ?? 0, (opacity[index] ?? 0) / 255);
+    offsets.set(index, value);
+    return value;
+  };
+  const shapes = new Map<number, Uint8Array>();
+  const cells = UP * UP;
+  const read = (x: number, y: number) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+  const corners: number[] = [];
+  const thin: number[] = [];
+  // A pixel's line is reliable when a neighbouring edge pixel runs the same way; corner pixels' lines are not.
+  const reliable = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!partial(index)) continue;
+      for (let dy = -1; dy <= 1 && reliable[index] === 0; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx0 = x + dx, ny0 = y + dy;
+          if ((dx === 0 && dy === 0) || nx0 < 0 || ny0 < 0 || nx0 >= width || ny0 >= height) continue;
+          const other = ny0 * width + nx0;
+          if (partial(other) && (normalX[other] ?? 0) * (normalX[index] ?? 0) + (normalY[other] ?? 0) * (normalY[index] ?? 0) >= Math.cos(CORNER_TILT)) { reliable[index] = 1; break; }
+        }
+      }
+    }
+  }
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const level = opacity[index] ?? 0;
+      if (level > CLEAR_OPACITY && level < SOLID_OPACITY && !partial(index)) {
+        shapes.set(index, thinShape(level, read(x - 1, y) + read(x + 1, y) - 2 * level, read(x, y - 1) + read(x, y + 1) - 2 * level));
+        thin.push(index);
+        continue;
+      }
+      if (!partial(index)) continue;
+      const lines: { readonly nx: number; readonly ny: number; readonly mask: Uint8Array }[] = [];
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx0 = x + dx, ny0 = y + dy;
+          if (nx0 < 0 || ny0 < 0 || nx0 >= width || ny0 >= height) continue;
+          const other = ny0 * width + nx0;
+          if (!partial(other) || ((dx !== 0 || dy !== 0) && reliable[other] !== 1)) continue;
+          const nx = normalX[other] ?? 0, ny = normalY[other] ?? 0, limit = offset(other);
+          const mask = new Uint8Array(cells);
+          for (let cell = 0; cell < cells; cell += 1) {
+            const u = ((cell % UP) + 0.5) / UP - 0.5 - dx, v = (Math.floor(cell / UP) + 0.5) / UP - 0.5 - dy;
+            mask[cell] = nx * u + ny * v >= limit ? 1 : 0;
+          }
+          if (dx === 0 && dy === 0) lines.unshift({ nx, ny, mask });
+          else lines.push({ nx, ny, mask });
+        }
+      }
+      const target = (opacity[index] ?? 0) / 255;
+      const coverage = (mask: Uint8Array) => mask.reduce((sum, value) => sum + value, 0) / cells;
+      const own = lines[0];
+      let best = own?.mask ?? new Uint8Array(cells);
+      const neighbours = lines.slice(1);
+      if (own !== undefined && neighbours.length > 0 && reliable[index] !== 1) {
+        // No neighbouring edge runs the way this pixel's gradient points: the gradient is a corner blend.
+        let bestError = Number.POSITIVE_INFINITY;
+        const consider = (mask: Uint8Array) => {
+          const error = Math.abs(coverage(mask) - target);
+          if (error <= CORNER_SLACK && error < bestError) { best = mask; bestError = error; }
+        };
+        for (let a = 0; a < neighbours.length; a += 1) {
+          for (let b = a + 1; b < neighbours.length; b += 1) {
+            const left = neighbours[a], right = neighbours[b];
+            if (left === undefined || right === undefined || left.nx * right.nx + left.ny * right.ny > Math.cos(CORNER_TILT)) continue;
+            consider(left.mask.map((value, cell) => value & (right.mask[cell] ?? 0)));
+            consider(left.mask.map((value, cell) => value | (right.mask[cell] ?? 0)));
+          }
+        }
+        // Two edges meeting in this pixel explain it best; a single extended edge is the fallback.
+        if (bestError === Number.POSITIVE_INFINITY) for (const line of neighbours) consider(line.mask);
+      }
+      shapes.set(index, best);
+      if (reliable[index] !== 1) corners.push(index);
+    }
+  }
+  // Straight and curved edges keep the smooth bilinear contour; only corner pixels and the edge pixels around them
+  // use the reconstructed lines (and thin parts / small holes their ridge and valley shapes, set above).
+  const zone = new Set<number>(thin);
+  for (const index of corners) {
+    const x = index % width;
+    const y = (index - x) / width;
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        const nx0 = x + dx, ny0 = y + dy;
+        if (nx0 >= 0 && ny0 >= 0 && nx0 < width && ny0 < height) zone.add(ny0 * width + nx0);
+      }
+    }
+  }
+  for (const index of [...shapes.keys()]) if (!zone.has(index)) shapes.delete(index);
+  return shapes;
+}
+
 function cutTransparent(labels: Uint8Array, opacity: Uint8Array, width: number, height: number): void {
   if (opacity.every((value) => value === 255)) return;
   const upW = width * UP;
   const upH = height * UP;
   const read = (x: number, y: number) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+  // Each partially covered pixel is cut by one straight edge: normal along the alpha gradient, offset so the kept
+  // area matches the pixel's coverage. Fully covered and fully empty pixels keep their square, so hard corners stay
+  // hard; the bilinear 50% contour rounded every corner by about half a source pixel.
+  const normalX = new Float64Array(width * height);
+  const normalY = new Float64Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const own = opacity[y * width + x] ?? 0;
+      if (own <= CLEAR_OPACITY || own >= SOLID_OPACITY) continue;
+      const gx = read(x + 1, y - 1) + 2 * read(x + 1, y) + read(x + 1, y + 1) - read(x - 1, y - 1) - 2 * read(x - 1, y) - read(x - 1, y + 1);
+      const gy = read(x - 1, y + 1) + 2 * read(x, y + 1) + read(x + 1, y + 1) - read(x - 1, y - 1) - 2 * read(x, y - 1) - read(x + 1, y - 1);
+      const length = Math.hypot(gx, gy);
+      if (length === 0) continue;
+      // Only a real edge (opaque on one side, clear on the other) gets a half-plane. Ridges (thin parts) and valleys
+      // (thin gaps, seams between touching shapes) are handled in edgeShapes.
+      const stepX = Math.round(gx / length), stepY = Math.round(gy / length);
+      const ahead = read(x + stepX, y + stepY), behind = read(x - stepX, y - stepY);
+      if (ahead - behind < 96 || ahead < own - 8 || behind > own + 8) continue;
+      // A pixel with solid pixels on two opposite sides and none on the other two is a seam between touching shapes
+      // (its missing coverage is the anti-aliased seam, not the outline); cutting it opened specks where a seam meets
+      // the outline. A corner tip has a third solid side and keeps its cut.
+      const solid = (dx: number, dy: number) => read(x + dx, y + dy) >= SOLID_OPACITY;
+      const across = (dx: number, dy: number) => solid(dx, dy) && solid(-dx, -dy) && !solid(dy, dx) && !solid(-dy, -dx);
+      if (across(1, 0) || across(0, 1)) continue;
+      normalX[y * width + x] = gx / length;
+      normalY[y * width + x] = gy / length;
+    }
+  }
+  // Snap near-axis normals on straight axis-aligned edges: a 3x3 gradient next to a corner tilts by up to ~20 degrees,
+  // and those tilted lines, extended into the corner pixel, are what rounded or spiked axis-aligned corners. Only
+  // pixels within two steps of an untilted pixel on the same edge snap; a curve's normals turn gradually and stay.
+  const tiltOf = (index: number): number => {
+    const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+    return Math.atan2(Math.min(Math.abs(nx), Math.abs(ny)), Math.max(Math.abs(nx), Math.abs(ny)));
+  };
+  const axisOf = (index: number, limit = AXIS_SNAP): number => {
+    const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+    if (nx === 0 && ny === 0) return 0;
+    if (tiltOf(index) > limit) return 0;
+    return Math.abs(nx) >= Math.abs(ny) ? (nx > 0 ? 1 : 2) : ny > 0 ? 3 : 4;
+  };
+  const flat = (index: number, axis: number): boolean => {
+    const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+    return axisOf(index) === axis && Math.min(Math.abs(nx), Math.abs(ny)) <= Math.sin(AXIS_FLAT);
+  };
+  const snapped: number[] = [];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const axis = axisOf(index, AXIS_SNAP_NEAR);
+      if (axis === 0) continue;
+      const alongX = axis <= 2 ? 0 : 1, alongY = axis <= 2 ? 1 : 0;
+      let anchored = false;
+      const junction = tiltOf(index) > AXIS_SNAP;
+      for (const step of junction ? [-1, 1] : [-2, -1, 0, 1, 2]) {
+        const nx = x + step * alongX, ny = y + step * alongY;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        // A junction-tilted pixel snaps only where its edge runs into a gap (the pixel past it is fainter); where the
+        // outline turns into the shape instead (a star's inner corner) the tilt is real.
+        if (junction && read(x - step * alongX, y - step * alongY) >= (opacity[index] ?? 0)) continue;
+        if (flat(ny * width + nx, axis)) anchored = true;
+      }
+      if (anchored) snapped.push(index, axis);
+    }
+  }
+  for (let at = 0; at < snapped.length; at += 2) {
+    const index = snapped[at] ?? 0, axis = snapped[at + 1] ?? 0;
+    normalX[index] = axis === 1 ? 1 : axis === 2 ? -1 : 0;
+    normalY[index] = axis === 3 ? 1 : axis === 4 ? -1 : 0;
+  }
+  const shape = edgeShapes(opacity, width, height, normalX, normalY);
   let pending: number[] = [];
   for (let uy = 0; uy < upH; uy += 1) {
     const sy = (uy + 0.5) / UP - 0.5;
@@ -737,7 +975,16 @@ function cutTransparent(labels: Uint8Array, opacity: Uint8Array, width: number, 
       const top = read(x0, y0) * (1 - fx) + read(x0 + 1, y0) * fx;
       const bottom = read(x0, y0 + 1) * (1 - fx) + read(x0 + 1, y0 + 1) * fx;
       const at = uy * upW + ux;
-      if (top * (1 - fy) + bottom * fy < 128) labels[at] = 255;
+      const ownIndex = Math.floor(uy / UP) * width + Math.floor(ux / UP);
+      const own = opacity[ownIndex] ?? 0;
+      let inside: boolean;
+      if (own >= SOLID_OPACITY) inside = true;
+      else if (own <= CLEAR_OPACITY) inside = false;
+      else {
+        const mask = shape.get(ownIndex);
+        inside = mask === undefined ? top * (1 - fy) + bottom * fy >= 128 : mask[(uy % UP) * UP + (ux % UP)] === 1;
+      }
+      if (!inside) labels[at] = 255;
       else if (labels[at] === 255) pending.push(at);
     }
   }

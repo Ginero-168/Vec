@@ -1,5 +1,5 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
-import { cornerColor, flatPlates, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
+import { cornerColor, flatPlates, hasClearPixel, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
 import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "./lab-model.ts";
 import { buildLabRasterStages, buildLabRasterStagesAsync, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId, type PipelineProgress } from "./lab-pipeline.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
@@ -199,6 +199,7 @@ function planFlat(
       originX: plate.originX,
       originY: plate.originY,
       borderColor: plate.borderColor,
+      cutOut: plate.cutOut,
       request: controls === undefined
         ? flatRequest(settings, plate.palette, plate.scale)
         : flatRequestForControls(settings, plate.palette, plate.scale, controls)
@@ -386,6 +387,7 @@ function planSegmented(rgba: Uint8Array, width: number, height: number, settings
         originX: 0,
         originY: 0,
         borderColor: cornerColor(rgba, width, height),
+        cutOut: hasClearPixel(rgba),
         request: {
           preset: settings.preset,
           maxColors: locked ? 0 : settings.maxColors,
@@ -421,6 +423,7 @@ function planSegmentedWithControls(
       originX: 0,
       originY: 0,
       borderColor: cornerColor(rgba, width, height),
+      cutOut: hasClearPixel(rgba),
       request: {
         ...request,
         removeBackground: settings.removeBackground

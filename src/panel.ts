@@ -236,6 +236,7 @@ function parsePlannedPlate(value: unknown): PlannedPlate | null {
     originX: value.originX,
     originY: value.originY,
     borderColor: value.borderColor,
+    ...(value.cutOut === true ? { cutOut: true } : {}),
     request
   };
 }

@@ -1,5 +1,5 @@
-import { fairPaths, relaxPaths } from "./edit.ts";
-import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
+import { fairPaths, relaxPaths, sharpenCorners } from "./edit.ts";
+import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps, unifyNearFills } from "./score.ts";
 import { scaleSvg, translateSvg } from "./svg-scale.ts";
 import type { Stacking, TracePreset } from "./trace.ts";
 
@@ -8,6 +8,8 @@ export type PlacedPlate = {
   readonly originX: number;
   readonly originY: number;
   readonly borderColor: string | null;
+  /** Set when the plate's source has transparent pixels (see FlatPlate.cutOut). */
+  readonly cutOut?: boolean;
 };
 
 const SHAPE = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
@@ -44,7 +46,22 @@ export function mergePlates(
     '">' +
     drawings.join("") +
     "</svg>";
-  return fitGeometry ? fitShapes(merged) : merged;
+  // A traced fillet up to two source pixels is VTracer's rounding on large inputs; on small icons a two-pixel bend is
+  // real geometry, so the fillet limit shrinks to 1.25 px at 128 px and below. Corners rounded inside long cubics are
+  // only judged on inputs of 128 px and up, where VTracer's rounding is much smaller than the shapes' own radii.
+  const size = Math.max(width, height);
+  const fillet = Math.min(2, Math.max(1.25, size / 128));
+  const curl = size >= 128 ? Math.min(2, size / 128) : 0;
+  if (!fitGeometry) return merged;
+  const cutOut = plates.length > 0 && plates.every((plate) => plate.cutOut === true);
+  // Near-identical fills are an anti-aliasing fringe's palette slot on a cut-out; on an opaque backdrop they can be
+  // real neighbouring shades (JPEG), and merging them raised MAE.
+  const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged);
+  // Only cut-out (transparent-backdrop) sources: their edges come from the corner-preserving transparent cut. On an
+  // opaque backdrop (white, JPEG) the traced bends follow anti-aliasing or compression noise, and sharpening them
+  // made false corners (si-spotify-128-white-q60) and raised MAE (om-gear-32-white +1.0). The corner colour alone
+  // does not tell: a logo filling its crop has four different opaque corners and no border colour either.
+  return cutOut ? sharpenCorners(fitted, fillet, 35, curl) : fitted;
 }
 
 export function assembleTrace(

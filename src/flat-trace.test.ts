@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cornerColor, labelImage, subjectBoxes } from "./flat-trace.ts";
+import { cornerColor, hasClearPixel, labelImage, subjectBoxes } from "./flat-trace.ts";
+import { mergePlates } from "./trace-finish.ts";
 import { encodeRgbaPng } from "./png-alpha.ts";
 import { cappedPalette, planTrace, punchBorderBackdrop } from "./trace-pipeline.ts";
 
@@ -166,6 +167,62 @@ test("a soft transparent edge is cut at its sub-pixel contour, not on the pixel 
   assert.equal(first, 47);
 });
 
+test("an anti-aliased square keeps a square corner in the cut label map", () => {
+  // Interior 6..13 opaque, half-covered side pixels, quarter-covered corner pixels: the true corner is at (5.5, 5.5).
+  const painted = labelImage(square(20, (x, y) => inside(x, y, 6, 13) ? 255 : edgeOf(x, y, 6, 13)), 20, 20, 8);
+  const opaque = (x: number, y: number) => (painted.rgba[(y * painted.width + x) * 4 + 3] ?? 0) > 0;
+  assert.ok(opaque(44, 44) && opaque(45, 44) && opaque(44, 45), "sub-pixels at the corner stay opaque");
+  assert.ok(!opaque(43, 44) && !opaque(44, 43) && !opaque(43, 43), "nothing grows past the corner");
+  assert.ok(opaque(44, 80) && !opaque(43, 80) && opaque(80, 44) && !opaque(80, 43), "straight sides at the half-coverage line");
+});
+
+test("an anti-aliased L shape keeps its concave corner", () => {
+  // Opaque 4..15 x 4..15 minus the quadrant right of x = 10.5 and above y = 9.5: the notch sides are half-covered
+  // pixels and the corner pixel (10, 9) is three-quarters covered.
+  const notch = (x: number, y: number) => x >= 10 && y <= 9;
+  const alpha = (x: number, y: number) => {
+    if (!inside(x, y, 4, 15)) return edgeOf(x, y, 4, 15);
+    if (notch(x, y)) return x === 10 && y === 9 ? 192 : x === 10 || y === 9 ? 128 : 0;
+    return 255;
+  };
+  const painted = labelImage(square(20, alpha), 20, 20, 8);
+  const opaque = (x: number, y: number) => (painted.rgba[(y * painted.width + x) * 4 + 3] ?? 0) > 0;
+  // The notch corner sits at (10.5, 9.5) source px = (84, 76) sub-pixels.
+  assert.ok(opaque(83, 76) && opaque(83, 75) && opaque(84, 76) && opaque(85, 76), "the concave corner is filled to the vertex");
+  assert.ok(!opaque(84, 75) && !opaque(85, 74), "the notch stays clear up to the vertex");
+});
+
+test("anti-aliased seams between touching shapes stay filled where they meet the outline", () => {
+  // Three flats meet a transparent quadrant (x >= 11, y >= 10), as in an exported logo: the seams between the flats are
+  // 207-alpha pixels, the outline pixels are quarter-covered. Seam pixels next to the junction must not be cut.
+  const alpha = (x: number, y: number) => {
+    if (!inside(x, y, 4, 15)) return 0;
+    if (y <= 8) return x === 10 ? 207 : 255;
+    if (y === 9) return x <= 9 ? 207 : x === 10 ? 98 : 64;
+    return x <= 9 ? 255 : x === 10 ? 64 : 0;
+  };
+  const painted = labelImage(square(20, alpha), 20, 20, 8);
+  const open: string[] = [];
+  for (const [px, py] of [[10, 8], [10, 7], [9, 9], [8, 9]]) {
+    for (let dy = 0; dy < 8; dy += 1) for (let dx = 0; dx < 8; dx += 1) {
+      if ((painted.rgba[((py * 8 + dy) * painted.width + px * 8 + dx) * 4 + 3] ?? 0) === 0) open.push(`${px},${py}:${dx},${dy}`);
+    }
+  }
+  assert.deepEqual(open, []);
+});
+
+test("a thin faint stroke and a small faint hole survive the transparent cut", () => {
+  const stroke = labelImage(square(20, (x, y) => x === 10 && y >= 3 && y < 17 ? 100 : 0), 20, 20, 8);
+  const strokeRow = 10 * 8 + 4;
+  const covered = [...Array(stroke.width).keys()].filter((x) => (stroke.rgba[(strokeRow * stroke.width + x) * 4 + 3] ?? 0) > 0);
+  assert.ok(covered.length >= 2 && covered.length <= 5, "a 39% stroke keeps a centred strip: " + covered.join(","));
+  assert.ok(covered.every((x) => x >= 80 && x < 88));
+  const hole = labelImage(square(20, (x, y) => x === 10 && y === 10 ? 100 : inside(x, y, 4, 15) ? 255 : 0), 20, 20, 8);
+  const holeRow = 10 * 8 + 4;
+  const open = [...Array(8).keys()].filter((dx) => (hole.rgba[(holeRow * hole.width + 80 + dx) * 4 + 3] ?? 0) === 0);
+  assert.ok(open.length >= 3 && open.length <= 6, "a 61% hole stays open: " + open.join(","));
+});
+
 test("the backdrop punch peels a pale anti-aliasing halo but keeps pale content beyond one source pixel", () => {
   const width = 96;
   const image = fill(width, width, 255, 255, 255, 255);
@@ -180,6 +237,35 @@ test("the backdrop punch peels a pale anti-aliasing halo but keeps pale content 
   assert.equal(alpha(66, 40), 0, "edge of the pale block");
   assert.equal(alpha(78, 40), 255, "pale block interior, 14px from the backdrop");
 });
+
+function inside(x: number, y: number, low: number, high: number): boolean {
+  return x >= low && x <= high && y >= low && y <= high;
+}
+
+// Coverage of a pixel in the one-pixel anti-aliased rim around the square low..high: 50% on sides, 25% at corners.
+function edgeOf(x: number, y: number, low: number, high: number): number {
+  const sideX = x === low - 1 || x === high + 1;
+  const sideY = y === low - 1 || y === high + 1;
+  const spanX = x >= low && x <= high;
+  const spanY = y >= low && y <= high;
+  if (sideX && sideY) return 64;
+  if ((sideX && spanY) || (sideY && spanX)) return 128;
+  return 0;
+}
+
+function square(size: number, alpha: (x: number, y: number) => number): Uint8Array {
+  const rgba = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const offset = (y * size + x) * 4;
+      rgba[offset] = 220;
+      rgba[offset + 1] = 30;
+      rgba[offset + 2] = 40;
+      rgba[offset + 3] = alpha(x, y);
+    }
+  }
+  return rgba;
+}
 
 function fill(width: number, height: number, red: number, green: number, blue: number, alpha: number): Image {
   const rgba = new Uint8Array(width * height * 4);
@@ -214,3 +300,19 @@ function pixel(rgba: Uint8Array, width: number, x: number, y: number): { r: numb
 function channel(hex: string, index: number): number {
   return Number.parseInt(hex.slice(1 + index * 2, 3 + index * 2), 16);
 }
+
+test("traced fillets are sharpened only on cut-out sources, never on an opaque backdrop", () => {
+  const traced = '<svg viewBox="0 0 20 20"><path d="M0,0L9.6,0C9.85,0 10,0.15 10,0.4L10,10L5,10L5,15L0,15Z" fill="#000000"/></svg>';
+  const plate = (cutOut: boolean) => ({ scale: 1, originX: 0, originY: 0, borderColor: null, cutOut });
+  const cut = mergePlates([traced], [plate(true)], 20, 20, null, false);
+  assert.ok(!cut.includes("9.6,0"), cut);
+  const backdrop = mergePlates([traced], [plate(false)], 20, 20, null, false);
+  assert.ok(backdrop.includes("9.6,0"), backdrop);
+});
+
+test("a source is a cut-out only when it has see-through pixels", () => {
+  const opaque = new Uint8Array(4 * 4).fill(255);
+  assert.equal(hasClearPixel(opaque), false);
+  opaque[7] = 0;
+  assert.equal(hasClearPixel(opaque), true);
+});

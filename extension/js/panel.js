@@ -910,6 +910,129 @@
     if (match === null) return null;
     return match[1] ?? match[2] ?? "";
   }
+  function sharpenCorners(svg, fillet = 1.25, minTurn = 35, curl = fillet) {
+    return svg.replace(shapePattern(), (tag) => {
+      if (!/^<path\b/i.test(tag)) return tag;
+      const quoted = readD(tag);
+      if (quoted === null) return tag;
+      const parsed = parsePath(quoted.value);
+      if (parsed === null || parsed.length === 0) return tag;
+      const sharpened = parsed.map((subpath) => sharpenSubpath(subpath, fillet, minTurn, curl));
+      const next = serialize(sharpened);
+      if (next === quoted.value) return tag;
+      return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+    });
+  }
+  function sharpenSubpath(subpath, fillet, minTurn, curl) {
+    if (!subpath.closed || subpath.cubics.length < 4) return subpath;
+    const cubics = subpath.cubics.map((cubic) => ({ p0: { ...cubic.p0 }, p1: { ...cubic.p1 }, p2: { ...cubic.p2 }, p3: { ...cubic.p3 } }));
+    const turnLimit = minTurn * Math.PI / 180;
+    let index = 0;
+    while (index < cubics.length && cubics.length >= 4) {
+      let replaced = false;
+      let run = 0;
+      let length = 0;
+      while (!replaced && run < 4 && cubics.length - run >= 3) {
+        const piece = cubics[(index + run) % cubics.length];
+        if (piece === void 0) break;
+        length += distance(piece.p0, piece.p3);
+        run += 1;
+        if (length > fillet) break;
+        const before = cubics[(index - 1 + cubics.length) % cubics.length];
+        const after = cubics[(index + run) % cubics.length];
+        if (before === void 0 || after === void 0 || before === after) break;
+        const into = incoming(before);
+        const out = outgoing(after);
+        if (angleBetween(into, out) < turnLimit) continue;
+        if (distance(before.p0, before.p3) < 2 * length || distance(after.p0, after.p3) < 2 * length) continue;
+        const meet = intersectLines(before.p3, into, after.p0, out);
+        if (meet === null || distance(meet, before.p3) > 2 * fillet || distance(meet, after.p0) > 2 * fillet) continue;
+        before.p2 = { x: before.p2.x + meet.x - before.p3.x, y: before.p2.y + meet.y - before.p3.y };
+        before.p3 = { ...meet };
+        after.p1 = { x: after.p1.x + meet.x - after.p0.x, y: after.p1.y + meet.y - after.p0.y };
+        after.p0 = { ...meet };
+        for (let removed = 0; removed < run; removed += 1) {
+          const at = index % cubics.length;
+          cubics.splice(at, 1);
+          if (at < index) index -= 1;
+        }
+        replaced = true;
+      }
+      if (!replaced) index += 1;
+    }
+    if (curl > 0) for (let joint = 0; joint < cubics.length; joint += 1) sharpenJoint(cubics, joint, curl, turnLimit);
+    return { cubics, closed: subpath.closed };
+  }
+  var STRAIGHT_TOLERANCE = 0.15;
+  function sharpenJoint(cubics, joint, fillet, turnLimit) {
+    const before = cubics[(joint - 1 + cubics.length) % cubics.length];
+    const after = cubics[joint];
+    if (before === void 0 || after === void 0 || before === after) return;
+    const tail = straightBody(reverseCubic(before));
+    const head = straightBody(after);
+    if (tail === null || head === null) return;
+    const corner = after.p0;
+    const from = bezier(before, 1 - tail.t);
+    const to = bezier(after, head.t);
+    if (distance(from, corner) + distance(corner, to) < 0.05) return;
+    const into = { x: -tail.direction.x, y: -tail.direction.y };
+    if (angleBetween(into, head.direction) < turnLimit) return;
+    const reach = 3 * fillet;
+    if (tail.length < Math.max(reach, 2 * distance(from, corner)) || head.length < Math.max(reach, 2 * distance(corner, to))) return;
+    const meet = intersectLines(from, into, to, head.direction);
+    if (meet === null || distance(meet, corner) > fillet) return;
+    if ((meet.x - from.x) * into.x + (meet.y - from.y) * into.y < -0.05) return;
+    if ((to.x - meet.x) * head.direction.x + (to.y - meet.y) * head.direction.y < -0.05) return;
+    const kept = splitCubic(before, 1 - tail.t)[0];
+    const rest = splitCubic(after, head.t)[1];
+    before.p0 = kept.p0;
+    before.p1 = kept.p1;
+    before.p2 = { x: kept.p2.x + meet.x - kept.p3.x, y: kept.p2.y + meet.y - kept.p3.y };
+    before.p3 = { ...meet };
+    after.p0 = { ...meet };
+    after.p1 = { x: rest.p1.x + meet.x - rest.p0.x, y: rest.p1.y + meet.y - rest.p0.y };
+    after.p2 = rest.p2;
+    after.p3 = rest.p3;
+  }
+  function straightBody(cubic) {
+    const end = bezier(cubic, 1);
+    const anchor = bezier(cubic, 0.75);
+    const aim = bezier(cubic, 0.45);
+    const span = { x: aim.x - anchor.x, y: aim.y - anchor.y };
+    const size = lengthOf(span);
+    if (size < 0.5) return null;
+    const unit2 = { x: span.x / size, y: span.y / size };
+    const off = (point2) => Math.abs((point2.x - anchor.x) * unit2.y - (point2.y - anchor.y) * unit2.x);
+    for (let step = 16; step >= 8; step -= 1) if (off(bezier(cubic, step / 20)) > STRAIGHT_TOLERANCE) return null;
+    let t = 0.4;
+    for (let step = 39; step >= 0; step -= 1) {
+      const at = step / 100;
+      if (off(bezier(cubic, at)) > STRAIGHT_TOLERANCE) break;
+      t = at;
+    }
+    return { t, direction: { x: -unit2.x, y: -unit2.y }, length: distance(bezier(cubic, t), end) };
+  }
+  function reverseCubic(cubic) {
+    return { p0: cubic.p3, p1: cubic.p2, p2: cubic.p1, p3: cubic.p0 };
+  }
+  function splitCubic(cubic, t) {
+    const mix = (a2, b2) => ({ x: a2.x + (b2.x - a2.x) * t, y: a2.y + (b2.y - a2.y) * t });
+    const a = mix(cubic.p0, cubic.p1), b = mix(cubic.p1, cubic.p2), c = mix(cubic.p2, cubic.p3);
+    const d = mix(a, b), e = mix(b, c), f = mix(d, e);
+    return [{ p0: cubic.p0, p1: a, p2: d, p3: f }, { p0: f, p1: e, p2: c, p3: cubic.p3 }];
+  }
+  function angleBetween(left, right) {
+    const dot = left.x * right.x + left.y * right.y;
+    const scale = lengthOf(left) * lengthOf(right);
+    if (!(scale > 0)) return 0;
+    return Math.acos(Math.max(-1, Math.min(1, dot / scale)));
+  }
+  function intersectLines(a, da, b, db) {
+    const cross = da.x * db.y - da.y * db.x;
+    if (Math.abs(cross) < 1e-9) return null;
+    const t = ((b.x - a.x) * db.y - (b.y - a.y) * db.x) / cross;
+    return { x: a.x + da.x * t, y: a.y + da.y * t };
+  }
 
   // src/png-alpha.ts
   var zlib = __toESM(__require("zlib"));
@@ -1498,15 +1621,58 @@
   function fitShapes(svg) {
     const tags = pathTags(svg);
     if (tags.length === 0) return svg;
+    const box = /viewBox="\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg);
+    const canvas = box === null ? null : { x: Number(box[1]), y: Number(box[2]), width: Number(box[3]), height: Number(box[4]) };
+    const touching = canvas === null ? [] : tags.map((tag) => {
+      const data = elementName(tag.source) === "path" ? readAttr2(tagAttrs(tag.source), "d") : null;
+      if (data === null) return false;
+      const measured = measurePath(data);
+      if (measured.area < 0.02 * canvas.width * canvas.height) return false;
+      return measured.minX <= canvas.x + 0.05 || measured.minY <= canvas.y + 0.05 || measured.maxX >= canvas.x + canvas.width - 0.05 || measured.maxY >= canvas.y + canvas.height - 0.05;
+    });
+    const touchCount = touching.filter(Boolean).length;
     let result = "";
     let cursor = 0;
-    for (const tag of tags) {
+    for (const [index, tag] of tags.entries()) {
       result += svg.slice(cursor, tag.index);
-      result += fittedMarkup(tag) ?? tag.source;
+      result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
       cursor = tag.index + tag.length;
     }
     return result + svg.slice(cursor);
   }
+  function unifyNearFills(svg) {
+    const tags = pathTags(svg);
+    const area = /* @__PURE__ */ new Map();
+    const fills = tags.map((tag) => {
+      const attrs = tagAttrs(tag.source);
+      const fill = readAttr2(attrs, "fill");
+      const data = readAttr2(attrs, "d");
+      if (fill === null || !/^#[0-9a-f]{6}$/i.test(fill) || data === null) return null;
+      const key = fill.toUpperCase();
+      area.set(key, (area.get(key) ?? 0) + Math.abs(measurePath(data).area));
+      return key;
+    });
+    if (area.size < 2) return svg;
+    const rgb = (hex3) => [1, 3, 5].map((at) => parseInt(hex3.slice(at, at + 2), 16));
+    const target = /* @__PURE__ */ new Map();
+    const ranked = [...area.entries()].sort((a, b) => b[1] - a[1]).map(([key]) => key);
+    for (const [rank, key] of ranked.entries()) {
+      const own = rgb(key);
+      const into = ranked.slice(0, rank).find((other) => target.get(other) === void 0 && rgb(other).every((value, channel) => Math.abs(value - (own[channel] ?? 0)) <= NEAR_FILL));
+      if (into !== void 0) target.set(key, into);
+    }
+    if (target.size === 0) return svg;
+    let result = "";
+    let cursor = 0;
+    for (const [index, tag] of tags.entries()) {
+      const into = fills[index] === null ? void 0 : target.get(fills[index] ?? "");
+      result += svg.slice(cursor, tag.index);
+      result += into === void 0 ? tag.source : tag.source.replace(/fill="[^"]*"/i, 'fill="' + into + '"');
+      cursor = tag.index + tag.length;
+    }
+    return result + svg.slice(cursor);
+  }
+  var NEAR_FILL = 2;
   function sealGaps(svg, strokeWidth = 0.8) {
     const width = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;
     return svg.replace(/<(path|circle|ellipse|rect)\b([^>]*?)\s*(\/?)\s*>/gi, (full, name, attrs, slash) => {
@@ -1517,7 +1683,7 @@
       return "<" + name + attrs + ' stroke="' + fill.replace(/"/g, "") + '" stroke-width="' + String(width) + '" stroke-linejoin="round"' + (slash === "/" ? "/" : "") + ">";
     });
   }
-  function fittedMarkup(tag) {
+  function fittedMarkup(tag, canvas = null) {
     if (elementName(tag.source) !== "path") return null;
     const attrs = tagAttrs(tag.source);
     const data = readAttr2(attrs, "d");
@@ -1530,7 +1696,7 @@
     if (rect !== null) return '<rect x="' + fmt2(rect.x) + '" y="' + fmt2(rect.y) + '" width="' + fmt2(rect.width) + '" height="' + fmt2(rect.height) + '"' + fillAttr + "/>";
     const round = fitRoundRect(measured);
     if (round !== null) return '<rect x="' + fmt2(round.x) + '" y="' + fmt2(round.y) + '" width="' + fmt2(round.width) + '" height="' + fmt2(round.height) + '" rx="' + fmt2(round.r) + '" ry="' + fmt2(round.r) + '"' + fillAttr + "/>";
-    const circle = fitCircle(measured);
+    const circle = fitCircle(measured, canvas);
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
@@ -1602,7 +1768,7 @@
     }
     return arc && side ? maxError : null;
   }
-  function fitCircle(measured) {
+  function fitCircle(measured, canvas = null) {
     const points = measured.samples;
     if (points.length < 8) return null;
     let sumX = 0;
@@ -1649,7 +1815,20 @@
     const expected = Math.PI * radius * radius;
     if (Math.abs(measured.area - expected) / expected > 0.12) return null;
     const areaRadius = Math.sqrt(measured.area / Math.PI);
-    return { cx, cy, r: Math.abs(areaRadius - radius) <= radius * 6e-3 ? areaRadius : radius };
+    let chosen = Math.abs(areaRadius - radius) <= radius * 6e-3 ? areaRadius : radius;
+    let centreX = cx, centreY = cy;
+    if (canvas !== null) {
+      const edge = 0.05;
+      const left = measured.minX <= canvas.x + edge, right = measured.maxX >= canvas.x + canvas.width - edge;
+      const top = measured.minY <= canvas.y + edge, bottom = measured.maxY >= canvas.y + canvas.height - edge;
+      if (left && right) centreX = canvas.x + canvas.width / 2;
+      if (top && bottom) centreY = canvas.y + canvas.height / 2;
+      if (left) chosen = Math.max(chosen, centreX - canvas.x);
+      if (top) chosen = Math.max(chosen, centreY - canvas.y);
+      if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
+      if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+    }
+    return { cx: centreX, cy: centreY, r: chosen };
   }
   function fitEllipse(measured) {
     const rx = (measured.maxX - measured.minX) / 2;
@@ -3124,7 +3303,13 @@
       drawings.push((next.match(SHAPE) ?? []).join(""));
     }
     const merged = '<svg xmlns="http://www.w3.org/2000/svg" width="' + String(width) + '" height="' + String(height) + '" viewBox="0 0 ' + String(width) + " " + String(height) + '">' + drawings.join("") + "</svg>";
-    return fitGeometry ? fitShapes(merged) : merged;
+    const size = Math.max(width, height);
+    const fillet = Math.min(2, Math.max(1.25, size / 128));
+    const curl = size >= 128 ? Math.min(2, size / 128) : 0;
+    if (!fitGeometry) return merged;
+    const cutOut = plates.length > 0 && plates.every((plate) => plate.cutOut === true);
+    const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged);
+    return cutOut ? sharpenCorners(fitted, fillet, 35, curl) : fitted;
   }
 
   // src/lab-pipeline.ts
@@ -3477,7 +3662,8 @@
         originY: box.y,
         sourceWidth: cropW,
         sourceHeight: cropH,
-        borderColor: cornerColor(crop, cropW, cropH)
+        borderColor: cornerColor(crop, cropW, cropH),
+        cutOut: hasClearPixel(crop)
       });
     }
     onProgress?.(1);
@@ -3521,8 +3707,13 @@
       originY: box.y,
       sourceWidth: cropW,
       sourceHeight: cropH,
-      borderColor: cornerColor(crop, cropW, cropH)
+      borderColor: cornerColor(crop, cropW, cropH),
+      cutOut: hasClearPixel(crop)
     };
+  }
+  function hasClearPixel(rgba) {
+    for (let offset = 3; offset < rgba.length; offset += 4) if ((rgba[offset] ?? 0) <= CLEAR_OPACITY) return true;
+    return false;
   }
   function cornerColor(rgba, width, height) {
     const points = [
@@ -4041,11 +4232,211 @@
     onProgress?.(1);
     return labels;
   }
+  var SOLID_OPACITY = 250;
+  var CLEAR_OPACITY = 5;
+  var THIN_BEND = 64;
+  var AXIS_SNAP = 20 * Math.PI / 180;
+  var AXIS_SNAP_NEAR = 30 * Math.PI / 180;
+  var AXIS_FLAT = 3 * Math.PI / 180;
+  var CORNER_SLACK = 0.1;
+  var CORNER_TILT = 20 * Math.PI / 180;
+  function planeOffset(nx, ny, area) {
+    const steps = 16;
+    const covered = (limit) => {
+      let count = 0;
+      for (let j = 0; j < steps; j += 1) {
+        for (let i = 0; i < steps; i += 1) if (nx * ((i + 0.5) / steps - 0.5) + ny * ((j + 0.5) / steps - 0.5) >= limit) count += 1;
+      }
+      return count / (steps * steps);
+    };
+    let low = -1;
+    let high = 1;
+    for (let iteration = 0; iteration < 14; iteration += 1) {
+      const middle = (low + high) / 2;
+      if (covered(middle) > area) low = middle;
+      else high = middle;
+    }
+    return (low + high) / 2;
+  }
+  function thinShape(level, bendX, bendY) {
+    const mask = new Uint8Array(UP * UP);
+    const alongX = Math.abs(bendX) >= Math.abs(bendY);
+    const bend = alongX ? bendX : bendY;
+    const coverage = level / 255;
+    for (let cell = 0; cell < mask.length; cell += 1) {
+      const across = Math.abs(((alongX ? cell % UP : Math.floor(cell / UP)) + 0.5) / UP - 0.5);
+      if (level >= 128) mask[cell] = 1;
+      else if (bend < -THIN_BEND) mask[cell] = across <= coverage / 2 ? 1 : 0;
+      else if (bend > THIN_BEND) mask[cell] = across >= (1 - coverage) / 2 ? 1 : 0;
+      else mask[cell] = 0;
+    }
+    return mask;
+  }
+  function edgeShapes(opacity, width, height, normalX, normalY) {
+    const partial = (index) => (opacity[index] ?? 0) > CLEAR_OPACITY && (opacity[index] ?? 0) < SOLID_OPACITY && ((normalX[index] ?? 0) !== 0 || (normalY[index] ?? 0) !== 0);
+    const offsets = /* @__PURE__ */ new Map();
+    const offset = (index) => {
+      const known = offsets.get(index);
+      if (known !== void 0) return known;
+      const value = planeOffset(normalX[index] ?? 0, normalY[index] ?? 0, (opacity[index] ?? 0) / 255);
+      offsets.set(index, value);
+      return value;
+    };
+    const shapes = /* @__PURE__ */ new Map();
+    const cells = UP * UP;
+    const read = (x, y) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+    const corners = [];
+    const thin = [];
+    const reliable = new Uint8Array(width * height);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (!partial(index)) continue;
+        for (let dy = -1; dy <= 1 && reliable[index] === 0; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            const nx0 = x + dx, ny0 = y + dy;
+            if (dx === 0 && dy === 0 || nx0 < 0 || ny0 < 0 || nx0 >= width || ny0 >= height) continue;
+            const other = ny0 * width + nx0;
+            if (partial(other) && (normalX[other] ?? 0) * (normalX[index] ?? 0) + (normalY[other] ?? 0) * (normalY[index] ?? 0) >= Math.cos(CORNER_TILT)) {
+              reliable[index] = 1;
+              break;
+            }
+          }
+        }
+      }
+    }
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        const level = opacity[index] ?? 0;
+        if (level > CLEAR_OPACITY && level < SOLID_OPACITY && !partial(index)) {
+          shapes.set(index, thinShape(level, read(x - 1, y) + read(x + 1, y) - 2 * level, read(x, y - 1) + read(x, y + 1) - 2 * level));
+          thin.push(index);
+          continue;
+        }
+        if (!partial(index)) continue;
+        const lines = [];
+        for (let dy = -1; dy <= 1; dy += 1) {
+          for (let dx = -1; dx <= 1; dx += 1) {
+            const nx0 = x + dx, ny0 = y + dy;
+            if (nx0 < 0 || ny0 < 0 || nx0 >= width || ny0 >= height) continue;
+            const other = ny0 * width + nx0;
+            if (!partial(other) || (dx !== 0 || dy !== 0) && reliable[other] !== 1) continue;
+            const nx = normalX[other] ?? 0, ny = normalY[other] ?? 0, limit = offset(other);
+            const mask = new Uint8Array(cells);
+            for (let cell = 0; cell < cells; cell += 1) {
+              const u = (cell % UP + 0.5) / UP - 0.5 - dx, v = (Math.floor(cell / UP) + 0.5) / UP - 0.5 - dy;
+              mask[cell] = nx * u + ny * v >= limit ? 1 : 0;
+            }
+            if (dx === 0 && dy === 0) lines.unshift({ nx, ny, mask });
+            else lines.push({ nx, ny, mask });
+          }
+        }
+        const target = (opacity[index] ?? 0) / 255;
+        const coverage = (mask) => mask.reduce((sum, value) => sum + value, 0) / cells;
+        const own = lines[0];
+        let best = own?.mask ?? new Uint8Array(cells);
+        const neighbours = lines.slice(1);
+        if (own !== void 0 && neighbours.length > 0 && reliable[index] !== 1) {
+          let bestError = Number.POSITIVE_INFINITY;
+          const consider = (mask) => {
+            const error = Math.abs(coverage(mask) - target);
+            if (error <= CORNER_SLACK && error < bestError) {
+              best = mask;
+              bestError = error;
+            }
+          };
+          for (let a = 0; a < neighbours.length; a += 1) {
+            for (let b = a + 1; b < neighbours.length; b += 1) {
+              const left = neighbours[a], right = neighbours[b];
+              if (left === void 0 || right === void 0 || left.nx * right.nx + left.ny * right.ny > Math.cos(CORNER_TILT)) continue;
+              consider(left.mask.map((value, cell) => value & (right.mask[cell] ?? 0)));
+              consider(left.mask.map((value, cell) => value | (right.mask[cell] ?? 0)));
+            }
+          }
+          if (bestError === Number.POSITIVE_INFINITY) for (const line2 of neighbours) consider(line2.mask);
+        }
+        shapes.set(index, best);
+        if (reliable[index] !== 1) corners.push(index);
+      }
+    }
+    const zone = new Set(thin);
+    for (const index of corners) {
+      const x = index % width;
+      const y = (index - x) / width;
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx0 = x + dx, ny0 = y + dy;
+          if (nx0 >= 0 && ny0 >= 0 && nx0 < width && ny0 < height) zone.add(ny0 * width + nx0);
+        }
+      }
+    }
+    for (const index of [...shapes.keys()]) if (!zone.has(index)) shapes.delete(index);
+    return shapes;
+  }
   function cutTransparent(labels, opacity, width, height) {
     if (opacity.every((value) => value === 255)) return;
     const upW = width * UP;
     const upH = height * UP;
     const read = (x, y) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+    const normalX = new Float64Array(width * height);
+    const normalY = new Float64Array(width * height);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const own = opacity[y * width + x] ?? 0;
+        if (own <= CLEAR_OPACITY || own >= SOLID_OPACITY) continue;
+        const gx = read(x + 1, y - 1) + 2 * read(x + 1, y) + read(x + 1, y + 1) - read(x - 1, y - 1) - 2 * read(x - 1, y) - read(x - 1, y + 1);
+        const gy = read(x - 1, y + 1) + 2 * read(x, y + 1) + read(x + 1, y + 1) - read(x - 1, y - 1) - 2 * read(x, y - 1) - read(x + 1, y - 1);
+        const length = Math.hypot(gx, gy);
+        if (length === 0) continue;
+        const stepX = Math.round(gx / length), stepY = Math.round(gy / length);
+        const ahead = read(x + stepX, y + stepY), behind = read(x - stepX, y - stepY);
+        if (ahead - behind < 96 || ahead < own - 8 || behind > own + 8) continue;
+        const solid = (dx, dy) => read(x + dx, y + dy) >= SOLID_OPACITY;
+        const across = (dx, dy) => solid(dx, dy) && solid(-dx, -dy) && !solid(dy, dx) && !solid(-dy, -dx);
+        if (across(1, 0) || across(0, 1)) continue;
+        normalX[y * width + x] = gx / length;
+        normalY[y * width + x] = gy / length;
+      }
+    }
+    const tiltOf = (index) => {
+      const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+      return Math.atan2(Math.min(Math.abs(nx), Math.abs(ny)), Math.max(Math.abs(nx), Math.abs(ny)));
+    };
+    const axisOf = (index, limit = AXIS_SNAP) => {
+      const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+      if (nx === 0 && ny === 0) return 0;
+      if (tiltOf(index) > limit) return 0;
+      return Math.abs(nx) >= Math.abs(ny) ? nx > 0 ? 1 : 2 : ny > 0 ? 3 : 4;
+    };
+    const flat = (index, axis) => {
+      const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+      return axisOf(index) === axis && Math.min(Math.abs(nx), Math.abs(ny)) <= Math.sin(AXIS_FLAT);
+    };
+    const snapped = [];
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        const axis = axisOf(index, AXIS_SNAP_NEAR);
+        if (axis === 0) continue;
+        const alongX = axis <= 2 ? 0 : 1, alongY = axis <= 2 ? 1 : 0;
+        let anchored = false;
+        const junction = tiltOf(index) > AXIS_SNAP;
+        for (const step of junction ? [-1, 1] : [-2, -1, 0, 1, 2]) {
+          const nx = x + step * alongX, ny = y + step * alongY;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          if (junction && read(x - step * alongX, y - step * alongY) >= (opacity[index] ?? 0)) continue;
+          if (flat(ny * width + nx, axis)) anchored = true;
+        }
+        if (anchored) snapped.push(index, axis);
+      }
+    }
+    for (let at = 0; at < snapped.length; at += 2) {
+      const index = snapped[at] ?? 0, axis = snapped[at + 1] ?? 0;
+      normalX[index] = axis === 1 ? 1 : axis === 2 ? -1 : 0;
+      normalY[index] = axis === 3 ? 1 : axis === 4 ? -1 : 0;
+    }
+    const shape = edgeShapes(opacity, width, height, normalX, normalY);
     let pending = [];
     for (let uy = 0; uy < upH; uy += 1) {
       const sy = (uy + 0.5) / UP - 0.5;
@@ -4058,7 +4449,16 @@
         const top = read(x0, y0) * (1 - fx) + read(x0 + 1, y0) * fx;
         const bottom = read(x0, y0 + 1) * (1 - fx) + read(x0 + 1, y0 + 1) * fx;
         const at = uy * upW + ux;
-        if (top * (1 - fy) + bottom * fy < 128) labels[at] = 255;
+        const ownIndex = Math.floor(uy / UP) * width + Math.floor(ux / UP);
+        const own = opacity[ownIndex] ?? 0;
+        let inside;
+        if (own >= SOLID_OPACITY) inside = true;
+        else if (own <= CLEAR_OPACITY) inside = false;
+        else {
+          const mask = shape.get(ownIndex);
+          inside = mask === void 0 ? top * (1 - fy) + bottom * fy >= 128 : mask[uy % UP * UP + ux % UP] === 1;
+        }
+        if (!inside) labels[at] = 255;
         else if (labels[at] === 255) pending.push(at);
       }
     }
@@ -5026,6 +5426,7 @@
       originX: plate.originX,
       originY: plate.originY,
       borderColor: plate.borderColor,
+      cutOut: plate.cutOut,
       request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
     }));
     const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
@@ -5190,6 +5591,7 @@
           originX: 0,
           originY: 0,
           borderColor: cornerColor(rgba, width, height),
+          cutOut: hasClearPixel(rgba),
           request: {
             preset: settings.preset,
             maxColors: locked ? 0 : settings.maxColors,
@@ -5217,6 +5619,7 @@
         originX: 0,
         originY: 0,
         borderColor: cornerColor(rgba, width, height),
+        cutOut: hasClearPixel(rgba),
         request: {
           ...request,
           removeBackground: settings.removeBackground
@@ -6017,6 +6420,7 @@
       originX: value.originX,
       originY: value.originY,
       borderColor: value.borderColor,
+      ...value.cutOut === true ? { cutOut: true } : {},
       request
     };
   }

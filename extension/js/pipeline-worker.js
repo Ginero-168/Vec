@@ -110,8 +110,13 @@ function plateFor(rgba, width, height, box, maxColors, preprocess, onProgress) {
     originY: box.y,
     sourceWidth: cropW,
     sourceHeight: cropH,
-    borderColor: cornerColor(crop, cropW, cropH)
+    borderColor: cornerColor(crop, cropW, cropH),
+    cutOut: hasClearPixel(crop)
   };
+}
+function hasClearPixel(rgba) {
+  for (let offset = 3; offset < rgba.length; offset += 4) if ((rgba[offset] ?? 0) <= CLEAR_OPACITY) return true;
+  return false;
 }
 function cornerColor(rgba, width, height) {
   const points = [
@@ -263,11 +268,211 @@ function assignLabels(linear, lab, core, alpha, opacity, width, height, centers,
   onProgress?.(1);
   return labels;
 }
+var SOLID_OPACITY = 250;
+var CLEAR_OPACITY = 5;
+var THIN_BEND = 64;
+var AXIS_SNAP = 20 * Math.PI / 180;
+var AXIS_SNAP_NEAR = 30 * Math.PI / 180;
+var AXIS_FLAT = 3 * Math.PI / 180;
+var CORNER_SLACK = 0.1;
+var CORNER_TILT = 20 * Math.PI / 180;
+function planeOffset(nx, ny, area) {
+  const steps = 16;
+  const covered = (limit) => {
+    let count = 0;
+    for (let j = 0; j < steps; j += 1) {
+      for (let i = 0; i < steps; i += 1) if (nx * ((i + 0.5) / steps - 0.5) + ny * ((j + 0.5) / steps - 0.5) >= limit) count += 1;
+    }
+    return count / (steps * steps);
+  };
+  let low = -1;
+  let high = 1;
+  for (let iteration = 0; iteration < 14; iteration += 1) {
+    const middle = (low + high) / 2;
+    if (covered(middle) > area) low = middle;
+    else high = middle;
+  }
+  return (low + high) / 2;
+}
+function thinShape(level, bendX, bendY) {
+  const mask = new Uint8Array(UP * UP);
+  const alongX = Math.abs(bendX) >= Math.abs(bendY);
+  const bend = alongX ? bendX : bendY;
+  const coverage = level / 255;
+  for (let cell = 0; cell < mask.length; cell += 1) {
+    const across = Math.abs(((alongX ? cell % UP : Math.floor(cell / UP)) + 0.5) / UP - 0.5);
+    if (level >= 128) mask[cell] = 1;
+    else if (bend < -THIN_BEND) mask[cell] = across <= coverage / 2 ? 1 : 0;
+    else if (bend > THIN_BEND) mask[cell] = across >= (1 - coverage) / 2 ? 1 : 0;
+    else mask[cell] = 0;
+  }
+  return mask;
+}
+function edgeShapes(opacity, width, height, normalX, normalY) {
+  const partial = (index) => (opacity[index] ?? 0) > CLEAR_OPACITY && (opacity[index] ?? 0) < SOLID_OPACITY && ((normalX[index] ?? 0) !== 0 || (normalY[index] ?? 0) !== 0);
+  const offsets = /* @__PURE__ */ new Map();
+  const offset = (index) => {
+    const known = offsets.get(index);
+    if (known !== void 0) return known;
+    const value = planeOffset(normalX[index] ?? 0, normalY[index] ?? 0, (opacity[index] ?? 0) / 255);
+    offsets.set(index, value);
+    return value;
+  };
+  const shapes = /* @__PURE__ */ new Map();
+  const cells = UP * UP;
+  const read = (x, y) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+  const corners = [];
+  const thin = [];
+  const reliable = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!partial(index)) continue;
+      for (let dy = -1; dy <= 1 && reliable[index] === 0; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx0 = x + dx, ny0 = y + dy;
+          if (dx === 0 && dy === 0 || nx0 < 0 || ny0 < 0 || nx0 >= width || ny0 >= height) continue;
+          const other = ny0 * width + nx0;
+          if (partial(other) && (normalX[other] ?? 0) * (normalX[index] ?? 0) + (normalY[other] ?? 0) * (normalY[index] ?? 0) >= Math.cos(CORNER_TILT)) {
+            reliable[index] = 1;
+            break;
+          }
+        }
+      }
+    }
+  }
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const level = opacity[index] ?? 0;
+      if (level > CLEAR_OPACITY && level < SOLID_OPACITY && !partial(index)) {
+        shapes.set(index, thinShape(level, read(x - 1, y) + read(x + 1, y) - 2 * level, read(x, y - 1) + read(x, y + 1) - 2 * level));
+        thin.push(index);
+        continue;
+      }
+      if (!partial(index)) continue;
+      const lines = [];
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx0 = x + dx, ny0 = y + dy;
+          if (nx0 < 0 || ny0 < 0 || nx0 >= width || ny0 >= height) continue;
+          const other = ny0 * width + nx0;
+          if (!partial(other) || (dx !== 0 || dy !== 0) && reliable[other] !== 1) continue;
+          const nx = normalX[other] ?? 0, ny = normalY[other] ?? 0, limit = offset(other);
+          const mask = new Uint8Array(cells);
+          for (let cell = 0; cell < cells; cell += 1) {
+            const u = (cell % UP + 0.5) / UP - 0.5 - dx, v = (Math.floor(cell / UP) + 0.5) / UP - 0.5 - dy;
+            mask[cell] = nx * u + ny * v >= limit ? 1 : 0;
+          }
+          if (dx === 0 && dy === 0) lines.unshift({ nx, ny, mask });
+          else lines.push({ nx, ny, mask });
+        }
+      }
+      const target = (opacity[index] ?? 0) / 255;
+      const coverage = (mask) => mask.reduce((sum, value) => sum + value, 0) / cells;
+      const own = lines[0];
+      let best = own?.mask ?? new Uint8Array(cells);
+      const neighbours = lines.slice(1);
+      if (own !== void 0 && neighbours.length > 0 && reliable[index] !== 1) {
+        let bestError = Number.POSITIVE_INFINITY;
+        const consider = (mask) => {
+          const error = Math.abs(coverage(mask) - target);
+          if (error <= CORNER_SLACK && error < bestError) {
+            best = mask;
+            bestError = error;
+          }
+        };
+        for (let a = 0; a < neighbours.length; a += 1) {
+          for (let b = a + 1; b < neighbours.length; b += 1) {
+            const left = neighbours[a], right = neighbours[b];
+            if (left === void 0 || right === void 0 || left.nx * right.nx + left.ny * right.ny > Math.cos(CORNER_TILT)) continue;
+            consider(left.mask.map((value, cell) => value & (right.mask[cell] ?? 0)));
+            consider(left.mask.map((value, cell) => value | (right.mask[cell] ?? 0)));
+          }
+        }
+        if (bestError === Number.POSITIVE_INFINITY) for (const line of neighbours) consider(line.mask);
+      }
+      shapes.set(index, best);
+      if (reliable[index] !== 1) corners.push(index);
+    }
+  }
+  const zone = new Set(thin);
+  for (const index of corners) {
+    const x = index % width;
+    const y = (index - x) / width;
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        const nx0 = x + dx, ny0 = y + dy;
+        if (nx0 >= 0 && ny0 >= 0 && nx0 < width && ny0 < height) zone.add(ny0 * width + nx0);
+      }
+    }
+  }
+  for (const index of [...shapes.keys()]) if (!zone.has(index)) shapes.delete(index);
+  return shapes;
+}
 function cutTransparent(labels, opacity, width, height) {
   if (opacity.every((value) => value === 255)) return;
   const upW = width * UP;
   const upH = height * UP;
   const read = (x, y) => opacity[Math.min(height - 1, Math.max(0, y)) * width + Math.min(width - 1, Math.max(0, x))] ?? 0;
+  const normalX = new Float64Array(width * height);
+  const normalY = new Float64Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const own = opacity[y * width + x] ?? 0;
+      if (own <= CLEAR_OPACITY || own >= SOLID_OPACITY) continue;
+      const gx = read(x + 1, y - 1) + 2 * read(x + 1, y) + read(x + 1, y + 1) - read(x - 1, y - 1) - 2 * read(x - 1, y) - read(x - 1, y + 1);
+      const gy = read(x - 1, y + 1) + 2 * read(x, y + 1) + read(x + 1, y + 1) - read(x - 1, y - 1) - 2 * read(x, y - 1) - read(x + 1, y - 1);
+      const length = Math.hypot(gx, gy);
+      if (length === 0) continue;
+      const stepX = Math.round(gx / length), stepY = Math.round(gy / length);
+      const ahead = read(x + stepX, y + stepY), behind = read(x - stepX, y - stepY);
+      if (ahead - behind < 96 || ahead < own - 8 || behind > own + 8) continue;
+      const solid = (dx, dy) => read(x + dx, y + dy) >= SOLID_OPACITY;
+      const across = (dx, dy) => solid(dx, dy) && solid(-dx, -dy) && !solid(dy, dx) && !solid(-dy, -dx);
+      if (across(1, 0) || across(0, 1)) continue;
+      normalX[y * width + x] = gx / length;
+      normalY[y * width + x] = gy / length;
+    }
+  }
+  const tiltOf = (index) => {
+    const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+    return Math.atan2(Math.min(Math.abs(nx), Math.abs(ny)), Math.max(Math.abs(nx), Math.abs(ny)));
+  };
+  const axisOf = (index, limit = AXIS_SNAP) => {
+    const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+    if (nx === 0 && ny === 0) return 0;
+    if (tiltOf(index) > limit) return 0;
+    return Math.abs(nx) >= Math.abs(ny) ? nx > 0 ? 1 : 2 : ny > 0 ? 3 : 4;
+  };
+  const flat = (index, axis) => {
+    const nx = normalX[index] ?? 0, ny = normalY[index] ?? 0;
+    return axisOf(index) === axis && Math.min(Math.abs(nx), Math.abs(ny)) <= Math.sin(AXIS_FLAT);
+  };
+  const snapped = [];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const axis = axisOf(index, AXIS_SNAP_NEAR);
+      if (axis === 0) continue;
+      const alongX = axis <= 2 ? 0 : 1, alongY = axis <= 2 ? 1 : 0;
+      let anchored = false;
+      const junction = tiltOf(index) > AXIS_SNAP;
+      for (const step of junction ? [-1, 1] : [-2, -1, 0, 1, 2]) {
+        const nx = x + step * alongX, ny = y + step * alongY;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        if (junction && read(x - step * alongX, y - step * alongY) >= (opacity[index] ?? 0)) continue;
+        if (flat(ny * width + nx, axis)) anchored = true;
+      }
+      if (anchored) snapped.push(index, axis);
+    }
+  }
+  for (let at = 0; at < snapped.length; at += 2) {
+    const index = snapped[at] ?? 0, axis = snapped[at + 1] ?? 0;
+    normalX[index] = axis === 1 ? 1 : axis === 2 ? -1 : 0;
+    normalY[index] = axis === 3 ? 1 : axis === 4 ? -1 : 0;
+  }
+  const shape = edgeShapes(opacity, width, height, normalX, normalY);
   let pending = [];
   for (let uy = 0; uy < upH; uy += 1) {
     const sy = (uy + 0.5) / UP - 0.5;
@@ -280,7 +485,16 @@ function cutTransparent(labels, opacity, width, height) {
       const top = read(x0, y0) * (1 - fx) + read(x0 + 1, y0) * fx;
       const bottom = read(x0, y0 + 1) * (1 - fx) + read(x0 + 1, y0 + 1) * fx;
       const at = uy * upW + ux;
-      if (top * (1 - fy) + bottom * fy < 128) labels[at] = 255;
+      const ownIndex = Math.floor(uy / UP) * width + Math.floor(ux / UP);
+      const own = opacity[ownIndex] ?? 0;
+      let inside;
+      if (own >= SOLID_OPACITY) inside = true;
+      else if (own <= CLEAR_OPACITY) inside = false;
+      else {
+        const mask = shape.get(ownIndex);
+        inside = mask === void 0 ? top * (1 - fy) + bottom * fy >= 128 : mask[uy % UP * UP + ux % UP] === 1;
+      }
+      if (!inside) labels[at] = 255;
       else if (labels[at] === 255) pending.push(at);
     }
   }
@@ -1957,6 +2171,7 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
     originX: plate.originX,
     originY: plate.originY,
     borderColor: plate.borderColor,
+    cutOut: plate.cutOut,
     request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
   }));
   const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
@@ -2121,6 +2336,7 @@ function planSegmented(rgba, width, height, settings) {
         originX: 0,
         originY: 0,
         borderColor: cornerColor(rgba, width, height),
+        cutOut: hasClearPixel(rgba),
         request: {
           preset: settings.preset,
           maxColors: locked ? 0 : settings.maxColors,
@@ -2148,6 +2364,7 @@ function planSegmentedWithControls(rgba, width, height, settings, controls, stag
       originX: 0,
       originY: 0,
       borderColor: cornerColor(rgba, width, height),
+      cutOut: hasClearPixel(rgba),
       request: {
         ...request,
         removeBackground: settings.removeBackground
