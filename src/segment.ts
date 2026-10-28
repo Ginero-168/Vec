@@ -26,6 +26,7 @@ export type SegmentColorStage = {
   readonly palette: readonly RGB[];
   readonly opaque: Uint8Array;
   readonly spread: number;
+  readonly sourceRgba?: Uint8Array;
 };
 
 export type SegmentBackdropStage = {
@@ -58,7 +59,7 @@ export function segmentColorStage(rgba: Uint8Array, width: number, height: numbe
     const labels = new Int16Array(count);
     labels.fill(-1);
     report(1);
-    return { colors: copy, labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0 };
+    return { colors: copy, labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0, sourceRgba: rgba };
   }
   const source = rgba;
   const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
@@ -97,7 +98,7 @@ export function segmentColorStage(rgba: Uint8Array, width: number, height: numbe
   }
   const colors = paintLabels(labels, palette, opaque, (fraction) => report(0.96 + fraction * 0.04));
   report(1);
-  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(source, width, height)?.spread ?? 0 };
+  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(source, width, height)?.spread ?? 0, sourceRgba: source };
 }
 
 export async function segmentColorStageAsync(
@@ -126,7 +127,7 @@ export async function segmentColorStageAsync(
     const labels = new Int16Array(count);
     labels.fill(-1);
     report(1);
-    return { colors: rgba.slice(), labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0 };
+    return { colors: rgba.slice(), labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0, sourceRgba: rgba };
   }
   const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
   const samples = collectSamples(rgba, width, height, cutoff);
@@ -173,7 +174,7 @@ export async function segmentColorStageAsync(
   }
   const colors = await paintLabelsAsync(labels, palette, opaque, cooperate, (fraction) => report(0.94 + fraction * 0.06));
   report(1);
-  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(rgba, width, height)?.spread ?? 0 };
+  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(rgba, width, height)?.spread ?? 0, sourceRgba: rgba };
 }
 
 async function clusterAsync(
@@ -512,7 +513,7 @@ export function borderSpread(rgba: Uint8Array, width: number, height: number): n
   return borderMeasure(rgba, width, height)?.spread ?? 0;
 }
 
-function paintLabels(labels: Int16Array, palette: readonly RGB[], alpha: Uint8Array, onProgress?: (fraction: number) => void): Uint8Array {
+export function paintLabels(labels: Int16Array, palette: readonly RGB[], alpha: Uint8Array, onProgress?: (fraction: number) => void): Uint8Array {
   const next = new Uint8Array(alpha.length * 4);
   for (let index = 0; index < alpha.length; index += 1) {
     const offset = index * 4;
