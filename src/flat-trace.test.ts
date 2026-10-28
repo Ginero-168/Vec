@@ -420,6 +420,14 @@ test("JPEG palette cleanup folds near-identical inks and keeps distinct ones", (
   assert.deepEqual(mergeNearCenters(distinct.centers, distinct.lab, distinct.core), distinct.centers);
 });
 
+test("JPEG palette cleanup folds a navy tint of a thin black outline into the black", () => {
+  // q60 tints a black outline navy here and there: ΔE2000 about 7 apart, both near-black, too many pixels to be a
+  // minor satellite. A dark but clearly coloured ink (deep red) stays.
+  const tint = centresWithPixels([[255, 255, 255, 5000], [11, 5, 2, 60], [7, 4, 18, 18], [90, 10, 10, 50]]);
+  const kept = mergeNearCenters(tint.centers, tint.lab, tint.core);
+  assert.equal(kept.length, 3);
+});
+
 test("JPEG palette cleanup drops a small ringing centre between two inks", () => {
   // Cream halfway between an orange star and the white backdrop, with few pixels: compression overshoot.
   const ring = centresWithPixels([[255, 255, 255, 2000], [244, 144, 12, 1000], [250, 200, 134, 40]]);

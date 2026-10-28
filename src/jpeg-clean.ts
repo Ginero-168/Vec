@@ -29,6 +29,8 @@ export function lossyCleanup(rgba: Uint8Array, width: number, height: number): t
 const MERGE_DELTA_E = 3;
 const MINOR_DELTA_E = 6;
 const MINOR_SHARE = 0.1;
+const DARK_L = 12;
+const DARK_DELTA_E = 10;
 
 /**
  * Fold palette centres closer than ΔE2000 3 (CIELab) into the centre that explains more core pixels. JPEG noise and
@@ -58,7 +60,11 @@ export function mergeNearCenters(centers: readonly Lab[], lab: Float64Array, cor
   for (const at of order) {
     // A minor centre (under a tenth of the lead's core pixels) within MINOR_DELTA_E is the lead's JPEG noise too:
     // q60 splits one flat ink into a main centre and small satellites ΔE 3-6 away.
-    const limit = (lead: number) => ((counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E);
+    // Near-black inks: q60 tints a thin black outline's pixels navy or brown (ΔE2000 6-11 at CIE L* under 12), and
+    // each tint became its own shape over the outline (om-grinning-128-q60's navy blobs over the tongue's corners).
+    const limit = (lead: number) =>
+      (cie[lead]?.L ?? 100) < DARK_L && (cie[at]?.L ?? 100) < DARK_L ? DARK_DELTA_E
+        : (counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E;
     // A centre with no core pixels is a thin feature's ink (an outline); with no flat area there is no noise to fold.
     const home = (counts[at] ?? 0) === 0 ? undefined : groups.find((group) => deltaE2000(cie[group.lead] as Lab, cie[at] as Lab) < limit(group.lead));
     if (home === undefined) groups.push({ lead: at, members: [at] });
