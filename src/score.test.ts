@@ -144,6 +144,40 @@ test("a traced circle and rectangle become real shapes with fewer anchors", () =
   assert.ok(Math.abs(Number(circle?.[1]) - 40) < 0.6);
 });
 
+test("a disc that runs into the canvas frame keeps its true radius", () => {
+  // The trace of a radius-16 disc in a 32 px canvas runs along the frame near each tangent point, 4.75 px either side
+  // of it in gl-chrome-32-white (where the disc comes within 0.75 px of the frame), with a vertex per pixel step there
+  // and long curves elsewhere. Those frame runs lie outside the disc and pull a least-squares radius outward; a
+  // smaller shape stacked on the disc reaches the frame too, so the disc is not grown to it either.
+  const points: string[] = [];
+  const steps = 512;
+  for (let step = 0; step < steps; step += 1) {
+    const angle = (step / steps) * Math.PI * 2;
+    const x = 16 + 16 * Math.cos(angle), y = 16 + 16 * Math.sin(angle);
+    const snap = (value: number) => (value < 0.75 ? 0 : value > 31.25 ? 32 : value);
+    const onFrame = snap(x) !== x || snap(y) !== y;
+    if (!onFrame && step % 16 !== 0) continue;
+    points.push((points.length === 0 ? "M" : "L") + snap(x).toFixed(3) + "," + snap(y).toFixed(3));
+  }
+  const svg = '<svg viewBox="0 0 32 32"><path d="' + points.join("") + 'Z" fill="#fbc116"/><path d="M12,0 H20 V8 H12 Z" fill="#227733"/></svg>';
+  const circle = /<circle\b[^>]*r="([^"]+)"/.exec(fitShapes(svg));
+  assert.ok(circle !== null);
+  assert.equal(Number(circle[1]), 16);
+});
+
+test("a larger disc clipped by the canvas keeps its fitted radius", () => {
+  // Radius 20 about the centre of a 32 px canvas: the trace is the clipped disc, reaching all four edges.
+  const points: string[] = [];
+  for (let step = 0; step < 256; step += 1) {
+    const angle = (step / 256) * Math.PI * 2;
+    const x = Math.min(32, Math.max(0, 16 + 20 * Math.cos(angle))), y = Math.min(32, Math.max(0, 16 + 20 * Math.sin(angle)));
+    points.push((step === 0 ? "M" : "L") + x.toFixed(3) + "," + y.toFixed(3));
+  }
+  const fitted = fitShapes('<svg viewBox="0 0 32 32"><path d="' + points.join("") + 'Z" fill="#fbc116"/></svg>');
+  const circle = /<circle\b[^>]*r="([^"]+)"/.exec(fitted);
+  if (circle !== null) assert.ok(Number(circle[1]) > 17, `r ${circle[1]}`);
+});
+
 test("a wide oval becomes an ellipse", () => {
   const kx = 50 * 0.5522847498;
   const ky = 24 * 0.5522847498;

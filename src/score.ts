@@ -297,7 +297,7 @@ export function fitShapes(svg: string): string {
   let cursor = 0;
   for (const [index, tag] of tags.entries()) {
     result += svg.slice(cursor, tag.index);
-    result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
+    result += fittedMarkup(tag, canvas, touching[index] === true && touchCount === 1) ?? tag.source;
     cursor = tag.index + tag.length;
   }
   return result + svg.slice(cursor);
@@ -356,7 +356,7 @@ export function sealGaps(svg: string, strokeWidth = 0.8): string {
 
 type Canvas = { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
 
-function fittedMarkup(tag: PathTag, canvas: Canvas | null = null): string | null {
+function fittedMarkup(tag: PathTag, canvas: Canvas | null = null, grow = false): string | null {
   if (elementName(tag.source) !== "path") return null;
   const attrs = tagAttrs(tag.source);
   const data = readAttr(attrs, "d");
@@ -369,7 +369,7 @@ function fittedMarkup(tag: PathTag, canvas: Canvas | null = null): string | null
   if (rect !== null) return '<rect x="' + fmt(rect.x) + '" y="' + fmt(rect.y) + '" width="' + fmt(rect.width) + '" height="' + fmt(rect.height) + '"' + fillAttr + "/>";
   const round = fitRoundRect(measured);
   if (round !== null) return '<rect x="' + fmt(round.x) + '" y="' + fmt(round.y) + '" width="' + fmt(round.width) + '" height="' + fmt(round.height) + '" rx="' + fmt(round.r) + '" ry="' + fmt(round.r) + '"' + fillAttr + "/>";
-  const circle = fitCircle(measured, canvas);
+  const circle = fitCircle(measured, canvas, grow);
   if (circle !== null) return '<circle cx="' + fmt(circle.cx) + '" cy="' + fmt(circle.cy) + '" r="' + fmt(circle.r) + '"' + fillAttr + "/>";
   const ellipse = fitEllipse(measured);
   if (ellipse !== null) return '<ellipse cx="' + fmt(ellipse.cx) + '" cy="' + fmt(ellipse.cy) + '" rx="' + fmt(ellipse.rx) + '" ry="' + fmt(ellipse.ry) + '"' + fillAttr + "/>";
@@ -445,7 +445,7 @@ function roundRectError(measured: MeasuredPath, radius: number): number | null {
   return arc && side ? maxError : null;
 }
 
-function fitCircle(measured: MeasuredPath, canvas: Canvas | null = null): { readonly cx: number; readonly cy: number; readonly r: number } | null {
+function fitCircle(measured: MeasuredPath, canvas: Canvas | null = null, grow = false): { readonly cx: number; readonly cy: number; readonly r: number } | null {
   const points = measured.samples;
   if (points.length < 8) return null;
   let sumX = 0;
@@ -494,19 +494,31 @@ function fitCircle(measured: MeasuredPath, canvas: Canvas | null = null): { read
   // Area-matched radius: the traced outline of a convex disc sits a little outside it.
   const areaRadius = Math.sqrt(measured.area / Math.PI);
   let chosen = Math.abs(areaRadius - radius) <= radius * 0.006 ? areaRadius : radius;
-  // A disc whose trace reaches the canvas edge keeps reaching it; a smaller fit leaves slivers of backdrop there. A disc
-  // reaching two opposite edges is centred between them, so it reaches both without overshooting either.
   let centreX = cx, centreY = cy;
   if (canvas !== null) {
     const edge = 0.05;
     const left = measured.minX <= canvas.x + edge, right = measured.maxX >= canvas.x + canvas.width - edge;
     const top = measured.minY <= canvas.y + edge, bottom = measured.maxY >= canvas.y + canvas.height - edge;
-    if (left && right) centreX = canvas.x + canvas.width / 2;
-    if (top && bottom) centreY = canvas.y + canvas.height / 2;
-    if (left) chosen = Math.max(chosen, centreX - canvas.x);
-    if (top) chosen = Math.max(chosen, centreY - canvas.y);
-    if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
-    if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+    const span = Math.min(left && right ? canvas.width / 2 : Infinity, top && bottom ? canvas.height / 2 : Infinity);
+    // The frame runs are whole frame pixels, so they move the fit by under one source pixel (a viewBox unit); a fit
+    // further past the half-span is a larger disc that the canvas clips, and keeps its fit.
+    if (Number.isFinite(span) && Math.abs(chosen - span) <= 1) {
+      // A disc reaching two opposite edges spans the canvas between them, which fixes its centre and radius on that
+      // axis. Fitting its trace instead overshoots: the trace runs along the frame near each tangent point, outside the
+      // disc (gl-chrome-32-white: least-squares radius 16.22 for a radius-16 disc), and the excess showed as a crescent
+      // around the shapes stacked on it, or as a halo past the frame tangents of a lone disc (si-spotify-32-white 16.2).
+      if (left && right) centreX = canvas.x + canvas.width / 2;
+      if (top && bottom) centreY = canvas.y + canvas.height / 2;
+      chosen = span;
+    }
+    // A lone disc whose trace reaches the canvas edge keeps reaching it; a smaller fit leaves slivers of backdrop there.
+    // A shape under others that reaches one edge may be cut by it (gl-figma-32's half-round tile), so it keeps the fit.
+    if (grow) {
+      if (left) chosen = Math.max(chosen, centreX - canvas.x);
+      if (top) chosen = Math.max(chosen, centreY - canvas.y);
+      if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
+      if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+    }
   }
   return { cx: centreX, cy: centreY, r: chosen };
 }
