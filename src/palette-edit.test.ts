@@ -11,7 +11,9 @@ import {
   applySplitShade,
   checkEditsParamChange,
   createDimmedPreview,
+  deriveSwatchColors,
   extractClusters,
+  getMaxColorsLimit,
   hexToRgb,
   isNetZeroEdits,
   PaletteEditHistory,
@@ -19,7 +21,9 @@ import {
   rgbToHex,
   type PaletteEdit
 } from "./palette-edit.ts";
+import { encodeRgbaPng } from "./png-alpha.ts";
 import { segmentColorStage, type SegmentColorStage } from "./segment.ts";
+import { planTrace, planTraceAsync, settingsFromControls } from "./trace-pipeline.ts";
 
 function createMockStage(): SegmentColorStage {
   const width = 4;
@@ -330,4 +334,67 @@ test("async pipeline hook substituteColors feeds edited colors downstream", asyn
   assert.strictEqual(substitutedStages.segmentation, edited);
   assert.strictEqual(substitutedStages.colors, edited.colors);
   assert.notStrictEqual(substitutedStages.backdrop, initialStages.backdrop);
+});
+
+test("deriveSwatchColors produces real palette colors for 1..N and deterministic farthest-point colors beyond N", () => {
+  const stage = createMockStage(); // 4 colors in palette: red, green, blue, yellow
+  const maxLimit = 10;
+  const swatches = deriveSwatchColors(stage, maxLimit);
+
+  assert.strictEqual(swatches.length, maxLimit);
+  // Swatches 1..4 match stage.palette exactly in order
+  assert.strictEqual(swatches[0], rgbToHex(stage.palette[0]!));
+  assert.strictEqual(swatches[1], rgbToHex(stage.palette[1]!));
+  assert.strictEqual(swatches[2], rgbToHex(stage.palette[2]!));
+  assert.strictEqual(swatches[3], rgbToHex(stage.palette[3]!));
+
+  // Swatches 5..10 are valid hex strings and deterministic
+  for (let i = 4; i < maxLimit; i++) {
+    assert.match(swatches[i]!, /^#[0-9a-f]{6}$/i);
+  }
+
+  // Running deriveSwatchColors again yields identical results (deterministic)
+  const swatches2 = deriveSwatchColors(stage, maxLimit);
+  assert.deepStrictEqual(swatches, swatches2);
+
+  // Null stage returns fallback swatches of requested length without throwing
+  const fallback = deriveSwatchColors(null, 8);
+  assert.strictEqual(fallback.length, 8);
+});
+
+test("getMaxColorsLimit caps count row according to lab-model mode and inputMax, never 48", () => {
+  assert.strictEqual(getMaxColorsLimit("photo"), 32);
+  assert.strictEqual(getMaxColorsLimit("poster"), 10);
+  assert.strictEqual(getMaxColorsLimit("icon"), 8);
+  assert.strictEqual(getMaxColorsLimit("logo"), 32);
+
+  // Input max attribute overrides
+  assert.strictEqual(getMaxColorsLimit("photo", 24), 24);
+  assert.strictEqual(getMaxColorsLimit(undefined, 16), 16);
+  assert.strictEqual(getMaxColorsLimit(undefined, undefined), 32);
+  assert.notStrictEqual(getMaxColorsLimit(), 48);
+});
+
+test("apply path: planTrace and planTraceAsync substitute colors and run downstream stages", async () => {
+  const stage = createMockStage();
+  const controls = controlsFor("photo");
+  const settings = settingsFromControls(controls);
+  const png = encodeRgbaPng(4, 4, stage.sourceRgba!);
+
+  const initialPlan = planTrace(png, settings, controls);
+  assert.ok(initialPlan !== null);
+
+  const edited = applyRecolor(stage, 0, "#00ffff");
+
+  // Call sync planTrace with substituteColors from step "backdrop"
+  const substitutedPlan = planTrace(png, settings, controls, initialPlan.rasterStages ?? null, "backdrop", undefined, edited);
+  assert.ok(substitutedPlan !== null);
+  assert.strictEqual(substitutedPlan.rasterStages?.segmentation, edited);
+  assert.strictEqual(substitutedPlan.rasterStages?.colors, edited.colors);
+
+  // Call async planTraceAsync with substituteColors from step "backdrop"
+  const asyncPlan = await planTraceAsync(png, settings, controls, initialPlan.rasterStages ?? null, "backdrop", undefined, undefined, edited);
+  assert.ok(asyncPlan !== null);
+  assert.strictEqual(asyncPlan.rasterStages?.segmentation, edited);
+  assert.strictEqual(asyncPlan.rasterStages?.colors, edited.colors);
 });

@@ -1,6 +1,7 @@
 import { labDistance2, oklabToRgb, rgbToOklab, type Lab } from "./color.ts";
-import type { LabControls } from "./lab-model.ts";
+import { controlsFor, type LabControls } from "./lab-model.ts";
 import { paintLabels, type RGB, type SegmentColorStage } from "./segment.ts";
+import type { TracePreset } from "./trace.ts";
 
 export type PaletteEdit =
   | { readonly kind: "merge"; readonly from: number; readonly to: number }
@@ -768,4 +769,126 @@ export function checkEditsParamChange(
     clearEdits: false,
     warning: null
   };
+}
+
+/**
+ * Returns the maximum allowed color count for the count row.
+ * - Caps at the current mode's maxColors limit from lab-model controls (e.g. 32 for photo, 10 for poster, 8 for icon)
+ * - Or reads from the max-colors input max attribute if provided
+ * - Never defaults to 48.
+ */
+export function getMaxColorsLimit(mode?: TracePreset, inputMax?: number): number {
+  if (inputMax !== undefined && Number.isFinite(inputMax) && inputMax > 0) {
+    return Math.floor(inputMax);
+  }
+  if (mode) {
+    const ctrl = controlsFor(mode);
+    if (ctrl.maxColors > 0) return ctrl.maxColors;
+  }
+  return 32;
+}
+
+/**
+ * Derives the real colors for the color-count swatches 1..maxCount.
+ * - Swatches 1..palette.length use the cluster palette colors in order.
+ * - Swatches beyond palette.length are derived deterministically by finding
+ *   the farthest unrepresented color from the cached source image / clustering
+ *   (or hierarchical sub-shade split), matching how k-means / segment.ts adds
+ *   new cluster centroids when maxColors increases.
+ */
+export function deriveSwatchColors(
+  stage: SegmentColorStage | null,
+  maxCount: number = 32
+): string[] {
+  if (maxCount <= 0) return [];
+  if (!stage || stage.palette.length === 0) {
+    const fallback: string[] = [];
+    for (let i = 0; i < maxCount; i++) {
+      const v = Math.round(30 + (i / Math.max(1, maxCount - 1)) * 195);
+      fallback.push(rgbToHex({ r: v, g: v, b: v }));
+    }
+    return fallback;
+  }
+
+  const result: string[] = [];
+  const paletteColors: RGB[] = stage.palette.map((c) => ({ r: c.r, g: c.g, b: c.b }));
+
+  // 1. Swatches 1..palette.length: use the active palette in order
+  for (let i = 0; i < Math.min(paletteColors.length, maxCount); i++) {
+    result.push(rgbToHex(paletteColors[i]!));
+  }
+  if (result.length >= maxCount) return result;
+
+  // 2. Swatches beyond palette.length:
+  // Collect candidate sample colors from sourceRgba or cluster sub-shades
+  const source = stage.sourceRgba;
+  const sampleColors: RGB[] = [];
+
+  if (source && source.length >= 16) {
+    const totalPixels = Math.floor(source.length / 4);
+    const targetSamples = 1000;
+    const stride = Math.max(1, Math.floor(totalPixels / targetSamples));
+    for (let i = 0; i < totalPixels; i += stride) {
+      const alpha = source[i * 4 + 3] ?? 0;
+      if (alpha < 128) continue;
+      sampleColors.push({
+        r: source[i * 4] ?? 0,
+        g: source[i * 4 + 1] ?? 0,
+        b: source[i * 4 + 2] ?? 0
+      });
+    }
+  }
+
+  if (sampleColors.length === 0) {
+    const clusters = extractClusters(stage);
+    for (const cl of clusters) {
+      for (const shade of cl.subShades) {
+        sampleColors.push(shade.color);
+      }
+    }
+  }
+
+  const runningPalette: RGB[] = [...paletteColors];
+
+  while (result.length < maxCount) {
+    if (sampleColors.length > 0) {
+      let bestDist = -1;
+      let bestColor = sampleColors[0]!;
+      let bestIdx = 0;
+
+      for (let sIdx = 0; sIdx < sampleColors.length; sIdx++) {
+        const s = sampleColors[sIdx]!;
+        let minDistToPalette = Infinity;
+        for (const p of runningPalette) {
+          const dr = s.r - p.r;
+          const dg = s.g - p.g;
+          const db = s.b - p.b;
+          const d2 = dr * dr + dg * dg + db * db;
+          if (d2 < minDistToPalette) minDistToPalette = d2;
+        }
+        if (minDistToPalette > bestDist) {
+          bestDist = minDistToPalette;
+          bestColor = s;
+          bestIdx = sIdx;
+        }
+      }
+
+      runningPalette.push(bestColor);
+      result.push(rgbToHex(bestColor));
+      sampleColors.splice(bestIdx, 1);
+    } else {
+      // If candidates exhausted, perform hierarchical OKLab split of the largest palette cluster
+      const last = runningPalette[runningPalette.length - 1] ?? { r: 128, g: 128, b: 128 };
+      const lab = rgbToOklab(last);
+      const shifted = oklabToRgb({
+        L: lab.L > 0.5 ? Math.max(0.1, lab.L - 0.12) : Math.min(0.9, lab.L + 0.12),
+        a: lab.a + 0.04,
+        b: lab.b - 0.04
+      });
+      runningPalette.push(shifted);
+      result.push(rgbToHex(shifted));
+    }
+  }
+
+  return result;
 }
