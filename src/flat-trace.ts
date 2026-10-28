@@ -1129,11 +1129,11 @@ function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number, 
 // A lossy (JPEG) edge is decided mostly in gamma-encoded sRGB, where the encoder and every rasteriser mixed it: a pixel
 // half covered by blue on white is the sRGB midpoint of the two. Interpolating in linear light and splitting at the
 // OKLab midpoint put the switch near 57% blue instead, and on the 2-3 px wide ramps q60 leaves, that moved each
-// saturated ink 0.1-0.2 px into white (gl-figma-128-q60's blue circle +0.18 px). The split is 0.7 sRGB, 0.3 OKLab:
+// saturated ink 0.1-0.2 px into white (gl-figma-128-q60's blue circle +0.18 px). The split weighs sRGB and OKLab equally (0.5):
 // q60 also quantises luma, and on long straight ink/white edges that pulls the sRGB 50% point up to 0.2 px into the
 // ink; the pure sRGB split grew gl-microsoft-128-q60's white gap 10% (worst IoU 0.984 -> 0.906). Weights 0.5-0.8 keep
-// that gap at IoU 0.95-0.98; 0.85 and up do not. Clean rasters keep the linear/OKLab rule.
-const LOSSY_SRGB_WEIGHT = 0.7;
+// that gap at IoU 0.95-0.98; 0.85 and up do not. 0.5 is the neutral point of that band, not a bench optimum. Clean rasters keep the linear/OKLab rule.
+const LOSSY_SRGB_WEIGHT = 0.5;
 
 type LossyEdges = { readonly srgb: Float64Array; readonly centers: readonly RGB[] };
 

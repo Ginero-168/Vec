@@ -5595,7 +5595,7 @@
     onProgress?.(1);
     return nearest2;
   }
-  var LOSSY_SRGB_WEIGHT = 0.7;
+  var LOSSY_SRGB_WEIGHT = 0.5;
   function lossyEdges(source, count, centers) {
     const srgb = new Float64Array(count * 3);
     for (let index = 0; index < count; index += 1) {
