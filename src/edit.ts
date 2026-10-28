@@ -1220,6 +1220,12 @@ const FIT_SCALES = [1, 0.6];
 const FIT_RESIDUAL = 0.3;
 const FIT_REACH = 2.5;
 const FIT_CONTRAST = 48;
+/** Underlay area (px^2) a fit may uncover. */
+const FIT_EXPOSED_AREA = 0.1;
+/** How far (px) an underlay's outline may be from a fitted corner's ends to be given the same corner. */
+const FIT_FOLLOW = 0.75;
+/** Length (px) of the curve easing from the old outline onto a fitted side line. */
+const FIT_JOIN = 1;
 
 /**
  * Corners VTracer traced as one long wobbly curve (a teardrop tip, the end of a band). Where the outline turns
@@ -1230,15 +1236,31 @@ const FIT_CONTRAST = 48;
  * for corners a few pixels apart (the end of a tooth band).
  */
 export function fitRasterCorners(svg: string, colourAt: ColourAt, confirm: CornerCheck): string {
-  return svg.replace(shapePattern(), (tag) => {
-    if (!/^<path\b/i.test(tag)) return tag;
-    const quoted = readD(tag);
-    if (quoted === null) return tag;
-    const parsed = parsePath(quoted.value);
-    if (parsed === null || parsed.length === 0) return tag;
-    const fill = /\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "";
-    const subpaths = parsed.map((subpath) => ({ cubics: [...subpath.cubics], closed: subpath.closed }));
-    let changed = false;
+  // Shapes in paint order. A fitted corner's side lines snap to the source edge, which can pull the outline in by a
+  // fraction of a pixel next to the bend; a differently filled shape stacked underneath (an underlay reaching the old
+  // outline) then shows through as a sliver (om-gear-256-white). Such an underlay is given the same corner, and the
+  // fit is refused when that is not possible.
+  const shapes: FitShape[] = [];
+  const pattern = shapePattern();
+  for (let match = pattern.exec(svg); match !== null; match = pattern.exec(svg)) {
+    const tag = match[0];
+    const fill = (/\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "").toLowerCase();
+    const shape: FitShape = { tag, at: match.index, fill, subpaths: null, quoted: null, changed: false, rings: null, primitive: null };
+    if (/^<path\b/i.test(tag)) {
+      const quoted = readD(tag);
+      const parsed = quoted === null ? null : parsePath(quoted.value);
+      if (quoted !== null && parsed !== null && parsed.length > 0) {
+        shape.quoted = quoted;
+        shape.subpaths = parsed.map((subpath) => ({ cubics: [...subpath.cubics], closed: subpath.closed }));
+      }
+    } else shape.primitive = primitiveInside(tag);
+    shapes.push(shape);
+  }
+  for (let order = 0; order < shapes.length; order += 1) {
+    const shape = shapes[order];
+    const subpaths = shape?.subpaths;
+    if (shape === undefined || subpaths === null || subpaths === undefined) continue;
+    const under = shapes.slice(0, order).filter((other) => other.fill !== shape.fill && (other.subpaths !== null || other.primitive !== null));
     for (let index = 0; index < subpaths.length; index += 1) {
       // Each accepted corner re-samples the outline; a subpath is bounded by its own candidate count.
       for (let guard = 0; guard < 16; guard += 1) {
@@ -1246,15 +1268,169 @@ export function fitRasterCorners(svg: string, colourAt: ColourAt, confirm: Corne
         if (subpath === undefined) break;
         const rings = flatten(subpaths);
         const inside = (x: number, y: number) => insideFlat(rings, x, y);
-        const next = fitOneCorner(subpath, colourAt, (cap) => confirm(fill, cap, inside), inside);
+        const covers = (next: Subpath, cap: readonly Point[], away: readonly number[], corner: FitCorner): boolean => {
+          if (under.length === 0) return true;
+          const nextRings = flatten(subpaths.map((other, at) => (at === index ? next : other)));
+          const after = (x: number, y: number) => insideFlat(nextRings, x, y);
+          const exposed = exposedShapes(cap, inside, after, under, away);
+          if (exposed.length === 0) return true;
+          const edits: { readonly shape: FitShape; readonly subpaths: Subpath[] }[] = [];
+          for (const below of exposed) {
+            const followed = below.subpaths === null ? null : followCorner(below.subpaths, corner);
+            // An underlay whose outline does not reach the corner (or a primitive) is left as fix7 left it.
+            if (followed === null) continue;
+            edits.push({ shape: below, subpaths: followed });
+          }
+          const trial = new Map(edits.map((edit) => [edit.shape, flatten(edit.subpaths)] as const));
+          const still = exposedShapes(cap, inside, after, under, away, trial).filter((below) => trial.has(below));
+          if (still.length > 0) return false;
+          for (const edit of edits) {
+            edit.shape.subpaths = edit.subpaths;
+            edit.shape.rings = trial.get(edit.shape) ?? null;
+            edit.shape.changed = true;
+          }
+          return true;
+        };
+        const next = fitOneCorner(subpath, colourAt, (cap) => confirm(shape.fill, cap, inside), inside, covers);
         if (next === null) break;
         subpaths[index] = next;
-        changed = true;
+        shape.changed = true;
       }
     }
-    if (!changed) return tag;
-    return tag.slice(0, quoted.start) + serialize(subpaths) + tag.slice(quoted.end);
-  });
+    shape.rings = flatten(subpaths);
+  }
+  let out = "";
+  let cursor = 0;
+  for (const shape of shapes) {
+    if (!shape.changed || shape.subpaths === null || shape.quoted === null) continue;
+    out += svg.slice(cursor, shape.at) + shape.tag.slice(0, shape.quoted.start) + serialize(shape.subpaths) + shape.tag.slice(shape.quoted.end);
+    cursor = shape.at + shape.tag.length;
+  }
+  return out + svg.slice(cursor);
+}
+
+type FitShape = {
+  readonly tag: string;
+  readonly at: number;
+  readonly fill: string;
+  subpaths: Subpath[] | null;
+  quoted: { readonly value: string; readonly start: number; readonly end: number } | null;
+  changed: boolean;
+  rings: Point[][] | null;
+  primitive: ((x: number, y: number) => boolean) | null;
+};
+
+/** A fitted corner: where it leaves the old outline, the points it runs through, and where it rejoins. */
+type FitCorner = { readonly start: Point; readonly end: Point; readonly vertices: readonly Point[] };
+
+function shapeInside(shape: FitShape, rings: Point[][] | null | undefined, x: number, y: number): boolean {
+  if (shape.primitive !== null) return shape.primitive(x, y);
+  const flat = rings ?? shape.rings;
+  return flat !== null && insideFlat(flat, x, y);
+}
+
+/**
+ * Underlays a fit would uncover by more than FIT_EXPOSED_AREA: area the old outline covered and the new one does not,
+ * where the topmost shape below has a fill unlike the source's colour beyond the edge.
+ */
+function exposedShapes(
+  cap: readonly Point[],
+  before: (x: number, y: number) => boolean,
+  after: (x: number, y: number) => boolean,
+  under: readonly FitShape[],
+  away: readonly number[],
+  trial: ReadonlyMap<FitShape, Point[][]> = new Map()
+): FitShape[] {
+  const xs = cap.map((point) => point.x);
+  const ys = cap.map((point) => point.y);
+  const step = 0.125;
+  const area = new Map<FitShape, number>();
+  for (let y = Math.floor(Math.min(...ys)) - 1 + step / 2; y < Math.max(...ys) + 1; y += step) {
+    for (let x = Math.floor(Math.min(...xs)) - 1 + step / 2; x < Math.max(...xs) + 1; x += step) {
+      if (!before(x, y) || after(x, y)) continue;
+      let shown: FitShape | undefined;
+      for (let at = under.length - 1; at >= 0 && shown === undefined; at -= 1) {
+        const shape = under[at];
+        if (shape !== undefined && shapeInside(shape, trial.get(shape), x, y)) shown = shape;
+      }
+      if (shown === undefined) continue;
+      const theirs = rgbOf(shown.fill);
+      if (theirs !== null && distanceRgb(theirs, away) <= FIT_CONTRAST) continue;
+      area.set(shown, (area.get(shown) ?? 0) + step * step);
+    }
+  }
+  return [...area].filter(([, value]) => value > FIT_EXPOSED_AREA).map(([shape]) => shape);
+}
+
+/** The same corner spliced into an underlay whose outline runs through both of the corner's ends, or null. */
+function followCorner(subpaths: readonly Subpath[], corner: FitCorner): Subpath[] | null {
+  for (let index = 0; index < subpaths.length; index += 1) {
+    const subpath = subpaths[index];
+    if (subpath === undefined || !subpath.closed || subpath.cubics.length < 2) continue;
+    const list = stations(subpath.cubics);
+    const last = list[list.length - 1];
+    const first = list[0];
+    if (last === undefined || first === undefined) continue;
+    const total = last.at + distance(last.point, first.point);
+    const nearest = (point: Point): Station | null => {
+      let best: Station | null = null;
+      for (const station of list) if (best === null || distance(station.point, point) < distance(best.point, point)) best = station;
+      return best !== null && distance(best.point, point) <= FIT_FOLLOW ? best : null;
+    };
+    const start = nearest(corner.start);
+    const end = nearest(corner.end);
+    if (start === null || end === null) continue;
+    const forward = (((end.at - start.at) % total) + total) % total;
+    const reversed = forward > total / 2;
+    const from = reversed ? end : start;
+    const to = reversed ? start : end;
+    const vertices = reversed ? [...corner.vertices].reverse() : corner.vertices;
+    const next = spliceCorner(subpath, from, to, vertices[0] ?? corner.start, (a, b) => {
+      const points = [a, ...vertices, b];
+      return points.slice(1).map((point, at) => line(points[at]!, point));
+    });
+    if (next === null) return null;
+    return subpaths.map((other, at) => (at === index ? next : other));
+  }
+  return null;
+}
+
+function rgbOf(fill: string): readonly [number, number, number] | null {
+  const match = /^#([0-9a-f]{6})$/i.exec(fill);
+  if (match?.[1] === undefined) return null;
+  const value = Number.parseInt(match[1], 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+}
+
+function distanceRgb(a: readonly number[], b: readonly number[]): number {
+  return Math.hypot((a[0] ?? 0) - (b[0] ?? 0), (a[1] ?? 0) - (b[1] ?? 0), (a[2] ?? 0) - (b[2] ?? 0));
+}
+
+function primitiveInside(tag: string): ((x: number, y: number) => boolean) | null {
+  if (/\btransform=/i.test(tag)) return null;
+  const number = (name: string): number | null => {
+    const match = new RegExp("\\b" + name + '="([^"]*)"', "i").exec(tag);
+    const value = match?.[1] === undefined ? Number.NaN : Number.parseFloat(match[1]);
+    return Number.isFinite(value) ? value : null;
+  };
+  if (/^<circle\b/i.test(tag)) {
+    const cx = number("cx") ?? 0;
+    const cy = number("cy") ?? 0;
+    const r = number("r");
+    return r === null ? null : (x, y) => (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
+  }
+  if (/^<ellipse\b/i.test(tag)) {
+    const cx = number("cx") ?? 0;
+    const cy = number("cy") ?? 0;
+    const rx = number("rx");
+    const ry = number("ry");
+    return rx === null || ry === null || rx <= 0 || ry <= 0 ? null : (x, y) => ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
+  }
+  const left = number("x") ?? 0;
+  const top = number("y") ?? 0;
+  const width = number("width");
+  const height = number("height");
+  return width === null || height === null ? null : (x, y) => x >= left && x <= left + width && y >= top && y <= top + height;
 }
 
 function stations(cubics: readonly Cubic[]): Station[] {
@@ -1278,7 +1454,8 @@ function fitOneCorner(
   subpath: Subpath,
   colourAt: ColourAt,
   check: (cap: readonly Point[]) => boolean,
-  inside: (x: number, y: number) => boolean
+  inside: (x: number, y: number) => boolean,
+  covers: (next: Subpath, cap: readonly Point[], away: readonly number[], corner: FitCorner) => boolean
 ): Subpath | null {
   if (!subpath.closed || subpath.cubics.length < 2) return null;
   const list = stations(subpath.cubics);
@@ -1362,7 +1539,35 @@ function fitOneCorner(
       for (let at = centre.at - spanBefore; at <= centre.at + spanAfter; at += 0.2) cap.push(pointAt(at).point);
       cap.push(end.point, { ...meet });
       if (!check(cap)) continue;
-      return spliceCorner(subpath, start, end, meet);
+      const onLine = (point: Point, side: { readonly origin: Point; readonly direction: Point }): Point => {
+        const t = (point.x - side.origin.x) * side.direction.x + (point.y - side.origin.y) * side.direction.y;
+        return { x: side.origin.x + side.direction.x * t, y: side.origin.y + side.direction.y * t };
+      };
+      // The side lines run on the fitted source edge from a pixel after the old outline is left; a short curve
+      // tangent to both eases from the old outline onto them. Two plain lines from the old outline's points tilted
+      // each side by the outline's offset from the edge, which broke its anti-aliased run against the true edge into
+      // slivers (om-gear-256-white).
+      let middle: ((from: Point, to: Point) => Cubic[]) | null = null;
+      let vertices: Point[] = [meet];
+      const lead = Math.min(FIT_JOIN, 0.5 * distance(start.point, meet));
+      const trail = Math.min(FIT_JOIN, 0.5 * distance(end.point, meet));
+      const inPoint = onLine(pointAt(centre.at - spanBefore + lead).point, before);
+      const outPoint = onLine(pointAt(centre.at + spanAfter - trail).point, after);
+      const startTangent = unit({ x: pointAt(centre.at - spanBefore + 0.2).point.x - start.point.x, y: pointAt(centre.at - spanBefore + 0.2).point.y - start.point.y });
+      const endTangent = unit({ x: end.point.x - pointAt(centre.at + spanAfter - 0.2).point.x, y: end.point.y - pointAt(centre.at + spanAfter - 0.2).point.y });
+      if (startTangent !== null && endTangent !== null) {
+        const ease = (from: Point, fromTangent: Point, to: Point, toTangent: Point): Cubic => {
+          const k = distance(from, to) / 3;
+          return { p0: from, p1: { x: from.x + fromTangent.x * k, y: from.y + fromTangent.y * k }, p2: { x: to.x - toTangent.x * k, y: to.y - toTangent.y * k }, p3: to };
+        };
+        middle = (from, to) => [ease(from, startTangent, inPoint, before.direction), line(inPoint, meet), line(meet, outPoint), ease(outPoint, after.direction, to, endTangent)];
+        vertices = [inPoint, meet, outPoint];
+      }
+      const next = spliceCorner(subpath, start, end, meet, middle);
+      if (next === null) return null;
+      const away = before.away.map((value, channel) => (value + after.away[channel]!) / 2);
+      if (!covers(next, cap, away, { start: start.point, end: end.point, vertices })) continue;
+      return next;
     }
   }
   return null;
@@ -1376,8 +1581,9 @@ function sideLine(
   pointAt: (at: number) => Station,
   colourAt: ColourAt,
   inside: (x: number, y: number) => boolean
-): { readonly origin: Point; readonly direction: Point } | null {
+): { readonly origin: Point; readonly direction: Point; readonly away: readonly [number, number, number] } | null {
   const snapped: Point[] = [];
+  const outside = [0, 0, 0];
   for (const offset of offsets) {
     const here = pointAt(centre + side * offset).point;
     const a = pointAt(centre + side * offset - 0.3).point;
@@ -1395,6 +1601,7 @@ function sideLine(
     const span = [away[0] - ink[0], away[1] - ink[1], away[2] - ink[2]] as const;
     const spanSquared = span[0] ** 2 + span[1] ** 2 + span[2] ** 2;
     if (spanSquared < FIT_CONTRAST ** 2) return null;
+    for (let channel = 0; channel < 3; channel += 1) outside[channel]! += away[channel]! / offsets.length;
     const mix = (k: number): number | null => {
       const colour = colourAt(here.x + normal.x * k, here.y + normal.y * k);
       if (colour === null) return null;
@@ -1436,11 +1643,12 @@ function sideLine(
   // Travel runs toward the bend on the incoming side and away from it on the outgoing side.
   const travel = side < 0 ? { x: firstPoint.x - lastPoint.x, y: firstPoint.y - lastPoint.y } : { x: lastPoint.x - firstPoint.x, y: lastPoint.y - firstPoint.y };
   if (travel.x * direction.x + travel.y * direction.y < 0) direction = { x: -direction.x, y: -direction.y };
-  return { origin: mean, direction };
+  return { origin: mean, direction, away: [outside[0]!, outside[1]!, outside[2]!] };
 }
 
-/** Replace the outline from `start` to `end` (in travel order) with two lines meeting at `meet`. */
-function spliceCorner(subpath: Subpath, start: Station, end: Station, meet: Point): Subpath | null {
+/** Replace the outline from `start` to `end` (in travel order) with two lines meeting at `meet`, or with `middle`. */
+function spliceCorner(subpath: Subpath, start: Station, end: Station, meet: Point, middle: ((from: Point, to: Point) => Cubic[]) | null = null): Subpath | null {
+  const corner = (from: Point, to: Point): Cubic[] => (middle === null ? [line(from, meet), line(meet, to)] : middle(from, to));
   const count = subpath.cubics.length;
   const rotated = [...subpath.cubics.slice(start.cubic), ...subpath.cubics.slice(0, start.cubic)];
   const endIndex = (end.cubic - start.cubic + count) % count;
@@ -1453,7 +1661,7 @@ function spliceCorner(subpath: Subpath, start: Station, end: Station, meet: Poin
     const [kept, rest] = splitCubic(head, start.t);
     const [, after] = splitCubic(rest, (end.t - start.t) / (1 - start.t));
     if (start.t > 0) cubics.push(kept);
-    cubics.push(line(kept.p3, meet), line(meet, after.p0), after);
+    cubics.push(...corner(kept.p3, after.p0), after);
     for (let index = 1; index < count; index += 1) {
       const cubic = rotated[index];
       if (cubic !== undefined) cubics.push(cubic);
@@ -1462,7 +1670,7 @@ function spliceCorner(subpath: Subpath, start: Station, end: Station, meet: Poin
     const kept = splitCubic(head, start.t)[0];
     const after = splitCubic(tail, end.t)[1];
     if (start.t > 0) cubics.push(kept);
-    cubics.push(line(kept.p3, meet), line(meet, after.p0));
+    cubics.push(...corner(kept.p3, after.p0));
     if (end.t < 1) cubics.push(after);
     for (let index = endIndex + 1; index < count; index += 1) {
       const cubic = rotated[index];

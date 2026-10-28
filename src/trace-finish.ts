@@ -70,7 +70,9 @@ export function mergePlates(
   // pixels are shared with its neighbours: sharpening there cost om-gear-32-white +1.0 MAE and om-grinning-64-q60 +0.14.
   const check = size >= MIN_CHECKED_SIDE ? sourceCheck(plates) : null;
   if (check === null) return fitted;
-  const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, check);
+  // Sharpening keeps a corner only where the path's own ink is inside it; the raster fit instead gives an underlay
+  // the corner of the shape above it (fitRasterCorners), so it is judged with every fill.
+  const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, sourceCheck(plates, true) ?? check);
   const colour = sourceColour(plates);
   return colour === null ? sharpened : fitRasterCorners(sharpened, colour, check);
 }
@@ -103,7 +105,7 @@ function sourceColour(plates: readonly PlacedPlate[]): ColourAt | null {
  * the sharp corner) and compared with the pixel's own mix between the path's ink and the colour outside it. The
  * label map cannot decide this: its upsampling rounds every corner, convex and concave, by about a source pixel.
  */
-function sourceCheck(plates: readonly PlacedPlate[]): CornerCheck | null {
+function sourceCheck(plates: readonly PlacedPlate[], ownInk = false): CornerCheck | null {
   const source = plates.find((plate) => plate.source !== undefined)?.source;
   if (source === undefined) return null;
   const { rgba, width, height } = source;
@@ -143,6 +145,24 @@ function sourceCheck(plates: readonly PlacedPlate[]): CornerCheck | null {
     }
     if (outsideCount === 0) return false;
     const away = outside.map((sum) => sum / outsideCount);
+    // The pixels both versions cover must show this path's own ink. An underlay (a lighter body drawn under its
+    // outline ring) reaches the same silhouette, but the source there is the ring's colour: judged with its own fill
+    // the coverage clamps and the sharp corner always wins, so the underlay's corner poked out past the ring's
+    // rounded one as a sliver (om-gear-256-white).
+    if (ownInk) {
+      const within = [0, 0, 0];
+      let withinCount = 0;
+      for (const pixel of pixels) {
+        if (pixel.round < 1 || pixel.sharp < 1) continue;
+        for (let channel = 0; channel < 3; channel += 1) within[channel]! += rgba[pixel.at + channel] ?? 0;
+        withinCount += 1;
+      }
+      if (withinCount > 0) {
+        const mean = within.map((sum) => sum / withinCount);
+        const toInk = Math.hypot(...mean.map((value, channel) => value - ink[channel]!));
+        if (toInk > OWN_INK * Math.hypot(...ink.map((value, channel) => value - away[channel]!))) return false;
+      }
+    }
     const span = ink.map((value, channel) => value - away[channel]!);
     const spanSquared = span.reduce((sum, value) => sum + value * value, 0);
     if (spanSquared < MIN_CONTRAST ** 2) return false;
@@ -168,6 +188,8 @@ const SAMPLES = 8;
 const SHARP_MARGIN = 0.75;
 /** Ink and outside colours closer than this (RGB distance) cannot be told apart by coverage. */
 const MIN_CONTRAST = 48;
+/** Inside a corner the source must be within this share of the ink-to-outside distance of the path's own ink. */
+const OWN_INK = 0.5;
 
 function parseFill(fill: string): readonly [number, number, number] | null {
   const match = /^#([0-9a-f]{6})$/i.exec(fill);

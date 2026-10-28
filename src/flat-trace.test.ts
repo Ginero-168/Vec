@@ -341,6 +341,20 @@ test("on an opaque backdrop a traced fillet is sharpened only where the source p
   assert.ok(round.includes("9.6,0"), round);
 });
 
+test("on an opaque backdrop a fillet is not sharpened on a path whose ink is not the source colour inside it", () => {
+  // An underlay (a light body drawn under its outline ring) reaching a sharp black corner: judged with its own
+  // fill the black pixels count as full coverage and the sharp corner would always win.
+  const traced = (fill: string) =>
+    '<svg viewBox="0 0 1024 1024"><path d="M0,0L76.8,0C78.8,0 80,1.2 80,3.2L80,80L40,80L40,120L0,120Z" fill="' + fill + '"/></svg>';
+  const rgba = new Uint8Array(128 * 128 * 4).fill(255);
+  for (let y = 0; y < 15; y += 1) for (let x = 0; x < (y < 10 ? 10 : 5); x += 1) rgba.fill(0, (y * 128 + x) * 4, (y * 128 + x) * 4 + 3);
+  const plate = { scale: 8, originX: 0, originY: 0, borderColor: null, cutOut: false, source: { rgba, width: 128, height: 128 } };
+  const own = mergePlates([traced("#000000")], [plate], 128, 128, null, false);
+  assert.ok(!own.includes("9.6,0"), own);
+  const underlay = mergePlates([traced("#D0CFCE")], [plate], 128, 128, null, false);
+  assert.ok(underlay.includes("9.6,0"), underlay);
+});
+
 test("on an opaque backdrop a corner traced as one long bend is refitted with two lines when the source is sharp", () => {
   // Traced at 8x: a 3 px rounding at (60,60) in source pixels, too long for the fillet rules; the round left side
   // keeps the shape from fitting as a rectangle.

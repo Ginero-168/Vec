@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { expandPrimitives, fairPaths, fairTolerance, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape, sharpenCorners } from "./edit.ts";
+import { expandPrimitives, fairPaths, fitRasterCorners, fairTolerance, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape, sharpenCorners } from "./edit.ts";
 
 function pathData(svg: string): string {
   const match = /\bd="([^"]*)"/.exec(svg);
@@ -143,4 +143,24 @@ test("sharpenCorners turns a traced fillet into a sharp corner but keeps a real 
   assert.ok(/(^|[^\d.])10,0([^.\d]|$)/.test(sharp), "the sides meet at the vertex: " + sharp);
   const round = '<svg viewBox="0 0 20 20"><path d="M0,0L6,0C8.2,0 10,1.8 10,4L10,10L0,10Z" fill="#000"/></svg>';
   assert.ok(pathData(sharpenCorners(round)).includes("C8.2,0 10,1.8 10,4"), "a 4px round corner stays round");
+});
+
+test("a raster corner fit that pulls the outline in gives the underlay below the same corner", () => {
+  // Source: a black 40 px square ending at (60,60) on white. The traced black outline runs 0.3 px outside it and
+  // rounds the corner over 3 px; a grey underlay (an already sharp square) reaches the same 0.3 px line. Snapping
+  // the black sides to the source edge alone would leave a grey strip showing past them.
+  const colourAt = (x: number, y: number): readonly [number, number, number] => {
+    const overlap = (centre: number) => Math.max(0, Math.min(centre + 0.5, 60) - Math.max(centre - 0.5, 20));
+    const value = 255 * (1 - overlap(x) * overlap(y));
+    return [value, value, value];
+  };
+  const svg =
+    '<svg viewBox="0 0 128 128"><path d="M20,20L60.3,20L60.3,60.3L20,60.3Z" fill="#D0CFCE"/>' +
+    '<path d="M60.3,20L60.3,57C60.3,59.8 59.8,60.3 57,60.3L40,60.3C29,60.3 20,51.3 20,40C20,29 29,20 40,20Z" fill="#000000"/></svg>';
+  const out = fitRasterCorners(svg, colourAt, () => true);
+  const [grey, black] = [...out.matchAll(/d="([^"]*)"/g)].map((match) => match[1] ?? "");
+  const nearCorner = (d: string) => /(?<![\d.])(59\.9\d*|60(\.0\d*)?),(59\.9\d*|60(\.0\d*)?)(?![\d.])/.test(d);
+  assert.ok(nearCorner(black ?? ""), black);
+  assert.ok(nearCorner(grey ?? ""), grey);
+  assert.ok(!(grey ?? "").includes("60.3,60.3"), grey);
 });
