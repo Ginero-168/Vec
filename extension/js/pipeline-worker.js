@@ -557,13 +557,14 @@ function labelImage(rgba, width, height, maxColors, preprocess = identityRaster,
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
   const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-  const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
+  const edges = source !== rgba ? lossyEdges(source, count, centers) : void 0;
+  const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
   return painted;
 }
-function assignLabels(linear, lab, core, alpha, opacity, width, height, centers, onProgress) {
+function assignLabels(linear, lab, core, alpha, opacity, width, height, centers, onProgress, edges) {
   const count = width * height;
   const kCount = centers.length;
   const coreLabel = new Int16Array(count);
@@ -647,8 +648,7 @@ function assignLabels(linear, lab, core, alpha, opacity, width, height, centers,
               labels[at] = bits[0] ?? 0;
               continue;
             }
-            const sample = bicubicLabAt(linear, width, bicubic, ux, uy);
-            labels[at] = explain(sample, bits, centers);
+            labels[at] = edges === void 0 ? explain(bicubicLabAt(linear, width, bicubic, ux, uy), bits, centers) : explainLossy(edges, width, bicubic, ux, uy, bits, centers);
           }
         }
       }
@@ -948,7 +948,44 @@ function nearestCoreLabel(coreLabel, width, height, onProgress) {
   onProgress?.(1);
   return nearest2;
 }
-function explain(sample, bits, centers) {
+var LOSSY_SRGB_WEIGHT = 0.7;
+function lossyEdges(source, count, centers) {
+  const srgb = new Float64Array(count * 3);
+  for (let index = 0; index < count; index += 1) {
+    srgb[index * 3] = source[index * 4] ?? 0;
+    srgb[index * 3 + 1] = source[index * 4 + 1] ?? 0;
+    srgb[index * 3 + 2] = source[index * 4 + 2] ?? 0;
+  }
+  return { srgb, centers: centers.map((center) => oklabToRgb(center)) };
+}
+function explainLossy(edges, width, table, x, y, bits, centers) {
+  const xOffset = x * 4;
+  const yOffset = y * 4;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  for (let ky = 0; ky < 4; ky += 1) {
+    const weightY = table.yWeights[yOffset + ky];
+    const sampleY = table.yIndices[yOffset + ky];
+    for (let kx = 0; kx < 4; kx += 1) {
+      const weight = weightY * table.xWeights[xOffset + kx];
+      const offset = (sampleY * width + table.xIndices[xOffset + kx]) * 3;
+      red += edges.srgb[offset] * weight;
+      green += edges.srgb[offset + 1] * weight;
+      blue += edges.srgb[offset + 2] * weight;
+    }
+  }
+  const rgb = { r: Math.min(255, Math.max(0, red)), g: Math.min(255, Math.max(0, green)), b: Math.min(255, Math.max(0, blue)) };
+  return explain(rgbToOklab(rgb), bits, centers, (a, b, oklab) => {
+    const from = edges.centers[a];
+    const to = edges.centers[b];
+    const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
+    const length = dr * dr + dg * dg + db * db;
+    const srgb = length === 0 ? oklab : ((rgb.r - from.r) * dr + (rgb.g - from.g) * dg + (rgb.b - from.b) * db) / length;
+    return LOSSY_SRGB_WEIGHT * srgb + (1 - LOSSY_SRGB_WEIGHT) * oklab;
+  });
+}
+function explain(sample, bits, centers, mix) {
   let best = bits[0] ?? 0;
   let bestDistance = Infinity;
   for (const label of bits) {
@@ -971,7 +1008,7 @@ function explain(sample, bits, centers) {
       const projected = projectLab(sample, first, second);
       if (projected.distance < bestDistance) {
         bestDistance = projected.distance;
-        best = projected.t < 0.5 ? a : b;
+        best = (mix === void 0 ? projected.t : mix(a, b, projected.t)) < 0.5 ? a : b;
       }
     }
   }
