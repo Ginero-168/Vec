@@ -12,7 +12,9 @@ import {
   applySplit,
   applySplitShade,
   createDimmedPreview,
+  deriveSwatchColors,
   extractClusters,
+  getMaxColorsLimit,
   hexToRgb,
   isNetZeroEdits,
   PaletteEditHistory,
@@ -22,6 +24,7 @@ import {
   type PaletteEdit
 } from "./palette-edit.ts";
 import { rgbToOklab } from "./color.ts";
+import type { TracePreset } from "./trace.ts";
 
 export type ColorDiagramApi = {
   readonly onMerge?: (from: number, to: number) => void;
@@ -34,6 +37,7 @@ export type ColorDiagramApi = {
   readonly onToggleView?: (view: "original" | "output") => void;
   readonly onSetMaxColors?: (count: number) => void;
   readonly getMaxColors?: () => number;
+  readonly getMaxColorsLimit?: () => number;
   readonly onEditsChanged?: (edits: readonly PaletteEdit[], currentStage: SegmentColorStage) => void;
   readonly onApply?: (editedStage: SegmentColorStage) => void;
   readonly onDiscard?: () => void;
@@ -42,7 +46,10 @@ export type ColorDiagramApi = {
 };
 
 export type ColorDiagramHandle = {
-  readonly update: (colorsOutput: SegmentColorStage | null, options?: { readonly maxColors?: number }) => void;
+  readonly update: (
+    colorsOutput: SegmentColorStage | null,
+    options?: { readonly maxColors?: number; readonly maxColorsLimit?: number; readonly mode?: TracePreset }
+  ) => void;
   readonly selectCluster: (clusterIndex: number | null) => void;
   readonly showApplyBar: (show: boolean) => void;
   readonly destroy: () => void;
@@ -458,30 +465,52 @@ export function mountColorDiagram(
   const swatchGrid = document.createElement("div");
   swatchGrid.className = "cd-swatch-grid";
 
-  const MAX_PRESET_COUNT = 48;
+  function getDomMaxColorsInputMax(): number | undefined {
+    if (typeof document === "undefined") return undefined;
+    const input = document.getElementById("max-colors") as HTMLInputElement | null;
+    if (input && input.max) {
+      const val = Number(input.max);
+      if (Number.isFinite(val) && val > 0) return val;
+    }
+    return undefined;
+  }
+
+  let currentMaxColorsLimit = getMaxColorsLimit(undefined, getDomMaxColorsInputMax());
   const swatchButtons: HTMLDivElement[] = [];
 
-  for (let count = 1; count <= MAX_PRESET_COUNT; count++) {
-    const swatch = document.createElement("div");
-    swatch.className = "cd-swatch";
-    swatch.textContent = String(count);
-    swatch.dataset.count = String(count);
+  function renderSwatchGrid(limit: number): void {
+    swatchGrid.replaceChildren();
+    swatchButtons.length = 0;
 
-    const hue = (count * 137.508) % 360;
-    const lightness = 40 + ((count * 19) % 25);
-    swatch.style.backgroundColor = `hsl(${hue}, 70%, ${lightness}%)`;
+    const colors = deriveSwatchColors(activeColorsOutput ?? rawColorsOutput, limit);
 
-    if (count === currentMaxColors) {
-      swatch.classList.add("selected");
+    for (let count = 1; count <= limit; count++) {
+      const swatch = document.createElement("div");
+      swatch.className = "cd-swatch";
+      swatch.textContent = String(count);
+      swatch.dataset.count = String(count);
+
+      const colorHex = colors[count - 1] ?? "#666666";
+      swatch.style.backgroundColor = colorHex;
+
+      const rgb = hexToRgb(colorHex);
+      const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+      swatch.style.color = lum > 140 ? "#111827" : "#ffffff";
+
+      if (count === currentMaxColors) {
+        swatch.classList.add("selected");
+      }
+
+      swatch.addEventListener("click", () => {
+        handleMaxColorsChange(count);
+      });
+
+      swatchGrid.append(swatch);
+      swatchButtons.push(swatch);
     }
-
-    swatch.addEventListener("click", () => {
-      handleMaxColorsChange(count);
-    });
-
-    swatchGrid.append(swatch);
-    swatchButtons.push(swatch);
   }
+
+  renderSwatchGrid(currentMaxColorsLimit);
 
   presetsSection.append(presetsHeader, swatchGrid);
   root.append(header, canvasContainer, toolRow, presetsSection);
@@ -545,6 +574,7 @@ export function mountColorDiagram(
     syncHistoryButtons();
     syncDiscardApplyBar();
     renderBubbles();
+    renderSwatchGrid(currentMaxColorsLimit);
   });
 
   btnApply.addEventListener("click", () => {
@@ -560,6 +590,7 @@ export function mountColorDiagram(
     syncHistoryButtons();
     syncDiscardApplyBar();
     renderBubbles();
+    renderSwatchGrid(currentMaxColorsLimit);
 
     api.onPreviewUpdate?.(activeColorsOutput.colors);
 
@@ -862,11 +893,16 @@ export function mountColorDiagram(
   }
 
   return {
-    update(colorsOutput: SegmentColorStage | null, options?: { readonly maxColors?: number }): void {
+    update(
+      colorsOutput: SegmentColorStage | null,
+      options?: { readonly maxColors?: number; readonly maxColorsLimit?: number; readonly mode?: TracePreset }
+    ): void {
       if (options?.maxColors !== undefined && options.maxColors > 0) {
         currentMaxColors = options.maxColors;
         updateSelectedPreset();
       }
+
+      currentMaxColorsLimit = options?.maxColorsLimit ?? api.getMaxColorsLimit?.() ?? getMaxColorsLimit(options?.mode, getDomMaxColorsInputMax());
 
       const prevRaw = rawColorsOutput;
       rawColorsOutput = colorsOutput;
@@ -885,6 +921,7 @@ export function mountColorDiagram(
       syncHistoryButtons();
       syncDiscardApplyBar();
       renderBubbles();
+      renderSwatchGrid(currentMaxColorsLimit);
     },
 
     selectCluster(clusterIndex: number | null): void {

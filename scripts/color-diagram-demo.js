@@ -43,6 +43,50 @@
     return dL * dL + da * da + db * db;
   }
 
+  // src/trace.ts
+  function presetDefaults(preset) {
+    if (preset === "photo") return { maxColors: 48, smoothness: 2, corner: 20, removeBackground: false, stacking: "stacked" };
+    if (preset === "poster") return { maxColors: 10, smoothness: 2.2, corner: 16, removeBackground: false, stacking: "stacked" };
+    if (preset === "icon") return { maxColors: 8, smoothness: 2, corner: 55, removeBackground: true, stacking: "cutout" };
+    return { maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" };
+  }
+  function simplifyTolerance(smoothness) {
+    const clamped = Math.min(3, Math.max(0, smoothness));
+    const tolerance = 2.2 - clamped * 0.75;
+    return Math.round(Math.max(0.15, tolerance) * 100) / 100;
+  }
+
+  // src/lab-model.ts
+  var SPECK = { logo: 18, icon: 12, photo: 6, poster: 28 };
+  var PRECISION = { logo: 6, icon: 5, photo: 8, poster: 4 };
+  function controlsFor(mode) {
+    const defaults = presetDefaults(mode);
+    const segmentColors = mode === "logo" ? 0 : Math.min(32, Math.max(2, defaults.maxColors || (mode === "photo" ? 32 : mode === "poster" ? 10 : 8)));
+    return {
+      mode,
+      maxColors: segmentColors,
+      snapBlends: mode === "logo" || mode === "icon",
+      speckArea: SPECK[mode],
+      removeBackground: defaults.removeBackground,
+      backdropSpread: 22,
+      opaqueAt: mode === "photo" || mode === "poster" ? 128 : 200,
+      traceColors: defaults.maxColors > 0 ? defaults.maxColors : segmentColors,
+      lockPalette: true,
+      colorPrecision: PRECISION[mode],
+      filterSpeckle: mode === "photo" ? 1 : 0,
+      clustering: mode === "photo" ? "watershed" : "off",
+      watershedDetail: 128,
+      simplify: simplifyTolerance(defaults.smoothness),
+      stacking: defaults.stacking,
+      dropPlate: defaults.removeBackground,
+      fitGeometry: true,
+      smoothness: defaults.smoothness,
+      corner: defaults.corner,
+      seal: mode === "photo" || mode === "poster",
+      sealWidth: defaults.stacking === "cutout" ? 2 : 0.8
+    };
+  }
+
   // src/segment.ts
   function paintLabels(labels, palette, alpha, onProgress) {
     const next = new Uint8Array(alpha.length * 4);
@@ -621,6 +665,95 @@
       this.redoStack = [];
     }
   };
+  function getMaxColorsLimit(mode, inputMax) {
+    if (inputMax !== void 0 && Number.isFinite(inputMax) && inputMax > 0) {
+      return Math.floor(inputMax);
+    }
+    if (mode) {
+      const ctrl = controlsFor(mode);
+      if (ctrl.maxColors > 0) return ctrl.maxColors;
+    }
+    return 32;
+  }
+  function deriveSwatchColors(stage, maxCount = 32) {
+    if (maxCount <= 0) return [];
+    if (!stage || stage.palette.length === 0) {
+      const fallback = [];
+      for (let i = 0; i < maxCount; i++) {
+        const v = Math.round(30 + i / Math.max(1, maxCount - 1) * 195);
+        fallback.push(rgbToHex({ r: v, g: v, b: v }));
+      }
+      return fallback;
+    }
+    const result = [];
+    const paletteColors = stage.palette.map((c) => ({ r: c.r, g: c.g, b: c.b }));
+    for (let i = 0; i < Math.min(paletteColors.length, maxCount); i++) {
+      result.push(rgbToHex(paletteColors[i]));
+    }
+    if (result.length >= maxCount) return result;
+    const source = stage.sourceRgba;
+    const sampleColors = [];
+    if (source && source.length >= 16) {
+      const totalPixels = Math.floor(source.length / 4);
+      const targetSamples = 1e3;
+      const stride = Math.max(1, Math.floor(totalPixels / targetSamples));
+      for (let i = 0; i < totalPixels; i += stride) {
+        const alpha = source[i * 4 + 3] ?? 0;
+        if (alpha < 128) continue;
+        sampleColors.push({
+          r: source[i * 4] ?? 0,
+          g: source[i * 4 + 1] ?? 0,
+          b: source[i * 4 + 2] ?? 0
+        });
+      }
+    }
+    if (sampleColors.length === 0) {
+      const clusters = extractClusters(stage);
+      for (const cl of clusters) {
+        for (const shade of cl.subShades) {
+          sampleColors.push(shade.color);
+        }
+      }
+    }
+    const runningPalette = [...paletteColors];
+    while (result.length < maxCount) {
+      if (sampleColors.length > 0) {
+        let bestDist = -1;
+        let bestColor = sampleColors[0];
+        let bestIdx = 0;
+        for (let sIdx = 0; sIdx < sampleColors.length; sIdx++) {
+          const s = sampleColors[sIdx];
+          let minDistToPalette = Infinity;
+          for (const p of runningPalette) {
+            const dr = s.r - p.r;
+            const dg = s.g - p.g;
+            const db = s.b - p.b;
+            const d2 = dr * dr + dg * dg + db * db;
+            if (d2 < minDistToPalette) minDistToPalette = d2;
+          }
+          if (minDistToPalette > bestDist) {
+            bestDist = minDistToPalette;
+            bestColor = s;
+            bestIdx = sIdx;
+          }
+        }
+        runningPalette.push(bestColor);
+        result.push(rgbToHex(bestColor));
+        sampleColors.splice(bestIdx, 1);
+      } else {
+        const last = runningPalette[runningPalette.length - 1] ?? { r: 128, g: 128, b: 128 };
+        const lab = rgbToOklab(last);
+        const shifted = oklabToRgb({
+          L: lab.L > 0.5 ? Math.max(0.1, lab.L - 0.12) : Math.min(0.9, lab.L + 0.12),
+          a: lab.a + 0.04,
+          b: lab.b - 0.04
+        });
+        runningPalette.push(shifted);
+        result.push(rgbToHex(shifted));
+      }
+    }
+    return result;
+  }
 
   // src/color-diagram.ts
   var SVG_NS = "http://www.w3.org/2000/svg";
@@ -957,25 +1090,42 @@
     presetsHeader.innerHTML = `Palette Presets <span class="cd-presets-subtitle">(processing color count)</span>`;
     const swatchGrid = document.createElement("div");
     swatchGrid.className = "cd-swatch-grid";
-    const MAX_PRESET_COUNT = 48;
-    const swatchButtons = [];
-    for (let count = 1; count <= MAX_PRESET_COUNT; count++) {
-      const swatch = document.createElement("div");
-      swatch.className = "cd-swatch";
-      swatch.textContent = String(count);
-      swatch.dataset.count = String(count);
-      const hue = count * 137.508 % 360;
-      const lightness = 40 + count * 19 % 25;
-      swatch.style.backgroundColor = `hsl(${hue}, 70%, ${lightness}%)`;
-      if (count === currentMaxColors) {
-        swatch.classList.add("selected");
+    function getDomMaxColorsInputMax() {
+      if (typeof document === "undefined") return void 0;
+      const input = document.getElementById("max-colors");
+      if (input && input.max) {
+        const val = Number(input.max);
+        if (Number.isFinite(val) && val > 0) return val;
       }
-      swatch.addEventListener("click", () => {
-        handleMaxColorsChange(count);
-      });
-      swatchGrid.append(swatch);
-      swatchButtons.push(swatch);
+      return void 0;
     }
+    let currentMaxColorsLimit = getMaxColorsLimit(void 0, getDomMaxColorsInputMax());
+    const swatchButtons = [];
+    function renderSwatchGrid(limit) {
+      swatchGrid.replaceChildren();
+      swatchButtons.length = 0;
+      const colors = deriveSwatchColors(activeColorsOutput ?? rawColorsOutput, limit);
+      for (let count = 1; count <= limit; count++) {
+        const swatch = document.createElement("div");
+        swatch.className = "cd-swatch";
+        swatch.textContent = String(count);
+        swatch.dataset.count = String(count);
+        const colorHex = colors[count - 1] ?? "#666666";
+        swatch.style.backgroundColor = colorHex;
+        const rgb = hexToRgb(colorHex);
+        const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+        swatch.style.color = lum > 140 ? "#111827" : "#ffffff";
+        if (count === currentMaxColors) {
+          swatch.classList.add("selected");
+        }
+        swatch.addEventListener("click", () => {
+          handleMaxColorsChange(count);
+        });
+        swatchGrid.append(swatch);
+        swatchButtons.push(swatch);
+      }
+    }
+    renderSwatchGrid(currentMaxColorsLimit);
     presetsSection.append(presetsHeader, swatchGrid);
     root.append(header, canvasContainer, toolRow, presetsSection);
     function handleMaxColorsChange(newCount) {
@@ -1030,6 +1180,7 @@
       syncHistoryButtons();
       syncDiscardApplyBar();
       renderBubbles();
+      renderSwatchGrid(currentMaxColorsLimit);
     });
     btnApply.addEventListener("click", () => {
       if (activeColorsOutput) {
@@ -1043,6 +1194,7 @@
       syncHistoryButtons();
       syncDiscardApplyBar();
       renderBubbles();
+      renderSwatchGrid(currentMaxColorsLimit);
       api.onPreviewUpdate?.(activeColorsOutput.colors);
       if (edit.kind === "merge") api.onMerge?.(edit.from, edit.to);
       else if (edit.kind === "split") api.onSplit?.(edit.cluster, edit.k ?? 2);
@@ -1295,6 +1447,7 @@
           currentMaxColors = options.maxColors;
           updateSelectedPreset();
         }
+        currentMaxColorsLimit = options?.maxColorsLimit ?? api.getMaxColorsLimit?.() ?? getMaxColorsLimit(options?.mode, getDomMaxColorsInputMax());
         const prevRaw = rawColorsOutput;
         rawColorsOutput = colorsOutput;
         if (colorsOutput) {
@@ -1309,6 +1462,7 @@
         syncHistoryButtons();
         syncDiscardApplyBar();
         renderBubbles();
+        renderSwatchGrid(currentMaxColorsLimit);
       },
       selectCluster(clusterIndex) {
         if (clusterIndex === null) {

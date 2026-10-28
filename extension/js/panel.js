@@ -6501,6 +6501,95 @@
       this.redoStack = [];
     }
   };
+  function getMaxColorsLimit(mode, inputMax) {
+    if (inputMax !== void 0 && Number.isFinite(inputMax) && inputMax > 0) {
+      return Math.floor(inputMax);
+    }
+    if (mode) {
+      const ctrl = controlsFor(mode);
+      if (ctrl.maxColors > 0) return ctrl.maxColors;
+    }
+    return 32;
+  }
+  function deriveSwatchColors(stage, maxCount = 32) {
+    if (maxCount <= 0) return [];
+    if (!stage || stage.palette.length === 0) {
+      const fallback = [];
+      for (let i = 0; i < maxCount; i++) {
+        const v = Math.round(30 + i / Math.max(1, maxCount - 1) * 195);
+        fallback.push(rgbToHex({ r: v, g: v, b: v }));
+      }
+      return fallback;
+    }
+    const result = [];
+    const paletteColors = stage.palette.map((c) => ({ r: c.r, g: c.g, b: c.b }));
+    for (let i = 0; i < Math.min(paletteColors.length, maxCount); i++) {
+      result.push(rgbToHex(paletteColors[i]));
+    }
+    if (result.length >= maxCount) return result;
+    const source = stage.sourceRgba;
+    const sampleColors = [];
+    if (source && source.length >= 16) {
+      const totalPixels = Math.floor(source.length / 4);
+      const targetSamples = 1e3;
+      const stride = Math.max(1, Math.floor(totalPixels / targetSamples));
+      for (let i = 0; i < totalPixels; i += stride) {
+        const alpha = source[i * 4 + 3] ?? 0;
+        if (alpha < 128) continue;
+        sampleColors.push({
+          r: source[i * 4] ?? 0,
+          g: source[i * 4 + 1] ?? 0,
+          b: source[i * 4 + 2] ?? 0
+        });
+      }
+    }
+    if (sampleColors.length === 0) {
+      const clusters = extractClusters(stage);
+      for (const cl of clusters) {
+        for (const shade of cl.subShades) {
+          sampleColors.push(shade.color);
+        }
+      }
+    }
+    const runningPalette = [...paletteColors];
+    while (result.length < maxCount) {
+      if (sampleColors.length > 0) {
+        let bestDist = -1;
+        let bestColor = sampleColors[0];
+        let bestIdx = 0;
+        for (let sIdx = 0; sIdx < sampleColors.length; sIdx++) {
+          const s = sampleColors[sIdx];
+          let minDistToPalette = Infinity;
+          for (const p of runningPalette) {
+            const dr = s.r - p.r;
+            const dg = s.g - p.g;
+            const db = s.b - p.b;
+            const d2 = dr * dr + dg * dg + db * db;
+            if (d2 < minDistToPalette) minDistToPalette = d2;
+          }
+          if (minDistToPalette > bestDist) {
+            bestDist = minDistToPalette;
+            bestColor = s;
+            bestIdx = sIdx;
+          }
+        }
+        runningPalette.push(bestColor);
+        result.push(rgbToHex(bestColor));
+        sampleColors.splice(bestIdx, 1);
+      } else {
+        const last = runningPalette[runningPalette.length - 1] ?? { r: 128, g: 128, b: 128 };
+        const lab = rgbToOklab(last);
+        const shifted = oklabToRgb({
+          L: lab.L > 0.5 ? Math.max(0.1, lab.L - 0.12) : Math.min(0.9, lab.L + 0.12),
+          a: lab.a + 0.04,
+          b: lab.b - 0.04
+        });
+        runningPalette.push(shifted);
+        result.push(rgbToHex(shifted));
+      }
+    }
+    return result;
+  }
 
   // src/color-diagram.ts
   var SVG_NS = "http://www.w3.org/2000/svg";
@@ -6837,25 +6926,42 @@
     presetsHeader.innerHTML = `Palette Presets <span class="cd-presets-subtitle">(processing color count)</span>`;
     const swatchGrid = document.createElement("div");
     swatchGrid.className = "cd-swatch-grid";
-    const MAX_PRESET_COUNT = 48;
-    const swatchButtons = [];
-    for (let count = 1; count <= MAX_PRESET_COUNT; count++) {
-      const swatch = document.createElement("div");
-      swatch.className = "cd-swatch";
-      swatch.textContent = String(count);
-      swatch.dataset.count = String(count);
-      const hue = count * 137.508 % 360;
-      const lightness = 40 + count * 19 % 25;
-      swatch.style.backgroundColor = `hsl(${hue}, 70%, ${lightness}%)`;
-      if (count === currentMaxColors) {
-        swatch.classList.add("selected");
+    function getDomMaxColorsInputMax() {
+      if (typeof document === "undefined") return void 0;
+      const input = document.getElementById("max-colors");
+      if (input && input.max) {
+        const val = Number(input.max);
+        if (Number.isFinite(val) && val > 0) return val;
       }
-      swatch.addEventListener("click", () => {
-        handleMaxColorsChange(count);
-      });
-      swatchGrid.append(swatch);
-      swatchButtons.push(swatch);
+      return void 0;
     }
+    let currentMaxColorsLimit = getMaxColorsLimit(void 0, getDomMaxColorsInputMax());
+    const swatchButtons = [];
+    function renderSwatchGrid(limit) {
+      swatchGrid.replaceChildren();
+      swatchButtons.length = 0;
+      const colors = deriveSwatchColors(activeColorsOutput ?? rawColorsOutput, limit);
+      for (let count = 1; count <= limit; count++) {
+        const swatch = document.createElement("div");
+        swatch.className = "cd-swatch";
+        swatch.textContent = String(count);
+        swatch.dataset.count = String(count);
+        const colorHex = colors[count - 1] ?? "#666666";
+        swatch.style.backgroundColor = colorHex;
+        const rgb = hexToRgb(colorHex);
+        const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+        swatch.style.color = lum > 140 ? "#111827" : "#ffffff";
+        if (count === currentMaxColors) {
+          swatch.classList.add("selected");
+        }
+        swatch.addEventListener("click", () => {
+          handleMaxColorsChange(count);
+        });
+        swatchGrid.append(swatch);
+        swatchButtons.push(swatch);
+      }
+    }
+    renderSwatchGrid(currentMaxColorsLimit);
     presetsSection.append(presetsHeader, swatchGrid);
     root.append(header, canvasContainer, toolRow, presetsSection);
     function handleMaxColorsChange(newCount) {
@@ -6910,6 +7016,7 @@
       syncHistoryButtons();
       syncDiscardApplyBar();
       renderBubbles();
+      renderSwatchGrid(currentMaxColorsLimit);
     });
     btnApply.addEventListener("click", () => {
       if (activeColorsOutput) {
@@ -6923,6 +7030,7 @@
       syncHistoryButtons();
       syncDiscardApplyBar();
       renderBubbles();
+      renderSwatchGrid(currentMaxColorsLimit);
       api.onPreviewUpdate?.(activeColorsOutput.colors);
       if (edit.kind === "merge") api.onMerge?.(edit.from, edit.to);
       else if (edit.kind === "split") api.onSplit?.(edit.cluster, edit.k ?? 2);
@@ -7175,6 +7283,7 @@
           currentMaxColors = options.maxColors;
           updateSelectedPreset();
         }
+        currentMaxColorsLimit = options?.maxColorsLimit ?? api.getMaxColorsLimit?.() ?? getMaxColorsLimit(options?.mode, getDomMaxColorsInputMax());
         const prevRaw = rawColorsOutput;
         rawColorsOutput = colorsOutput;
         if (colorsOutput) {
@@ -7189,6 +7298,7 @@
         syncHistoryButtons();
         syncDiscardApplyBar();
         renderBubbles();
+        renderSwatchGrid(currentMaxColorsLimit);
       },
       selectCluster(clusterIndex) {
         if (clusterIndex === null) {
@@ -8283,8 +8393,38 @@
               const p = previewOf(state);
               if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raster));
             },
-            onApply: (_editedStage) => {
-              message("\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E01\u0E32\u0E23\u0E41\u0E01\u0E49\u0E44\u0E02\u0E2A\u0E35\u0E41\u0E25\u0E49\u0E27");
+            onApply: async (editedStage) => {
+              if (state.kind !== "preview" || state.job === null || batching) return;
+              const current = state.job;
+              const previous = state;
+              const controls2 = readControls(ui);
+              const progress = beginProgress("backdrop");
+              const job = {
+                id: current.id,
+                directory: current.directory,
+                pngPath: current.pngPath,
+                svgPath: current.svgPath,
+                settings: settingsFromControls(controls2),
+                controls: controls2,
+                placementBounds: current.placementBounds,
+                cancelled: false
+              };
+              try {
+                message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E04\u0E33\u0E19\u0E27\u0E13\u0E02\u0E31\u0E49\u0E19 backdrop \u0E41\u0E25\u0E49\u0E27\u0E25\u0E32\u0E01\u0E40\u0E2A\u0E49\u0E19\u0E43\u0E2B\u0E21\u0E48\u2026");
+                await vectorize(previous.selection, job, void 0, latestPlan, "backdrop", progress, editedStage);
+                colorDiagram?.update(latestPlan?.rasterStages?.segmentation ?? null, {
+                  maxColors: Number(ui.controls.maxColors.value) || 8,
+                  maxColorsLimit: Number(ui.controls.maxColors.max) || 32,
+                  mode: controls2.mode
+                });
+              } catch (error) {
+                state = previous;
+                latestPreview = previous;
+                hideProgress();
+                liveControls = null;
+                message(errorMessage(error), true);
+                render();
+              }
             },
             onDiscard: () => {
               const raw = latestPlan?.rasterStages?.segmentation;
@@ -8295,8 +8435,11 @@
             }
           });
         }
+        const controls = readControls(ui);
         colorDiagram.update(latestPlan?.rasterStages?.segmentation ?? null, {
-          maxColors: Number(ui.controls.maxColors.value) || 8
+          maxColors: Number(ui.controls.maxColors.value) || 8,
+          maxColorsLimit: Number(ui.controls.maxColors.max) || 32,
+          mode: controls.mode
         });
       }
     }
@@ -8538,7 +8681,7 @@
         showPalette();
       }
     }
-    function planInWorker(selection, job, sourcePng, previousPlan, from, progress) {
+    function planInWorker(selection, job, sourcePng, previousPlan, from, progress, substituteColors) {
       liveControls = job.controls;
       const Ctor = loadWorkerConstructor();
       let worker = null;
@@ -8550,7 +8693,7 @@
           worker = null;
         }
       }
-      if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from, progress);
+      if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from, progress, substituteColors);
       const activeWorker = worker;
       state = { kind: "planning", selection, job, runner: { cancel: () => {
         void activeWorker.terminate();
@@ -8583,7 +8726,7 @@
             reject(new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27"));
             return;
           }
-          planInPanel(selection, job, sourcePng, previousPlan, from, progress).then(resolve, reject);
+          planInPanel(selection, job, sourcePng, previousPlan, from, progress, substituteColors).then(resolve, reject);
         };
         activeWorker.on("message", (value) => {
           if (job.cancelled) {
@@ -8619,14 +8762,15 @@
             settings: job.settings,
             controls: job.controls,
             previousStages: previousPlan?.rasterStages ?? null,
-            from
+            from,
+            substituteColors
           });
         } catch {
           fallback();
         }
       });
     }
-    async function planInPanel(selection, job, sourcePng, previousPlan, from, progress) {
+    async function planInPanel(selection, job, sourcePng, previousPlan, from, progress, substituteColors) {
       let cancelled = false;
       state = { kind: "planning", selection, job, runner: { cancel: () => {
         cancelled = true;
@@ -8637,11 +8781,11 @@
         window.setTimeout(resolve, 50);
       });
       if (job.cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
-      const plan = await planTraceAsync(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from, (step, fraction) => progress.report(step, fraction), () => cancelled || job.cancelled);
+      const plan = await planTraceAsync(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from, (step, fraction) => progress.report(step, fraction), () => cancelled || job.cancelled, substituteColors);
       if (job.cancelled || cancelled) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
       return plan;
     }
-    async function vectorize(selection, job, palette, previousPlan = null, from = "colors", progress = beginProgress(from)) {
+    async function vectorize(selection, job, palette, previousPlan = null, from = "colors", progress = beginProgress(from), substituteColors) {
       if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49\u0E2A\u0E48\u0E07\u0E20\u0E32\u0E1E PNG \u0E01\u0E25\u0E31\u0E1A\u0E21\u0E32");
       const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
       if (!fs.existsSync(binary)) throw new Error("\u0E44\u0E21\u0E48\u0E1E\u0E1A VTracer \u0E17\u0E35\u0E48 " + binary);
@@ -8649,7 +8793,7 @@
       liveControls = job.controls;
       const flatMode = job.controls.mode === "logo" || job.controls.mode === "icon";
       const reuseExistingPlan = previousPlan !== null && (from === "trace" || flatMode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors"));
-      let plan = reuseExistingPlan ? replanTracePlan(previousPlan, job.controls) : await planInWorker(selection, job, sourcePng, previousPlan, from, progress);
+      let plan = reuseExistingPlan ? replanTracePlan(previousPlan, job.controls) : await planInWorker(selection, job, sourcePng, previousPlan, from, progress, substituteColors);
       if (reuseExistingPlan && flatMode) {
         if (LAB_STEPS.indexOf(from) <= LAB_STEPS.indexOf("backdrop")) progress.report("backdrop", 1);
         if (LAB_STEPS.indexOf(from) <= LAB_STEPS.indexOf("punch")) progress.report("punch", 1);

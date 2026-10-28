@@ -1378,8 +1378,38 @@ function start(): void {
             const p = previewOf(state);
             if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raster));
           },
-          onApply: (_editedStage) => {
-            message("บันทึกการแก้ไขสีแล้ว");
+          onApply: async (editedStage) => {
+            if (state.kind !== "preview" || state.job === null || batching) return;
+            const current = state.job;
+            const previous = state;
+            const controls = readControls(ui);
+            const progress = beginProgress("backdrop");
+            const job: Job = {
+              id: current.id,
+              directory: current.directory,
+              pngPath: current.pngPath,
+              svgPath: current.svgPath,
+              settings: settingsFromControls(controls),
+              controls,
+              placementBounds: current.placementBounds,
+              cancelled: false
+            };
+            try {
+              message("กำลังคำนวณขั้น backdrop แล้วลากเส้นใหม่…");
+              await vectorize(previous.selection, job, undefined, latestPlan, "backdrop", progress, editedStage);
+              colorDiagram?.update(latestPlan?.rasterStages?.segmentation ?? null, {
+                maxColors: Number(ui.controls.maxColors.value) || 8,
+                maxColorsLimit: Number(ui.controls.maxColors.max) || 32,
+                mode: controls.mode
+              });
+            } catch (error) {
+              state = previous;
+              latestPreview = previous;
+              hideProgress();
+              liveControls = null;
+              message(errorMessage(error), true);
+              render();
+            }
           },
           onDiscard: () => {
             const raw = latestPlan?.rasterStages?.segmentation;
@@ -1390,8 +1420,11 @@ function start(): void {
           }
         });
       }
+      const controls = readControls(ui);
       colorDiagram.update(latestPlan?.rasterStages?.segmentation ?? null, {
-        maxColors: Number(ui.controls.maxColors.value) || 8
+        maxColors: Number(ui.controls.maxColors.value) || 8,
+        maxColorsLimit: Number(ui.controls.maxColors.max) || 32,
+        mode: controls.mode
       });
     }
   }
@@ -1646,7 +1679,9 @@ function start(): void {
     sourcePng: Buffer,
     previousPlan: TracePlan | null,
     from: LabStepId,
-    progress: ProgressReporter
+    progress: ProgressReporter,
+    // === Color Diagram Hook: Thread substituteColors ===
+    substituteColors?: SegmentColorStage | null
   ): Promise<TracePlan | null> {
     liveControls = job.controls;
     const Ctor = loadWorkerConstructor();
@@ -1659,7 +1694,7 @@ function start(): void {
         worker = null;
       }
     }
-    if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from, progress);
+    if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from, progress, substituteColors);
     const activeWorker = worker;
     state = { kind: "planning", selection, job, runner: { cancel: () => { void activeWorker.terminate(); } }, from };
     message("กำลังจัดสีและเตรียมขั้นลากเส้น…");
@@ -1691,7 +1726,7 @@ function start(): void {
           reject(new Error("ยกเลิกแล้ว"));
           return;
         }
-        planInPanel(selection, job, sourcePng, previousPlan, from, progress).then(resolve, reject);
+        planInPanel(selection, job, sourcePng, previousPlan, from, progress, substituteColors).then(resolve, reject);
       };
       activeWorker.on("message", (value: unknown) => {
         if (job.cancelled) {
@@ -1727,7 +1762,8 @@ function start(): void {
           settings: job.settings,
           controls: job.controls,
           previousStages: previousPlan?.rasterStages ?? null,
-          from
+          from,
+          substituteColors
         });
       } catch {
         fallback();
@@ -1742,7 +1778,9 @@ function start(): void {
     sourcePng: Buffer,
     previousPlan: TracePlan | null,
     from: LabStepId,
-    progress: ProgressReporter
+    progress: ProgressReporter,
+    // === Color Diagram Hook: Thread substituteColors ===
+    substituteColors?: SegmentColorStage | null
   ): Promise<TracePlan | null> {
     let cancelled = false;
     state = { kind: "planning", selection, job, runner: { cancel: () => { cancelled = true; } }, from };
@@ -1750,7 +1788,7 @@ function start(): void {
     render();
     await new Promise<void>((resolve) => { window.setTimeout(resolve, 50); });
     if (job.cancelled) throw new Error("ยกเลิกแล้ว");
-    const plan = await planTraceAsync(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from, (step, fraction) => progress.report(step, fraction), () => cancelled || job.cancelled);
+    const plan = await planTraceAsync(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from, (step, fraction) => progress.report(step, fraction), () => cancelled || job.cancelled, substituteColors);
     if (job.cancelled || cancelled) throw new Error("ยกเลิกแล้ว");
     return plan;
   }
@@ -1761,7 +1799,9 @@ function start(): void {
     palette?: readonly string[],
     previousPlan: TracePlan | null = null,
     from: LabStepId = "colors",
-    progress: ProgressReporter = beginProgress(from)
+    progress: ProgressReporter = beginProgress(from),
+    // === Color Diagram Hook: Thread substituteColors ===
+    substituteColors?: SegmentColorStage | null
   ): Promise<void> {
     if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
     const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
@@ -1772,7 +1812,7 @@ function start(): void {
     const reuseExistingPlan = previousPlan !== null && (from === "trace" || (flatMode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")));
     let plan = reuseExistingPlan
       ? replanTracePlan(previousPlan, job.controls)
-      : await planInWorker(selection, job, sourcePng, previousPlan, from, progress);
+      : await planInWorker(selection, job, sourcePng, previousPlan, from, progress, substituteColors);
     if (reuseExistingPlan && flatMode) {
       if (LAB_STEPS.indexOf(from) <= LAB_STEPS.indexOf("backdrop")) progress.report("backdrop", 1);
       if (LAB_STEPS.indexOf(from) <= LAB_STEPS.indexOf("punch")) progress.report("punch", 1);
