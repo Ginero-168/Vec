@@ -1,6 +1,6 @@
 import type { ChildProcess } from "child_process";
 import * as childProcess from "child_process";
-import { Worker } from "worker_threads";
+import type { Worker } from "worker_threads";
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
@@ -11,7 +11,7 @@ import { holeNote, scoreSvg, shapeNote, type TraceFacts } from "./score";
 import { controlsFor, type LabControls } from "./lab-model";
 import { CONTROL_STEPS, earliestChangedStep, LAB_STEPS, fairLabVector, sealLabVector, styleLabVectors, type LabRasterStages, type LabStepId } from "./lab-pipeline";
 import type { SegmentColorStage } from "./segment";
-import { cappedPalette, replanTracePlan, settingsFromControls, vectorStagesForPlan, type PipelineSettings, type PlannedPlate, type TracePlan } from "./trace-pipeline";
+import { cappedPalette, planTrace, replanTracePlan, settingsFromControls, vectorStagesForPlan, type PipelineSettings, type PlannedPlate, type TracePlan } from "./trace-pipeline";
 import { resolveVtracer, vtracerArguments, type TraceRequest } from "./trace";
 
 interface CepBridge {
@@ -67,12 +67,37 @@ type PlanWorkerMessage =
   | { readonly kind: "plan"; readonly plan: TracePlan | null }
   | { readonly kind: "error"; readonly error: string };
 
+type PlanRunner = { readonly cancel: () => void };
+
+type WorkerConstructor = new (filename: string) => Worker;
+
+/** Longest a worker round trip may take before the panel gives up and shows an error. */
+const PLAN_TIMEOUT_MS = 180_000;
+
+let workerConstructor: WorkerConstructor | null | undefined;
+
+/**
+ * CEP's embedded Node (NW.js-style integration) may not expose worker_threads.
+ * A top-level import made the whole panel script throw on load, leaving the
+ * static HTML with no click handlers. Load it lazily and remember a failure.
+ */
+function loadWorkerConstructor(): WorkerConstructor | null {
+  if (workerConstructor !== undefined) return workerConstructor;
+  try {
+    const module = require("worker_threads") as { Worker?: unknown };
+    workerConstructor = typeof module.Worker === "function" ? module.Worker as WorkerConstructor : null;
+  } catch {
+    workerConstructor = null;
+  }
+  return workerConstructor;
+}
+
 type State =
   | { readonly kind: "empty" }
   | { readonly kind: "loading" }
   | { readonly kind: "selected"; readonly selection: Selection }
   | { readonly kind: "capturing"; readonly selection: Selection; readonly job: Job }
-  | { readonly kind: "planning"; readonly selection: Selection; readonly job: Job; readonly worker: Worker; readonly from: LabStepId }
+  | { readonly kind: "planning"; readonly selection: Selection; readonly job: Job; readonly runner: PlanRunner; readonly from: LabStepId }
   | { readonly kind: "tracing"; readonly selection: Selection; readonly job: Job; readonly child: ChildProcess }
   | ({ readonly kind: "preview" } & Preview)
   | ({ readonly kind: "applying" } & Preview);
@@ -961,26 +986,53 @@ function start(): void {
     previousPlan: TracePlan | null,
     from: LabStepId
   ): Promise<TracePlan | null> {
-    const worker = new Worker(path.join(extensionPath, "js", "pipeline-worker.js"));
     liveControls = job.controls;
-    state = { kind: "planning", selection, job, worker, from };
+    const Ctor = loadWorkerConstructor();
+    let worker: Worker | null = null;
+    if (Ctor !== null) {
+      try {
+        worker = new Ctor(path.join(extensionPath, "js", "pipeline-worker.js"));
+      } catch {
+        workerConstructor = null;
+        worker = null;
+      }
+    }
+    if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from);
+    const activeWorker = worker;
+    state = { kind: "planning", selection, job, runner: { cancel: () => { void activeWorker.terminate(); } }, from };
     message("กำลังจัดสีและเตรียมขั้นลากเส้น…");
     render();
     return new Promise((resolve, reject) => {
       let settled = false;
-      const finish = (plan: TracePlan | null): void => {
-        if (settled) return;
+      let received = false;
+      const timer = window.setTimeout(() => {
+        fail(new Error("ขั้นจัดสีใช้เวลานานเกิน " + String(Math.round(PLAN_TIMEOUT_MS / 1000)) + " วินาที · ลองลดขนาดภาพหรือจำนวนสี"));
+      }, PLAN_TIMEOUT_MS);
+      const settle = (): boolean => {
+        if (settled) return false;
         settled = true;
-        void worker.terminate();
-        resolve(plan);
+        window.clearTimeout(timer);
+        void activeWorker.terminate();
+        return true;
+      };
+      const finish = (plan: TracePlan | null): void => {
+        if (settle()) resolve(plan);
       };
       const fail = (error: Error): void => {
-        if (settled) return;
-        settled = true;
-        void worker.terminate();
-        reject(error);
+        if (settle()) reject(error);
       };
-      worker.once("message", (value: unknown) => {
+      const fallback = (): void => {
+        // The worker could not run in this host. Plan in the panel instead of hanging.
+        workerConstructor = null;
+        if (!settle()) return;
+        if (job.cancelled) {
+          reject(new Error("ยกเลิกแล้ว"));
+          return;
+        }
+        planInPanel(selection, job, sourcePng, previousPlan, from).then(resolve, reject);
+      };
+      activeWorker.once("message", (value: unknown) => {
+        received = true;
         if (job.cancelled) {
           fail(new Error("ยกเลิกแล้ว"));
           return;
@@ -994,18 +1046,46 @@ function start(): void {
           finish(result.plan);
         }
       });
-      worker.once("error", (error) => fail(error));
-      worker.once("exit", (code) => {
-        if (!settled) fail(new Error(job.cancelled ? "ยกเลิกแล้ว" : "ขั้นจัดสีหยุดก่อนจบ (" + String(code) + ")"));
+      activeWorker.once("error", () => {
+        if (job.cancelled) fail(new Error("ยกเลิกแล้ว"));
+        else fallback();
       });
-      worker.postMessage({
-        sourcePng: new Uint8Array(sourcePng),
-        settings: job.settings,
-        controls: job.controls,
-        previousStages: previousPlan?.rasterStages ?? null,
-        from
+      activeWorker.once("exit", (code) => {
+        if (settled) return;
+        if (job.cancelled) fail(new Error("ยกเลิกแล้ว"));
+        else if (!received) fallback();
+        else fail(new Error("ขั้นจัดสีหยุดก่อนจบ (" + String(code) + ")"));
       });
+      try {
+        activeWorker.postMessage({
+          sourcePng: new Uint8Array(sourcePng),
+          settings: job.settings,
+          controls: job.controls,
+          previousStages: previousPlan?.rasterStages ?? null,
+          from
+        });
+      } catch {
+        fallback();
+      }
     });
+  }
+
+  /** Same planning as the worker, on the panel thread. Used only when worker_threads is unavailable. */
+  async function planInPanel(
+    selection: Selection,
+    job: Job,
+    sourcePng: Buffer,
+    previousPlan: TracePlan | null,
+    from: LabStepId
+  ): Promise<TracePlan | null> {
+    state = { kind: "planning", selection, job, runner: { cancel: () => undefined }, from };
+    message("กำลังจัดสีและเตรียมขั้นลากเส้น… (Panel อาจไม่ตอบสนองสักครู่)");
+    render();
+    await new Promise<void>((resolve) => { window.setTimeout(resolve, 50); });
+    if (job.cancelled) throw new Error("ยกเลิกแล้ว");
+    const plan = planTrace(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from);
+    if (job.cancelled) throw new Error("ยกเลิกแล้ว");
+    return plan;
   }
 
   async function vectorize(
@@ -1324,7 +1404,7 @@ function start(): void {
       liveControls = controls;
       retraceQueued = true;
       state.job.cancelled = true;
-      void state.worker.terminate();
+      state.runner.cancel();
       message("ค่าปรับเปลี่ยนแล้ว · กำลังหยุดการจัดสีเก่า…");
       return;
     }
@@ -1480,7 +1560,7 @@ function start(): void {
       retraceQueued = false;
       window.clearTimeout(retraceTimer);
       state.job.cancelled = true;
-      void state.worker.terminate();
+      state.runner.cancel();
       message("กำลังยกเลิก…");
       return;
     }
@@ -1567,7 +1647,7 @@ function start(): void {
     }
     if (state.kind === "planning") {
       state.job.cancelled = true;
-      void state.worker.terminate();
+      state.runner.cancel();
       cleanJob(state.job);
     }
   });
@@ -1585,4 +1665,18 @@ function start(): void {
   }
 }
 
-start();
+function showFatal(error: unknown): void {
+  const status = document.getElementById("status");
+  if (status === null) return;
+  status.textContent = "Panel ขัดข้อง: " + (error instanceof Error ? error.message : String(error));
+  status.classList.add("error");
+}
+
+window.addEventListener("error", (event) => { showFatal(event.error ?? event.message); });
+window.addEventListener("unhandledrejection", (event) => { showFatal(event.reason); });
+
+try {
+  start();
+} catch (error) {
+  showFatal(error);
+}
