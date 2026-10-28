@@ -1232,7 +1232,7 @@ function segmentColorStage(rgba, width, height, options, onProgress) {
     const labels2 = new Int16Array(count);
     labels2.fill(-1);
     report(1);
-    return { colors: copy, labels: labels2, punchLabels: labels2, palette: [], opaque: new Uint8Array(count), spread: 0 };
+    return { colors: copy, labels: labels2, punchLabels: labels2, palette: [], opaque: new Uint8Array(count), spread: 0, sourceRgba: copy };
   }
   const source = rgba;
   const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
@@ -1271,7 +1271,7 @@ function segmentColorStage(rgba, width, height, options, onProgress) {
   }
   const colors = paintLabels2(labels, palette, opaque, (fraction) => report(0.96 + fraction * 0.04));
   report(1);
-  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(source, width, height)?.spread ?? 0 };
+  return { colors, labels, punchLabels, palette, opaque, spread: borderMeasure(source, width, height)?.spread ?? 0, sourceRgba: source };
 }
 function segmentBackdropStage(rgba, width, height, colors, removeBackground, spreadLimit, onProgress) {
   onProgress?.(0);
@@ -1669,7 +1669,7 @@ function distance2(a, b) {
 
 // src/lab-pipeline.ts
 var LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"];
-function buildLabRasterStages(source, width, height, controls, previous = null, from = "colors", onProgress) {
+function buildLabRasterStages(source, width, height, controls, previous = null, from = "colors", onProgress, substituteColors) {
   if (controls.mode === "logo" || controls.mode === "icon") {
     if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
     const colors2 = source;
@@ -1688,19 +1688,20 @@ function buildLabRasterStages(source, width, height, controls, previous = null, 
   }
   const fromIndex = LAB_STEPS.indexOf(from);
   const sameMode = previous?.mode === controls.mode;
-  const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== void 0 && fromIndex > LAB_STEPS.indexOf("colors");
-  if (!canReuseColors) onProgress?.("colors", 0);
-  const segmentation = canReuseColors && previous !== null ? previous.segmentation : segmentColorStage(source, width, height, {
+  const hasSubstitute = substituteColors !== void 0 && substituteColors !== null;
+  const canReuseColors = !hasSubstitute && sameMode && previous?.segmentation !== null && previous?.segmentation !== void 0 && fromIndex > LAB_STEPS.indexOf("colors");
+  if (!canReuseColors && !hasSubstitute) onProgress?.("colors", 0);
+  const segmentation = (hasSubstitute ? substituteColors : null) ?? (canReuseColors && previous !== null ? previous.segmentation : segmentColorStage(source, width, height, {
     mode: controls.mode,
     maxColors: controls.maxColors,
     snapBlends: controls.snapBlends,
     speckArea: controls.speckArea,
     removeBackground: false,
     opaqueAt: controlsFor(controls.mode).opaqueAt
-  }, (fraction) => onProgress?.("colors", fraction));
+  }, (fraction) => onProgress?.("colors", fraction)));
   if (!canReuseColors) onProgress?.("colors", 1);
   const colors = segmentation.colors;
-  const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
+  const canReuseBackdrop = !hasSubstitute && sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
   if (!canReuseBackdrop) onProgress?.("backdrop", 0);
   const backdropStage = canReuseBackdrop ? { backdrop: previous.backdrop, punchInput: previous.punchInput } : segmentBackdropStage(source, width, height, segmentation, controls.removeBackground, controls.backdropSpread, (fraction) => onProgress?.("backdrop", fraction));
   if (!canReuseBackdrop) onProgress?.("backdrop", 1);
@@ -1708,7 +1709,7 @@ function buildLabRasterStages(source, width, height, controls, previous = null, 
   const punchInput = backdropStage.punchInput;
   const spread = segmentation.spread;
   const paletteSize = segmentation.palette.length;
-  const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
+  const canReusePunch = !hasSubstitute && sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
   if (canReusePunch && previous !== null) return previous;
   onProgress?.("punch", 0);
   const punched = punchRgba(punchInput, width, height, controls.opaqueAt, (fraction) => onProgress?.("punch", fraction));
@@ -1931,7 +1932,7 @@ function chunk(type, data) {
 }
 
 // src/trace-pipeline.ts
-function planTrace(source, settings, controls, previousStages = null, from = "colors", onProgress) {
+function planTrace(source, settings, controls, previousStages = null, from = "colors", onProgress, substituteColors) {
   const decoded = readRgbaPng(source);
   if (decoded === null) return null;
   if (controls !== void 0) {
@@ -1943,7 +1944,7 @@ function planTrace(source, settings, controls, previousStages = null, from = "co
       onProgress?.("punch", 1);
       return plan;
     }
-    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress);
+    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, substituteColors);
     return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, rasterStages);
   }
   if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);

@@ -33,6 +33,8 @@ import { writeResultSvgAtomically } from "./result-svg-file";
 import { initialActiveStep, isLabStep, reduceActiveStep } from "./step-selection";
 import { initialThumbnailState, isCurrentThumbnailCapture, reduceThumbnailState, type ThumbnailState } from "./thumbnail-state";
 import { clampCropRect, cropRectToArtboardBounds, cropRgba, estimateRgbaBytes, formatRasterMegapixels, moveCropRect, requiresCropChoice, thumbnailPointToSourcePixels, type PixelPoint, type PixelRect, type RasterSize } from "./crop-geometry";
+// === Color Diagram Hook ===
+import { mountColorDiagram, type ColorDiagramHandle } from "./color-diagram";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -1083,6 +1085,8 @@ function start(): void {
   let retraceTimer = 0;
   let retraceQueued = false;
   let liveControls: LabControls | null = null;
+  // === Color Diagram Hook ===
+  let colorDiagram: ColorDiagramHandle | null = null;
   const host = illustratorHost();
   const extensionPath = host === null ? "" : host.getSystemPath(SystemPath.EXTENSION);
   let progressTimer = 0;
@@ -1362,6 +1366,24 @@ function start(): void {
   function showStep(): void {
     for (const button of ui.stepButtons) button.setAttribute("aria-pressed", button.dataset.step === selectedStep ? "true" : "false");
     for (const field of ui.stepFields) field.hidden = field.id !== "fields-" + selectedStep;
+    // === COLOR DIAGRAM HOOK: Mount/update diagram when Colors step is shown ===
+    if (selectedStep === "colors") {
+      if (!colorDiagram) {
+        colorDiagram = mountColorDiagram(document.getElementById("fields-colors"), {
+          onSetMaxColors: (n) => {
+            ui.controls.maxColors.value = String(n);
+            ui.controls.maxColors.dispatchEvent(new Event("input"));
+          },
+          onPreviewUpdate: (raster) => {
+            const p = previewOf(state);
+            if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raster));
+          }
+        });
+      }
+      colorDiagram.update(latestPlan?.rasterStages?.segmentation ?? null, {
+        maxColors: Number(ui.controls.maxColors.value) || 8
+      });
+    }
   }
 
   function syncOutputs(): void {
