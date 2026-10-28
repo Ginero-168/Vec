@@ -3220,7 +3220,7 @@
       segmentation
     };
   }
-  async function buildLabRasterStagesAsync(source, width, height, controls, previous = null, from = "colors", onProgress, shouldCancel) {
+  async function buildLabRasterStagesAsync(source, width, height, controls, previous = null, from = "colors", onProgress, shouldCancel, substituteColors) {
     if (controls.mode === "logo" || controls.mode === "icon") {
       if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
       const colors2 = source;
@@ -3228,18 +3228,19 @@
     }
     const fromIndex = LAB_STEPS.indexOf(from);
     const sameMode = previous?.mode === controls.mode;
-    const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== void 0 && fromIndex > LAB_STEPS.indexOf("colors");
-    if (!canReuseColors) onProgress?.("colors", 0);
-    const segmentation = canReuseColors && previous !== null ? previous.segmentation : await segmentColorStageAsync(source, width, height, {
+    const hasSubstitute = substituteColors !== void 0 && substituteColors !== null;
+    const canReuseColors = !hasSubstitute && sameMode && previous?.segmentation !== null && previous?.segmentation !== void 0 && fromIndex > LAB_STEPS.indexOf("colors");
+    if (!canReuseColors && !hasSubstitute) onProgress?.("colors", 0);
+    const segmentation = (hasSubstitute ? substituteColors : null) ?? (canReuseColors && previous !== null ? previous.segmentation : await segmentColorStageAsync(source, width, height, {
       mode: controls.mode,
       maxColors: controls.maxColors,
       snapBlends: controls.snapBlends,
       speckArea: controls.speckArea,
       removeBackground: false,
       opaqueAt: controlsFor(controls.mode).opaqueAt
-    }, (fraction) => onProgress?.("colors", fraction), shouldCancel);
+    }, (fraction) => onProgress?.("colors", fraction), shouldCancel));
     const colors = segmentation.colors;
-    const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
+    const canReuseBackdrop = !hasSubstitute && sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
     if (!canReuseBackdrop) onProgress?.("backdrop", 0);
     const backdropStage = canReuseBackdrop ? { backdrop: previous.backdrop, punchInput: previous.punchInput } : await segmentBackdropStageAsync(source, width, height, segmentation, controls.removeBackground, controls.backdropSpread, (fraction) => onProgress?.("backdrop", fraction), shouldCancel);
     const backdrop = backdropStage.backdrop;
@@ -3247,7 +3248,7 @@
     if (!canReuseBackdrop) onProgress?.("backdrop", 1);
     const spread = segmentation.spread;
     const paletteSize = segmentation.palette.length;
-    const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
+    const canReusePunch = !hasSubstitute && sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
     if (canReusePunch && previous !== null) return previous;
     onProgress?.("punch", 0);
     const punched = await punchRgbaAsync(punchInput, width, height, controls.opaqueAt, (fraction) => onProgress?.("punch", fraction), shouldCancel);
@@ -4960,15 +4961,15 @@
     if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);
     return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
   }
-  async function planTraceAsync(source, settings, controls, previousStages = null, from = "colors", onProgress, shouldCancel) {
+  async function planTraceAsync(source, settings, controls, previousStages = null, from = "colors", onProgress, shouldCancel, substituteColors) {
     if (shouldCancel?.() === true) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
     const decoded = readRgbaPng(source);
     if (decoded === null) return null;
     if (controls === void 0) {
-      return planTrace(source, settings, controls, previousStages, from, onProgress);
+      return planTrace(source, settings, controls, previousStages, from, onProgress, substituteColors);
     }
     if (settings.preset !== "logo" && settings.preset !== "icon") {
-      const stages = await buildLabRasterStagesAsync(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, shouldCancel);
+      const stages = await buildLabRasterStagesAsync(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, shouldCancel, substituteColors);
       if (shouldCancel?.() === true) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
       return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, stages);
     }
@@ -8281,6 +8282,16 @@
             onPreviewUpdate: (raster) => {
               const p = previewOf(state);
               if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raster));
+            },
+            onApply: (_editedStage) => {
+              message("\u0E1A\u0E31\u0E19\u0E17\u0E36\u0E01\u0E01\u0E32\u0E23\u0E41\u0E01\u0E49\u0E44\u0E02\u0E2A\u0E35\u0E41\u0E25\u0E49\u0E27");
+            },
+            onDiscard: () => {
+              const raw = latestPlan?.rasterStages?.segmentation;
+              if (raw) {
+                const p = previewOf(state);
+                if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raw.colors));
+              }
             }
           });
         }

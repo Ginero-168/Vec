@@ -2207,7 +2207,7 @@ if (import_node_worker_threads.parentPort === null) throw new Error("Pipeline wo
 import_node_worker_threads.parentPort.on("message", (input) => {
   try {
     const progress = createProgressReporter(input.from, (event) => import_node_worker_threads.parentPort?.postMessage({ kind: "progress", progress: event }));
-    const plan = planTrace(Buffer.from(input.sourcePng), input.settings, input.controls, input.previousStages, input.from, progress.report);
+    const plan = planTrace(Buffer.from(input.sourcePng), input.settings, input.controls, input.previousStages, input.from, progress.report, input.substituteColors);
     import_node_worker_threads.parentPort?.postMessage({ kind: "plan", plan });
   } catch (error) {
     import_node_worker_threads.parentPort?.postMessage({ kind: "error", error: error instanceof Error ? error.message : String(error) });

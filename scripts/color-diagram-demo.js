@@ -44,7 +44,7 @@
   }
 
   // src/segment.ts
-  function paintLabels(labels, palette, alpha) {
+  function paintLabels(labels, palette, alpha, onProgress) {
     const next = new Uint8Array(alpha.length * 4);
     for (let index = 0; index < alpha.length; index += 1) {
       const offset = index * 4;
@@ -54,7 +54,9 @@
       next[offset + 1] = color.g;
       next[offset + 2] = color.b;
       next[offset + 3] = 255;
+      if (index % 16384 === 0) onProgress?.(index / alpha.length);
     }
+    onProgress?.(1);
     return next;
   }
 

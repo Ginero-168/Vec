@@ -1377,6 +1377,16 @@ function start(): void {
           onPreviewUpdate: (raster) => {
             const p = previewOf(state);
             if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raster));
+          },
+          onApply: (_editedStage) => {
+            message("บันทึกการแก้ไขสีแล้ว");
+          },
+          onDiscard: () => {
+            const raw = latestPlan?.rasterStages?.segmentation;
+            if (raw) {
+              const p = previewOf(state);
+              if (p?.raster) ui.preview.src = pngDataUrl(encodeRgbaPng(p.raster.width, p.raster.height, raw.colors));
+            }
           }
         });
       }
