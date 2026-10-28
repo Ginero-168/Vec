@@ -1965,6 +1965,7 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
     height,
     droppedColor: null,
     plates,
+    sourceRgba: rgba,
     ...rasterStages === void 0 ? {} : { rasterStages }
   };
 }
@@ -2114,6 +2115,7 @@ function planSegmented(rgba, width, height, settings) {
     width,
     height,
     droppedColor: punched.droppedColor,
+    sourceRgba: rgba,
     plates: [
       {
         png: punched.png,
@@ -2142,6 +2144,7 @@ function planSegmentedWithControls(rgba, width, height, settings, controls, stag
     height,
     droppedColor: stages.droppedColor,
     rasterStages: stages,
+    sourceRgba: rgba,
     plates: [{
       png,
       scale: 1,

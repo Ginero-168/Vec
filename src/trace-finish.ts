@@ -1,5 +1,6 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
+import { refineSvgEdges } from "./subpixel-edges.ts";
 import { scaleSvg, translateSvg } from "./svg-scale.ts";
 import type { Stacking, TracePreset } from "./trace.ts";
 
@@ -57,10 +58,17 @@ export function assembleTrace(
   removeBackground: boolean,
   smoothness: number,
   corner: number,
-  stacking: Stacking
+  stacking: Stacking,
+  sourceRgba?: Uint8Array
 ): string {
   const fitted = mergePlates(svgs, plates, width, height, droppedColor, removeBackground);
-  if (preset === "logo" || preset === "icon") return groupPathsByFill(relaxPaths(fitted, 0.15));
+  let faired = (preset === "logo" || preset === "icon")
+    ? relaxPaths(fitted, 0.15)
+    : fairPaths(fitted, { smoothness, cornerDegrees: corner });
+  if (sourceRgba !== undefined) {
+    faired = refineSvgEdges(faired, sourceRgba, width, height);
+  }
+  if (preset === "logo" || preset === "icon") return groupPathsByFill(faired);
   const stroke = stacking === "cutout" ? 2 : 0.8;
-  return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness, cornerDegrees: corner }), stroke));
+  return groupPathsByFill(sealGaps(faired, stroke));
 }

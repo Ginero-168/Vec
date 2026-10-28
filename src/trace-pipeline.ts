@@ -29,6 +29,7 @@ export type TracePlan = {
   readonly plates: readonly PlannedPlate[];
   readonly droppedColor: string | null;
   readonly rasterStages?: LabRasterStages;
+  readonly sourceRgba?: Uint8Array;
 };
 
 export function planTrace(
@@ -104,7 +105,7 @@ export function traceRaster(
 }
 
 export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: PipelineSettings, controls?: LabControls): string {
-  if (controls !== undefined) return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls).sealed;
+  if (controls !== undefined) return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, undefined, plan.sourceRgba ?? plan.rasterStages?.traceInput).sealed;
   return assembleTrace(
     svgs,
     plan.plates,
@@ -115,7 +116,8 @@ export function finishTrace(svgs: readonly string[], plan: TracePlan, settings: 
     settings.removeBackground,
     settings.smoothness,
     settings.corner,
-    settings.stacking
+    settings.stacking,
+    plan.sourceRgba ?? plan.rasterStages?.traceInput
   );
 }
 
@@ -131,7 +133,7 @@ export function traceRasterWithControls(
 }
 
 export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, controls: LabControls, onProgress?: PipelineProgress) {
-  return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+  return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress, plan.sourceRgba ?? plan.rasterStages?.traceInput);
 }
 
 export function settingsFromControls(controls: LabControls): PipelineSettings {
@@ -209,6 +211,7 @@ function planFlat(
     height,
     droppedColor: null,
     plates,
+    sourceRgba: rgba,
     ...(rasterStages === undefined ? {} : { rasterStages })
   };
 }
@@ -379,6 +382,7 @@ function planSegmented(rgba: Uint8Array, width: number, height: number, settings
     width,
     height,
     droppedColor: punched.droppedColor,
+    sourceRgba: rgba,
     plates: [
       {
         png: punched.png,
@@ -415,6 +419,7 @@ function planSegmentedWithControls(
     height,
     droppedColor: stages.droppedColor,
     rasterStages: stages,
+    sourceRgba: rgba,
     plates: [{
       png,
       scale: 1,

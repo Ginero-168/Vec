@@ -3037,6 +3037,500 @@
     return dr * dr + dg * dg + db * db;
   }
 
+  // src/subpixel-edges.ts
+  function sampleBilinearRgba(rgba, width, height, px, py) {
+    const x = Math.max(0, Math.min(width - 1, px - 0.5));
+    const y = Math.max(0, Math.min(height - 1, py - 0.5));
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+    const x1 = Math.min(x0 + 1, width - 1);
+    const y1 = Math.min(y0 + 1, height - 1);
+    const fx = x - x0;
+    const fy = y - y0;
+    const w00 = (1 - fx) * (1 - fy);
+    const w10 = fx * (1 - fy);
+    const w01 = (1 - fx) * fy;
+    const w11 = fx * fy;
+    const idx00 = (y0 * width + x0) * 4;
+    const idx10 = (y0 * width + x1) * 4;
+    const idx01 = (y1 * width + x0) * 4;
+    const idx11 = (y1 * width + x1) * 4;
+    const r = (rgba[idx00] ?? 0) * w00 + (rgba[idx10] ?? 0) * w10 + (rgba[idx01] ?? 0) * w01 + (rgba[idx11] ?? 0) * w11;
+    const g = (rgba[idx00 + 1] ?? 0) * w00 + (rgba[idx10 + 1] ?? 0) * w10 + (rgba[idx01 + 1] ?? 0) * w01 + (rgba[idx11 + 1] ?? 0) * w11;
+    const b = (rgba[idx00 + 2] ?? 0) * w00 + (rgba[idx10 + 2] ?? 0) * w10 + (rgba[idx01 + 2] ?? 0) * w01 + (rgba[idx11 + 2] ?? 0) * w11;
+    const a = (rgba[idx00 + 3] ?? 0) * w00 + (rgba[idx10 + 3] ?? 0) * w10 + (rgba[idx01 + 3] ?? 0) * w01 + (rgba[idx11 + 3] ?? 0) * w11;
+    return [r, g, b, a];
+  }
+  function parseRgb(color) {
+    if (typeof color !== "string") return [color[0], color[1], color[2]];
+    const clean = color.trim().replace(/^#/, "");
+    if (clean.length === 3) {
+      return [
+        parseInt(clean[0] + clean[0], 16),
+        parseInt(clean[1] + clean[1], 16),
+        parseInt(clean[2] + clean[2], 16)
+      ];
+    }
+    if (clean.length === 6) {
+      return [
+        parseInt(clean.slice(0, 2), 16),
+        parseInt(clean.slice(2, 4), 16),
+        parseInt(clean.slice(4, 6), 16)
+      ];
+    }
+    return [0, 0, 0];
+  }
+  function fitCircleOnCoverage(initial, rgba, width, height, targetColor) {
+    const { cx, cy, r: r0 } = initial;
+    if (!(r0 > 1.5)) return null;
+    const numAngles = 16;
+    const sampleDist = 1.8;
+    const rIn = Math.max(0.5, r0 - sampleDist);
+    const rOut = r0 + sampleDist;
+    let inR = 0, inG = 0, inB = 0, inA = 0;
+    let outR = 0, outG = 0, outB = 0, outA = 0;
+    for (let k = 0; k < numAngles; k++) {
+      const theta = 2 * Math.PI * k / numAngles;
+      const cosT = Math.cos(theta);
+      const sinT = Math.sin(theta);
+      const cin = sampleBilinearRgba(rgba, width, height, cx + rIn * cosT, cy + rIn * sinT);
+      const cout = sampleBilinearRgba(rgba, width, height, cx + rOut * cosT, cy + rOut * sinT);
+      inR += cin[0];
+      inG += cin[1];
+      inB += cin[2];
+      inA += cin[3];
+      outR += cout[0];
+      outG += cout[1];
+      outB += cout[2];
+      outA += cout[3];
+    }
+    let cIn = [inR / numAngles, inG / numAngles, inB / numAngles, inA / numAngles];
+    let cOut = [outR / numAngles, outG / numAngles, outB / numAngles, outA / numAngles];
+    if (targetColor !== void 0) {
+      const tgt = parseRgb(targetColor);
+      const distIn = (cIn[0] - tgt[0]) ** 2 + (cIn[1] - tgt[1]) ** 2 + (cIn[2] - tgt[2]) ** 2;
+      const distOut = (cOut[0] - tgt[0]) ** 2 + (cOut[1] - tgt[1]) ** 2 + (cOut[2] - tgt[2]) ** 2;
+      if (distOut < distIn) {
+        const tmp = cIn;
+        cIn = cOut;
+        cOut = tmp;
+      }
+    }
+    const dAlpha = cIn[3] - cOut[3];
+    const dr = cIn[0] - cOut[0];
+    const dg = cIn[1] - cOut[1];
+    const db = cIn[2] - cOut[2];
+    const normSq = dr * dr + dg * dg + db * db;
+    const useAlpha = Math.abs(dAlpha) >= 20;
+    if (!useAlpha && normSq < 36) return null;
+    const band = 2;
+    const minX = Math.max(0, Math.floor(cx - r0 - band));
+    const maxX = Math.min(width - 1, Math.ceil(cx + r0 + band));
+    const minY = Math.max(0, Math.floor(cy - r0 - band));
+    const maxY = Math.min(height - 1, Math.ceil(cy + r0 + band));
+    let sumW = 0;
+    let sumWR = 0;
+    let sumWX = 0;
+    let sumWY = 0;
+    let sampleCount = 0;
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        const px = x + 0.5;
+        const py = y + 0.5;
+        const d = Math.hypot(px - cx, py - cy);
+        if (Math.abs(d - r0) > band) continue;
+        const idx = (y * width + x) * 4;
+        let cov = 0;
+        if (useAlpha) {
+          cov = Math.max(0, Math.min(1, ((rgba[idx + 3] ?? 0) - cOut[3]) / dAlpha));
+        } else {
+          const pr = rgba[idx] ?? 0;
+          const pg = rgba[idx + 1] ?? 0;
+          const pb = rgba[idx + 2] ?? 0;
+          cov = Math.max(0, Math.min(1, ((pr - cOut[0]) * dr + (pg - cOut[1]) * dg + (pb - cOut[2]) * db) / normSq));
+        }
+        if (cov <= 0.05 || cov >= 0.95) continue;
+        const rPred = d + (cov - 0.5);
+        const weight = cov * (1 - cov);
+        sumW += weight;
+        sumWR += weight * rPred;
+        const cosA = (px - cx) / d;
+        const sinA = (py - cy) / d;
+        sumWX += weight * (rPred - r0) * cosA;
+        sumWY += weight * (rPred - r0) * sinA;
+        sampleCount++;
+      }
+    }
+    if (sampleCount < 16 || sumW < 1e-4) return null;
+    const refinedR = sumWR / sumW;
+    const dCx = sumWX / sumW;
+    const dCy = sumWY / sumW;
+    if (Math.abs(refinedR - r0) > 0.35 || Math.hypot(dCx, dCy) > 0.35) return null;
+    return {
+      cx: Math.round((cx + dCx) * 100) / 100,
+      cy: Math.round((cy + dCy) * 100) / 100,
+      r: Math.round(refinedR * 100) / 100
+    };
+  }
+  function fitRoundedRectOnCoverage(initial, rgba, imgWidth, imgHeight, targetColor) {
+    const { x, y, width, height, r } = initial;
+    const halfW = width / 2;
+    const halfH = height / 2;
+    const cx = x + halfW;
+    const cy = y + halfH;
+    const refineEdge = (samplePoints, normal) => {
+      let sumShift = 0;
+      let weightSum = 0;
+      for (const pt of samplePoints) {
+        const sh = findSubpixelShift(rgba, imgWidth, imgHeight, pt, normal, 1.5, targetColor);
+        if (Math.abs(sh) <= 1.2) {
+          sumShift += sh;
+          weightSum += 1;
+        }
+      }
+      return weightSum >= 3 ? sumShift / weightSum : 0;
+    };
+    const leftSamples = [];
+    const rightSamples = [];
+    const topSamples = [];
+    const bottomSamples = [];
+    const spanY = Math.max(2, halfH - r - 2);
+    const spanX = Math.max(2, halfW - r - 2);
+    for (let s = -spanY; s <= spanY; s += 2) {
+      leftSamples.push({ x: cx - halfW, y: cy + s });
+      rightSamples.push({ x: cx + halfW, y: cy + s });
+    }
+    for (let s = -spanX; s <= spanX; s += 2) {
+      topSamples.push({ x: cx + s, y: cy - halfH });
+      bottomSamples.push({ x: cx + s, y: cy + halfH });
+    }
+    const dLeft = refineEdge(leftSamples, { x: -1, y: 0 });
+    const dRight = refineEdge(rightSamples, { x: 1, y: 0 });
+    const dTop = refineEdge(topSamples, { x: 0, y: -1 });
+    const dBottom = refineEdge(bottomSamples, { x: 0, y: 1 });
+    const newX0 = cx - halfW - dLeft;
+    const newX1 = cx + halfW + dRight;
+    const newY0 = cy - halfH - dTop;
+    const newY1 = cy + halfH + dBottom;
+    return {
+      x: Math.round(newX0 * 100) / 100,
+      y: Math.round(newY0 * 100) / 100,
+      width: Math.round((newX1 - newX0) * 100) / 100,
+      height: Math.round((newY1 - newY0) * 100) / 100,
+      r: Math.round(r * 100) / 100
+    };
+  }
+  function findSubpixelShift(rgba, width, height, p, normal, maxDist = 1.2, targetColor) {
+    if (p.x <= 0.6 || p.x >= width - 0.6 || p.y <= 0.6 || p.y >= height - 0.6) return 0;
+    const normLen = Math.hypot(normal.x, normal.y);
+    if (normLen < 1e-5) return 0;
+    let nx = normal.x / normLen;
+    let ny = normal.y / normLen;
+    let flipped = false;
+    const sampleDist = 1.8;
+    let cIn = sampleBilinearRgba(rgba, width, height, p.x - sampleDist * nx, p.y - sampleDist * ny);
+    let cOut = sampleBilinearRgba(rgba, width, height, p.x + sampleDist * nx, p.y + sampleDist * ny);
+    const dAlpha = cIn[3] - cOut[3];
+    if (Math.abs(dAlpha) >= 20) {
+      if (dAlpha < 0) {
+        nx = -nx;
+        ny = -ny;
+        flipped = !flipped;
+      }
+      const sVals2 = [-maxDist, -0.8, -0.4, 0, 0.4, 0.8, maxDist];
+      const covs2 = sVals2.map((s) => sampleBilinearRgba(rgba, width, height, p.x + s * nx, p.y + s * ny)[3] / 255);
+      for (let i = 0; i < sVals2.length - 1; i++) {
+        const c0 = covs2[i] ?? 0;
+        const c1 = covs2[i + 1] ?? 0;
+        if ((c0 - 0.5) * (c1 - 0.5) <= 0 && Math.abs(c1 - c0) > 1e-4) {
+          const raw = (sVals2[i] ?? 0) + (0.5 - c0) / (c1 - c0) * ((sVals2[i + 1] ?? 0) - (sVals2[i] ?? 0));
+          return flipped ? -raw : raw;
+        }
+      }
+      return 0;
+    }
+    let dr = cIn[0] - cOut[0];
+    let dg = cIn[1] - cOut[1];
+    let db = cIn[2] - cOut[2];
+    let normSq = dr * dr + dg * dg + db * db;
+    if (targetColor !== void 0) {
+      const tgt = parseRgb(targetColor);
+      const distIn = (cIn[0] - tgt[0]) ** 2 + (cIn[1] - tgt[1]) ** 2 + (cIn[2] - tgt[2]) ** 2;
+      const distOut = (cOut[0] - tgt[0]) ** 2 + (cOut[1] - tgt[1]) ** 2 + (cOut[2] - tgt[2]) ** 2;
+      if (distOut < distIn) {
+        nx = -nx;
+        ny = -ny;
+        flipped = !flipped;
+        cIn = sampleBilinearRgba(rgba, width, height, p.x - sampleDist * nx, p.y - sampleDist * ny);
+        cOut = sampleBilinearRgba(rgba, width, height, p.x + sampleDist * nx, p.y + sampleDist * ny);
+        dr = cIn[0] - cOut[0];
+        dg = cIn[1] - cOut[1];
+        db = cIn[2] - cOut[2];
+        normSq = dr * dr + dg * dg + db * db;
+      }
+    }
+    if (normSq < 36) return 0;
+    const steps = 11;
+    const sVals = [];
+    const covs = [];
+    for (let k = 0; k < steps; k++) {
+      const s = -maxDist + 2 * maxDist * k / (steps - 1);
+      sVals.push(s);
+      const samp = sampleBilinearRgba(rgba, width, height, p.x + s * nx, p.y + s * ny);
+      const proj = ((samp[0] - cOut[0]) * dr + (samp[1] - cOut[1]) * dg + (samp[2] - cOut[2]) * db) / normSq;
+      covs.push(proj);
+    }
+    for (let i = 0; i < sVals.length - 1; i++) {
+      const c0 = covs[i] ?? 0;
+      const c1 = covs[i + 1] ?? 0;
+      if ((c0 - 0.5) * (c1 - 0.5) <= 0 && Math.abs(c1 - c0) > 1e-4) {
+        const raw = (sVals[i] ?? 0) + (0.5 - c0) / (c1 - c0) * ((sVals[i + 1] ?? 0) - (sVals[i] ?? 0));
+        return flipped ? -raw : raw;
+      }
+    }
+    return 0;
+  }
+  function refineSubpathsInEdgeBand(subpaths, rgba, width, height, fillColor) {
+    return subpaths.map((subpath) => {
+      const cubics = subpath.cubics;
+      const n = cubics.length;
+      if (n < 2) return subpath;
+      const shifts = [];
+      const normals = [];
+      for (let i = 0; i < n; i++) {
+        const cur = cubics[i];
+        const prev = cubics[(i - 1 + n) % n];
+        if (cur === void 0 || prev === void 0) {
+          shifts.push(0);
+          normals.push({ x: 0, y: 0 });
+          continue;
+        }
+        const p0 = cur.p0;
+        const tOut = { x: cur.p1.x - p0.x, y: cur.p1.y - p0.y };
+        const tIn = { x: p0.x - prev.p2.x, y: p0.y - prev.p2.y };
+        const tx = tOut.x + tIn.x;
+        const ty = tOut.y + tIn.y;
+        const tLen = Math.hypot(tx, ty);
+        if (tLen < 1e-4) {
+          shifts.push(0);
+          normals.push({ x: 0, y: 0 });
+          continue;
+        }
+        const norm = { x: -ty / tLen, y: tx / tLen };
+        const shift2 = findSubpixelShift(rgba, width, height, p0, norm, 1.2, fillColor);
+        shifts.push(shift2);
+        normals.push(norm);
+      }
+      const refinedCubics = [];
+      for (let i = 0; i < n; i++) {
+        const cur = cubics[i];
+        const sh0 = shifts[i] ?? 0;
+        const norm0 = normals[i] ?? { x: 0, y: 0 };
+        const nextIdx = (i + 1) % n;
+        const sh1 = shifts[nextIdx] ?? 0;
+        const norm1 = normals[nextIdx] ?? { x: 0, y: 0 };
+        if (cur === void 0) continue;
+        let p0 = { x: cur.p0.x + sh0 * norm0.x, y: cur.p0.y + sh0 * norm0.y };
+        let p1 = { x: cur.p1.x + sh0 * norm0.x, y: cur.p1.y + sh0 * norm0.y };
+        let p2 = { x: cur.p2.x + sh1 * norm1.x, y: cur.p2.y + sh1 * norm1.y };
+        let p3 = { x: cur.p3.x + sh1 * norm1.x, y: cur.p3.y + sh1 * norm1.y };
+        const chordLen = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+        if (chordLen >= 1.5) {
+          const midX = 0.125 * p0.x + 0.375 * p1.x + 0.375 * p2.x + 0.125 * p3.x;
+          const midY = 0.125 * p0.y + 0.375 * p1.y + 0.375 * p2.y + 0.125 * p3.y;
+          const tx = 0.75 * (p3.x + p2.x - p1.x - p0.x);
+          const ty = 0.75 * (p3.y + p2.y - p1.y - p0.y);
+          const tLen = Math.hypot(tx, ty);
+          if (tLen > 1e-4) {
+            const normMid = { x: -ty / tLen, y: tx / tLen };
+            const shMid = findSubpixelShift(rgba, width, height, { x: midX, y: midY }, normMid, 0.8, fillColor);
+            if (Math.abs(shMid) > 0.01 && Math.abs(shMid) <= 0.6) {
+              const delta = shMid * 4 / 3 * 0.5;
+              p1 = { x: p1.x + delta * normMid.x, y: p1.y + delta * normMid.y };
+              p2 = { x: p2.x + delta * normMid.x, y: p2.y + delta * normMid.y };
+            }
+          }
+        }
+        refinedCubics.push({ p0, p1, p2, p3 });
+      }
+      return { cubics: refinedCubics, closed: subpath.closed };
+    });
+  }
+  var SHAPE_PATTERN = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
+  function readD2(tag) {
+    const match = /\bd\s*=\s*(["'])([\s\S]*?)\1/i.exec(tag);
+    if (match === null || match[1] === void 0 || match.index === void 0) return null;
+    const value = match[2] ?? "";
+    const open = match.index + match[0].indexOf(match[1]);
+    return { value, start: open + 1, end: open + 1 + value.length };
+  }
+  function parseTokens(data) {
+    const tokenRegex = /([MmLlHhVvCcSsQqTtAaZz])|(-?\d*\.?\d+(?:[eE][-+]?\d+)?)/g;
+    const tokens = [];
+    let currentCmd = null;
+    let currentArgs = [];
+    let match;
+    while ((match = tokenRegex.exec(data)) !== null) {
+      const cmd = match[1];
+      const num = match[2];
+      if (cmd !== void 0) {
+        if (currentCmd !== null) tokens.push({ cmd: currentCmd, args: currentArgs });
+        currentCmd = cmd;
+        currentArgs = [];
+      } else if (num !== void 0) {
+        currentArgs.push(Number(num));
+      }
+    }
+    if (currentCmd !== null) tokens.push({ cmd: currentCmd, args: currentArgs });
+    return tokens;
+  }
+  function parseSvgPath(data) {
+    const tokens = parseTokens(data);
+    if (tokens === null) return null;
+    const subpaths = [];
+    let current = [];
+    let cx = 0;
+    let cy = 0;
+    let sx = 0;
+    let sy = 0;
+    for (const token of tokens) {
+      const op = token.cmd.toLowerCase();
+      const rel = token.cmd === op;
+      const args = token.args;
+      if (op === "m" && args.length >= 2) {
+        if (current.length > 0) {
+          subpaths.push({ cubics: current, closed: false });
+          current = [];
+        }
+        cx = rel ? cx + (args[0] ?? 0) : args[0] ?? 0;
+        cy = rel ? cy + (args[1] ?? 0) : args[1] ?? 0;
+        sx = cx;
+        sy = cy;
+        for (let k = 2; k + 1 < args.length; k += 2) {
+          const x = rel ? cx + (args[k] ?? 0) : args[k] ?? 0;
+          const y = rel ? cy + (args[k + 1] ?? 0) : args[k + 1] ?? 0;
+          const p1 = { x: cx + (x - cx) / 3, y: cy + (y - cy) / 3 };
+          const p2 = { x: cx + (x - cx) * 2 / 3, y: cy + (y - cy) * 2 / 3 };
+          current.push({ p0: { x: cx, y: cy }, p1, p2, p3: { x, y } });
+          cx = x;
+          cy = y;
+        }
+      } else if (op === "c" && args.length >= 6) {
+        for (let k = 0; k + 5 < args.length; k += 6) {
+          const p1 = rel ? { x: cx + (args[k] ?? 0), y: cy + (args[k + 1] ?? 0) } : { x: args[k] ?? 0, y: args[k + 1] ?? 0 };
+          const p2 = rel ? { x: cx + (args[k + 2] ?? 0), y: cy + (args[k + 3] ?? 0) } : { x: args[k + 2] ?? 0, y: args[k + 3] ?? 0 };
+          const p3 = rel ? { x: cx + (args[k + 4] ?? 0), y: cy + (args[k + 5] ?? 0) } : { x: args[k + 4] ?? 0, y: args[k + 5] ?? 0 };
+          current.push({ p0: { x: cx, y: cy }, p1, p2, p3 });
+          cx = p3.x;
+          cy = p3.y;
+        }
+      } else if (op === "l" && args.length >= 2) {
+        for (let k = 0; k + 1 < args.length; k += 2) {
+          const x = rel ? cx + (args[k] ?? 0) : args[k] ?? 0;
+          const y = rel ? cy + (args[k + 1] ?? 0) : args[k + 1] ?? 0;
+          const p1 = { x: cx + (x - cx) / 3, y: cy + (y - cy) / 3 };
+          const p2 = { x: cx + (x - cx) * 2 / 3, y: cy + (y - cy) * 2 / 3 };
+          current.push({ p0: { x: cx, y: cy }, p1, p2, p3: { x, y } });
+          cx = x;
+          cy = y;
+        }
+      } else if (op === "h" && args.length >= 1) {
+        for (let k = 0; k < args.length; k++) {
+          const x = rel ? cx + (args[k] ?? 0) : args[k] ?? 0;
+          const p1 = { x: cx + (x - cx) / 3, y: cy };
+          const p2 = { x: cx + (x - cx) * 2 / 3, y: cy };
+          current.push({ p0: { x: cx, y: cy }, p1, p2, p3: { x, y: cy } });
+          cx = x;
+        }
+      } else if (op === "v" && args.length >= 1) {
+        for (let k = 0; k < args.length; k++) {
+          const y = rel ? cy + (args[k] ?? 0) : args[k] ?? 0;
+          const p1 = { x: cx, y: cy + (y - cy) / 3 };
+          const p2 = { x: cx, y: cy + (y - cy) * 2 / 3 };
+          current.push({ p0: { x: cx, y: cy }, p1, p2, p3: { x: cx, y } });
+          cy = y;
+        }
+      } else if (op === "z") {
+        if (current.length > 0) {
+          subpaths.push({ cubics: current, closed: true });
+          current = [];
+        }
+        cx = sx;
+        cy = sy;
+      }
+    }
+    if (current.length > 0) subpaths.push({ cubics: current, closed: false });
+    return subpaths;
+  }
+  function serializeSvgPath(subpaths) {
+    const fmt3 = (v) => {
+      const r = Math.round(v * 100) / 100;
+      return Object.is(r, -0) ? "0" : String(r);
+    };
+    return subpaths.map((subpath) => {
+      if (subpath.cubics.length === 0) return "";
+      const cmds = ["M" + fmt3(subpath.cubics[0]?.p0.x ?? 0) + "," + fmt3(subpath.cubics[0]?.p0.y ?? 0)];
+      for (const c of subpath.cubics) {
+        cmds.push(
+          "C" + fmt3(c.p1.x) + "," + fmt3(c.p1.y) + " " + fmt3(c.p2.x) + "," + fmt3(c.p2.y) + " " + fmt3(c.p3.x) + "," + fmt3(c.p3.y)
+        );
+      }
+      if (subpath.closed) cmds.push("Z");
+      return cmds.join("");
+    }).join("");
+  }
+  function refineSvgEdges(svg, rgba, width, height) {
+    return svg.replace(SHAPE_PATTERN, (tag) => {
+      const fillMatch = /\bfill\s*=\s*(["'])([^"']+)\1/i.exec(tag);
+      const fillColor = fillMatch ? fillMatch[2] : void 0;
+      if (/^<circle\b/i.test(tag)) {
+        const cxMatch = /\bcx\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        const cyMatch = /\bcy\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        const rMatch = /\br\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        if (cxMatch && cyMatch && rMatch) {
+          const cx = Number(cxMatch[2]);
+          const cy = Number(cyMatch[2]);
+          const r = Number(rMatch[2]);
+          const refined2 = fitCircleOnCoverage({ cx, cy, r }, rgba, width, height, fillColor);
+          if (refined2 !== null) {
+            return tag.replace(cxMatch[0], `cx="${refined2.cx}"`).replace(cyMatch[0], `cy="${refined2.cy}"`).replace(rMatch[0], `r="${refined2.r}"`);
+          }
+        }
+        return tag;
+      }
+      if (/^<rect\b/i.test(tag) && /\brx\s*=/i.test(tag)) {
+        const xMatch = /\bx\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        const yMatch = /\by\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        const wMatch = /\bwidth\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        const hMatch = /\bheight\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        const rxMatch = /\brx\s*=\s*(["'])([\d.-]+)\1/i.exec(tag);
+        if (xMatch && yMatch && wMatch && hMatch && rxMatch) {
+          const initial = {
+            x: Number(xMatch[2]),
+            y: Number(yMatch[2]),
+            width: Number(wMatch[2]),
+            height: Number(hMatch[2]),
+            r: Number(rxMatch[2])
+          };
+          const refined2 = fitRoundedRectOnCoverage(initial, rgba, width, height, fillColor);
+          if (refined2 !== null) {
+            return tag.replace(xMatch[0], `x="${refined2.x}"`).replace(yMatch[0], `y="${refined2.y}"`).replace(wMatch[0], `width="${refined2.width}"`).replace(hMatch[0], `height="${refined2.height}"`).replace(rxMatch[0], `rx="${refined2.r}"`);
+          }
+        }
+        return tag;
+      }
+      if (!/^<path\b/i.test(tag)) return tag;
+      const quoted = readD2(tag);
+      if (quoted === null) return tag;
+      const parsed = parseSvgPath(quoted.value);
+      if (parsed === null || parsed.length === 0) return tag;
+      const refined = refineSubpathsInEdgeBand(parsed, rgba, width, height, fillColor);
+      const next = serializeSvgPath(refined);
+      if (next === quoted.value) return tag;
+      return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
+    });
+  }
+
   // src/svg-scale.ts
   var COMMAND = /([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)/g;
   var NUMBER = /[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?/g;
@@ -3305,13 +3799,16 @@
     const sealed = sealLabVector(faired, controls);
     return { fitted, faired, sealed };
   }
-  function vectorStagesFromPlan(svgs, plates, width, height, droppedColor, controls, onProgress) {
+  function vectorStagesFromPlan(svgs, plates, width, height, droppedColor, controls, onProgress, sourceRgba) {
     onProgress?.("fit", 0);
     const trace = mergePlates(svgs, plates, width, height, null, false, false);
     const fitted = mergePlates(svgs, plates, width, height, droppedColor, controls.dropPlate, controls.fitGeometry);
     onProgress?.("fit", 1);
     onProgress?.("fair", 0);
-    const faired = fairLabVector(fitted, controls);
+    let faired = fairLabVector(fitted, controls);
+    if (sourceRgba !== void 0) {
+      faired = refineSvgEdges(faired, sourceRgba, width, height);
+    }
     onProgress?.("fair", 1);
     onProgress?.("seal", 0);
     const sealed = sealLabVector(faired, controls);
@@ -4989,7 +5486,7 @@
     return plan;
   }
   function vectorStagesForPlan(svgs, plan, controls, onProgress) {
-    return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+    return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress, plan.sourceRgba ?? plan.rasterStages?.traceInput);
   }
   function settingsFromControls(controls) {
     return {
@@ -5034,6 +5531,7 @@
       height,
       droppedColor: null,
       plates,
+      sourceRgba: rgba,
       ...rasterStages === void 0 ? {} : { rasterStages }
     };
   }
@@ -5183,6 +5681,7 @@
       width,
       height,
       droppedColor: punched.droppedColor,
+      sourceRgba: rgba,
       plates: [
         {
           png: punched.png,
@@ -5211,6 +5710,7 @@
       height,
       droppedColor: stages.droppedColor,
       rasterStages: stages,
+      sourceRgba: rgba,
       plates: [{
         png,
         scale: 1,

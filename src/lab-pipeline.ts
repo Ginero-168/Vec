@@ -4,6 +4,7 @@ import { controlsFor, type LabControls } from "./lab-model.ts";
 import { punchRgba, punchRgbaAsync, revealSentinel } from "./punch-rgba.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
 import { segmentBackdropStage, segmentBackdropStageAsync, segmentColorStage, segmentColorStageAsync, type SegmentColorStage } from "./segment.ts";
+import { refineSvgEdges } from "./subpixel-edges.ts";
 import { mergePlates, type PlacedPlate } from "./trace-finish.ts";
 
 export const LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"] as const;
@@ -259,14 +260,18 @@ export function vectorStagesFromPlan(
   height: number,
   droppedColor: string | null,
   controls: LabControls,
-  onProgress?: PipelineProgress
+  onProgress?: PipelineProgress,
+  sourceRgba?: Uint8Array
 ): LabVectorStages {
   onProgress?.("fit", 0);
   const trace = mergePlates(svgs, plates, width, height, null, false, false);
   const fitted = mergePlates(svgs, plates, width, height, droppedColor, controls.dropPlate, controls.fitGeometry);
   onProgress?.("fit", 1);
   onProgress?.("fair", 0);
-  const faired = fairLabVector(fitted, controls);
+  let faired = fairLabVector(fitted, controls);
+  if (sourceRgba !== undefined) {
+    faired = refineSvgEdges(faired, sourceRgba, width, height);
+  }
   onProgress?.("fair", 1);
   onProgress?.("seal", 0);
   const sealed = sealLabVector(faired, controls);
