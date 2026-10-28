@@ -59,7 +59,7 @@ export function segmentColorStage(rgba: Uint8Array, width: number, height: numbe
     const labels = new Int16Array(count);
     labels.fill(-1);
     report(1);
-    return { colors: copy, labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0, sourceRgba: rgba };
+    return { colors: copy, labels, punchLabels: labels, palette: [], opaque: new Uint8Array(count), spread: 0, sourceRgba: copy };
   }
   const source = rgba;
   const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));

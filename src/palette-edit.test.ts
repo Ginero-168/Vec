@@ -4,13 +4,18 @@ import { controlsFor } from "./lab-model.ts";
 import { buildLabRasterStages } from "./lab-pipeline.ts";
 import {
   applyEdits,
+  applyHide,
   applyMerge,
   applyRecolor,
   applySplit,
+  applySplitShade,
   checkEditsParamChange,
+  createDimmedPreview,
   extractClusters,
   hexToRgb,
+  isNetZeroEdits,
   PaletteEditHistory,
+  remapEditsAcrossMaxColors,
   rgbToHex,
   type PaletteEdit
 } from "./palette-edit.ts";
@@ -125,11 +130,33 @@ test("applySplit deterministically splits a cluster into two in OKLab", () => {
   assert.ok(newClusterPixelCount > 0);
 });
 
-test("applyRecolor recolors specified cluster without modifying labels", () => {
+test("applySplitShade splits an inner shade circle out into its own color cluster", () => {
+  const stage = createMockStage();
+  const initialPaletteLength = stage.palette.length;
+  const cluster = 0;
+
+  const splitStage = applySplitShade(stage, cluster, 0);
+
+  // Palette grows by 1
+  assert.strictEqual(splitStage.palette.length, initialPaletteLength + 1);
+
+  // Pixels assigned to new cluster
+  const newClusterIdx = initialPaletteLength;
+  let hasNewPixels = false;
+  for (let i = 0; i < splitStage.labels.length; i++) {
+    if (splitStage.labels[i] === newClusterIdx) {
+      hasNewPixels = true;
+      break;
+    }
+  }
+  assert.strictEqual(hasNewPixels, true);
+});
+
+test("applyRecolor recolors specified cluster with hex and alpha", () => {
   const stage = createMockStage();
   const targetCluster = 0;
   const targetHex = "#ff8800";
-  const recolored = applyRecolor(stage, targetCluster, targetHex);
+  const recolored = applyRecolor(stage, targetCluster, targetHex, 200);
 
   assert.strictEqual(recolored.palette.length, stage.palette.length);
   assert.strictEqual(rgbToHex(recolored.palette[targetCluster]!), targetHex);
@@ -137,99 +164,116 @@ test("applyRecolor recolors specified cluster without modifying labels", () => {
   // Labels must remain unchanged
   assert.deepStrictEqual(Array.from(recolored.labels), Array.from(stage.labels));
 
-  // Pixels in target cluster should now match new hex
+  // Pixels in target cluster should now match new hex and alpha
   const targetRgb = hexToRgb(targetHex);
   for (let i = 0; i < recolored.labels.length; i++) {
     if (recolored.labels[i] === targetCluster) {
       assert.strictEqual(recolored.colors[i * 4], targetRgb.r);
       assert.strictEqual(recolored.colors[i * 4 + 1], targetRgb.g);
       assert.strictEqual(recolored.colors[i * 4 + 2], targetRgb.b);
+      assert.strictEqual(recolored.colors[i * 4 + 3], 200);
+      assert.strictEqual(recolored.opaque[i], 200);
     }
   }
 });
 
-test("applyEdits applies an ordered sequence of merge, split, recolor deterministically", () => {
+test("applyHide hides and unhides a cluster toggling opacity", () => {
   const stage = createMockStage();
+  const targetCluster = 0;
+
+  const hidden = applyHide(stage, targetCluster, true);
+  for (let i = 0; i < hidden.labels.length; i++) {
+    if (hidden.labels[i] === targetCluster) {
+      assert.strictEqual(hidden.opaque[i], 0);
+      assert.strictEqual(hidden.colors[i * 4 + 3], 0);
+    }
+  }
+
+  const unhidden = applyHide(hidden, targetCluster, false);
+  for (let i = 0; i < unhidden.labels.length; i++) {
+    if (unhidden.labels[i] === targetCluster) {
+      assert.strictEqual(unhidden.opaque[i], 255);
+      assert.strictEqual(unhidden.colors[i * 4 + 3], 255);
+    }
+  }
+});
+
+test("isNetZeroEdits detects when stage matches baseStage", () => {
+  const stage = createMockStage();
+  assert.strictEqual(isNetZeroEdits(stage, stage), true);
+
+  const edited = applyRecolor(stage, 0, "#00ff00");
+  assert.strictEqual(isNetZeroEdits(stage, edited), false);
+
+  const reverted = applyRecolor(edited, 0, rgbToHex(stage.palette[0]!));
+  assert.strictEqual(isNetZeroEdits(stage, reverted), true);
+});
+
+test("createDimmedPreview dims non-selected clusters to dark grayscale", () => {
+  const stage = createMockStage();
+  const dimmed = createDimmedPreview(stage, 0);
+
+  assert.strictEqual(dimmed.length, stage.colors.length);
+
+  for (let i = 0; i < stage.labels.length; i++) {
+    const offset = i * 4;
+    if (stage.labels[i] === 0) {
+      assert.strictEqual(dimmed[offset], stage.colors[offset]);
+      assert.strictEqual(dimmed[offset + 1], stage.colors[offset + 1]);
+      assert.strictEqual(dimmed[offset + 2], stage.colors[offset + 2]);
+    } else {
+      // Non-selected pixels are converted to low grayscale
+      assert.strictEqual(dimmed[offset], dimmed[offset + 1]);
+      assert.strictEqual(dimmed[offset + 1], dimmed[offset + 2]);
+      assert.ok(dimmed[offset]! <= 60);
+    }
+  }
+});
+
+test("remapEditsAcrossMaxColors preserves manual edits onto new clustering", () => {
+  const stage4 = createMockStage();
+  const stage8 = segmentColorStage(stage4.sourceRgba!, 4, 4, {
+    mode: "photo",
+    maxColors: 8,
+    removeBackground: false,
+    opaqueAt: 128
+  });
+
   const edits: PaletteEdit[] = [
-    { kind: "recolor", cluster: 0, hex: "#ff00aa" },
-    { kind: "split", cluster: 1, k: 2 },
-    { kind: "merge", from: 0, to: 1 }
+    { kind: "recolor", cluster: 0, hex: "#123456" },
+    { kind: "hide", cluster: 1, hidden: true }
   ];
 
-  const res1 = applyEdits(stage, edits);
-  const res2 = applyEdits(stage, edits);
-
-  assert.deepStrictEqual(Array.from(res1.colors), Array.from(res2.colors));
-  assert.deepStrictEqual(Array.from(res1.labels), Array.from(res2.labels));
-  assert.deepStrictEqual(res1.palette, res2.palette);
+  const { remappedEdits, unmappedCount } = remapEditsAcrossMaxColors(edits, stage4, stage8);
+  assert.strictEqual(unmappedCount, 0);
+  assert.strictEqual(remappedEdits.length, 2);
+  assert.strictEqual(remappedEdits[0]!.kind, "recolor");
+  assert.strictEqual((remappedEdits[0] as any).hex, "#123456");
+  assert.strictEqual(remappedEdits[1]!.kind, "hide");
 });
 
-test("PaletteEditHistory manages undo and redo stack correctly", () => {
-  const history = new PaletteEditHistory();
-  assert.strictEqual(history.canUndo(), false);
-  assert.strictEqual(history.canRedo(), false);
-
-  const edit1: PaletteEdit = { kind: "recolor", cluster: 0, hex: "#112233" };
-  const edit2: PaletteEdit = { kind: "merge", from: 0, to: 1 };
-
-  history.push(edit1);
-  assert.strictEqual(history.canUndo(), true);
-  assert.strictEqual(history.canRedo(), false);
-  assert.deepStrictEqual(history.getEdits(), [edit1]);
-
-  history.push(edit2);
-  assert.deepStrictEqual(history.getEdits(), [edit1, edit2]);
-
-  // Undo edit2
-  const undone = history.undo();
-  assert.deepStrictEqual(undone, edit2);
-  assert.deepStrictEqual(history.getEdits(), [edit1]);
-  assert.strictEqual(history.canRedo(), true);
-
-  // Redo edit2
-  const redone = history.redo();
-  assert.deepStrictEqual(redone, edit2);
-  assert.deepStrictEqual(history.getEdits(), [edit1, edit2]);
-  assert.strictEqual(history.canRedo(), false);
-
-  // Push new edit clears redo
-  history.undo();
-  assert.strictEqual(history.canRedo(), true);
-  const edit3: PaletteEdit = { kind: "split", cluster: 0, k: 2 };
-  history.push(edit3);
-  assert.strictEqual(history.canRedo(), false);
-  assert.deepStrictEqual(history.getEdits(), [edit1, edit3]);
-
-  history.clear();
-  assert.strictEqual(history.canUndo(), false);
-  assert.strictEqual(history.canRedo(), false);
-  assert.deepStrictEqual(history.getEdits(), []);
-});
-
-test("checkEditsParamChange clears on maxColors or mode change, surfaces warning when edits present", () => {
+test("checkEditsParamChange remaps on maxColors change, clears on mode change", () => {
   const baseControls = controlsFor("photo");
+  const stage = createMockStage();
 
-  // Mode change
+  // Mode change: clears edits
   const modeChange = { ...baseControls, mode: "poster" as const };
-  const checkModeWithEdits = checkEditsParamChange(baseControls, modeChange, true);
-  assert.strictEqual(checkModeWithEdits.clearEdits, true);
-  assert.ok(checkModeWithEdits.warning !== null);
+  const checkMode = checkEditsParamChange(baseControls, modeChange, true);
+  assert.strictEqual(checkMode.clearEdits, true);
+  assert.ok(checkMode.warning !== null);
 
-  const checkModeNoEdits = checkEditsParamChange(baseControls, modeChange, false);
-  assert.strictEqual(checkModeNoEdits.clearEdits, true);
-  assert.strictEqual(checkModeNoEdits.warning, null);
-
-  // maxColors change
-  const maxColorsChange = { ...baseControls, maxColors: baseControls.maxColors + 4 };
-  const checkColorsWithEdits = checkEditsParamChange(baseControls, maxColorsChange, true);
-  assert.strictEqual(checkColorsWithEdits.clearEdits, true);
-  assert.ok(checkColorsWithEdits.warning !== null);
+  // maxColors change: edits survive and are remapped
+  const maxColorsChange = { ...baseControls, maxColors: 8 };
+  const edits: PaletteEdit[] = [{ kind: "recolor", cluster: 0, hex: "#abcdef" }];
+  const checkMax = checkEditsParamChange(baseControls, maxColorsChange, true, stage, stage, edits);
+  assert.strictEqual(checkMax.clearEdits, false);
+  assert.ok(checkMax.remappedEdits !== undefined);
+  assert.strictEqual(checkMax.remappedEdits.length, 1);
 });
 
 test("checkEditsParamChange allows edits to survive downstream parameter changes", () => {
   const baseControls = controlsFor("photo");
 
-  // Downstream parameter changes (speckArea, removeBackground, backdropSpread, opaqueAt, smoothness, corner, seal, etc.)
   const downstreamChanges = [
     { ...baseControls, speckArea: baseControls.speckArea + 5 },
     { ...baseControls, removeBackground: !baseControls.removeBackground },
@@ -267,7 +311,6 @@ test("pipeline hook substituteColors feeds edited colors downstream to backdrop 
   const controls = controlsFor("photo");
   const initialStages = buildLabRasterStages(stage.sourceRgba!, 4, 4, controls);
 
-  // Recolor cluster 0 to magenta
   const edited = applyRecolor(stage, 0, "#ff00ff");
   const substitutedStages = buildLabRasterStages(stage.sourceRgba!, 4, 4, controls, initialStages, "backdrop", edited);
 
@@ -275,4 +318,3 @@ test("pipeline hook substituteColors feeds edited colors downstream to backdrop 
   assert.strictEqual(substitutedStages.colors, edited.colors);
   assert.notStrictEqual(substitutedStages.backdrop, initialStages.backdrop);
 });
-

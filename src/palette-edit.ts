@@ -5,7 +5,9 @@ import { paintLabels, type RGB, type SegmentColorStage } from "./segment.ts";
 export type PaletteEdit =
   | { readonly kind: "merge"; readonly from: number; readonly to: number }
   | { readonly kind: "split"; readonly cluster: number; readonly k?: number }
-  | { readonly kind: "recolor"; readonly cluster: number; readonly hex: string };
+  | { readonly kind: "splitShade"; readonly cluster: number; readonly shadeIndex: number }
+  | { readonly kind: "recolor"; readonly cluster: number; readonly hex: string; readonly alpha?: number }
+  | { readonly kind: "hide"; readonly cluster: number; readonly hidden: boolean };
 
 export type SubShade = {
   readonly color: RGB;
@@ -19,11 +21,14 @@ export type PaletteCluster = {
   readonly hex: string;
   readonly pixelCount: number;
   readonly subShades: readonly SubShade[];
+  readonly alpha?: number;
+  readonly hidden?: boolean;
 };
 
 export type ParamCheckResult = {
   readonly clearEdits: boolean;
   readonly warning: string | null;
+  readonly remappedEdits?: PaletteEdit[];
 };
 
 export function rgbToHex(rgb: RGB): string {
@@ -79,7 +84,7 @@ export function extractClusters(stage: SegmentColorStage): PaletteCluster[] {
   return clusters;
 }
 
-function extractSubShades(
+export function extractSubShades(
   stage: SegmentColorStage,
   clusterIndex: number,
   baseColor: RGB,
@@ -89,7 +94,6 @@ function extractSubShades(
   if (totalPixels <= 0) return [];
 
   if (source && source.length >= stage.labels.length * 4) {
-    // Collect unique colors / sub-shades with 5-bit quantization for nice clustering
     const bins = new Map<string, { r: number; g: number; b: number; count: number }>();
     const stride = Math.max(1, Math.floor(stage.labels.length / 5000));
 
@@ -98,7 +102,6 @@ function extractSubShades(
       const r = source[i * 4] ?? 0;
       const g = source[i * 4 + 1] ?? 0;
       const b = source[i * 4 + 2] ?? 0;
-      // 5-bit quantized key
       const key = `${r >> 3},${g >> 3},${b >> 3}`;
       const entry = bins.get(key);
       if (entry) {
@@ -128,7 +131,6 @@ function extractSubShades(
     }
   }
 
-  // Synthetic deterministic sub-shades based on base color lightness
   const baseLab = rgbToOklab(baseColor);
   const variations: { dL: number; weight: number }[] = [
     { dL: -0.06, weight: 3 },
@@ -166,7 +168,6 @@ export function applyMerge(stage: SegmentColorStage, from: number, to: number): 
   const newLabels = new Int16Array(count);
   const newPunchLabels = new Int16Array(stage.punchLabels.length);
 
-  // If `to > from`, its new index shifts down by 1 because `from` is removed.
   const targetNewIndex = to > from ? to - 1 : to;
 
   for (let i = 0; i < count; i++) {
@@ -206,22 +207,37 @@ export function applyMerge(stage: SegmentColorStage, from: number, to: number): 
 }
 
 /**
- * Recolors cluster `cluster` to the new hex color.
+ * Recolors cluster `cluster` to the new hex color and optional alpha (0..255).
  */
-export function applyRecolor(stage: SegmentColorStage, cluster: number, hex: string): SegmentColorStage {
+export function applyRecolor(
+  stage: SegmentColorStage,
+  cluster: number,
+  hex: string,
+  alpha?: number
+): SegmentColorStage {
   if (cluster < 0 || cluster >= stage.palette.length) return stage;
   const newColor = hexToRgb(hex);
   const newPalette = stage.palette.map((c, i) => (i === cluster ? newColor : c));
   const newColors = stage.colors.slice();
+  const newOpaque = stage.opaque.slice();
+
+  const effectiveAlpha = alpha !== undefined ? Math.max(0, Math.min(255, Math.round(alpha))) : 255;
 
   for (let i = 0; i < stage.labels.length; i++) {
-    if ((stage.opaque[i] ?? 0) === 0) continue;
     if (stage.labels[i] === cluster) {
       const offset = i * 4;
-      newColors[offset] = newColor.r;
-      newColors[offset + 1] = newColor.g;
-      newColors[offset + 2] = newColor.b;
-      newColors[offset + 3] = 255;
+      newOpaque[i] = effectiveAlpha;
+      if (effectiveAlpha === 0) {
+        newColors[offset] = 0;
+        newColors[offset + 1] = 0;
+        newColors[offset + 2] = 0;
+        newColors[offset + 3] = 0;
+      } else {
+        newColors[offset] = newColor.r;
+        newColors[offset + 1] = newColor.g;
+        newColors[offset + 2] = newColor.b;
+        newColors[offset + 3] = effectiveAlpha;
+      }
     }
   }
 
@@ -230,7 +246,47 @@ export function applyRecolor(stage: SegmentColorStage, cluster: number, hex: str
     labels: stage.labels,
     punchLabels: stage.punchLabels,
     palette: newPalette,
-    opaque: stage.opaque,
+    opaque: newOpaque,
+    spread: stage.spread,
+    ...(stage.sourceRgba !== undefined ? { sourceRgba: stage.sourceRgba } : {})
+  };
+}
+
+/**
+ * Toggles visibility / hiding of a cluster.
+ * When hidden, cluster pixels become transparent (opaque = 0).
+ */
+export function applyHide(stage: SegmentColorStage, cluster: number, hidden: boolean): SegmentColorStage {
+  if (cluster < 0 || cluster >= stage.palette.length) return stage;
+  const newOpaque = stage.opaque.slice();
+  const newColors = stage.colors.slice();
+  const color = stage.palette[cluster] ?? { r: 0, g: 0, b: 0 };
+
+  for (let i = 0; i < stage.labels.length; i++) {
+    if (stage.labels[i] === cluster) {
+      const offset = i * 4;
+      if (hidden) {
+        newOpaque[i] = 0;
+        newColors[offset] = 0;
+        newColors[offset + 1] = 0;
+        newColors[offset + 2] = 0;
+        newColors[offset + 3] = 0;
+      } else {
+        newOpaque[i] = 255;
+        newColors[offset] = color.r;
+        newColors[offset + 1] = color.g;
+        newColors[offset + 2] = color.b;
+        newColors[offset + 3] = 255;
+      }
+    }
+  }
+
+  return {
+    colors: newColors,
+    labels: stage.labels,
+    punchLabels: stage.punchLabels,
+    palette: stage.palette,
+    opaque: newOpaque,
     spread: stage.spread,
     ...(stage.sourceRgba !== undefined ? { sourceRgba: stage.sourceRgba } : {})
   };
@@ -238,7 +294,6 @@ export function applyRecolor(stage: SegmentColorStage, cluster: number, hex: str
 
 /**
  * Splits cluster `cluster` into k=2 sub-clusters using deterministic k-means in OKLab.
- * Re-clusters ONLY this cluster's pixels.
  */
 export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): SegmentColorStage {
   if (cluster < 0 || cluster >= stage.palette.length) return stage;
@@ -251,7 +306,6 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
   }
   if (memberIndices.length < 2) return stage;
 
-  // Gather OKLab colors of pixels in this cluster
   const source = stage.sourceRgba;
   const pixelColors: { index: number; oklab: Lab; rgb: RGB }[] = [];
 
@@ -271,8 +325,6 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
     pixelColors.push({ index: idx, oklab: rgbToOklab(rgb), rgb });
   }
 
-  // Deterministic seed initialization for k = 2
-  // Compute mean OKLab
   let sumL = 0, sumA = 0, sumB = 0;
   for (const p of pixelColors) {
     sumL += p.oklab.L;
@@ -281,7 +333,6 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
   }
   const mean: Lab = { L: sumL / pixelColors.length, a: sumA / pixelColors.length, b: sumB / pixelColors.length };
 
-  // Seed 0: point furthest from mean in OKLab
   let bestDist0 = -1;
   let seed0 = pixelColors[0]!.oklab;
   for (const p of pixelColors) {
@@ -292,7 +343,6 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
     }
   }
 
-  // Seed 1: point furthest from seed 0 in OKLab
   let bestDist1 = -1;
   let seed1 = seed0;
   for (const p of pixelColors) {
@@ -303,14 +353,11 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
     }
   }
 
-  // If seeds are virtually identical (e.g. solid single color in source),
-  // split deterministically along lightness axis
   if (bestDist1 < 1e-4) {
     seed0 = { L: Math.max(0, seed0.L - 0.05), a: seed0.a, b: seed0.b };
     seed1 = { L: Math.min(1, seed1.L + 0.05), a: seed1.a, b: seed1.b };
   }
 
-  // k-means iterations (fixed 10 rounds for deterministic convergence)
   let c0: Lab = { ...seed0 };
   let c1: Lab = { ...seed1 };
   let assign0: number[] = [];
@@ -347,7 +394,6 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
     }
   }
 
-  // Guarantee neither cluster is empty
   if (assign0.length === 0 && assign1.length > 1) {
     assign0.push(assign1.pop()!);
   } else if (assign1.length === 0 && assign0.length > 1) {
@@ -389,6 +435,72 @@ export function applySplit(stage: SegmentColorStage, cluster: number, _k = 2): S
 }
 
 /**
+ * Splits a specific inner shade circle out of its bubble into its own color cluster.
+ * Used when dragging an inner circle OUT of its bubble.
+ */
+export function applySplitShade(
+  stage: SegmentColorStage,
+  cluster: number,
+  shadeIndex: number
+): SegmentColorStage {
+  if (cluster < 0 || cluster >= stage.palette.length) return stage;
+  const baseColor = stage.palette[cluster] ?? { r: 0, g: 0, b: 0 };
+  const subShades = extractSubShades(stage, cluster, baseColor, 100, stage.sourceRgba);
+  if (shadeIndex < 0 || shadeIndex >= subShades.length) return stage;
+
+  const targetShade = subShades[shadeIndex]!;
+  const targetLab = rgbToOklab(targetShade.color);
+  const source = stage.sourceRgba;
+
+  const newClusterIndex = stage.palette.length;
+  const newPalette = [...stage.palette, targetShade.color];
+  const newLabels = new Int16Array(stage.labels);
+  const newPunchLabels = new Int16Array(stage.punchLabels);
+
+  let splitPixelCount = 0;
+  for (let i = 0; i < stage.labels.length; i++) {
+    if (stage.labels[i] === cluster) {
+      if (source && source.length >= (i + 1) * 4) {
+        const r = source[i * 4] ?? 0;
+        const g = source[i * 4 + 1] ?? 0;
+        const b = source[i * 4 + 2] ?? 0;
+        const pLab = rgbToOklab({ r, g, b });
+        const dTarget = labDistance2(pLab, targetLab);
+        const dBase = labDistance2(pLab, rgbToOklab(baseColor));
+        if (dTarget < dBase) {
+          newLabels[i] = newClusterIndex;
+          if (newPunchLabels[i] === cluster) newPunchLabels[i] = newClusterIndex;
+          splitPixelCount++;
+        }
+      }
+    }
+  }
+
+  // If no pixels met condition, split at least 1 pixel
+  if (splitPixelCount === 0) {
+    for (let i = 0; i < stage.labels.length; i++) {
+      if (stage.labels[i] === cluster) {
+        newLabels[i] = newClusterIndex;
+        if (newPunchLabels[i] === cluster) newPunchLabels[i] = newClusterIndex;
+        break;
+      }
+    }
+  }
+
+  const newColors = paintLabels(newLabels, newPalette, stage.opaque);
+
+  return {
+    colors: newColors,
+    labels: newLabels,
+    punchLabels: newPunchLabels,
+    palette: newPalette,
+    opaque: stage.opaque,
+    spread: stage.spread,
+    ...(stage.sourceRgba !== undefined ? { sourceRgba: stage.sourceRgba } : {})
+  };
+}
+
+/**
  * Applies an ordered list of edits to the Colors step cluster output.
  * If edits is empty, returns colorsOutput byte-identical (and reference-identical).
  */
@@ -405,11 +517,162 @@ export function applyEdits(
       current = applyMerge(current, edit.from, edit.to);
     } else if (edit.kind === "split") {
       current = applySplit(current, edit.cluster, edit.k ?? 2);
+    } else if (edit.kind === "splitShade") {
+      current = applySplitShade(current, edit.cluster, edit.shadeIndex);
     } else if (edit.kind === "recolor") {
-      current = applyRecolor(current, edit.cluster, edit.hex);
+      current = applyRecolor(current, edit.cluster, edit.hex, edit.alpha);
+    } else if (edit.kind === "hide") {
+      current = applyHide(current, edit.cluster, edit.hidden);
     }
   }
   return current;
+}
+
+/**
+ * Determines whether net edits are zero (meaning current output matches base output).
+ */
+export function isNetZeroEdits(baseStage: SegmentColorStage, currentStage: SegmentColorStage): boolean {
+  if (baseStage === currentStage) return true;
+  if (baseStage.palette.length !== currentStage.palette.length) return false;
+
+  for (let i = 0; i < baseStage.palette.length; i++) {
+    const b = baseStage.palette[i]!;
+    const c = currentStage.palette[i]!;
+    if (b.r !== c.r || b.g !== c.g || b.b !== c.b) return false;
+  }
+
+  for (let i = 0; i < baseStage.labels.length; i++) {
+    if (baseStage.labels[i] !== currentStage.labels[i]) return false;
+  }
+
+  for (let i = 0; i < baseStage.opaque.length; i++) {
+    if (baseStage.opaque[i] !== currentStage.opaque[i]) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Creates a dimmed preview raster where the selected cluster is highlighted
+ * in full color, and all other clusters are dimmed (dark grayscale).
+ */
+export function createDimmedPreview(stage: SegmentColorStage, selectedCluster: number): Uint8Array {
+  const dimmed = new Uint8Array(stage.colors.length);
+  const count = stage.labels.length;
+
+  for (let i = 0; i < count; i++) {
+    const offset = i * 4;
+    const isSelected = stage.labels[i] === selectedCluster;
+    const opaque = stage.opaque[i] ?? 0;
+
+    if (opaque === 0) {
+      dimmed[offset] = 0;
+      dimmed[offset + 1] = 0;
+      dimmed[offset + 2] = 0;
+      dimmed[offset + 3] = 0;
+      continue;
+    }
+
+    const r = stage.colors[offset] ?? 0;
+    const g = stage.colors[offset + 1] ?? 0;
+    const b = stage.colors[offset + 2] ?? 0;
+
+    if (isSelected) {
+      dimmed[offset] = r;
+      dimmed[offset + 1] = g;
+      dimmed[offset + 2] = b;
+      dimmed[offset + 3] = 255;
+    } else {
+      const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+      const dimmedVal = Math.round(lum * 0.2);
+      dimmed[offset] = dimmedVal;
+      dimmed[offset + 1] = dimmedVal;
+      dimmed[offset + 2] = dimmedVal;
+      dimmed[offset + 3] = 160;
+    }
+  }
+
+  return dimmed;
+}
+
+/**
+ * Remaps manual edits across a maxColors clustering change.
+ * Recolor and hide edits follow the nearest cluster by color.
+ * Merges re-apply if both sides still exist distinctly in the new palette.
+ */
+export function remapEditsAcrossMaxColors(
+  edits: readonly PaletteEdit[],
+  oldStage: SegmentColorStage,
+  newStage: SegmentColorStage
+): { remappedEdits: PaletteEdit[]; unmappedCount: number; warning: string | null } {
+  const remappedEdits: PaletteEdit[] = [];
+  let unmappedCount = 0;
+
+  function findNearestCluster(color: RGB, palette: readonly RGB[]): number {
+    const targetLab = rgbToOklab(color);
+    let bestDist = Infinity;
+    let bestIdx = 0;
+    for (let i = 0; i < palette.length; i++) {
+      const pLab = rgbToOklab(palette[i]!);
+      const d = labDistance2(pLab, targetLab);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  for (const edit of edits) {
+    if (edit.kind === "recolor") {
+      const oldColor = oldStage.palette[edit.cluster];
+      if (oldColor) {
+        const newIdx = findNearestCluster(oldColor, newStage.palette);
+        remappedEdits.push({ kind: "recolor", cluster: newIdx, hex: edit.hex, alpha: edit.alpha });
+      } else {
+        unmappedCount++;
+      }
+    } else if (edit.kind === "hide") {
+      const oldColor = oldStage.palette[edit.cluster];
+      if (oldColor) {
+        const newIdx = findNearestCluster(oldColor, newStage.palette);
+        remappedEdits.push({ kind: "hide", cluster: newIdx, hidden: edit.hidden });
+      } else {
+        unmappedCount++;
+      }
+    } else if (edit.kind === "merge") {
+      const oldFromColor = oldStage.palette[edit.from];
+      const oldToColor = oldStage.palette[edit.to];
+      if (oldFromColor && oldToColor) {
+        const newFrom = findNearestCluster(oldFromColor, newStage.palette);
+        const newTo = findNearestCluster(oldToColor, newStage.palette);
+        if (newFrom !== newTo) {
+          remappedEdits.push({ kind: "merge", from: newFrom, to: newTo });
+        }
+      } else {
+        unmappedCount++;
+      }
+    } else if (edit.kind === "split") {
+      const oldColor = oldStage.palette[edit.cluster];
+      if (oldColor) {
+        const newIdx = findNearestCluster(oldColor, newStage.palette);
+        remappedEdits.push({ kind: "split", cluster: newIdx, k: edit.k });
+      } else {
+        unmappedCount++;
+      }
+    } else if (edit.kind === "splitShade") {
+      const oldColor = oldStage.palette[edit.cluster];
+      if (oldColor) {
+        const newIdx = findNearestCluster(oldColor, newStage.palette);
+        remappedEdits.push({ kind: "splitShade", cluster: newIdx, shadeIndex: edit.shadeIndex });
+      } else {
+        unmappedCount++;
+      }
+    }
+  }
+
+  const warning = unmappedCount > 0 ? `${unmappedCount} edit(s) could not be remapped to the new palette.` : null;
+  return { remappedEdits, unmappedCount, warning };
 }
 
 /**
@@ -458,6 +721,11 @@ export class PaletteEditHistory {
     return [...this.undoStack];
   }
 
+  setEdits(edits: readonly PaletteEdit[]): void {
+    this.undoStack = [...edits];
+    this.redoStack = [];
+  }
+
   clear(): void {
     this.undoStack = [];
     this.redoStack = [];
@@ -465,23 +733,37 @@ export class PaletteEditHistory {
 }
 
 /**
- * Checks whether palette edits should be cleared upon control param changes.
- * Edits survive downstream param changes (speckArea, removeBackground, opaqueAt, etc.).
- * If maxColors or mode (upstream/at Colors) change, edits are cleared and a warning is returned.
+ * Checks whether palette edits should survive or be remapped across control param changes.
+ * Mode change clears edits with a warning.
+ * maxColors change: manual edits SURVIVE and are remapped onto the new clustering.
+ * Downstream parameter changes (speckArea, removeBackground, etc.): edits survive directly.
  */
 export function checkEditsParamChange(
   previousControls: LabControls,
   nextControls: LabControls,
-  hasEdits: boolean
+  hasEdits: boolean,
+  oldStage?: SegmentColorStage,
+  newStage?: SegmentColorStage,
+  currentEdits: readonly PaletteEdit[] = []
 ): ParamCheckResult {
-  if (previousControls.mode !== nextControls.mode || previousControls.maxColors !== nextControls.maxColors) {
+  // Mode change: clear with warning
+  if (previousControls.mode !== nextControls.mode) {
     return {
       clearEdits: true,
-      warning: hasEdits
-        ? "Palette edits cleared because color count or mode changed."
-        : null
+      warning: hasEdits ? "Palette edits cleared because mode changed." : null
     };
   }
+
+  // maxColors change: manual edits survive via remapping
+  if (previousControls.maxColors !== nextControls.maxColors && hasEdits && oldStage && newStage) {
+    const { remappedEdits, warning } = remapEditsAcrossMaxColors(currentEdits, oldStage, newStage);
+    return {
+      clearEdits: false,
+      warning,
+      remappedEdits
+    };
+  }
+
   return {
     clearEdits: false,
     warning: null

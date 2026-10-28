@@ -4,7 +4,7 @@ import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "
 import { buildLabRasterStages, buildLabRasterStagesAsync, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId, type PipelineProgress } from "./lab-pipeline.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
-import { segmentRaster } from "./segment.ts";
+import { segmentRaster, type SegmentColorStage } from "./segment.ts";
 import { scaleSvg } from "./svg-scale.ts";
 import { assembleTrace, mergePlates, type PlacedPlate } from "./trace-finish.ts";
 import { type Stacking, type TracePreset, type TraceRequest } from "./trace.ts";
