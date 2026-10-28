@@ -1846,7 +1846,7 @@ function planTrace(source, settings, controls, previousStages = null, from = "co
 function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, void 0, onProgress);
   const plates = flat.map((plate) => ({
-    png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
+    png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor) : plate.rgba),
     scale: plate.scale,
     originX: plate.originX,
     originY: plate.originY,
@@ -1861,6 +1861,43 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
     plates,
     ...rasterStages === void 0 ? {} : { rasterStages }
   };
+}
+var BACKDROP_TOLERANCE = 24;
+function punchBorderBackdrop(rgba, width, height, sourceBorder) {
+  const corners = [0, width - 1, (height - 1) * width, height * width - 1];
+  if (sourceBorder === null || corners.some((pixel) => (rgba[pixel * 4 + 3] ?? 0) < 250)) return rgba;
+  const corner = cornerColor(rgba, width, height);
+  if (corner === null) return rgba;
+  const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);
+  const near = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
+  const out = new Uint8Array(rgba);
+  const seen = new Uint8Array(width * height);
+  const stack = [];
+  const push = (pixel) => {
+    if (seen[pixel] === 1 || !near(pixel)) return;
+    seen[pixel] = 1;
+    stack.push(pixel);
+  };
+  for (let x = 0; x < width; x += 1) {
+    push(x);
+    push((height - 1) * width + x);
+  }
+  for (let y = 0; y < height; y += 1) {
+    push(y * width);
+    push(y * width + width - 1);
+  }
+  let punched = 0;
+  while (stack.length > 0) {
+    const pixel = stack.pop() ?? 0;
+    out[pixel * 4 + 3] = 0;
+    punched += 1;
+    const x = pixel % width;
+    if (x > 0) push(pixel - 1);
+    if (x < width - 1) push(pixel + 1);
+    if (pixel >= width) push(pixel - width);
+    if (pixel < (height - 1) * width) push(pixel + width);
+  }
+  return punched === width * height ? rgba : out;
 }
 function flatRequest(settings, palette, scale) {
   return {
