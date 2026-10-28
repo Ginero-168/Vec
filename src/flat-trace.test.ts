@@ -341,6 +341,37 @@ test("on an opaque backdrop a traced fillet is sharpened only where the source p
   assert.ok(round.includes("9.6,0"), round);
 });
 
+test("on an opaque backdrop a corner traced as one long bend is refitted with two lines when the source is sharp", () => {
+  // Traced at 8x: a 3 px rounding at (60,60) in source pixels, too long for the fillet rules; the round left side
+  // keeps the shape from fitting as a rectangle.
+  const traced = '<svg viewBox="0 0 1024 1024"><path d="M480,160L480,456C480,476 476,480 456,480L320,480C232,480 160,408 160,320C160,232 232,160 320,160Z" fill="#000000"/></svg>';
+  const source = (radius: number) => {
+    const rgba = new Uint8Array(128 * 128 * 4).fill(255);
+    for (let y = 0; y < 128; y += 1) {
+      for (let x = 0; x < 128; x += 1) {
+        let covered = 0;
+        for (let sy = 0; sy < 8; sy += 1) {
+          for (let sx = 0; sx < 8; sx += 1) {
+            const px = x + (sx + 0.5) / 8;
+            const py = y + (sy + 0.5) / 8;
+            const shape = px >= 20 && px < 60 && py >= 20 && py < 60 && (px >= 40 || Math.hypot(px - 40, py - 40) <= 20);
+            const tip = radius > 0 && px > 60 - radius && py > 60 - radius && Math.hypot(px - (60 - radius), py - (60 - radius)) > radius;
+            if (shape && !tip) covered += 1;
+          }
+        }
+        rgba.fill(Math.round(255 * (1 - covered / 64)), (y * 128 + x) * 4, (y * 128 + x) * 4 + 3);
+      }
+    }
+    return { rgba, width: 128, height: 128 };
+  };
+  const plate = (radius: number) => ({ scale: 8, originX: 0, originY: 0, borderColor: null, cutOut: false, source: source(radius) });
+  const sharp = mergePlates([traced], [plate(0)], 128, 128, null, false);
+  const corner = /60(\.0\d*)?,60(\.0\d*)?|59\.9\d*,59\.9\d*|60(\.0\d*)?,59\.9\d*|59\.9\d*,60(\.0\d*)?/;
+  assert.ok(corner.test(sharp), sharp);
+  const round = mergePlates([traced], [plate(3)], 128, 128, null, false);
+  assert.ok(round.includes("C60,59.5 59.5,60 57,60"), round);
+});
+
 test("a source is a cut-out only when it has see-through pixels", () => {
   const opaque = new Uint8Array(4 * 4).fill(255);
   assert.equal(hasClearPixel(opaque), false);

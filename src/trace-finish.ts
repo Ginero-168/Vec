@@ -1,4 +1,4 @@
-import { fairPaths, relaxPaths, sharpenConfirmed, sharpenCorners, type CornerCheck } from "./edit.ts";
+import { fairPaths, fitRasterCorners, relaxPaths, sharpenConfirmed, sharpenCorners, type ColourAt, type CornerCheck } from "./edit.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps, unifyNearFills } from "./score.ts";
 import { scaleSvg, translateSvg } from "./svg-scale.ts";
 import type { Stacking, TracePreset } from "./trace.ts";
@@ -69,7 +69,31 @@ export function mergePlates(
   // Below 96 px (the JPEG cleanup's line too) a bend of a pixel or two is the icon's own geometry and a corner's
   // pixels are shared with its neighbours: sharpening there cost om-gear-32-white +1.0 MAE and om-grinning-64-q60 +0.14.
   const check = size >= MIN_CHECKED_SIDE ? sourceCheck(plates) : null;
-  return check === null ? fitted : sharpenConfirmed(fitted, fillet, 35, curl, check);
+  if (check === null) return fitted;
+  const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, check);
+  const colour = sourceColour(plates);
+  return colour === null ? sharpened : fitRasterCorners(sharpened, colour, check);
+}
+
+function sourceColour(plates: readonly PlacedPlate[]): ColourAt | null {
+  const source = plates.find((plate) => plate.source !== undefined)?.source;
+  if (source === undefined) return null;
+  const { rgba, width, height } = source;
+  return (x, y) => {
+    const fx = x - 0.5;
+    const fy = y - 0.5;
+    if (fx < 0 || fy < 0 || fx > width - 1 || fy > height - 1) return null;
+    const x0 = Math.min(width - 2, Math.floor(fx));
+    const y0 = Math.min(height - 2, Math.floor(fy));
+    const ax = fx - x0;
+    const ay = fy - y0;
+    const out: [number, number, number] = [0, 0, 0];
+    for (let channel = 0; channel < 3; channel += 1) {
+      const at = (yy: number, xx: number) => rgba[(yy * width + xx) * 4 + channel] ?? 0;
+      out[channel] = (at(y0, x0) * (1 - ax) + at(y0, x0 + 1) * ax) * (1 - ay) + (at(y0 + 1, x0) * (1 - ax) + at(y0 + 1, x0 + 1) * ax) * ay;
+    }
+    return out;
+  };
 }
 
 /**
@@ -132,7 +156,7 @@ function sourceCheck(plates: readonly PlacedPlate[]): CornerCheck | null {
       roundError += (coverage - pixel.round) ** 2;
       sharpError += (coverage - pixel.sharp) ** 2;
     }
-    return sharpError < roundError;
+    return sharpError < SHARP_MARGIN * roundError;
   };
 }
 
@@ -140,6 +164,8 @@ const MIN_CHECKED_SIDE = 96;
 /** Source pixels searched around a cap, beyond its bounds. */
 const REACH = 2;
 const SAMPLES = 8;
+/** Sharp must explain the pixels clearly better than the rounding: near ties flipped round corners (tw-apple-128-q60, om-gear-256-white, gl-figma-128-white). */
+const SHARP_MARGIN = 0.75;
 /** Ink and outside colours closer than this (RGB distance) cannot be told apart by coverage. */
 const MIN_CONTRAST = 48;
 

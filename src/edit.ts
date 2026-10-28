@@ -1203,3 +1203,271 @@ function intersectLines(a: Point, da: Point, b: Point, db: Point): Point | null 
   const t = ((b.x - a.x) * db.y - (b.y - a.y) * db.x) / cross;
   return { x: a.x + da.x * t, y: a.y + da.y * t };
 }
+
+/** Colour of the source raster at a point (path coordinates, bilinear), or null outside it. */
+export type ColourAt = (x: number, y: number) => readonly [number, number, number] | null;
+
+type Station = { readonly point: Point; readonly cubic: number; readonly t: number; readonly at: number };
+
+const FIT_WINDOW = 1.5;
+const FIT_MIN_TURN = 40;
+const FIT_SIDE = [1.25, 1.75, 2.25, 2.75, 3.25, 3.75];
+const FIT_SPLIT = 3.75;
+const FIT_BEND_MAX = 2.5;
+const FIT_STRAIGHT_TURN = 12;
+/** Side reach scales tried in turn: the full reach first, then a short one for corners a few pixels apart. */
+const FIT_SCALES = [1, 0.6];
+const FIT_RESIDUAL = 0.3;
+const FIT_REACH = 2.5;
+const FIT_CONTRAST = 48;
+
+/**
+ * Corners VTracer traced as one long wobbly curve (a teardrop tip, the end of a band). Where the outline turns
+ * sharply within a pixel and a half, the source edge on each side, beyond the bend, is located (the 50% crossing
+ * between the inks on either side, along the outline's normal) and fitted with a line. When both sides are straight
+ * and meet near the bend, the curve between is replaced by the two lines running to their intersection, but only
+ * when `confirm` says the source pixels are better explained that way. A short reach is tried after the full one,
+ * for corners a few pixels apart (the end of a tooth band).
+ */
+export function fitRasterCorners(svg: string, colourAt: ColourAt, confirm: CornerCheck): string {
+  return svg.replace(shapePattern(), (tag) => {
+    if (!/^<path\b/i.test(tag)) return tag;
+    const quoted = readD(tag);
+    if (quoted === null) return tag;
+    const parsed = parsePath(quoted.value);
+    if (parsed === null || parsed.length === 0) return tag;
+    const fill = /\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "";
+    const subpaths = parsed.map((subpath) => ({ cubics: [...subpath.cubics], closed: subpath.closed }));
+    let changed = false;
+    for (let index = 0; index < subpaths.length; index += 1) {
+      // Each accepted corner re-samples the outline; a subpath is bounded by its own candidate count.
+      for (let guard = 0; guard < 16; guard += 1) {
+        const subpath = subpaths[index];
+        if (subpath === undefined) break;
+        const rings = flatten(subpaths);
+        const inside = (x: number, y: number) => insideFlat(rings, x, y);
+        const next = fitOneCorner(subpath, colourAt, (cap) => confirm(fill, cap, inside), inside);
+        if (next === null) break;
+        subpaths[index] = next;
+        changed = true;
+      }
+    }
+    if (!changed) return tag;
+    return tag.slice(0, quoted.start) + serialize(subpaths) + tag.slice(quoted.end);
+  });
+}
+
+function stations(cubics: readonly Cubic[]): Station[] {
+  const out: Station[] = [];
+  let at = 0;
+  let previous: Point | null = null;
+  cubics.forEach((cubic, index) => {
+    const steps = Math.max(2, Math.ceil(chord(cubic) / 0.2));
+    for (let step = 0; step < steps; step += 1) {
+      const t = step / steps;
+      const point = bezier(cubic, t);
+      if (previous !== null) at += distance(previous, point);
+      out.push({ point, cubic: index, t, at });
+      previous = point;
+    }
+  });
+  return out;
+}
+
+function fitOneCorner(
+  subpath: Subpath,
+  colourAt: ColourAt,
+  check: (cap: readonly Point[]) => boolean,
+  inside: (x: number, y: number) => boolean
+): Subpath | null {
+  if (!subpath.closed || subpath.cubics.length < 2) return null;
+  const list = stations(subpath.cubics);
+  const last = list[list.length - 1];
+  const first = list[0];
+  if (last === undefined || first === undefined) return null;
+  const total = last.at + distance(last.point, first.point);
+  if (total < 4 * FIT_SPLIT * Math.min(...FIT_SCALES)) return null;
+  const pointAt = (at: number): Station => {
+    const wrapped = ((at % total) + total) % total;
+    let low = 0;
+    let high = list.length - 1;
+    while (low < high) {
+      const middle = (low + high + 1) >> 1;
+      if ((list[middle]?.at ?? 0) <= wrapped) low = middle;
+      else high = middle - 1;
+    }
+    return list[low] ?? first;
+  };
+  const turnAt = (station: Station): number => {
+    const back = pointAt(station.at - FIT_WINDOW).point;
+    const ahead = pointAt(station.at + FIT_WINDOW).point;
+    const into = unit({ x: station.point.x - back.x, y: station.point.y - back.y });
+    const out = unit({ x: ahead.x - station.point.x, y: ahead.y - station.point.y });
+    return into === null || out === null ? 0 : (angleBetween(into, out) * 180) / Math.PI;
+  };
+  // Corners already sharp (a tangent break at a joint) are not fitted again.
+  const breaks = list.filter((station) => {
+    if (station.t !== 0) return false;
+    const previous = subpath.cubics[(station.cubic - 1 + subpath.cubics.length) % subpath.cubics.length];
+    const current = subpath.cubics[station.cubic];
+    return previous !== undefined && current !== undefined && angleBetween(incoming(previous), outgoing(current)) >= (30 * Math.PI) / 180;
+  }).map((station) => station.at);
+  const turns = list.map(turnAt);
+  const localTurn = (at: number): number => {
+    const here = pointAt(at).point;
+    const back = pointAt(at - 0.5).point;
+    const ahead = pointAt(at + 0.5).point;
+    const into = unit({ x: here.x - back.x, y: here.y - back.y });
+    const out = unit({ x: ahead.x - here.x, y: ahead.y - here.y });
+    return into === null || out === null ? 0 : (angleBetween(into, out) * 180) / Math.PI;
+  };
+  const candidates: number[] = [];
+  for (let index = 0; index < list.length; index += 1) {
+    const turn = turns[index] ?? 0;
+    if (turn < FIT_MIN_TURN) continue;
+    let peak = true;
+    for (let other = 0; other < list.length && peak; other += 1) {
+      const gap = Math.abs((list[other]?.at ?? 0) - (list[index]?.at ?? 0));
+      if (other !== index && Math.min(gap, total - gap) <= 1 && (turns[other] ?? 0) > turn) peak = false;
+    }
+    if (peak) candidates.push(index);
+  }
+  for (const index of candidates) {
+    const centre = list[index];
+    if (centre === undefined) continue;
+    if (breaks.some((at) => Math.min(Math.abs(at - centre.at), total - Math.abs(at - centre.at)) <= 1)) continue;
+    // The side lines are fitted beyond the bend: where the outline stops turning on each side.
+    const bendEnd = (sign: -1 | 1): number => {
+      for (let reach = 0; reach <= FIT_BEND_MAX; reach += 0.125) if (localTurn(centre.at + sign * reach) < FIT_STRAIGHT_TURN) return reach;
+      return FIT_BEND_MAX;
+    };
+    const bendBefore = bendEnd(-1);
+    const bendAfter = bendEnd(1);
+    for (const scale of FIT_SCALES) {
+      const spanBefore = bendBefore + FIT_SPLIT * scale;
+      const spanAfter = bendAfter + FIT_SPLIT * scale;
+      if (total < 2 * (spanBefore + spanAfter)) continue;
+      const before = sideLine(centre.at, -1, FIT_SIDE.map((offset) => bendBefore + offset * scale), pointAt, colourAt, inside);
+      const after = sideLine(centre.at, 1, FIT_SIDE.map((offset) => bendAfter + offset * scale), pointAt, colourAt, inside);
+      if (before === null || after === null) continue;
+      if (angleBetween(before.direction, after.direction) < (35 * Math.PI) / 180) continue;
+      const meet = intersectLines(before.origin, before.direction, after.origin, after.direction);
+      if (meet === null || distance(meet, centre.point) > FIT_REACH * scale + Math.max(bendBefore, bendAfter)) continue;
+      const start = pointAt(centre.at - spanBefore);
+      const end = pointAt(centre.at + spanAfter);
+      // The meeting point must lie ahead of the incoming side and behind the outgoing one.
+      if ((meet.x - start.point.x) * before.direction.x + (meet.y - start.point.y) * before.direction.y <= 0) continue;
+      if ((end.point.x - meet.x) * after.direction.x + (end.point.y - meet.y) * after.direction.y <= 0) continue;
+      const cap: Point[] = [];
+      for (let at = centre.at - spanBefore; at <= centre.at + spanAfter; at += 0.2) cap.push(pointAt(at).point);
+      cap.push(end.point, { ...meet });
+      if (!check(cap)) continue;
+      return spliceCorner(subpath, start, end, meet);
+    }
+  }
+  return null;
+}
+
+/** The source edge on one side of a bend: snapped points along the outline, fitted with a line pointing along travel. */
+function sideLine(
+  centre: number,
+  side: -1 | 1,
+  offsets: readonly number[],
+  pointAt: (at: number) => Station,
+  colourAt: ColourAt,
+  inside: (x: number, y: number) => boolean
+): { readonly origin: Point; readonly direction: Point } | null {
+  const snapped: Point[] = [];
+  for (const offset of offsets) {
+    const here = pointAt(centre + side * offset).point;
+    const a = pointAt(centre + side * offset - 0.3).point;
+    const b = pointAt(centre + side * offset + 0.3).point;
+    const tangent = unit({ x: b.x - a.x, y: b.y - a.y });
+    if (tangent === null) return null;
+    let normal = { x: tangent.y, y: -tangent.x };
+    const outA = inside(here.x + normal.x * 0.6, here.y + normal.y * 0.6);
+    const outB = inside(here.x - normal.x * 0.6, here.y - normal.y * 0.6);
+    if (outA === outB) return null;
+    if (outA) normal = { x: -normal.x, y: -normal.y };
+    const ink = colourAt(here.x - normal.x * 2, here.y - normal.y * 2);
+    const away = colourAt(here.x + normal.x * 2, here.y + normal.y * 2);
+    if (ink === null || away === null) return null;
+    const span = [away[0] - ink[0], away[1] - ink[1], away[2] - ink[2]] as const;
+    const spanSquared = span[0] ** 2 + span[1] ** 2 + span[2] ** 2;
+    if (spanSquared < FIT_CONTRAST ** 2) return null;
+    const mix = (k: number): number | null => {
+      const colour = colourAt(here.x + normal.x * k, here.y + normal.y * k);
+      if (colour === null) return null;
+      return ((colour[0] - ink[0]) * span[0] + (colour[1] - ink[1]) * span[1] + (colour[2] - ink[2]) * span[2]) / spanSquared;
+    };
+    let crossing: number | null = null;
+    for (let step = 0; step <= 12 && crossing === null; step += 1) {
+      for (const sign of [1, -1]) {
+        const k0 = sign * step * 0.125;
+        const k1 = k0 + 0.125;
+        const m0 = mix(k0);
+        const m1 = mix(k1);
+        if (m0 === null || m1 === null) continue;
+        if ((m0 - 0.5) * (m1 - 0.5) <= 0 && m0 !== m1) {
+          crossing = k0 + ((0.5 - m0) / (m1 - m0)) * 0.125;
+          break;
+        }
+      }
+    }
+    if (crossing === null) return null;
+    snapped.push({ x: here.x + normal.x * crossing, y: here.y + normal.y * crossing });
+  }
+  const mean = snapped.reduce((sum, point) => ({ x: sum.x + point.x / snapped.length, y: sum.y + point.y / snapped.length }), { x: 0, y: 0 });
+  let xx = 0;
+  let xy = 0;
+  let yy = 0;
+  for (const point of snapped) {
+    xx += (point.x - mean.x) ** 2;
+    xy += (point.x - mean.x) * (point.y - mean.y);
+    yy += (point.y - mean.y) ** 2;
+  }
+  const angle = 0.5 * Math.atan2(2 * xy, xx - yy);
+  let direction = { x: Math.cos(angle), y: Math.sin(angle) };
+  const residual = Math.sqrt(snapped.reduce((sum, point) => sum + ((point.x - mean.x) * direction.y - (point.y - mean.y) * direction.x) ** 2, 0) / snapped.length);
+  if (residual > FIT_RESIDUAL) return null;
+  const firstPoint = snapped[0];
+  const lastPoint = snapped[snapped.length - 1];
+  if (firstPoint === undefined || lastPoint === undefined) return null;
+  // Travel runs toward the bend on the incoming side and away from it on the outgoing side.
+  const travel = side < 0 ? { x: firstPoint.x - lastPoint.x, y: firstPoint.y - lastPoint.y } : { x: lastPoint.x - firstPoint.x, y: lastPoint.y - firstPoint.y };
+  if (travel.x * direction.x + travel.y * direction.y < 0) direction = { x: -direction.x, y: -direction.y };
+  return { origin: mean, direction };
+}
+
+/** Replace the outline from `start` to `end` (in travel order) with two lines meeting at `meet`. */
+function spliceCorner(subpath: Subpath, start: Station, end: Station, meet: Point): Subpath | null {
+  const count = subpath.cubics.length;
+  const rotated = [...subpath.cubics.slice(start.cubic), ...subpath.cubics.slice(0, start.cubic)];
+  const endIndex = (end.cubic - start.cubic + count) % count;
+  if (endIndex === 0 && end.t <= start.t) return null;
+  const head = rotated[0];
+  const tail = rotated[endIndex];
+  if (head === undefined || tail === undefined) return null;
+  const cubics: Cubic[] = [];
+  if (endIndex === 0) {
+    const [kept, rest] = splitCubic(head, start.t);
+    const [, after] = splitCubic(rest, (end.t - start.t) / (1 - start.t));
+    if (start.t > 0) cubics.push(kept);
+    cubics.push(line(kept.p3, meet), line(meet, after.p0), after);
+    for (let index = 1; index < count; index += 1) {
+      const cubic = rotated[index];
+      if (cubic !== undefined) cubics.push(cubic);
+    }
+  } else {
+    const kept = splitCubic(head, start.t)[0];
+    const after = splitCubic(tail, end.t)[1];
+    if (start.t > 0) cubics.push(kept);
+    cubics.push(line(kept.p3, meet), line(meet, after.p0));
+    if (end.t < 1) cubics.push(after);
+    for (let index = endIndex + 1; index < count; index += 1) {
+      const cubic = rotated[index];
+      if (cubic !== undefined) cubics.push(cubic);
+    }
+  }
+  return { cubics, closed: true };
+}
