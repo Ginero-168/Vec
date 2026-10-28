@@ -26,6 +26,7 @@ type Token = { cmd: string; args: number[] };
 type AnchorLoc = { subIndex: number; kind: "start" | "end"; cubicIndex: number };
 
 const ARG_COUNT: Readonly<Record<string, number>> = { m: 2, l: 2, h: 1, v: 1, c: 6, z: 0 };
+const sampledCubics = new WeakMap<Cubic, readonly Point[]>();
 
 function shapePattern(): RegExp {
   return /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
@@ -525,10 +526,11 @@ function splitIndex(samples: readonly Point[], errorIndex: number): number {
 function farthest(samples: readonly Point[], cubic: Cubic): { readonly distance: number; readonly index: number } {
   let distanceWorst = 0;
   let index = 0;
+  const curveSamples = sampleCubic(cubic);
   for (let sampleIndex = 1; sampleIndex < samples.length - 1; sampleIndex += 1) {
     const point = samples[sampleIndex];
     if (point === undefined) continue;
-    const error = distanceToCubic(point, cubic);
+    const error = distanceToCubicSamples(point, curveSamples);
     if (error > distanceWorst) {
       distanceWorst = error;
       index = sampleIndex;
@@ -552,12 +554,24 @@ function distanceToSegment(point: Point, start: Point, end: Point): number {
   return distance(point, { x: start.x + dx * t, y: start.y + dy * t });
 }
 
-function distanceToCubic(point: Point, cubic: Cubic): number {
-  let best = Infinity;
-  for (let step = 0; step <= 24; step += 1) {
-    best = Math.min(best, distance(point, bezier(cubic, step / 24)));
+function sampleCubic(cubic: Cubic): readonly Point[] {
+  const cached = sampledCubics.get(cubic);
+  if (cached !== undefined) return cached;
+  const samples: Point[] = [];
+  for (let step = 0; step <= 24; step += 1) samples.push(bezier(cubic, step / 24));
+  sampledCubics.set(cubic, samples);
+  return samples;
+}
+
+function distanceToCubicSamples(point: Point, samples: readonly Point[]): number {
+  let bestSquared = Infinity;
+  for (const sample of samples) {
+    const dx = point.x - sample.x;
+    const dy = point.y - sample.y;
+    const squared = dx * dx + dy * dy;
+    if (squared < bestSquared) bestSquared = squared;
   }
-  return best;
+  return Math.sqrt(bestSquared);
 }
 
 function tangentAt(samples: readonly Point[], index: number): Point {
@@ -595,7 +609,8 @@ function fitCubic(samples: readonly Point[], tanStart: Point, tanEnd: Point): Cu
 
 function cubicError(samples: readonly Point[], cubic: Cubic): number {
   let worst = 0;
-  for (const sample of samples) worst = Math.max(worst, distanceToCubic(sample, cubic));
+  const curveSamples = sampleCubic(cubic);
+  for (const sample of samples) worst = Math.max(worst, distanceToCubicSamples(sample, curveSamples));
   return worst;
 }
 
