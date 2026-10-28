@@ -37,7 +37,8 @@ export function planTrace(
   controls?: LabControls,
   previousStages: LabRasterStages | null = null,
   from: LabStepId = "colors",
-  onProgress?: PipelineProgress
+  onProgress?: PipelineProgress,
+  substituteColors?: SegmentColorStage | null
 ): TracePlan | null {
   const decoded = readRgbaPng(source);
   if (decoded === null) return null;
@@ -50,7 +51,7 @@ export function planTrace(
       onProgress?.("punch", 1);
       return plan;
     }
-    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress);
+    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, substituteColors);
     return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, rasterStages);
   }
   if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);
