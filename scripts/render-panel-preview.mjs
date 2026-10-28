@@ -40,7 +40,7 @@ const mockScript = `
         control.classList.add("is-modified");
         const marker = document.createElement("div");
         marker.className = "control-state";
-        marker.innerHTML = "<span>แก้ไขแล้ว</span><button class=\"control-reset\" type=\"button\">คืนค่า preset</button>";
+        marker.innerHTML = "<span>แก้ไขแล้ว</span><button class='control-reset' type='button'>คืนค่า preset</button>";
         const anchor = control.type === "checkbox" ? control.closest("label") : control;
         marker.querySelector("button").setAttribute("aria-label", "คืนค่า preset: " + label);
         anchor.insertAdjacentElement("afterend", marker);
