@@ -237,7 +237,8 @@ export function labelImage(
   const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
   // A preprocess that returned new pixels cleaned a lossy raster: fold the near-duplicate centres its noise split.
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-  const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
+  const edges = source !== rgba ? lossyEdges(source, count, centers) : undefined;
+  const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
@@ -288,7 +289,8 @@ async function labelImageAsync(
   const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   onProgress(0.26);
-  const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
+  const edges = source !== rgba ? lossyEdges(source, count, centers) : undefined;
+  const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers);
   onProgress(0.94);
   const painted = await paintLabelsAsync(labels, colors, width * UP, height * UP, context, (fraction) => onProgress(0.94 + fraction * 0.06));
@@ -345,7 +347,8 @@ async function assignLabelsAsync(
   height: number,
   centers: Lab[],
   context: CooperativeContext,
-  onProgress: (fraction: number) => void
+  onProgress: (fraction: number) => void,
+  edges?: LossyEdges
 ): Promise<Uint8Array> {
   const count = width * height;
   const kCount = centers.length;
@@ -433,8 +436,9 @@ async function assignLabelsAsync(
               labels[at] = bits[0] ?? 0;
               continue;
             }
-            const sample = bicubicLabAt(linear, width, bicubic, ux, uy);
-            labels[at] = explain(sample, bits, centers);
+            labels[at] = edges === undefined
+              ? explain(bicubicLabAt(linear, width, bicubic, ux, uy), bits, centers)
+              : explainLossy(edges, width, bicubic, ux, uy, bits, centers);
           }
         }
       }
@@ -702,7 +706,7 @@ async function paintLabelsAsync(labels: Uint8Array, colors: readonly RGB[], widt
   return { rgba, width, height, palette };
 }
 
-function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, opacity: Uint8Array, width: number, height: number, centers: Lab[], onProgress?: (fraction: number) => void): Uint8Array {
+function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, opacity: Uint8Array, width: number, height: number, centers: Lab[], onProgress?: (fraction: number) => void, edges?: LossyEdges): Uint8Array {
   const count = width * height;
   const kCount = centers.length;
   const coreLabel = new Int16Array(count);
@@ -786,8 +790,9 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
               labels[at] = bits[0] ?? 0;
               continue;
             }
-            const sample = bicubicLabAt(linear, width, bicubic, ux, uy);
-            labels[at] = explain(sample, bits, centers);
+            labels[at] = edges === undefined
+              ? explain(bicubicLabAt(linear, width, bicubic, ux, uy), bits, centers)
+              : explainLossy(edges, width, bicubic, ux, uy, bits, centers);
           }
         }
       }
@@ -1121,7 +1126,58 @@ function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number, 
   return nearest;
 }
 
-function explain(sample: Lab, bits: readonly number[], centers: readonly Lab[]): number {
+// A lossy (JPEG) edge is decided mostly in gamma-encoded sRGB, where the encoder and every rasteriser mixed it: a pixel
+// half covered by blue on white is the sRGB midpoint of the two. Interpolating in linear light and splitting at the
+// OKLab midpoint put the switch near 57% blue instead, and on the 2-3 px wide ramps q60 leaves, that moved each
+// saturated ink 0.1-0.2 px into white (gl-figma-128-q60's blue circle +0.18 px). The split is 0.7 sRGB, 0.3 OKLab:
+// q60 also quantises luma, and on long straight ink/white edges that pulls the sRGB 50% point up to 0.2 px into the
+// ink; the pure sRGB split grew gl-microsoft-128-q60's white gap 10% (worst IoU 0.984 -> 0.906). Weights 0.5-0.8 keep
+// that gap at IoU 0.95-0.98; 0.85 and up do not. Clean rasters keep the linear/OKLab rule.
+const LOSSY_SRGB_WEIGHT = 0.7;
+
+type LossyEdges = { readonly srgb: Float64Array; readonly centers: readonly RGB[] };
+
+function lossyEdges(source: Uint8Array, count: number, centers: readonly Lab[]): LossyEdges {
+  const srgb = new Float64Array(count * 3);
+  for (let index = 0; index < count; index += 1) {
+    srgb[index * 3] = source[index * 4] ?? 0;
+    srgb[index * 3 + 1] = source[index * 4 + 1] ?? 0;
+    srgb[index * 3 + 2] = source[index * 4 + 2] ?? 0;
+  }
+  return { srgb, centers: centers.map((center) => oklabToRgb(center)) };
+}
+
+function explainLossy(edges: LossyEdges, width: number, table: BicubicTable, x: number, y: number, bits: readonly number[], centers: readonly Lab[]): number {
+  const xOffset = x * 4;
+  const yOffset = y * 4;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  for (let ky = 0; ky < 4; ky += 1) {
+    const weightY = table.yWeights[yOffset + ky]!;
+    const sampleY = table.yIndices[yOffset + ky]!;
+    for (let kx = 0; kx < 4; kx += 1) {
+      const weight = weightY * table.xWeights[xOffset + kx]!;
+      const offset = (sampleY * width + table.xIndices[xOffset + kx]!) * 3;
+      red += edges.srgb[offset]! * weight;
+      green += edges.srgb[offset + 1]! * weight;
+      blue += edges.srgb[offset + 2]! * weight;
+    }
+  }
+  const rgb = { r: Math.min(255, Math.max(0, red)), g: Math.min(255, Math.max(0, green)), b: Math.min(255, Math.max(0, blue)) };
+  return explain(rgbToOklab(rgb), bits, centers, (a, b, oklab) => {
+    const from = edges.centers[a]!;
+    const to = edges.centers[b]!;
+    const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
+    const length = dr * dr + dg * dg + db * db;
+    const srgb = length === 0 ? oklab : ((rgb.r - from.r) * dr + (rgb.g - from.g) * dg + (rgb.b - from.b) * db) / length;
+    return LOSSY_SRGB_WEIGHT * srgb + (1 - LOSSY_SRGB_WEIGHT) * oklab;
+  });
+}
+
+/** The label that explains `sample`: the nearest centre, or the nearer end of the nearest two-centre mix. `mix` gives
+ * the sample's position between two centres when the OKLab projection is not the right measure (lossy edges). */
+function explain(sample: Lab, bits: readonly number[], centers: readonly Lab[], mix?: (a: number, b: number, oklab: number) => number): number {
   let best = bits[0] ?? 0;
   let bestDistance = Infinity;
   for (const label of bits) {
@@ -1144,7 +1200,7 @@ function explain(sample: Lab, bits: readonly number[], centers: readonly Lab[]):
       const projected = projectLab(sample, first, second);
       if (projected.distance < bestDistance) {
         bestDistance = projected.distance;
-        best = projected.t < 0.5 ? a : b;
+        best = (mix === undefined ? projected.t : mix(a, b, projected.t)) < 0.5 ? a : b;
       }
     }
   }

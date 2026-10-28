@@ -446,3 +446,24 @@ test("JPEG cleanup is chosen once per source and never for clean or small raster
   for (let at = 0; at < tall.length; at += 4) tall.fill(220 + (((at / 4) * 7919) % 29), at, at + 3);
   assert.notEqual(lossyCleanup(tall, 86, 128), undefined);
 });
+
+test("a lossy edge splits a half-covered pixel at its sRGB midpoint, not the OKLab one", () => {
+  // Blue on white with one column at 50% coverage, mixed in sRGB as a JPEG encoder and a rasteriser mix it. The edge
+  // belongs in the middle of that column (16.5 px). A preprocess that returns new pixels marks the raster as lossy.
+  const blue = [26, 188, 254] as const;
+  const image = fill(32, 16, 255, 255, 255, 255);
+  for (let y = 0; y < 16; y += 1) {
+    for (let x = 0; x < 16; x += 1) setPixel(image, 32, x, y, blue[0], blue[1], blue[2], 255);
+    setPixel(image, 32, 16, y, Math.round((blue[0] + 255) / 2), Math.round((blue[1] + 255) / 2), 255, 255);
+  }
+  const blueRun = (painted: { rgba: Uint8Array; width: number }) => {
+    const row = 8 * 8 + 4;
+    let count = 0;
+    for (let x = 0; x < painted.width; x += 1) if ((painted.rgba[(row * painted.width + x) * 4] ?? 255) < 140) count += 1;
+    return count / 8;
+  };
+  const lossy = blueRun(labelImage(image.rgba, 32, 16, 2, (rgba) => rgba.slice()));
+  assert.ok(Math.abs(lossy - 16.5) < 1 / 16, `lossy edge at ${lossy}`);
+  // The clean rule (linear interpolation, OKLab midpoint) keeps its own split: blue takes 5/8 of the column.
+  assert.equal(blueRun(labelImage(image.rgba, 32, 16, 2)), 16.625);
+});
