@@ -111,9 +111,9 @@
       }
       const locations = anchorLocations(parsed);
       for (let anchorIndex = 0; anchorIndex < locations.length; anchorIndex += 1) {
-        const point = pointOf(parsed, locations[anchorIndex]);
-        if (point === null) continue;
-        anchors.push({ pathIndex, anchorIndex, x: point.x, y: point.y });
+        const point2 = pointOf(parsed, locations[anchorIndex]);
+        if (point2 === null) continue;
+        anchors.push({ pathIndex, anchorIndex, x: point2.x, y: point2.y });
       }
       pathIndex += 1;
     }
@@ -291,9 +291,9 @@
     let at = -1;
     for (let index = 1; index < chain.length - 1; index += 1) {
       const pointIndex = chain[index] ?? 0;
-      const point = points[pointIndex];
-      if (point === void 0) continue;
-      const gap = distanceToSegment(point, start2, end);
+      const point2 = points[pointIndex];
+      if (point2 === void 0) continue;
+      const gap = distanceToSegment(point2, start2, end);
       if (gap > worst) {
         worst = gap;
         at = pointIndex;
@@ -322,9 +322,9 @@
       const origin = points[start2];
       if (origin === void 0) continue;
       for (let index = start2 + 1; index < points.length; index += 1) {
-        const point = points[index];
-        if (point === void 0) continue;
-        const gap = distance(origin, point);
+        const point2 = points[index];
+        if (point2 === void 0) continue;
+        const gap = distance(origin, point2);
         if (gap > best) {
           best = gap;
           left = start2;
@@ -340,9 +340,9 @@
     let best = 0;
     let at = origin;
     for (let index = 0; index < points.length; index += 1) {
-      const point = points[index];
-      if (point === void 0) continue;
-      const gap = distance(start2, point);
+      const point2 = points[index];
+      if (point2 === void 0) continue;
+      const gap = distance(start2, point2);
       if (gap > best) {
         best = gap;
         at = index;
@@ -481,9 +481,9 @@
     let bulge = 0;
     let at = Math.max(1, Math.floor(last / 2));
     for (let index = 2; index <= last - 2; index += 1) {
-      const point = samples[index];
-      if (point === void 0) continue;
-      const error = distanceToSegment(point, first, end);
+      const point2 = samples[index];
+      if (point2 === void 0) continue;
+      const error = distanceToSegment(point2, first, end);
       if (error > bulge) {
         bulge = error;
         at = index;
@@ -495,9 +495,9 @@
     let distanceWorst = 0;
     let index = 0;
     for (let sampleIndex = 1; sampleIndex < samples.length - 1; sampleIndex += 1) {
-      const point = samples[sampleIndex];
-      if (point === void 0) continue;
-      const error = distanceToCubic(point, cubic);
+      const point2 = samples[sampleIndex];
+      if (point2 === void 0) continue;
+      const error = distanceToCubic(point2, cubic);
       if (error > distanceWorst) {
         distanceWorst = error;
         index = sampleIndex;
@@ -507,21 +507,21 @@
   }
   function maxSegmentDistance(samples, start2, end) {
     let worst = 0;
-    for (const point of samples) worst = Math.max(worst, distanceToSegment(point, start2, end));
+    for (const point2 of samples) worst = Math.max(worst, distanceToSegment(point2, start2, end));
     return worst;
   }
-  function distanceToSegment(point, start2, end) {
+  function distanceToSegment(point2, start2, end) {
     const dx = end.x - start2.x;
     const dy = end.y - start2.y;
     const lengthSquared = dx * dx + dy * dy;
-    if (lengthSquared < 1e-8) return distance(point, start2);
-    const t = Math.min(1, Math.max(0, ((point.x - start2.x) * dx + (point.y - start2.y) * dy) / lengthSquared));
-    return distance(point, { x: start2.x + dx * t, y: start2.y + dy * t });
+    if (lengthSquared < 1e-8) return distance(point2, start2);
+    const t = Math.min(1, Math.max(0, ((point2.x - start2.x) * dx + (point2.y - start2.y) * dy) / lengthSquared));
+    return distance(point2, { x: start2.x + dx * t, y: start2.y + dy * t });
   }
-  function distanceToCubic(point, cubic) {
+  function distanceToCubic(point2, cubic) {
     let best = Infinity;
     for (let step = 0; step <= 24; step += 1) {
-      best = Math.min(best, distance(point, bezier(cubic, step / 24)));
+      best = Math.min(best, distance(point2, bezier(cubic, step / 24)));
     }
     return best;
   }
@@ -665,13 +665,13 @@
     const dot = Math.min(1, Math.max(-1, a.x * b.x + a.y * b.y));
     return Math.acos(dot) * 180 / Math.PI;
   }
-  function unit(point) {
-    const length = lengthOf(point);
+  function unit(point2) {
+    const length = lengthOf(point2);
     if (length < 1e-6) return null;
-    return { x: point.x / length, y: point.y / length };
+    return { x: point2.x / length, y: point2.y / length };
   }
-  function lengthOf(point) {
-    return Math.hypot(point.x, point.y);
+  function lengthOf(point2) {
+    return Math.hypot(point2.x, point2.y);
   }
   function distance(a, b) {
     return Math.hypot(a.x - b.x, a.y - b.y);
@@ -736,8 +736,8 @@
       return { cubics, closed: subpath.closed };
     });
   }
-  function shift(point, dx, dy) {
-    return { x: point.x + dx, y: point.y + dy };
+  function shift(point2, dx, dy) {
+    return { x: point2.x + dx, y: point2.y + dy };
   }
   function serialize(subpaths) {
     return subpaths.map((subpath) => {
@@ -748,8 +748,8 @@
       return commands.join("");
     }).join("");
   }
-  function pair(point) {
-    return fmt(point.x) + "," + fmt(point.y);
+  function pair(point2) {
+    return fmt(point2.x) + "," + fmt(point2.y);
   }
   function fmt(value) {
     const rounded = Math.round(value * 100) / 100;
@@ -1075,6 +1075,14 @@
     let value = index;
     for (let bit = 0; bit < 8; bit += 1) value = (value & 1) === 1 ? 3988292384 ^ value >>> 1 : value >>> 1;
     CRC_TABLE[index] = value;
+  }
+  function readPngDimensions(png) {
+    if (png.length < 33 || !png.subarray(0, 8).equals(pngSignature())) return null;
+    if (png.readUInt32BE(8) !== 13 || png.toString("ascii", 12, 16) !== "IHDR") return null;
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    if (width === 0 || height === 0) return null;
+    return { width, height };
   }
   function punchTransparency(png, opaqueAt = 128) {
     const image = readRgbaPng(png);
@@ -1452,11 +1460,11 @@
     let right = false;
     let top = false;
     let bottom = false;
-    for (const point of measured.samples) {
-      if (point.x <= 1) left = true;
-      if (point.y <= 1) top = true;
-      if (point.x >= width - 1) right = true;
-      if (point.y >= height - 1) bottom = true;
+    for (const point2 of measured.samples) {
+      if (point2.x <= 1) left = true;
+      if (point2.y <= 1) top = true;
+      if (point2.x >= width - 1) right = true;
+      if (point2.y >= height - 1) bottom = true;
     }
     return Number(left) + Number(right) + Number(top) + Number(bottom);
   }
@@ -1537,11 +1545,11 @@
     let right = false;
     let top = false;
     let bottom = false;
-    for (const point of measured.samples) {
-      const nearLeft = Math.abs(point.x - measured.minX);
-      const nearRight = Math.abs(point.x - measured.maxX);
-      const nearTop = Math.abs(point.y - measured.minY);
-      const nearBottom = Math.abs(point.y - measured.maxY);
+    for (const point2 of measured.samples) {
+      const nearLeft = Math.abs(point2.x - measured.minX);
+      const nearRight = Math.abs(point2.x - measured.maxX);
+      const nearTop = Math.abs(point2.y - measured.minY);
+      const nearBottom = Math.abs(point2.y - measured.maxY);
       if (Math.min(nearLeft, nearRight, nearTop, nearBottom) > tolerance) return null;
       if (nearLeft <= tolerance) left = true;
       if (nearRight <= tolerance) right = true;
@@ -1583,9 +1591,9 @@
     let maxError = 0;
     let arc = false;
     let side = false;
-    for (const point of measured.samples) {
-      const qx = Math.abs(point.x - cx) - (halfW - radius);
-      const qy = Math.abs(point.y - cy) - (halfH - radius);
+    for (const point2 of measured.samples) {
+      const qx = Math.abs(point2.x - cx) - (halfW - radius);
+      const qy = Math.abs(point2.y - cy) - (halfH - radius);
       const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0));
       const inside = Math.min(Math.max(qx, qy), 0);
       maxError = Math.max(maxError, Math.abs(outside + inside - radius));
@@ -1606,9 +1614,9 @@
     let sumY3 = 0;
     let sumX2Y = 0;
     let sumXY2 = 0;
-    for (const point of points) {
-      const x = point.x;
-      const y = point.y;
+    for (const point2 of points) {
+      const x = point2.x;
+      const y = point2.y;
       const x2 = x * x;
       const y2 = y * y;
       sumX += x;
@@ -1632,11 +1640,11 @@
     const cx = (d * c - b * e) / denom;
     const cy = (a * e - b * d) / denom;
     let radius = 0;
-    for (const point of points) radius += Math.hypot(point.x - cx, point.y - cy);
+    for (const point2 of points) radius += Math.hypot(point2.x - cx, point2.y - cy);
     radius /= count;
     if (!(radius > 1.5)) return null;
     let maxError = 0;
-    for (const point of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point.x - cx, point.y - cy) - radius));
+    for (const point2 of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point2.x - cx, point2.y - cy) - radius));
     if (maxError > Math.max(1.25, radius * 0.04)) return null;
     const expected = Math.PI * radius * radius;
     if (Math.abs(measured.area - expected) / expected > 0.12) return null;
@@ -1651,8 +1659,8 @@
     const cx = (measured.minX + measured.maxX) / 2;
     const cy = (measured.minY + measured.maxY) / 2;
     let maxError = 0;
-    for (const point of measured.samples) {
-      maxError = Math.max(maxError, Math.abs(Math.hypot((point.x - cx) / rx, (point.y - cy) / ry) - 1));
+    for (const point2 of measured.samples) {
+      maxError = Math.max(maxError, Math.abs(Math.hypot((point2.x - cx) / rx, (point2.y - cy) / ry) - 1));
     }
     if (maxError > 0.04) return null;
     const expected = Math.PI * rx * ry;
@@ -1847,11 +1855,11 @@
     let maxY = -Infinity;
     let open = [];
     const subs = [];
-    function track(point) {
-      if (point.x < minX) minX = point.x;
-      if (point.y < minY) minY = point.y;
-      if (point.x > maxX) maxX = point.x;
-      if (point.y > maxY) maxY = point.y;
+    function track(point2) {
+      if (point2.x < minX) minX = point2.x;
+      if (point2.y < minY) minY = point2.y;
+      if (point2.x > maxX) maxX = point2.x;
+      if (point2.y > maxY) maxY = point2.y;
     }
     function finish() {
       if (open.length === 0) return;
@@ -1862,9 +1870,9 @@
       const closing = open.length > 0 && Math.hypot(x - sx, y - sy) < 0.05;
       if (!closing) anchors += 1;
       if (!curve && (!closing || open.length === 0)) {
-        const point = { x, y };
-        open.push(point);
-        track(point);
+        const point2 = { x, y };
+        open.push(point2);
+        track(point2);
       }
       cx = x;
       cy = y;
@@ -1891,9 +1899,9 @@
         const start2 = { x: cx, y: cy };
         const cubic = curveControls(op, relative, args, start2, prevControl);
         for (const t of [0.25, 0.5, 0.75, 1]) {
-          const point = bezier2(start2, cubic.p1, cubic.p2, cubic.p3, t);
-          open.push(point);
-          track(point);
+          const point2 = bezier2(start2, cubic.p1, cubic.p2, cubic.p3, t);
+          open.push(point2);
+          track(point2);
         }
         prevControl = cubic.control;
         addAnchor(cubic.p3.x, cubic.p3.y, true);
@@ -1902,9 +1910,9 @@
         addAnchor(end.x, end.y, false);
       } else if (op === "z") {
         if (Math.hypot(cx - sx, cy - sy) >= 0.05) {
-          const point = { x: sx, y: sy };
-          open.push(point);
-          track(point);
+          const point2 = { x: sx, y: sy };
+          open.push(point2);
+          track(point2);
         }
         cx = sx;
         cy = sy;
@@ -1951,9 +1959,9 @@
     const p3 = { x: abs(0, "x"), y: abs(1, "y") };
     return { p1: control, p2: control, p3, control };
   }
-  function reflect(control, point) {
-    if (control === null) return point;
-    return { x: point.x * 2 - control.x, y: point.y * 2 - control.y };
+  function reflect(control, point2) {
+    if (control === null) return point2;
+    return { x: point2.x * 2 - control.x, y: point2.y * 2 - control.y };
   }
   function arcEnd(relative, args, cx, cy) {
     const x = args[5] ?? 0;
@@ -1995,23 +2003,23 @@
   function centroid(points) {
     let x = 0;
     let y = 0;
-    for (const point of points) {
-      x += point.x;
-      y += point.y;
+    for (const point2 of points) {
+      x += point2.x;
+      y += point2.y;
     }
     const count = points.length || 1;
     return { x: x / count, y: y / count };
   }
-  function pointInPoly(point, poly) {
+  function pointInPoly(point2, poly) {
     let inside = false;
     for (let index = 0, previous = poly.length - 1; index < poly.length; previous = index, index += 1) {
       const current = poly[index];
       const prior = poly[previous];
       if (current === void 0 || prior === void 0) continue;
-      const crosses = current.y > point.y !== prior.y > point.y;
+      const crosses = current.y > point2.y !== prior.y > point2.y;
       if (!crosses) continue;
-      const x = (prior.x - current.x) * (point.y - current.y) / (prior.y - current.y) + current.x;
-      if (point.x < x) inside = !inside;
+      const x = (prior.x - current.x) * (point2.y - current.y) / (prior.y - current.y) + current.x;
+      if (point2.x < x) inside = !inside;
     }
     return inside;
   }
@@ -3523,9 +3531,9 @@
       [width - 1, height - 1]
     ];
     const opaque = [];
-    for (const point of points) {
-      const x = point[0] ?? 0;
-      const y = point[1] ?? 0;
+    for (const point2 of points) {
+      const x = point2[0] ?? 0;
+      const y = point2[1] ?? 0;
       const offset = (y * width + x) * 4;
       if ((rgba[offset + 3] ?? 0) < 250) continue;
       opaque.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
@@ -5021,6 +5029,719 @@
     };
   }
 
+  // src/placement-svg.ts
+  var SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+  var XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>';
+  var MAX_PLACEMENT_NUMBER = 1e12;
+  var PATH_COMMANDS = "MmLlHhVvCcSsQqTtAaZz";
+  var CURVE_KAPPA = 0.5522847498307936;
+  function validEntities(value) {
+    const entityPattern = /&(#(?:x[\da-f]+|\d+)|amp|lt|gt|quot|apos);/gi;
+    let remainder = value;
+    let match = entityPattern.exec(value);
+    while (match !== null) {
+      const entity = match[1] ?? "";
+      if (entity.startsWith("#")) {
+        const isHex = entity[1]?.toLowerCase() === "x";
+        const digits = entity.slice(isHex ? 2 : 1);
+        const point2 = Number.parseInt(digits, isHex ? 16 : 10);
+        const validPoint = point2 === 9 || point2 === 10 || point2 === 13 || point2 >= 32 && point2 <= 55295 || point2 >= 57344 && point2 <= 65533 || point2 >= 65536 && point2 <= 1114111;
+        if (!Number.isFinite(point2) || !validPoint) return false;
+      }
+      remainder = remainder.replace(match[0], "");
+      match = entityPattern.exec(value);
+    }
+    return !remainder.includes("&");
+  }
+  function parseAttributes(source) {
+    const attributes = /* @__PURE__ */ new Map();
+    let cursor = 0;
+    while (cursor < source.length) {
+      while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+      if (cursor >= source.length) break;
+      const nameMatch = /^[A-Za-z_][A-Za-z0-9_.:-]*/.exec(source.slice(cursor));
+      if (nameMatch === null) return null;
+      const name = nameMatch[0];
+      if (attributes.has(name)) return null;
+      cursor += name.length;
+      while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+      if (source[cursor] !== "=") return null;
+      cursor += 1;
+      while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+      const quote = source[cursor];
+      if (quote !== '"' && quote !== "'") return null;
+      cursor += 1;
+      const end = source.indexOf(quote, cursor);
+      if (end < 0) return null;
+      const value = source.slice(cursor, end);
+      if (value.includes("<") || !validEntities(value)) return null;
+      attributes.set(name, value);
+      cursor = end + 1;
+    }
+    return attributes;
+  }
+  function parseTag(source, start2) {
+    let end = start2 + 1;
+    let quote = null;
+    while (end < source.length) {
+      const character = source[end];
+      if (quote !== null) {
+        if (character === quote) quote = null;
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === ">") {
+        break;
+      }
+      end += 1;
+    }
+    if (end >= source.length || quote !== null) return null;
+    let body = source.slice(start2 + 1, end).trim();
+    if (body.startsWith("/")) {
+      const name2 = body.slice(1).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_.:-]*$/.test(name2)) return null;
+      return { tag: { kind: "close", name: name2 }, end: end + 1 };
+    }
+    const nameMatch = /^[A-Za-z_][A-Za-z0-9_.:-]*/.exec(body);
+    if (nameMatch === null) return null;
+    const name = nameMatch[0];
+    body = body.slice(name.length);
+    const trimmed = body.trimEnd();
+    const selfClosing = trimmed.endsWith("/");
+    if (selfClosing) body = trimmed.slice(0, -1);
+    const attributes = parseAttributes(body);
+    if (attributes === null) return null;
+    return { tag: { kind: "open", name, attributes, selfClosing }, end: end + 1 };
+  }
+  function skipWhitespaceAndComments(source, start2) {
+    let cursor = start2;
+    while (cursor < source.length) {
+      while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+      if (!source.startsWith("<!--", cursor)) return cursor;
+      const end = source.indexOf("-->", cursor + 4);
+      if (end < 0 || source.slice(cursor + 4, end).includes("--")) return null;
+      cursor = end + 3;
+    }
+    return cursor;
+  }
+  function parseSimpleSvg(source, allowUntransformedGroups = true) {
+    let cursor = source.charCodeAt(0) === 65279 ? 1 : 0;
+    cursor = skipWhitespaceAndComments(source, cursor) ?? -1;
+    if (cursor < 0) return null;
+    if (source.startsWith("<?xml", cursor)) {
+      const declarationEnd = source.indexOf("?>", cursor + 5);
+      if (declarationEnd < 0) return null;
+      const declaration = source.slice(cursor, declarationEnd + 2);
+      const encoding = /\bencoding\s*=\s*(['"])(.*?)\1/i.exec(declaration)?.[2];
+      if (encoding !== void 0 && encoding.toLowerCase() !== "utf-8") return null;
+      cursor = skipWhitespaceAndComments(source, declarationEnd + 2) ?? -1;
+      if (cursor < 0) return null;
+    }
+    if (source[cursor] !== "<") return null;
+    const root = parseTag(source, cursor);
+    if (root === null || root.tag.kind !== "open" || root.tag.name !== "svg" || root.tag.selfClosing) return null;
+    const children = [];
+    const groups = [];
+    cursor = root.end;
+    while (cursor < source.length) {
+      cursor = skipWhitespaceAndComments(source, cursor) ?? -1;
+      if (cursor < 0 || cursor >= source.length) return null;
+      if (source[cursor] !== "<") return null;
+      const parsed = parseTag(source, cursor);
+      if (parsed === null) return null;
+      if (parsed.tag.kind === "close") {
+        if (parsed.tag.name === "g") {
+          if (groups.length === 0) return null;
+          groups.pop();
+          cursor = parsed.end;
+          continue;
+        }
+        if (parsed.tag.name !== "svg") return null;
+        if (groups.length !== 0) return null;
+        cursor = parsed.end;
+        cursor = skipWhitespaceAndComments(source, cursor) ?? -1;
+        if (cursor !== source.length) return null;
+        return { rootAttributes: root.tag.attributes, children };
+      }
+      if (parsed.tag.name === "g") {
+        if (!allowUntransformedGroups) return null;
+        if (!hasOnlyAttributes(parsed.tag.attributes, ["id"])) return null;
+        if (!parsed.tag.selfClosing) groups.push("g");
+        cursor = parsed.end;
+        continue;
+      }
+      if (!parsed.tag.selfClosing && parsed.tag.name !== "path") return null;
+      if (parsed.tag.name !== "path" && parsed.tag.name !== "rect" && parsed.tag.name !== "circle" && parsed.tag.name !== "ellipse") return null;
+      cursor = parsed.end;
+      if (!parsed.tag.selfClosing) {
+        cursor = skipWhitespaceAndComments(source, cursor) ?? -1;
+        if (cursor < 0 || source[cursor] !== "<") return null;
+        const closing = parseTag(source, cursor);
+        if (closing === null || closing.tag.kind !== "close" || closing.tag.name !== "path") return null;
+        cursor = closing.end;
+      }
+      children.push({ name: parsed.tag.name, attributes: parsed.tag.attributes });
+    }
+    return null;
+  }
+  function finiteNumber(value) {
+    if (value === void 0 || value.trim() === "") return null;
+    const trimmed = value.trim();
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) return null;
+    const number = Number(trimmed);
+    return Number.isFinite(number) && Math.abs(number) <= MAX_PLACEMENT_NUMBER ? number : null;
+  }
+  function formatNumber(value) {
+    if (!Number.isFinite(value) || Math.abs(value) > MAX_PLACEMENT_NUMBER) throw new Error("SVG contains an out-of-range number");
+    const rounded = Math.round(value * 1e3) / 1e3;
+    if (Object.is(rounded, -0) || rounded === 0) return "0";
+    return rounded.toFixed(3).replace(/\.?0+$/, "");
+  }
+  function pathTokens(source) {
+    const tokens = [];
+    let cursor = 0;
+    while (cursor < source.length) {
+      if (/[\s,]/.test(source[cursor] ?? "")) {
+        cursor += 1;
+        continue;
+      }
+      const character = source[cursor] ?? "";
+      if (PATH_COMMANDS.includes(character)) {
+        tokens.push({ kind: "command", value: character });
+        cursor += 1;
+        continue;
+      }
+      const numberMatch = /^[+-]?(?:(?:\d+\.?\d*)|(?:\.\d+))(?:[eE][+-]?\d+)?/.exec(source.slice(cursor));
+      if (numberMatch === null) return null;
+      const value = Number(numberMatch[0]);
+      if (!Number.isFinite(value) || Math.abs(value) > MAX_PLACEMENT_NUMBER) return null;
+      tokens.push({ kind: "number", value });
+      cursor += numberMatch[0].length;
+    }
+    return tokens;
+  }
+  function point(x, y) {
+    return { x, y };
+  }
+  function reflected(control, around) {
+    return point(2 * around.x - control.x, 2 * around.y - control.y);
+  }
+  function appendCubic(parts, curve) {
+    parts.push("C" + formatNumber(curve.control1.x) + " " + formatNumber(curve.control1.y) + " " + formatNumber(curve.control2.x) + " " + formatNumber(curve.control2.y) + " " + formatNumber(curve.end.x) + " " + formatNumber(curve.end.y));
+  }
+  function vectorAngle(ux, uy, vx, vy) {
+    const dot = ux * vx + uy * vy;
+    const length = Math.sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+    const angle = Math.acos(Math.max(-1, Math.min(1, dot / length)));
+    return ux * vy - uy * vx < 0 ? -angle : angle;
+  }
+  function arcToCubics(start2, rxValue, ryValue, rotationDegrees, largeArc, sweep, end) {
+    let rx = Math.abs(rxValue);
+    let ry = Math.abs(ryValue);
+    if (largeArc !== 0 && largeArc !== 1 || sweep !== 0 && sweep !== 1) return null;
+    if (start2.x === end.x && start2.y === end.y) return [];
+    if (rx === 0 || ry === 0) return [{ control1: end, control2: end, end }];
+    const phi = rotationDegrees % 360 * Math.PI / 180;
+    const cosine = Math.cos(phi);
+    const sine = Math.sin(phi);
+    const halfX = (start2.x - end.x) / 2;
+    const halfY = (start2.y - end.y) / 2;
+    const xPrime = cosine * halfX + sine * halfY;
+    const yPrime = -sine * halfX + cosine * halfY;
+    const lambda = xPrime * xPrime / (rx * rx) + yPrime * yPrime / (ry * ry);
+    if (lambda > 1) {
+      const scale = Math.sqrt(lambda);
+      rx *= scale;
+      ry *= scale;
+    }
+    const rx2 = rx * rx;
+    const ry2 = ry * ry;
+    const x2 = xPrime * xPrime;
+    const y2 = yPrime * yPrime;
+    const denominator = rx2 * y2 + ry2 * x2;
+    const numerator = Math.max(0, rx2 * ry2 - rx2 * y2 - ry2 * x2);
+    const sign = largeArc === sweep ? -1 : 1;
+    const coefficient = denominator === 0 ? 0 : sign * Math.sqrt(numerator / denominator);
+    const centerPrimeX = coefficient * rx * yPrime / ry;
+    const centerPrimeY = coefficient * -ry * xPrime / rx;
+    const centerX = cosine * centerPrimeX - sine * centerPrimeY + (start2.x + end.x) / 2;
+    const centerY = sine * centerPrimeX + cosine * centerPrimeY + (start2.y + end.y) / 2;
+    const ux = (xPrime - centerPrimeX) / rx;
+    const uy = (yPrime - centerPrimeY) / ry;
+    const vx = (-xPrime - centerPrimeX) / rx;
+    const vy = (-yPrime - centerPrimeY) / ry;
+    const theta = vectorAngle(1, 0, ux, uy);
+    let delta = vectorAngle(ux, uy, vx, vy);
+    if (sweep === 0 && delta > 0) delta -= 2 * Math.PI;
+    if (sweep === 1 && delta < 0) delta += 2 * Math.PI;
+    const count = Math.ceil(Math.abs(delta) / (Math.PI / 2));
+    const transform = (x, y) => point(centerX + cosine * x - sine * y, centerY + sine * x + cosine * y);
+    const derivative = (angle) => point(-rx * Math.sin(angle), ry * Math.cos(angle));
+    const curves = [];
+    for (let index = 0; index < count; index += 1) {
+      const angle1 = theta + delta * index / count;
+      const angle2 = theta + delta * (index + 1) / count;
+      const step = angle2 - angle1;
+      const factor = 4 / 3 * Math.tan(step / 4);
+      const p1 = transform(rx * Math.cos(angle1), ry * Math.sin(angle1));
+      const p2 = transform(rx * Math.cos(angle2), ry * Math.sin(angle2));
+      const d1 = derivative(angle1);
+      const d2 = derivative(angle2);
+      curves.push({
+        control1: transform(rx * Math.cos(angle1) + factor * d1.x, ry * Math.sin(angle1) + factor * d1.y),
+        control2: transform(rx * Math.cos(angle2) - factor * d2.x, ry * Math.sin(angle2) - factor * d2.y),
+        end: p2
+      });
+    }
+    if (curves.length > 0) {
+      const last = curves[curves.length - 1];
+      if (last !== void 0) curves[curves.length - 1] = { control1: last.control1, control2: last.control2, end };
+    }
+    return curves;
+  }
+  function normalizePathData(source) {
+    const tokens = pathTokens(source);
+    if (tokens === null || tokens.length === 0) return null;
+    const parts = [];
+    let cursor = 0;
+    let activeCommand = null;
+    let current = point(0, 0);
+    let subpathStart = point(0, 0);
+    let previousCommand = "";
+    let previousCubicControl = current;
+    let previousQuadraticControl = current;
+    let hasMove = false;
+    while (cursor < tokens.length) {
+      const token = tokens[cursor];
+      if (token?.kind === "command") {
+        activeCommand = token.value;
+        cursor += 1;
+        if (activeCommand.toUpperCase() === "Z") {
+          if (!hasMove) return null;
+          parts.push("Z");
+          current = subpathStart;
+          previousCommand = "Z";
+          activeCommand = null;
+        }
+        continue;
+      }
+      if (activeCommand === null) return null;
+      const inputCommand = activeCommand;
+      const command = inputCommand.toUpperCase();
+      const relative = inputCommand !== command;
+      const count = command === "H" || command === "V" ? 1 : command === "M" || command === "L" || command === "T" ? 2 : command === "S" || command === "Q" ? 4 : command === "C" ? 6 : command === "A" ? 7 : 0;
+      if (count === 0 || cursor + count > tokens.length) return null;
+      const values = [];
+      for (let index = 0; index < count; index += 1) {
+        const value = tokens[cursor + index];
+        if (value?.kind !== "number") return null;
+        values.push(value.value);
+      }
+      cursor += count;
+      const x = (value) => relative ? current.x + value : value;
+      const y = (value) => relative ? current.y + value : value;
+      if (command === "M") {
+        current = point(x(values[0] ?? 0), y(values[1] ?? 0));
+        subpathStart = current;
+        parts.push("M" + formatNumber(current.x) + " " + formatNumber(current.y));
+        hasMove = true;
+        activeCommand = relative ? "l" : "L";
+        previousCommand = "M";
+        previousCubicControl = current;
+        previousQuadraticControl = current;
+        continue;
+      }
+      if (!hasMove) return null;
+      if (command === "L" || command === "H" || command === "V") {
+        const end = command === "H" ? point(x(values[0] ?? 0), current.y) : command === "V" ? point(current.x, y(values[0] ?? 0)) : point(x(values[0] ?? 0), y(values[1] ?? 0));
+        parts.push("L" + formatNumber(end.x) + " " + formatNumber(end.y));
+        current = end;
+        previousCommand = command;
+        previousCubicControl = current;
+        previousQuadraticControl = current;
+        continue;
+      }
+      if (command === "C") {
+        const control1 = point(x(values[0] ?? 0), y(values[1] ?? 0));
+        const control2 = point(x(values[2] ?? 0), y(values[3] ?? 0));
+        const end = point(x(values[4] ?? 0), y(values[5] ?? 0));
+        appendCubic(parts, { control1, control2, end });
+        current = end;
+        previousCubicControl = control2;
+        previousQuadraticControl = current;
+        previousCommand = "C";
+        continue;
+      }
+      if (command === "S") {
+        const control1 = previousCommand === "C" || previousCommand === "S" ? reflected(previousCubicControl, current) : current;
+        const control2 = point(x(values[0] ?? 0), y(values[1] ?? 0));
+        const end = point(x(values[2] ?? 0), y(values[3] ?? 0));
+        appendCubic(parts, { control1, control2, end });
+        current = end;
+        previousCubicControl = control2;
+        previousQuadraticControl = current;
+        previousCommand = "S";
+        continue;
+      }
+      if (command === "Q" || command === "T") {
+        const control = command === "Q" ? point(x(values[0] ?? 0), y(values[1] ?? 0)) : previousCommand === "Q" || previousCommand === "T" ? reflected(previousQuadraticControl, current) : current;
+        const end = command === "Q" ? point(x(values[2] ?? 0), y(values[3] ?? 0)) : point(x(values[0] ?? 0), y(values[1] ?? 0));
+        appendCubic(parts, {
+          control1: point(current.x + (control.x - current.x) * 2 / 3, current.y + (control.y - current.y) * 2 / 3),
+          control2: point(end.x + (control.x - end.x) * 2 / 3, end.y + (control.y - end.y) * 2 / 3),
+          end
+        });
+        current = end;
+        previousQuadraticControl = control;
+        previousCubicControl = current;
+        previousCommand = command;
+        continue;
+      }
+      if (command === "A") {
+        const end = point(x(values[5] ?? 0), y(values[6] ?? 0));
+        const curves = arcToCubics(current, values[0] ?? 0, values[1] ?? 0, values[2] ?? 0, values[3] ?? 0, values[4] ?? 0, end);
+        if (curves === null) return null;
+        if (curves.length === 0) {
+          current = end;
+        } else if (values[0] === 0 || values[1] === 0) {
+          parts.push("L" + formatNumber(end.x) + " " + formatNumber(end.y));
+          current = end;
+        } else {
+          for (const curve of curves) appendCubic(parts, curve);
+          current = end;
+        }
+        previousCubicControl = current;
+        previousQuadraticControl = current;
+        previousCommand = "A";
+        continue;
+      }
+      return null;
+    }
+    return parts.length === 0 ? null : parts.join(" ");
+  }
+  function numberAttribute(attributes, name, fallback) {
+    const raw = attributes.get(name);
+    if (raw === void 0 && fallback !== void 0) return fallback;
+    const value = finiteNumber(raw);
+    if (value === null) throw new Error("SVG contains an invalid " + name + " value");
+    return value;
+  }
+  function rectPath(attributes) {
+    const x = numberAttribute(attributes, "x", 0);
+    const y = numberAttribute(attributes, "y", 0);
+    const width = numberAttribute(attributes, "width");
+    const height = numberAttribute(attributes, "height");
+    if (width <= 0 || height <= 0) throw new Error("SVG rectangle must have positive dimensions");
+    const radiusX = Math.max(0, Math.min(numberAttribute(attributes, "rx", numberAttribute(attributes, "ry", 0)), width / 2));
+    const radiusY = Math.max(0, Math.min(numberAttribute(attributes, "ry", radiusX), height / 2));
+    if (radiusX === 0 || radiusY === 0) {
+      return "M" + formatNumber(x) + " " + formatNumber(y) + " L" + formatNumber(x + width) + " " + formatNumber(y) + " L" + formatNumber(x + width) + " " + formatNumber(y + height) + " L" + formatNumber(x) + " " + formatNumber(y + height) + " Z";
+    }
+    const right = x + width;
+    const bottom = y + height;
+    const kx = CURVE_KAPPA * radiusX;
+    const ky = CURVE_KAPPA * radiusY;
+    return [
+      "M" + formatNumber(x + radiusX) + " " + formatNumber(y),
+      "L" + formatNumber(right - radiusX) + " " + formatNumber(y),
+      "C" + formatNumber(right - radiusX + kx) + " " + formatNumber(y) + " " + formatNumber(right) + " " + formatNumber(y + radiusY - ky) + " " + formatNumber(right) + " " + formatNumber(y + radiusY),
+      "L" + formatNumber(right) + " " + formatNumber(bottom - radiusY),
+      "C" + formatNumber(right) + " " + formatNumber(bottom - radiusY + ky) + " " + formatNumber(right - radiusX + kx) + " " + formatNumber(bottom) + " " + formatNumber(right - radiusX) + " " + formatNumber(bottom),
+      "L" + formatNumber(x + radiusX) + " " + formatNumber(bottom),
+      "C" + formatNumber(x + radiusX - kx) + " " + formatNumber(bottom) + " " + formatNumber(x) + " " + formatNumber(bottom - radiusY + ky) + " " + formatNumber(x) + " " + formatNumber(bottom - radiusY),
+      "L" + formatNumber(x) + " " + formatNumber(y + radiusY),
+      "C" + formatNumber(x) + " " + formatNumber(y + radiusY - ky) + " " + formatNumber(x + radiusX - kx) + " " + formatNumber(y) + " " + formatNumber(x + radiusX) + " " + formatNumber(y),
+      "Z"
+    ].join(" ");
+  }
+  function ellipsePath2(cx, cy, rx, ry) {
+    if (rx <= 0 || ry <= 0) throw new Error("SVG ellipse must have positive radii");
+    const kx = CURVE_KAPPA * rx;
+    const ky = CURVE_KAPPA * ry;
+    return [
+      "M" + formatNumber(cx + rx) + " " + formatNumber(cy),
+      "C" + formatNumber(cx + rx) + " " + formatNumber(cy + ky) + " " + formatNumber(cx + kx) + " " + formatNumber(cy + ry) + " " + formatNumber(cx) + " " + formatNumber(cy + ry),
+      "C" + formatNumber(cx - kx) + " " + formatNumber(cy + ry) + " " + formatNumber(cx - rx) + " " + formatNumber(cy + ky) + " " + formatNumber(cx - rx) + " " + formatNumber(cy),
+      "C" + formatNumber(cx - rx) + " " + formatNumber(cy - ky) + " " + formatNumber(cx - kx) + " " + formatNumber(cy - ry) + " " + formatNumber(cx) + " " + formatNumber(cy - ry),
+      "C" + formatNumber(cx + kx) + " " + formatNumber(cy - ry) + " " + formatNumber(cx + rx) + " " + formatNumber(cy - ky) + " " + formatNumber(cx + rx) + " " + formatNumber(cy),
+      "Z"
+    ].join(" ");
+  }
+  function paintAttributes(attributes) {
+    const result = /* @__PURE__ */ new Map();
+    const style = /* @__PURE__ */ new Map();
+    for (const declaration of (attributes.get("style") ?? "").split(";")) {
+      const separator = declaration.indexOf(":");
+      if (separator <= 0) continue;
+      style.set(declaration.slice(0, separator).trim(), declaration.slice(separator + 1).trim());
+    }
+    for (const name of ["fill", "stroke", "stroke-width", "stroke-linejoin"]) {
+      const value = attributes.get(name) ?? style.get(name);
+      if (value === void 0 || value === "") continue;
+      if (name === "fill" || name === "stroke") {
+        if (!/^(?:none|#[\da-f]{3,8}|[a-z]+)$/i.test(value)) throw new Error("SVG contains an unsupported paint value");
+        result.set(name, value);
+      } else if (name === "stroke-width") {
+        const width = finiteNumber(value);
+        if (width === null || width < 0) throw new Error("SVG contains an invalid stroke width");
+        result.set(name, formatNumber(width));
+      } else {
+        if (value !== "miter" && value !== "round" && value !== "bevel") throw new Error("SVG contains an unsupported stroke join");
+        result.set(name, value);
+      }
+    }
+    return result;
+  }
+  function escapeAttribute(value) {
+    return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  }
+  function serializePathElement(data, paints) {
+    const attributes = ['d="' + escapeAttribute(data) + '"'];
+    for (const name of ["fill", "stroke", "stroke-width", "stroke-linejoin"]) {
+      const value = paints.get(name);
+      if (value !== void 0) attributes.push(name + '="' + escapeAttribute(value) + '"');
+    }
+    return "<path " + attributes.join(" ") + "/>";
+  }
+  function serializeShape(element) {
+    const paints = paintAttributes(element.attributes);
+    let data;
+    if (element.name === "path") {
+      const source = element.attributes.get("d");
+      data = source === void 0 ? null : normalizePathData(source);
+    } else if (element.name === "rect") {
+      data = rectPath(element.attributes);
+    } else if (element.name === "circle") {
+      data = ellipsePath2(numberAttribute(element.attributes, "cx", 0), numberAttribute(element.attributes, "cy", 0), numberAttribute(element.attributes, "r"), numberAttribute(element.attributes, "r"));
+    } else {
+      data = ellipsePath2(numberAttribute(element.attributes, "cx", 0), numberAttribute(element.attributes, "cy", 0), numberAttribute(element.attributes, "rx"), numberAttribute(element.attributes, "ry"));
+    }
+    if (data === null) throw new Error("SVG contains unsupported path data");
+    return serializePathElement(data, paints);
+  }
+  function parseViewBox(value) {
+    if (value === void 0) return null;
+    const pieces = value.trim().split(/[\s,]+/);
+    if (pieces.length !== 4) return null;
+    const values = pieces.map((piece) => finiteNumber(piece));
+    if (values.some((number) => number === null)) return null;
+    const left = values[0];
+    const top = values[1];
+    const width = values[2];
+    const height = values[3];
+    if (left === void 0 || top === void 0 || width === void 0 || height === void 0 || left === null || top === null || width === null || height === null || width <= 0 || height <= 0) return null;
+    return [left, top, width, height];
+  }
+  function formatFrame(viewBox) {
+    const [x, y, width, height] = viewBox;
+    return '<rect id="vp-frame" x="' + formatNumber(x) + '" y="' + formatNumber(y) + '" width="' + formatNumber(width) + '" height="' + formatNumber(height) + '" fill="none" stroke="none"/>';
+  }
+  function serializeSvgForIllustrator(svgText) {
+    const source = svgText.charCodeAt(0) === 65279 ? svgText.slice(1) : svgText;
+    const parsed = parseSimpleSvg(source);
+    if (parsed === null) throw new Error("Cannot prepare malformed or unsupported SVG for Illustrator");
+    if (parsed.rootAttributes.get("xmlns") !== SVG_NAMESPACE) throw new Error("SVG is missing its namespace");
+    const viewBox = parseViewBox(parsed.rootAttributes.get("viewBox"));
+    if (viewBox === null) throw new Error("SVG is missing a finite, positive viewBox");
+    const width = finiteNumber(parsed.rootAttributes.get("width"));
+    const height = finiteNumber(parsed.rootAttributes.get("height"));
+    if (width === null || height === null || width <= 0 || height <= 0) throw new Error("SVG is missing explicit positive dimensions");
+    const [x, y, viewWidth, viewHeight] = viewBox;
+    const frame = formatFrame(viewBox);
+    const body = parsed.children.map(serializeShape).join("");
+    return XML_DECLARATION + '\n<svg xmlns="' + SVG_NAMESPACE + '" width="' + formatNumber(viewWidth) + '" height="' + formatNumber(viewHeight) + '" viewBox="' + [x, y, viewWidth, viewHeight].map(formatNumber).join(" ") + '">' + frame + body + "</svg>";
+  }
+  function hasOnlyAttributes(attributes, allowed) {
+    for (const name of attributes.keys()) if (!allowed.includes(name)) return false;
+    return true;
+  }
+  function isCanonicalNumber(value, parsed) {
+    return value !== void 0 && parsed !== null && formatNumber(parsed) === value;
+  }
+  function isCanonicalPathData(data) {
+    const normalized = normalizePathData(data);
+    return normalized !== null && normalized === data;
+  }
+  function validateSvgForPlacement(svgText, expectedSvgText) {
+    if (svgText.trim() === "") return { kind: "invalid", reason: "empty" };
+    if (svgText.charCodeAt(0) === 65279) return { kind: "invalid", reason: "bom" };
+    if (!svgText.startsWith(XML_DECLARATION + "\n")) {
+      if (/\bencoding\s*=\s*(['"])(.*?)\1/i.test(svgText) && !/\bencoding\s*=\s*(['"])utf-8\1/i.test(svgText)) return { kind: "invalid", reason: "encoding" };
+      return { kind: "invalid", reason: "malformed-xml" };
+    }
+    if (/\b(?:NaN|Infinity)\b/i.test(svgText)) return { kind: "invalid", reason: "non-finite" };
+    const document2 = parseSimpleSvg(svgText, false);
+    if (document2 === null) return { kind: "invalid", reason: "malformed-xml" };
+    if (document2.rootAttributes.get("xmlns") !== SVG_NAMESPACE) return { kind: "invalid", reason: "missing-namespace" };
+    if (!hasOnlyAttributes(document2.rootAttributes, ["xmlns", "width", "height", "viewBox"])) return { kind: "invalid", reason: "unsafe-content" };
+    const width = finiteNumber(document2.rootAttributes.get("width"));
+    const height = finiteNumber(document2.rootAttributes.get("height"));
+    const viewBox = parseViewBox(document2.rootAttributes.get("viewBox"));
+    if (width === null || height === null || width <= 0 || height <= 0 || viewBox === null) return { kind: "invalid", reason: "invalid-dimensions" };
+    const expectedViewBox = viewBox.map(formatNumber).join(" ");
+    if (!isCanonicalNumber(document2.rootAttributes.get("width"), width) || !isCanonicalNumber(document2.rootAttributes.get("height"), height) || document2.rootAttributes.get("viewBox") !== expectedViewBox || width !== viewBox[2] || height !== viewBox[3]) return { kind: "invalid", reason: "invalid-dimensions" };
+    if (document2.children.length < 2) return { kind: "invalid", reason: "unsafe-content" };
+    const frame = document2.children[0];
+    if (frame === void 0 || frame.name !== "rect" || !hasOnlyAttributes(frame.attributes, ["id", "x", "y", "width", "height", "fill", "stroke"])) return { kind: "invalid", reason: "unsafe-content" };
+    const frameX = finiteNumber(frame.attributes.get("x"));
+    const frameY = finiteNumber(frame.attributes.get("y"));
+    const frameWidth = finiteNumber(frame.attributes.get("width"));
+    const frameHeight = finiteNumber(frame.attributes.get("height"));
+    if (!isCanonicalNumber(frame.attributes.get("x"), frameX) || !isCanonicalNumber(frame.attributes.get("y"), frameY) || !isCanonicalNumber(frame.attributes.get("width"), frameWidth) || !isCanonicalNumber(frame.attributes.get("height"), frameHeight)) return { kind: "invalid", reason: "unsafe-content" };
+    if (frame.attributes.get("id") !== "vp-frame" || frame.attributes.get("fill") !== "none" || frame.attributes.get("stroke") !== "none" || frameX !== viewBox[0] || frameY !== viewBox[1] || frameWidth !== viewBox[2] || frameHeight !== viewBox[3]) return { kind: "invalid", reason: "unsafe-content" };
+    for (const element of document2.children.slice(1)) {
+      if (element.name !== "path" || !hasOnlyAttributes(element.attributes, ["d", "fill", "stroke", "stroke-width", "stroke-linejoin"])) return { kind: "invalid", reason: "unsafe-content" };
+      const data = element.attributes.get("d");
+      if (data === void 0 || !isCanonicalPathData(data)) return { kind: "invalid", reason: "path-commands" };
+      const strokeWidth = element.attributes.get("stroke-width");
+      if (strokeWidth !== void 0 && !isCanonicalNumber(strokeWidth, finiteNumber(strokeWidth))) return { kind: "invalid", reason: "unsafe-content" };
+      try {
+        paintAttributes(element.attributes);
+      } catch {
+        return { kind: "invalid", reason: "unsafe-content" };
+      }
+    }
+    if (expectedSvgText !== void 0 && svgText !== serializeSvgForIllustrator(expectedSvgText)) return { kind: "invalid", reason: "stale-content" };
+    return { kind: "valid" };
+  }
+
+  // src/result-svg-file.ts
+  function writeResultSvgAtomically(svgPath, jobId, svgText, fileSystem) {
+    const temporaryPath = svgPath + "." + jobId + ".tmp";
+    try {
+      fileSystem.writeFileSync(temporaryPath, serializeSvgForIllustrator(svgText), { encoding: "utf8", flag: "wx" });
+      fileSystem.renameSync(temporaryPath, svgPath);
+    } catch (error) {
+      try {
+        fileSystem.rmSync(temporaryPath, { force: true });
+      } catch (_) {
+      }
+      throw error;
+    }
+  }
+
+  // src/step-selection.ts
+  function initialActiveStep() {
+    return "colors";
+  }
+  function reduceActiveStep(current, event) {
+    switch (event.kind) {
+      case "tab-selected":
+        return event.step;
+      case "preset-selected":
+        return "colors";
+      case "progress":
+      case "rerun-started":
+      case "rerun-completed":
+        return current;
+      default: {
+        const exhaustive = event;
+        return exhaustive;
+      }
+    }
+  }
+  function isLabStep(value) {
+    return LAB_STEPS.some((step) => step === value);
+  }
+
+  // src/thumbnail-state.ts
+  function initialThumbnailState() {
+    return { kind: "empty", generation: 0 };
+  }
+  function isCurrentThumbnailCapture(state, generation) {
+    return state.kind === "loading" && state.generation === generation;
+  }
+  function reduceThumbnailState(state, event) {
+    switch (event.kind) {
+      case "capture-started":
+        return event.generation > state.generation ? { kind: "loading", generation: event.generation } : state;
+      case "capture-completed":
+        return isCurrentThumbnailCapture(state, event.generation) ? { kind: "ready", generation: event.generation, dataUrl: event.dataUrl } : state;
+      case "capture-failed":
+        return isCurrentThumbnailCapture(state, event.generation) ? { kind: "empty", generation: event.generation } : state;
+      default: {
+        const exhaustive = event;
+        return exhaustive;
+      }
+    }
+  }
+
+  // src/crop-geometry.ts
+  var CROP_SUGGEST_PIXELS = 3145728;
+  function estimateRgbaBytes(size) {
+    assertRasterSize(size);
+    const bytes = size.width * size.height * 4;
+    if (!Number.isSafeInteger(bytes)) throw new RangeError("RGBA byte size exceeds safe integer range");
+    return bytes;
+  }
+  function requiresCropChoice(size) {
+    assertRasterSize(size);
+    return size.width * size.height > CROP_SUGGEST_PIXELS;
+  }
+  function formatRasterMegapixels(size) {
+    assertRasterSize(size);
+    const megapixels = size.width * size.height / 1e6;
+    return megapixels > 0 && megapixels < 0.1 ? "<0.1" : megapixels.toFixed(1);
+  }
+  function thumbnailPointToSourcePixels(point2, thumbnailSize, sourceSize) {
+    assertRasterSize(thumbnailSize);
+    assertRasterSize(sourceSize);
+    return {
+      x: clamp(point2.x / thumbnailSize.width * sourceSize.width, 0, sourceSize.width),
+      y: clamp(point2.y / thumbnailSize.height * sourceSize.height, 0, sourceSize.height)
+    };
+  }
+  function clampCropRect(rect, sourceSize) {
+    assertRasterSize(sourceSize);
+    const rawRight = rect.x + rect.width;
+    const rawBottom = rect.y + rect.height;
+    const left = clamp(Math.floor(Math.min(rect.x, rawRight)), 0, sourceSize.width - 1);
+    const top = clamp(Math.floor(Math.min(rect.y, rawBottom)), 0, sourceSize.height - 1);
+    const right = clamp(Math.ceil(Math.max(rect.x, rawRight)), left + 1, sourceSize.width);
+    const bottom = clamp(Math.ceil(Math.max(rect.y, rawBottom)), top + 1, sourceSize.height);
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  }
+  function moveCropRect(rect, dx, dy, sourceSize) {
+    assertRasterSize(sourceSize);
+    const width = Math.min(Math.max(1, Math.round(rect.width)), sourceSize.width);
+    const height = Math.min(Math.max(1, Math.round(rect.height)), sourceSize.height);
+    const x = clamp(Math.round(rect.x + dx), 0, sourceSize.width - width);
+    const y = clamp(Math.round(rect.y + dy), 0, sourceSize.height - height);
+    return { x, y, width, height };
+  }
+  function cropRectToArtboardBounds(sourceBounds, sourceSize, cropRect) {
+    assertRasterSize(sourceSize);
+    const rect = clampCropRect(cropRect, sourceSize);
+    const [left, top, right, bottom] = sourceBounds;
+    const pointsPerPixelX = (right - left) / sourceSize.width;
+    const pointsPerPixelY = (top - bottom) / sourceSize.height;
+    return [
+      left + rect.x * pointsPerPixelX,
+      top - rect.y * pointsPerPixelY,
+      left + (rect.x + rect.width) * pointsPerPixelX,
+      top - (rect.y + rect.height) * pointsPerPixelY
+    ];
+  }
+  function cropRgba(rgba, sourceSize, cropRect) {
+    assertRasterSize(sourceSize);
+    if (rgba.length !== estimateRgbaBytes(sourceSize)) throw new RangeError("RGBA data does not match raster size");
+    const rect = clampCropRect(cropRect, sourceSize);
+    const cropped = new Uint8Array(rect.width * rect.height * 4);
+    for (let y = 0; y < rect.height; y += 1) {
+      const sourceStart = ((rect.y + y) * sourceSize.width + rect.x) * 4;
+      const targetStart = y * rect.width * 4;
+      cropped.set(rgba.subarray(sourceStart, sourceStart + rect.width * 4), targetStart);
+    }
+    return cropped;
+  }
+  function assertRasterSize(size) {
+    if (!Number.isSafeInteger(size.width) || size.width < 1 || !Number.isSafeInteger(size.height) || size.height < 1) {
+      throw new RangeError("Raster dimensions must be positive safe integers");
+    }
+  }
+  function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+
   // src/panel.ts
   var HostTimeoutError = class extends Error {
     constructor() {
@@ -5207,6 +5928,16 @@
     if (!(value instanceof HTMLProgressElement)) throw new Error("Expected progress bar: " + id);
     return value;
   }
+  function getImage(id) {
+    const value = getElement(id);
+    if (!(value instanceof HTMLImageElement)) throw new Error("Expected image: " + id);
+    return value;
+  }
+  function getSvg(id) {
+    const value = getElement(id);
+    if (!(value instanceof SVGSVGElement)) throw new Error("Expected SVG: " + id);
+    return value;
+  }
   function getUi() {
     const preview = getElement("preview");
     const preset = getElement("preset");
@@ -5262,7 +5993,21 @@
       controlStatus.set(field, { marker, reset });
     }
     return {
-      selection: getElement("selection"),
+      selectionDetails: getElement("selection-details"),
+      selectionThumbnail: getImage("selection-thumbnail"),
+      selectionThumbnailPlaceholder: getElement("selection-thumbnail-placeholder"),
+      selectionCropOverlay: getSvg("selection-crop-overlay"),
+      largeImageNotice: getElement("large-image-notice"),
+      largeImageNoticeText: getElement("large-image-notice-text"),
+      cropStart: getButton("crop-start"),
+      useFullImage: getButton("use-full-image"),
+      cropEditor: getElement("crop-editor"),
+      cropSizeLive: getElement("crop-size-live"),
+      cropApply: getButton("crop-apply"),
+      cropCancel: getButton("crop-cancel"),
+      cropControls: getElement("crop-controls"),
+      cropAgain: getButton("crop-again"),
+      cropClear: getButton("crop-clear"),
       presetsSection: getElement("presets-section"),
       presetCards: Array.from(document.querySelectorAll("#preset-gallery .preset-card")),
       presetConfirm: getElement("preset-confirm"),
@@ -5356,6 +6101,38 @@
       fromResult: parts[10] === "1"
     };
   }
+  function selectionKey(selection) {
+    return JSON.stringify([selection.documentIdentity, selection.uuid]);
+  }
+  function sameSelectionSourceAndBounds(first, second) {
+    return selectionKey(first) === selectionKey(second) && first.bounds.join(",") === second.bounds.join(",");
+  }
+  function capturedPngDataUrl(pngPath) {
+    return "data:image/png;base64," + fs.readFileSync(pngPath).toString("base64");
+  }
+  function capturedPngBytes(dataUrl) {
+    const prefix = "data:image/png;base64,";
+    if (!dataUrl.startsWith(prefix)) throw new Error("\u0E20\u0E32\u0E1E\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07 PNG \u0E44\u0E21\u0E48\u0E16\u0E39\u0E01\u0E15\u0E49\u0E2D\u0E07");
+    return Buffer.from(dataUrl.slice(prefix.length), "base64");
+  }
+  function cropPngBytes(png, sourceSize, rect) {
+    const image = readRgbaPng(png);
+    if (image === null || image.width !== sourceSize.width || image.height !== sourceSize.height) {
+      throw new Error("\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E2A\u0E33\u0E2B\u0E23\u0E31\u0E1A\u0E04\u0E23\u0E2D\u0E1B\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49");
+    }
+    const clipped = clampCropRect(rect, sourceSize);
+    return encodeRgbaPng(clipped.width, clipped.height, cropRgba(image.rgba, sourceSize, clipped));
+  }
+  function cropJobInput(job, selection, capture) {
+    if (capture.choice.kind !== "cropped") return job;
+    const sourcePng = fs.readFileSync(job.pngPath);
+    const croppedPng = cropPngBytes(sourcePng, capture.size, capture.choice.rect);
+    fs.writeFileSync(job.pngPath, croppedPng);
+    return {
+      ...job,
+      placementBounds: cropRectToArtboardBounds(selection.bounds, capture.size, capture.choice.rect)
+    };
+  }
   function callHost(host, method, args = []) {
     const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
     const script = method + "(" + encoded + ")";
@@ -5381,7 +6158,7 @@
   function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
   }
-  function newJob(settings, controls) {
+  function newJob(settings, controls, selection) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vector-panel-"));
     return {
       id: crypto.randomBytes(8).toString("hex"),
@@ -5390,6 +6167,7 @@
       svgPath: path.join(directory, "result.svg"),
       settings,
       controls,
+      placementBounds: selection.bounds,
       cancelled: false
     };
   }
@@ -5542,19 +6320,133 @@
     ui.factNote.hidden = note === "";
     ui.factNote.textContent = note;
   }
-  function showSelection(ui, selection) {
-    ui.selection.replaceChildren();
-    if (selection === null) {
-      ui.selection.textContent = "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E20\u0E32\u0E1E\u0E2B\u0E23\u0E37\u0E2D\u0E01\u0E25\u0E38\u0E48\u0E21\u0E1A\u0E19 artboard";
-      return;
+  function currentCropRect(capture) {
+    return capture.choice.kind === "cropped" ? capture.choice.rect : null;
+  }
+  function cropStatsLabel(size) {
+    return size.width + " \xD7 " + size.height + " px \xB7 \u0E1B\u0E23\u0E30\u0E21\u0E32\u0E13 " + formatRasterMegapixels(size) + " MP";
+  }
+  function isCropHandle(value) {
+    return value === "nw" || value === "n" || value === "ne" || value === "e" || value === "se" || value === "s" || value === "sw" || value === "w";
+  }
+  function resizeCropRect(rect, handle, dx, dy, size) {
+    let left = rect.x;
+    let top = rect.y;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    if (handle.includes("w")) left = Math.min(right - 1, Math.max(0, rect.x + dx));
+    if (handle.includes("e")) right = Math.max(left + 1, Math.min(size.width, rect.x + rect.width + dx));
+    if (handle.includes("n")) top = Math.min(bottom - 1, Math.max(0, rect.y + dy));
+    if (handle.includes("s")) bottom = Math.max(top + 1, Math.min(size.height, rect.y + rect.height + dy));
+    return clampCropRect({ x: left, y: top, width: right - left, height: bottom - top }, size);
+  }
+  function drawCropOverlay(ui, size, rect) {
+    const overlay = ui.selectionCropOverlay;
+    overlay.setAttribute("viewBox", "0 0 " + size.width + " " + size.height);
+    overlay.setAttribute("preserveAspectRatio", "none");
+    overlay.replaceChildren();
+    const hitArea = document.createElementNS(SVG_NS, "rect");
+    hitArea.setAttribute("class", "crop-hit-area");
+    hitArea.setAttribute("width", String(size.width));
+    hitArea.setAttribute("height", String(size.height));
+    overlay.append(hitArea);
+    const shade = document.createElementNS(SVG_NS, "path");
+    shade.setAttribute("class", "crop-shade");
+    shade.setAttribute("d", "M0 0H" + size.width + "V" + size.height + "H0Z M" + rect.x + " " + rect.y + "H" + (rect.x + rect.width) + "V" + (rect.y + rect.height) + "H" + rect.x + "Z");
+    overlay.append(shade);
+    const selection = document.createElementNS(SVG_NS, "rect");
+    selection.setAttribute("class", "crop-selection");
+    selection.setAttribute("x", String(rect.x));
+    selection.setAttribute("y", String(rect.y));
+    selection.setAttribute("width", String(rect.width));
+    selection.setAttribute("height", String(rect.height));
+    overlay.append(selection);
+    const x1 = rect.x;
+    const x2 = rect.x + rect.width / 2;
+    const x3 = rect.x + rect.width;
+    const y1 = rect.y;
+    const y2 = rect.y + rect.height / 2;
+    const y3 = rect.y + rect.height;
+    const radius = Math.max(4, Math.min(size.width, size.height) * 0.035);
+    const handles = [
+      ["nw", x1, y1],
+      ["n", x2, y1],
+      ["ne", x3, y1],
+      ["e", x3, y2],
+      ["se", x3, y3],
+      ["s", x2, y3],
+      ["sw", x1, y3],
+      ["w", x1, y2]
+    ];
+    for (const [handle, x, y] of handles) {
+      const circle = document.createElementNS(SVG_NS, "circle");
+      circle.setAttribute("class", "crop-handle");
+      circle.setAttribute("data-handle", handle);
+      circle.setAttribute("cx", String(x));
+      circle.setAttribute("cy", String(y));
+      circle.setAttribute("r", String(radius));
+      overlay.append(circle);
     }
-    const title = document.createElement("strong");
-    title.textContent = selection.itemName || selection.itemType;
-    const detail = document.createElement("small");
-    const kind = selection.itemType === "GroupItem" ? "\u0E01\u0E25\u0E38\u0E48\u0E21" : selection.itemType === "PlacedItem" ? "linked" : selection.embedded ? "embedded" : "raster";
-    detail.textContent = selection.documentName + " \xB7 " + kind + " \xB7 " + Math.round(selection.widthPt) + " \xD7 " + Math.round(selection.heightPt) + " pt";
-    if (selection.fromResult) detail.textContent += " \xB7 \u0E41\u0E1B\u0E25\u0E07\u0E0B\u0E49\u0E33\u0E40\u0E1B\u0E47\u0E19\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48";
-    ui.selection.append(title, detail);
+  }
+  function showSelection(ui, selection, thumbnail, capture, cropDraft) {
+    ui.selectionDetails.replaceChildren();
+    if (selection === null) {
+      ui.selectionThumbnail.removeAttribute("src");
+      ui.selectionThumbnail.alt = "";
+      ui.selectionThumbnail.hidden = true;
+      ui.selectionThumbnailPlaceholder.textContent = "\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E20\u0E32\u0E1E\u0E2B\u0E23\u0E37\u0E2D\u0E01\u0E25\u0E38\u0E48\u0E21\u0E1A\u0E19 artboard";
+      ui.selectionThumbnailPlaceholder.hidden = false;
+      ui.selectionCropOverlay.setAttribute("hidden", "");
+      ui.selectionCropOverlay.replaceChildren();
+      ui.largeImageNotice.hidden = true;
+      ui.cropEditor.hidden = true;
+      ui.cropControls.hidden = true;
+    } else {
+      const matchingCapture = capture !== null && capture.selectionKey === selectionKey(selection) ? capture : null;
+      const title = document.createElement("strong");
+      title.textContent = selection.itemName || selection.itemType;
+      const detail = document.createElement("small");
+      const kind = selection.itemType === "GroupItem" ? "\u0E01\u0E25\u0E38\u0E48\u0E21" : selection.itemType === "PlacedItem" ? "linked" : selection.embedded ? "embedded" : "raster";
+      detail.textContent = selection.documentName + " \xB7 " + kind + " \xB7 " + Math.round(selection.widthPt) + " \xD7 " + Math.round(selection.heightPt) + " pt";
+      if (matchingCapture !== null) {
+        const rect = cropDraft?.rect ?? currentCropRect(matchingCapture);
+        const shownSize = rect === null ? matchingCapture.size : { width: rect.width, height: rect.height };
+        detail.textContent += " \xB7 " + cropStatsLabel(shownSize);
+      }
+      if (selection.fromResult) detail.textContent += " \xB7 \u0E41\u0E1B\u0E25\u0E07\u0E0B\u0E49\u0E33\u0E40\u0E1B\u0E47\u0E19\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48";
+      ui.selectionDetails.append(title, detail);
+      if (thumbnail.kind === "ready") {
+        const displayUrl = cropDraft !== null && matchingCapture !== null ? matchingCapture.fullDataUrl : thumbnail.dataUrl;
+        if (ui.selectionThumbnail.getAttribute("src") !== displayUrl) ui.selectionThumbnail.src = displayUrl;
+        ui.selectionThumbnail.alt = selection.itemName || "\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01";
+        ui.selectionThumbnail.hidden = false;
+        ui.selectionThumbnailPlaceholder.hidden = true;
+      } else {
+        ui.selectionThumbnail.removeAttribute("src");
+        ui.selectionThumbnail.alt = "";
+        ui.selectionThumbnail.hidden = true;
+        ui.selectionThumbnailPlaceholder.textContent = thumbnail.kind === "loading" ? "\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u2026" : "\u0E41\u0E2A\u0E14\u0E07\u0E20\u0E32\u0E1E\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49";
+        ui.selectionThumbnailPlaceholder.hidden = false;
+      }
+      const canCrop = matchingCapture !== null && thumbnail.kind === "ready" && requiresCropChoice(matchingCapture.size);
+      const needsChoice = canCrop && matchingCapture.choice.kind === "needs-choice";
+      ui.largeImageNotice.hidden = !needsChoice || cropDraft !== null;
+      if (matchingCapture !== null) {
+        ui.largeImageNoticeText.textContent = "\u0E20\u0E32\u0E1E\u0E43\u0E2B\u0E0D\u0E48 (\u0E1B\u0E23\u0E30\u0E21\u0E32\u0E13 " + formatRasterMegapixels(matchingCapture.size) + " MP) \u0E2D\u0E32\u0E08\u0E0A\u0E49\u0E32 \u2014 \u0E04\u0E23\u0E2D\u0E1B\u0E01\u0E48\u0E2D\u0E19\u0E41\u0E1B\u0E25\u0E07\u0E44\u0E2B\u0E21?";
+      }
+      ui.cropEditor.hidden = cropDraft === null;
+      ui.cropControls.hidden = !canCrop || needsChoice || cropDraft !== null;
+      ui.cropAgain.textContent = matchingCapture?.choice.kind === "cropped" ? "\u0E41\u0E01\u0E49\u0E04\u0E23\u0E2D\u0E1B" : "\u0E04\u0E23\u0E2D\u0E1B\u0E20\u0E32\u0E1E";
+      ui.cropClear.hidden = matchingCapture?.choice.kind !== "cropped";
+      if (cropDraft !== null && matchingCapture !== null) {
+        drawCropOverlay(ui, matchingCapture.size, cropDraft.rect);
+        ui.selectionCropOverlay.removeAttribute("hidden");
+        ui.cropSizeLive.textContent = cropStatsLabel({ width: cropDraft.rect.width, height: cropDraft.rect.height });
+      } else {
+        ui.selectionCropOverlay.setAttribute("hidden", "");
+        ui.selectionCropOverlay.replaceChildren();
+      }
+    }
   }
   function currentSelection(state) {
     switch (state.kind) {
@@ -5611,15 +6503,21 @@
   function svgPoint(svg, event) {
     const matrix = svg.getScreenCTM();
     if (matrix === null) return null;
-    const point = svg.createSVGPoint();
-    point.x = event.clientX;
-    point.y = event.clientY;
-    const local = point.matrixTransform(matrix.inverse());
+    const point2 = svg.createSVGPoint();
+    point2.x = event.clientX;
+    point2.y = event.clientY;
+    const local = point2.matrixTransform(matrix.inverse());
     return { x: local.x, y: local.y };
   }
   function start() {
     const ui = getUi();
     let state = { kind: "empty" };
+    let thumbnailState = initialThumbnailState();
+    let thumbnailGeneration = 0;
+    let cachedCapture = null;
+    let capturedImage = null;
+    let cropDraft = null;
+    let cropDrag = null;
     let view = "vector";
     let zoom = 1;
     let tool = "none";
@@ -5629,7 +6527,7 @@
     let stopBatch = false;
     let pendingFocus = null;
     let edited = false;
-    let selectedStep = "colors";
+    let selectedStep = initialActiveStep();
     let presetState = emptyPresetState();
     let pendingPreset = null;
     const browserFixture = new URLSearchParams(window.location.search).get("fixture") === "1";
@@ -5648,6 +6546,133 @@
     let progressOperationLabel = null;
     let progressDone = false;
     let displayedProgress = -1;
+    function clearCachedCapture() {
+      if (cachedCapture === null) return;
+      cleanJob(cachedCapture.job);
+      cachedCapture = null;
+    }
+    function beginThumbnailCapture() {
+      thumbnailGeneration += 1;
+      thumbnailState = reduceThumbnailState(thumbnailState, { kind: "capture-started", generation: thumbnailGeneration });
+      render();
+      return thumbnailGeneration;
+    }
+    function completeThumbnailCapture(generation, dataUrl) {
+      const next = reduceThumbnailState(thumbnailState, { kind: "capture-completed", generation, dataUrl });
+      if (next === thumbnailState) return false;
+      thumbnailState = next;
+      render();
+      return true;
+    }
+    function failThumbnailCapture(generation) {
+      const next = reduceThumbnailState(thumbnailState, { kind: "capture-failed", generation });
+      if (next === thumbnailState) return false;
+      thumbnailState = next;
+      render();
+      return true;
+    }
+    function cropChoicePending(selection) {
+      return selection !== null && capturedImage !== null && capturedImage.selectionKey === selectionKey(selection) && capturedImage.choice.kind === "needs-choice";
+    }
+    function recordCaptureThumbnail(selection, job, generation) {
+      if (!isCurrentThumbnailCapture(thumbnailState, generation)) return false;
+      const png = fs.readFileSync(job.pngPath);
+      const size = readPngDimensions(png);
+      if (size === null) throw new Error("\u0E2D\u0E48\u0E32\u0E19\u0E02\u0E19\u0E32\u0E14\u0E20\u0E32\u0E1E PNG \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49");
+      const key = selectionKey(selection);
+      const previous = capturedImage;
+      const retainChoice = previous !== null && previous.selectionKey === key && previous.size.width === size.width && previous.size.height === size.height;
+      let choice;
+      if (retainChoice && previous !== null) choice = previous.choice;
+      else choice = requiresCropChoice(size) ? { kind: "needs-choice" } : { kind: "not-required" };
+      const fullDataUrl = "data:image/png;base64," + png.toString("base64");
+      const nextCapture = { selectionKey: key, size, fullDataUrl, choice };
+      const displayedPng = choice.kind === "cropped" ? cropPngBytes(png, size, choice.rect) : png;
+      capturedImage = nextCapture;
+      if (!completeThumbnailCapture(generation, "data:image/png;base64," + displayedPng.toString("base64"))) {
+        capturedImage = previous;
+        return false;
+      }
+      return true;
+    }
+    async function ensureCurrentSelection(selection) {
+      if (host === null) return false;
+      try {
+        const liveSelection = parseSelection(await callHost(host, "VP_snapshot"));
+        if (sameSelectionSourceAndBounds(selection, liveSelection)) return true;
+        message("\u0E40\u0E1B\u0E25\u0E35\u0E48\u0E22\u0E19\u0E20\u0E32\u0E1E\u0E17\u0E35\u0E48\u0E40\u0E25\u0E37\u0E2D\u0E01 \xB7 \u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E43\u0E2B\u0E21\u0E48");
+      } catch {
+      }
+      await refresh();
+      return false;
+    }
+    function updateThumbnailDataUrl(dataUrl) {
+      if (thumbnailState.kind !== "ready") return;
+      thumbnailState = { ...thumbnailState, dataUrl };
+    }
+    async function openCropEditor() {
+      if (capturedImage === null || !requiresCropChoice(capturedImage.size)) return;
+      const selection = currentSelection(state);
+      if (selection === null || !await ensureCurrentSelection(selection)) return;
+      if (capturedImage === null) return;
+      const existing = currentCropRect(capturedImage);
+      const rect = existing ?? clampCropRect({
+        x: capturedImage.size.width * 0.1,
+        y: capturedImage.size.height * 0.1,
+        width: capturedImage.size.width * 0.8,
+        height: capturedImage.size.height * 0.8
+      }, capturedImage.size);
+      cropDraft = { rect };
+      cropDrag = null;
+      render();
+    }
+    async function acceptFullImage() {
+      if (capturedImage === null || capturedImage.choice.kind !== "needs-choice") return;
+      const selection = currentSelection(state);
+      if (selection === null || !await ensureCurrentSelection(selection)) return;
+      if (capturedImage === null || capturedImage.choice.kind !== "needs-choice") return;
+      capturedImage = { ...capturedImage, choice: { kind: "full" } };
+      updateThumbnailDataUrl(capturedImage.fullDataUrl);
+      message("\u0E43\u0E0A\u0E49\u0E17\u0E31\u0E49\u0E07\u0E20\u0E32\u0E1E\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E01\u0E14\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E41\u0E1B\u0E25\u0E07");
+      render();
+    }
+    function discardPreviewAfterCropChange() {
+      if (state.kind !== "preview") return;
+      if (state.job !== null) cleanJob(state.job);
+      state = { kind: "selected", selection: state.selection };
+      latestPlan = null;
+      latestSvgs = [];
+      latestVectors = null;
+      latestPreview = null;
+    }
+    async function applyCropSelection() {
+      if (capturedImage === null || cropDraft === null) return false;
+      const selection = currentSelection(state);
+      if (selection === null || !await ensureCurrentSelection(selection)) return false;
+      if (capturedImage === null || cropDraft === null) return false;
+      const rect = clampCropRect(cropDraft.rect, capturedImage.size);
+      const png = cropPngBytes(capturedPngBytes(capturedImage.fullDataUrl), capturedImage.size, rect);
+      discardPreviewAfterCropChange();
+      capturedImage = { ...capturedImage, choice: { kind: "cropped", rect } };
+      updateThumbnailDataUrl("data:image/png;base64," + png.toString("base64"));
+      cropDraft = null;
+      cropDrag = null;
+      render();
+      return true;
+    }
+    async function clearCropSelection() {
+      if (capturedImage === null || capturedImage.choice.kind !== "cropped") return;
+      const selection = currentSelection(state);
+      if (selection === null || !await ensureCurrentSelection(selection)) return;
+      if (capturedImage === null || capturedImage.choice.kind !== "cropped") return;
+      discardPreviewAfterCropChange();
+      capturedImage = { ...capturedImage, choice: { kind: "full" } };
+      updateThumbnailDataUrl(capturedImage.fullDataUrl);
+      cropDraft = null;
+      cropDrag = null;
+      message("\u0E25\u0E49\u0E32\u0E07\u0E04\u0E23\u0E2D\u0E1B\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E43\u0E0A\u0E49\u0E20\u0E32\u0E1E\u0E40\u0E15\u0E47\u0E21");
+      render();
+    }
     function flushProgress() {
       progressTimer = 0;
       if (pendingProgress === null) return;
@@ -5705,7 +6730,7 @@
       presetState = selected;
       pendingPreset = null;
       applyControls(ui, selected.controls);
-      selectedStep = "colors";
+      selectedStep = reduceActiveStep(selectedStep, { kind: "preset-selected" });
       render();
       if (host !== null) void trace();
       else runFixtureRetrace();
@@ -5774,7 +6799,7 @@
     function commitSvg(svgText, focus = null) {
       if (state.kind !== "preview") return;
       pendingFocus = focus;
-      if (state.job !== null) fs.writeFileSync(state.job.svgPath, svgText);
+      if (state.job !== null) writeResultSvgAtomically(state.job.svgPath, state.job.id, svgText, fs);
       state = { ...state, svgText, facts: scoreSvg(svgText), dataUrl: svgDataUrl(svgText) };
       latestPreview = state;
       render();
@@ -5864,10 +6889,10 @@
             if (data !== null) shape.setAttribute("d", data);
             const points = listAnchors(next);
             svg.querySelectorAll(".anchor-handle").forEach((node, index) => {
-              const point = points[index];
-              if (point === void 0) return;
-              node.setAttribute("cx", String(point.x));
-              node.setAttribute("cy", String(point.y));
+              const point2 = points[index];
+              if (point2 === void 0) return;
+              node.setAttribute("cx", String(point2.x));
+              node.setAttribute("cy", String(point2.y));
             });
           };
           handle.addEventListener("pointerdown", (event) => {
@@ -5878,9 +6903,9 @@
           });
           handle.addEventListener("pointermove", (event) => {
             if (!handle.hasPointerCapture(event.pointerId)) return;
-            const point = svgPoint(svg, event);
-            if (point === null) return;
-            follow(moveAnchor(live, currentPath, anchor.anchorIndex, point.x, point.y));
+            const point2 = svgPoint(svg, event);
+            if (point2 === null) return;
+            follow(moveAnchor(live, currentPath, anchor.anchorIndex, point2.x, point2.y));
           });
           handle.addEventListener("lostpointercapture", () => {
             handle.classList.remove("dragging");
@@ -5925,12 +6950,18 @@
     }
     function render() {
       showStep();
-      showSelection(ui, currentSelection(state));
+      showSelection(ui, currentSelection(state), thumbnailState, capturedImage, cropDraft);
       const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying";
       updatePresetUi(busy);
       ui.refresh.disabled = busy;
-      ui.trace.disabled = busy || state.kind === "empty" || presetState.kind === "unselected";
-      ui.batch.disabled = busy || presetState.kind === "unselected";
+      ui.trace.disabled = busy || state.kind === "empty" || presetState.kind === "unselected" || cropDraft !== null || cropChoicePending(currentSelection(state));
+      ui.batch.disabled = busy || presetState.kind === "unselected" || cropChoicePending(currentSelection(state));
+      ui.cropStart.disabled = busy;
+      ui.useFullImage.disabled = busy;
+      ui.cropApply.disabled = busy;
+      ui.cropCancel.disabled = busy;
+      ui.cropAgain.disabled = busy;
+      ui.cropClear.disabled = busy;
       ui.trace.textContent = currentSelection(state)?.fromResult ? "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E40\u0E27\u0E2D\u0E23\u0E4C\u0E0A\u0E31\u0E19\u0E43\u0E2B\u0E21\u0E48" : "\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07";
       ui.apply.disabled = state.kind !== "preview" || state.job === null || !sameControls(state.job.controls, readControls(ui));
       ui.cancel.hidden = state.kind !== "planning" && state.kind !== "tracing" && !batching;
@@ -6146,7 +7177,7 @@
       latestSvgs = svgs;
       latestVectors = vectorStagesForPlan(svgs, plan, job.controls, progress.report);
       const svgText = latestVectors.sealed;
-      fs.writeFileSync(job.svgPath, svgText);
+      writeResultSvgAtomically(job.svgPath, job.id, svgText, fs);
       const decoded = readRgbaPng(sourcePng);
       brushPixels = null;
       tool = "none";
@@ -6160,9 +7191,9 @@
         pngUrl: pngDataUrl(sourcePng),
         svgText,
         raster: decoded === null ? null : { width: decoded.width, height: decoded.height, rgba: decoded.rgba },
+        placementBounds: job.placementBounds,
         facts: scoreSvg(svgText)
       };
-      selectedStep = "seal";
       latestPreview = state;
       liveControls = null;
       finishProgress(progress);
@@ -6176,21 +7207,52 @@
       }
       if (state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying" || batching) return;
       if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+      clearCachedCapture();
+      capturedImage = null;
+      cropDraft = null;
+      cropDrag = null;
       latestPlan = null;
       latestSvgs = [];
       latestVectors = null;
       latestPreview = null;
       liveControls = null;
+      const generation = beginThumbnailCapture();
       const progress = beginProgress("capture", "\u0E15\u0E23\u0E27\u0E08\u0E20\u0E32\u0E1E");
       state = { kind: "loading" };
       render();
       try {
         const selection = parseSelection(await callHost(host, "VP_snapshot"));
-        progress.report("capture", 1);
-        finishProgress(progress);
+        if (!isCurrentThumbnailCapture(thumbnailState, generation)) return;
+        let captureError = null;
+        let job = null;
+        try {
+          const controls = readControls(ui);
+          job = newJob(settingsFromControls(controls), controls, selection);
+          await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+          if (!isCurrentThumbnailCapture(thumbnailState, generation)) {
+            cleanJob(job);
+            return;
+          }
+          if (!recordCaptureThumbnail(selection, job, generation)) {
+            cleanJob(job);
+            return;
+          }
+          cachedCapture = { selectionKey: selectionKey(selection), job };
+        } catch (error) {
+          if (job !== null) cleanJob(job);
+          if (!failThumbnailCapture(generation)) return;
+          captureError = error;
+        }
+        if (captureError === null) {
+          progress.report("capture", 1);
+          finishProgress(progress);
+        } else {
+          hideProgress();
+        }
         state = { kind: "selected", selection };
-        message("\u0E20\u0E32\u0E1E\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E41\u0E1B\u0E25\u0E07");
+        message(captureError === null ? "\u0E20\u0E32\u0E1E\u0E1E\u0E23\u0E49\u0E2D\u0E21\u0E41\u0E1B\u0E25\u0E07" : "\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E44\u0E21\u0E48\u0E44\u0E14\u0E49: " + errorMessage(captureError), captureError !== null);
       } catch (error) {
+        if (!failThumbnailCapture(generation)) return;
         hideProgress();
         state = { kind: "empty" };
         message(errorMessage(error), true);
@@ -6204,6 +7266,18 @@
       }
       if (state.kind !== "selected" && state.kind !== "preview") return;
       const selection = state.selection;
+      if (!await ensureCurrentSelection(selection)) return;
+      if (state.kind !== "selected" && state.kind !== "preview") return;
+      if (cropDraft !== null) {
+        message("\u0E43\u0E0A\u0E49\u0E04\u0E23\u0E2D\u0E1B\u0E19\u0E35\u0E49\u0E2B\u0E23\u0E37\u0E2D\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E01\u0E48\u0E2D\u0E19\u0E40\u0E23\u0E34\u0E48\u0E21\u0E41\u0E1B\u0E25\u0E07", true);
+        render();
+        return;
+      }
+      if (cropChoicePending(selection)) {
+        message("\u0E40\u0E25\u0E37\u0E2D\u0E01\u0E04\u0E23\u0E2D\u0E1B\u0E2B\u0E23\u0E37\u0E2D\u0E43\u0E0A\u0E49\u0E17\u0E31\u0E49\u0E07\u0E20\u0E32\u0E1E\u0E01\u0E48\u0E2D\u0E19\u0E40\u0E23\u0E34\u0E48\u0E21\u0E41\u0E1B\u0E25\u0E07", true);
+        render();
+        return;
+      }
       if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
       latestPlan = null;
       latestSvgs = [];
@@ -6211,13 +7285,39 @@
       latestPreview = null;
       liveControls = null;
       const controls = readControls(ui);
-      let job = newJob(settingsFromControls(controls), controls);
+      const cached = cachedCapture;
+      cachedCapture = null;
+      let reusedCapture = false;
+      let job;
+      if (cached !== null && cached.selectionKey === selectionKey(selection)) {
+        job = { ...cached.job, settings: settingsFromControls(controls), controls, cancelled: false };
+        reusedCapture = true;
+      } else {
+        if (cached !== null) cleanJob(cached.job);
+        job = newJob(settingsFromControls(controls), controls, selection);
+      }
       const progress = beginProgress("capture");
+      const thumbnailRequest = reusedCapture ? null : beginThumbnailCapture();
       try {
         state = { kind: "capturing", selection, job };
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E2D\u0E48\u0E32\u0E19\u0E20\u0E32\u0E1E\u0E08\u0E32\u0E01 Illustrator\u2026");
         render();
-        await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+        if (!reusedCapture) {
+          await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+          if (thumbnailRequest !== null && !recordCaptureThumbnail(selection, job, thumbnailRequest)) return;
+          if (cropChoicePending(selection)) {
+            cachedCapture = { selectionKey: selectionKey(selection), job };
+            state = { kind: "selected", selection };
+            progress.report("capture", 1);
+            finishProgress(progress);
+            message("\u0E20\u0E32\u0E1E\u0E43\u0E2B\u0E0D\u0E48 \u0E40\u0E25\u0E37\u0E2D\u0E01\u0E04\u0E23\u0E2D\u0E1B\u0E2B\u0E23\u0E37\u0E2D\u0E43\u0E0A\u0E49\u0E17\u0E31\u0E49\u0E07\u0E20\u0E32\u0E1E\u0E01\u0E48\u0E2D\u0E19\u0E40\u0E23\u0E34\u0E48\u0E21\u0E41\u0E1B\u0E25\u0E07");
+            render();
+            return;
+          }
+        }
+        if (capturedImage !== null && capturedImage.selectionKey === selectionKey(selection)) {
+          job = cropJobInput(job, selection, capturedImage);
+        }
         progress.report("capture", 1);
         const capturedControls = readControls(ui);
         job = { ...job, settings: settingsFromControls(capturedControls), controls: capturedControls, cancelled: false };
@@ -6241,6 +7341,7 @@
           await retraceFromCapture();
         }
       } catch (error) {
+        if (thumbnailRequest !== null) failThumbnailCapture(thumbnailRequest);
         if (!job.cancelled || !retraceQueued) hideProgress();
         cleanJob(job);
         state = { kind: "selected", selection };
@@ -6252,6 +7353,8 @@
     }
     async function apply() {
       if (host === null || state.kind !== "preview" || state.job === null) return false;
+      if (!batching && !await ensureCurrentSelection(state.selection)) return false;
+      if (state.kind !== "preview" || state.job === null) return false;
       if (!batching && !sameControls(state.job.controls, readControls(ui))) {
         message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E1B\u0E23\u0E31\u0E1A\u0E1C\u0E25\u0E43\u0E2B\u0E49\u0E15\u0E23\u0E07\u0E01\u0E31\u0E1A\u0E04\u0E48\u0E32\u0E25\u0E48\u0E32\u0E2A\u0E38\u0E14\u2026");
         scheduleRetrace();
@@ -6260,11 +7363,26 @@
       }
       const preview = state;
       const job = state.job;
+      let svgFileText = "";
+      try {
+        const svgBytes = fs.readFileSync(job.svgPath);
+        svgFileText = svgBytes.toString("utf8");
+        if (!Buffer.from(svgFileText, "utf8").equals(svgBytes)) throw new Error("\u0E44\u0E1F\u0E25\u0E4C\u0E44\u0E21\u0E48\u0E43\u0E0A\u0E48 UTF-8");
+      } catch {
+        message("\u0E27\u0E32\u0E07\u0E25\u0E07 Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49: \u0E44\u0E1F\u0E25\u0E4C\u0E1C\u0E25\u0E25\u0E31\u0E1E\u0E18\u0E4C\u0E44\u0E21\u0E48\u0E2A\u0E21\u0E1A\u0E39\u0E23\u0E13\u0E4C \u0E25\u0E2D\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
+        render();
+        return false;
+      }
+      if (validateSvgForPlacement(svgFileText, preview.svgText).kind === "invalid") {
+        message("\u0E27\u0E32\u0E07\u0E25\u0E07 Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49: \u0E44\u0E1F\u0E25\u0E4C\u0E1C\u0E25\u0E25\u0E31\u0E1E\u0E18\u0E4C\u0E44\u0E21\u0E48\u0E2A\u0E21\u0E1A\u0E39\u0E23\u0E13\u0E4C \u0E25\u0E2D\u0E07\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E43\u0E2B\u0E21\u0E48", true);
+        render();
+        return false;
+      }
       state = { ...preview, kind: "applying" };
       message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E19\u0E33 path \u0E40\u0E02\u0E49\u0E32 Illustrator\u2026");
       render();
       try {
-        const result = await callHost(host, "VP_commit", [preview.selection.uuid, job.svgPath, job.id, settingsNote(job.settings), preview.selection.bounds.join(","), preview.selection.documentIdentity]);
+        const result = await callHost(host, "VP_commit", [preview.selection.uuid, job.svgPath, job.id, settingsNote(job.settings), preview.selection.bounds.join(","), preview.placementBounds.join(","), preview.selection.documentIdentity]);
         message("\u0E43\u0E2A\u0E48\u0E1C\u0E25\u0E41\u0E25\u0E49\u0E27: " + (result[1] ?? "0") + " paths \xB7 \u0E15\u0E49\u0E19\u0E09\u0E1A\u0E31\u0E1A\u0E22\u0E31\u0E07\u0E2D\u0E22\u0E39\u0E48");
         cleanJob(job);
         state = { kind: "selected", selection: preview.selection };
@@ -6272,10 +7390,10 @@
         return true;
       } catch (error) {
         if (error instanceof HostTimeoutError) {
-          message("Illustrator \u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E15\u0E2D\u0E1A\u0E01\u0E25\u0E31\u0E1A \u0E15\u0E23\u0E27\u0E08 Layers \u0E01\u0E48\u0E2D\u0E19\u0E40\u0E23\u0E34\u0E48\u0E21\u0E07\u0E32\u0E19\u0E43\u0E2B\u0E21\u0E48 \u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E44\u0E21\u0E48\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E1C\u0E25\u0E0B\u0E49\u0E33", true);
+          message("\u0E27\u0E32\u0E07\u0E25\u0E07 Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49: Illustrator \u0E22\u0E31\u0E07\u0E44\u0E21\u0E48\u0E15\u0E2D\u0E1A\u0E01\u0E25\u0E31\u0E1A \u0E15\u0E23\u0E27\u0E08 Layers \u0E01\u0E48\u0E2D\u0E19\u0E40\u0E23\u0E34\u0E48\u0E21\u0E07\u0E32\u0E19\u0E43\u0E2B\u0E21\u0E48 \u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E44\u0E21\u0E48\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E1C\u0E25\u0E0B\u0E49\u0E33", true);
           state = { kind: "selected", selection: preview.selection };
         } else {
-          message(errorMessage(error), true);
+          message("\u0E27\u0E32\u0E07\u0E25\u0E07 Illustrator \u0E44\u0E21\u0E48\u0E44\u0E14\u0E49: " + errorMessage(error), true);
           state = preview;
         }
         render();
@@ -6289,6 +7407,7 @@
       }
       if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying") return;
       if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+      clearCachedCapture();
       batching = true;
       stopBatch = false;
       render();
@@ -6311,19 +7430,22 @@
             fromResult: false
           };
           const controls = readControls(ui);
-          const job = newJob(settingsFromControls(controls), controls);
+          const job = newJob(settingsFromControls(controls), controls, selection);
           const progress = beginProgress("capture");
           message("\u0E01\u0E33\u0E25\u0E31\u0E07\u0E41\u0E1B\u0E25\u0E07\u0E20\u0E32\u0E1E " + String(finished + 1) + "/" + String(list.items.length) + " \xB7 " + selection.itemName);
           state = { kind: "capturing", selection, job };
+          const thumbnailRequest = beginThumbnailCapture();
           render();
           try {
             await callHost(host, "VP_capture", [item.uuid, job.pngPath, list.documentIdentity, "1"]);
+            completeThumbnailCapture(thumbnailRequest, capturedPngDataUrl(job.pngPath));
             progress.report("capture", 1);
             await vectorize(selection, job, void 0, null, "colors", progress);
             const placed = await apply();
             if (!placed) return;
             finished += 1;
           } catch (error) {
+            failThumbnailCapture(thumbnailRequest);
             hideProgress();
             cleanJob(job);
             throw error;
@@ -6409,7 +7531,7 @@
         progress.report("seal", 1);
       }
       latestVectors = vectors;
-      fs.writeFileSync(job.svgPath, vectors.sealed);
+      writeResultSvgAtomically(job.svgPath, job.id, vectors.sealed, fs);
       const nextPreview = { ...previous, job, svgText: vectors.sealed, facts: scoreSvg(vectors.sealed), dataUrl: svgDataUrl(vectors.sealed) };
       state = { kind: "preview", ...nextPreview };
       latestPreview = nextPreview;
@@ -6493,6 +7615,7 @@
         svgPath: current.svgPath,
         settings: settingsFromControls(controls),
         controls,
+        placementBounds: current.placementBounds,
         cancelled: false
       };
       try {
@@ -6550,7 +7673,6 @@
       const styled = styleLabVectors(svgText, readControls(ui), null, null);
       latestVectors = { trace: svgText, ...styled };
       fixtureControls = readControls(ui);
-      selectedStep = "seal";
       state = {
         kind: "preview",
         selection: {
@@ -6570,6 +7692,7 @@
         pngUrl,
         svgText: styled.sealed,
         raster: { width, height, rgba },
+        placementBounds: [0, 100, 160, 0],
         facts: scoreSvg(styled.sealed)
       };
       latestPreview = state;
@@ -6579,6 +7702,81 @@
     ui.refresh.addEventListener("click", () => {
       void refresh();
     });
+    ui.cropStart.addEventListener("click", () => {
+      void openCropEditor();
+    });
+    ui.cropAgain.addEventListener("click", () => {
+      void openCropEditor();
+    });
+    ui.useFullImage.addEventListener("click", () => {
+      void acceptFullImage();
+    });
+    ui.cropApply.addEventListener("click", async () => {
+      try {
+        if (await applyCropSelection()) message("\u0E43\u0E0A\u0E49\u0E1E\u0E37\u0E49\u0E19\u0E17\u0E35\u0E48\u0E04\u0E23\u0E2D\u0E1B\u0E41\u0E25\u0E49\u0E27 \xB7 \u0E01\u0E14\u0E2A\u0E23\u0E49\u0E32\u0E07\u0E15\u0E31\u0E27\u0E2D\u0E22\u0E48\u0E32\u0E07\u0E40\u0E1E\u0E37\u0E48\u0E2D\u0E41\u0E1B\u0E25\u0E07");
+      } catch (error) {
+        message(errorMessage(error), true);
+      }
+    });
+    ui.cropCancel.addEventListener("click", () => {
+      cropDraft = null;
+      cropDrag = null;
+      render();
+    });
+    ui.cropClear.addEventListener("click", () => {
+      void clearCropSelection();
+    });
+    function cropPoint(event) {
+      if (capturedImage === null) return null;
+      const bounds2 = ui.selectionCropOverlay.getBoundingClientRect();
+      if (bounds2.width <= 0 || bounds2.height <= 0) return null;
+      return thumbnailPointToSourcePixels(
+        { x: event.clientX - bounds2.left, y: event.clientY - bounds2.top },
+        { width: bounds2.width, height: bounds2.height },
+        capturedImage.size
+      );
+    }
+    ui.selectionCropOverlay.addEventListener("pointerdown", (event) => {
+      if (cropDraft === null || capturedImage === null) return;
+      const point2 = cropPoint(event);
+      if (point2 === null) return;
+      const target = event.target instanceof SVGElement ? event.target : null;
+      const handle = target?.dataset.handle;
+      const initialRect = cropDraft.rect;
+      if (isCropHandle(handle)) {
+        cropDrag = { kind: "resize", pointerId: event.pointerId, start: point2, initialRect, handle };
+      } else if (target !== null && target.closest(".crop-selection") !== null) {
+        cropDrag = { kind: "move", pointerId: event.pointerId, start: point2, initialRect };
+      } else {
+        cropDrag = { kind: "draw", pointerId: event.pointerId, start: point2, initialRect };
+      }
+      ui.selectionCropOverlay.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    ui.selectionCropOverlay.addEventListener("pointermove", (event) => {
+      if (cropDrag === null || cropDrag.pointerId !== event.pointerId || capturedImage === null) return;
+      const point2 = cropPoint(event);
+      if (point2 === null) return;
+      const deltaX = point2.x - cropDrag.start.x;
+      const deltaY = point2.y - cropDrag.start.y;
+      let rect;
+      if (cropDrag.kind === "draw") {
+        rect = clampCropRect({ x: cropDrag.start.x, y: cropDrag.start.y, width: deltaX, height: deltaY }, capturedImage.size);
+      } else if (cropDrag.kind === "move") {
+        rect = moveCropRect(cropDrag.initialRect, deltaX, deltaY, capturedImage.size);
+      } else {
+        rect = resizeCropRect(cropDrag.initialRect, cropDrag.handle, deltaX, deltaY, capturedImage.size);
+      }
+      cropDraft = { rect };
+      render();
+    });
+    function endCropDrag(event) {
+      if (cropDrag === null || cropDrag.pointerId !== event.pointerId) return;
+      cropDrag = null;
+      render();
+    }
+    ui.selectionCropOverlay.addEventListener("pointerup", endCropDrag);
+    ui.selectionCropOverlay.addEventListener("pointercancel", endCropDrag);
     for (const card of ui.presetCards) {
       card.addEventListener("click", () => {
         const option = PRESET_PRESENTATION.find((candidate) => candidate.preset === card.dataset.preset);
@@ -6659,9 +7857,9 @@
     });
     for (const button of ui.stepButtons) {
       button.addEventListener("click", () => {
-        const step = LAB_STEPS.find((candidate) => candidate === button.dataset.step);
-        if (step === void 0) return;
-        selectedStep = step;
+        const step = button.dataset.step;
+        if (!isLabStep(step)) return;
+        selectedStep = reduceActiveStep(selectedStep, { kind: "tab-selected", step });
         render();
       });
     }

@@ -17,6 +17,15 @@ export type PunchedPng = {
   readonly droppedColor: string | null;
 };
 
+export function readPngDimensions(png: Buffer): { readonly width: number; readonly height: number } | null {
+  if (png.length < 33 || !png.subarray(0, 8).equals(pngSignature())) return null;
+  if (png.readUInt32BE(8) !== 13 || png.toString("ascii", 12, 16) !== "IHDR") return null;
+  const width = png.readUInt32BE(16);
+  const height = png.readUInt32BE(20);
+  if (width === 0 || height === 0) return null;
+  return { width, height };
+}
+
 export function punchTransparency(png: Buffer, opaqueAt = 128): PunchedPng {
   const image = readRgbaPng(png);
   if (image === null) return { png, droppedColor: null };

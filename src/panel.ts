@@ -6,7 +6,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { expandPrimitives, listAnchors, moveAnchor, paintDisc, paletteFromRaster, parseBatchFields, removeShape } from "./edit";
-import { encodeRgbaPng, readRgbaPng } from "./png-alpha";
+import { encodeRgbaPng, readPngDimensions, readRgbaPng } from "./png-alpha";
 import { holeNote, scoreSvg, shapeNote, type TraceFacts } from "./score";
 import { controlsFor, type LabControls } from "./lab-model";
 import {
@@ -28,6 +28,11 @@ import { createProgressReporter, type ProgressReporter, type StepProgress } from
 import type { SegmentColorStage } from "./segment";
 import { cappedPalette, planTraceAsync, replanTracePlan, settingsFromControls, vectorStagesForPlan, type PipelineSettings, type PlannedPlate, type TracePlan } from "./trace-pipeline";
 import { resolveVtracer, vtracerArguments, type TracePreset, type TraceRequest } from "./trace";
+import { serializeSvgForIllustrator, validateSvgForPlacement } from "./placement-svg";
+import { writeResultSvgAtomically } from "./result-svg-file";
+import { initialActiveStep, isLabStep, reduceActiveStep } from "./step-selection";
+import { initialThumbnailState, isCurrentThumbnailCapture, reduceThumbnailState, type ThumbnailState } from "./thumbnail-state";
+import { clampCropRect, cropRectToArtboardBounds, cropRgba, estimateRgbaBytes, formatRasterMegapixels, moveCropRect, requiresCropChoice, thumbnailPointToSourcePixels, type PixelPoint, type PixelRect, type RasterSize } from "./crop-geometry";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -63,6 +68,7 @@ type Job = {
   readonly svgPath: string;
   readonly settings: PipelineSettings;
   readonly controls: LabControls;
+  readonly placementBounds: Selection["bounds"];
   cancelled: boolean;
 };
 
@@ -75,8 +81,31 @@ type Preview = {
   readonly pngUrl: string;
   readonly svgText: string;
   readonly raster: Raster | null;
+  readonly placementBounds: Selection["bounds"];
   readonly facts: TraceFacts;
 };
+
+type CropChoice =
+  | { readonly kind: "not-required" }
+  | { readonly kind: "needs-choice" }
+  | { readonly kind: "full" }
+  | { readonly kind: "cropped"; readonly rect: PixelRect };
+
+type CapturedImage = {
+  readonly selectionKey: string;
+  readonly size: RasterSize;
+  readonly fullDataUrl: string;
+  readonly choice: CropChoice;
+};
+
+type CropHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+
+type CropDrag =
+  | { readonly kind: "draw"; readonly pointerId: number; readonly start: PixelPoint; readonly initialRect: PixelRect }
+  | { readonly kind: "move"; readonly pointerId: number; readonly start: PixelPoint; readonly initialRect: PixelRect }
+  | { readonly kind: "resize"; readonly pointerId: number; readonly start: PixelPoint; readonly initialRect: PixelRect; readonly handle: CropHandle };
+
+type CropDraft = { readonly rect: PixelRect };
 
 type PlanWorkerMessage =
   | { readonly kind: "plan"; readonly plan: TracePlan | null }
@@ -303,7 +332,21 @@ const PRESET_CONTROL_LABELS: Readonly<Record<PresetControlField, string>> = {
 };
 
 type Ui = {
-  readonly selection: HTMLElement;
+  readonly selectionDetails: HTMLElement;
+  readonly selectionThumbnail: HTMLImageElement;
+  readonly selectionThumbnailPlaceholder: HTMLElement;
+  readonly selectionCropOverlay: SVGSVGElement;
+  readonly largeImageNotice: HTMLElement;
+  readonly largeImageNoticeText: HTMLElement;
+  readonly cropStart: HTMLButtonElement;
+  readonly useFullImage: HTMLButtonElement;
+  readonly cropEditor: HTMLElement;
+  readonly cropSizeLive: HTMLElement;
+  readonly cropApply: HTMLButtonElement;
+  readonly cropCancel: HTMLButtonElement;
+  readonly cropControls: HTMLElement;
+  readonly cropAgain: HTMLButtonElement;
+  readonly cropClear: HTMLButtonElement;
   readonly presetsSection: HTMLElement;
   readonly presetCards: readonly HTMLButtonElement[];
   readonly presetConfirm: HTMLElement;
@@ -384,6 +427,18 @@ function getProgress(id: string): HTMLProgressElement {
   return value;
 }
 
+function getImage(id: string): HTMLImageElement {
+  const value = getElement(id);
+  if (!(value instanceof HTMLImageElement)) throw new Error("Expected image: " + id);
+  return value;
+}
+
+function getSvg(id: string): SVGSVGElement {
+  const value = getElement(id);
+  if (!(value instanceof SVGSVGElement)) throw new Error("Expected SVG: " + id);
+  return value;
+}
+
 function getUi(): Ui {
   const preview = getElement("preview");
   const preset = getElement("preset");
@@ -439,7 +494,21 @@ function getUi(): Ui {
     controlStatus.set(field, { marker, reset });
   }
   return {
-    selection: getElement("selection"),
+    selectionDetails: getElement("selection-details"),
+    selectionThumbnail: getImage("selection-thumbnail"),
+    selectionThumbnailPlaceholder: getElement("selection-thumbnail-placeholder"),
+    selectionCropOverlay: getSvg("selection-crop-overlay"),
+    largeImageNotice: getElement("large-image-notice"),
+    largeImageNoticeText: getElement("large-image-notice-text"),
+    cropStart: getButton("crop-start"),
+    useFullImage: getButton("use-full-image"),
+    cropEditor: getElement("crop-editor"),
+    cropSizeLive: getElement("crop-size-live"),
+    cropApply: getButton("crop-apply"),
+    cropCancel: getButton("crop-cancel"),
+    cropControls: getElement("crop-controls"),
+    cropAgain: getButton("crop-again"),
+    cropClear: getButton("crop-clear"),
     presetsSection: getElement("presets-section"),
     presetCards: Array.from(document.querySelectorAll<HTMLButtonElement>("#preset-gallery .preset-card")),
     presetConfirm: getElement("preset-confirm"),
@@ -539,6 +608,44 @@ function parseSelection(parts: string[]): Selection {
   };
 }
 
+function selectionKey(selection: Selection): string {
+  return JSON.stringify([selection.documentIdentity, selection.uuid]);
+}
+
+function sameSelectionSourceAndBounds(first: Selection, second: Selection): boolean {
+  return selectionKey(first) === selectionKey(second) && first.bounds.join(",") === second.bounds.join(",");
+}
+
+function capturedPngDataUrl(pngPath: string): string {
+  return "data:image/png;base64," + fs.readFileSync(pngPath).toString("base64");
+}
+
+function capturedPngBytes(dataUrl: string): Buffer {
+  const prefix = "data:image/png;base64,";
+  if (!dataUrl.startsWith(prefix)) throw new Error("ภาพตัวอย่าง PNG ไม่ถูกต้อง");
+  return Buffer.from(dataUrl.slice(prefix.length), "base64");
+}
+
+function cropPngBytes(png: Buffer, sourceSize: RasterSize, rect: PixelRect): Buffer {
+  const image = readRgbaPng(png);
+  if (image === null || image.width !== sourceSize.width || image.height !== sourceSize.height) {
+    throw new Error("อ่านภาพต้นฉบับสำหรับครอปไม่ได้");
+  }
+  const clipped = clampCropRect(rect, sourceSize);
+  return encodeRgbaPng(clipped.width, clipped.height, cropRgba(image.rgba, sourceSize, clipped));
+}
+
+function cropJobInput(job: Job, selection: Selection, capture: CapturedImage): Job {
+  if (capture.choice.kind !== "cropped") return job;
+  const sourcePng = fs.readFileSync(job.pngPath);
+  const croppedPng = cropPngBytes(sourcePng, capture.size, capture.choice.rect);
+  fs.writeFileSync(job.pngPath, croppedPng);
+  return {
+    ...job,
+    placementBounds: cropRectToArtboardBounds(selection.bounds, capture.size, capture.choice.rect)
+  };
+}
+
 function callHost(host: CepBridge, method: "VP_snapshot" | "VP_capture" | "VP_commit" | "VP_list", args: readonly string[] = []): Promise<string[]> {
   const encoded = args.map((value) => '"' + encodeURIComponent(value) + '"').join(",");
   const script = method + "(" + encoded + ")";
@@ -566,7 +673,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function newJob(settings: PipelineSettings, controls: LabControls): Job {
+function newJob(settings: PipelineSettings, controls: LabControls, selection: Selection): Job {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vector-panel-"));
   return {
     id: crypto.randomBytes(8).toString("hex"),
@@ -575,6 +682,7 @@ function newJob(settings: PipelineSettings, controls: LabControls): Job {
     svgPath: path.join(directory, "result.svg"),
     settings,
     controls,
+    placementBounds: selection.bounds,
     cancelled: false
   };
 }
@@ -741,19 +849,144 @@ function showFacts(ui: Ui, facts: TraceFacts | null): void {
   ui.factNote.textContent = note;
 }
 
-function showSelection(ui: Ui, selection: Selection | null): void {
-  ui.selection.replaceChildren();
-  if (selection === null) {
-    ui.selection.textContent = "เลือกภาพหรือกลุ่มบน artboard";
-    return;
+function currentCropRect(capture: CapturedImage): PixelRect | null {
+  return capture.choice.kind === "cropped" ? capture.choice.rect : null;
+}
+
+function cropStatsLabel(size: RasterSize): string {
+  return size.width + " × " + size.height + " px · ประมาณ " + formatRasterMegapixels(size) + " MP";
+}
+
+function isCropHandle(value: string | undefined): value is CropHandle {
+  return value === "nw" || value === "n" || value === "ne" || value === "e" || value === "se" || value === "s" || value === "sw" || value === "w";
+}
+
+function resizeCropRect(rect: PixelRect, handle: CropHandle, dx: number, dy: number, size: RasterSize): PixelRect {
+  let left = rect.x;
+  let top = rect.y;
+  let right = rect.x + rect.width;
+  let bottom = rect.y + rect.height;
+  if (handle.includes("w")) left = Math.min(right - 1, Math.max(0, rect.x + dx));
+  if (handle.includes("e")) right = Math.max(left + 1, Math.min(size.width, rect.x + rect.width + dx));
+  if (handle.includes("n")) top = Math.min(bottom - 1, Math.max(0, rect.y + dy));
+  if (handle.includes("s")) bottom = Math.max(top + 1, Math.min(size.height, rect.y + rect.height + dy));
+  return clampCropRect({ x: left, y: top, width: right - left, height: bottom - top }, size);
+}
+
+function drawCropOverlay(ui: Ui, size: RasterSize, rect: PixelRect): void {
+  const overlay = ui.selectionCropOverlay;
+  overlay.setAttribute("viewBox", "0 0 " + size.width + " " + size.height);
+  overlay.setAttribute("preserveAspectRatio", "none");
+  overlay.replaceChildren();
+
+  const hitArea = document.createElementNS(SVG_NS, "rect");
+  hitArea.setAttribute("class", "crop-hit-area");
+  hitArea.setAttribute("width", String(size.width));
+  hitArea.setAttribute("height", String(size.height));
+  overlay.append(hitArea);
+
+  const shade = document.createElementNS(SVG_NS, "path");
+  shade.setAttribute("class", "crop-shade");
+  shade.setAttribute("d", "M0 0H" + size.width + "V" + size.height + "H0Z M" + rect.x + " " + rect.y + "H" + (rect.x + rect.width) + "V" + (rect.y + rect.height) + "H" + rect.x + "Z");
+  overlay.append(shade);
+
+  const selection = document.createElementNS(SVG_NS, "rect");
+  selection.setAttribute("class", "crop-selection");
+  selection.setAttribute("x", String(rect.x));
+  selection.setAttribute("y", String(rect.y));
+  selection.setAttribute("width", String(rect.width));
+  selection.setAttribute("height", String(rect.height));
+  overlay.append(selection);
+
+  const x1 = rect.x;
+  const x2 = rect.x + rect.width / 2;
+  const x3 = rect.x + rect.width;
+  const y1 = rect.y;
+  const y2 = rect.y + rect.height / 2;
+  const y3 = rect.y + rect.height;
+  const radius = Math.max(4, Math.min(size.width, size.height) * 0.035);
+  const handles: readonly (readonly [CropHandle, number, number])[] = [
+    ["nw", x1, y1], ["n", x2, y1], ["ne", x3, y1], ["e", x3, y2],
+    ["se", x3, y3], ["s", x2, y3], ["sw", x1, y3], ["w", x1, y2]
+  ];
+  for (const [handle, x, y] of handles) {
+    const circle = document.createElementNS(SVG_NS, "circle");
+    circle.setAttribute("class", "crop-handle");
+    circle.setAttribute("data-handle", handle);
+    circle.setAttribute("cx", String(x));
+    circle.setAttribute("cy", String(y));
+    circle.setAttribute("r", String(radius));
+    overlay.append(circle);
   }
-  const title = document.createElement("strong");
-  title.textContent = selection.itemName || selection.itemType;
-  const detail = document.createElement("small");
-  const kind = selection.itemType === "GroupItem" ? "กลุ่ม" : selection.itemType === "PlacedItem" ? "linked" : selection.embedded ? "embedded" : "raster";
-  detail.textContent = selection.documentName + " · " + kind + " · " + Math.round(selection.widthPt) + " × " + Math.round(selection.heightPt) + " pt";
-  if (selection.fromResult) detail.textContent += " · แปลงซ้ำเป็นเวอร์ชันใหม่";
-  ui.selection.append(title, detail);
+}
+
+function showSelection(
+  ui: Ui,
+  selection: Selection | null,
+  thumbnail: ThumbnailState,
+  capture: CapturedImage | null,
+  cropDraft: CropDraft | null
+): void {
+  ui.selectionDetails.replaceChildren();
+  if (selection === null) {
+    ui.selectionThumbnail.removeAttribute("src");
+    ui.selectionThumbnail.alt = "";
+    ui.selectionThumbnail.hidden = true;
+    ui.selectionThumbnailPlaceholder.textContent = "เลือกภาพหรือกลุ่มบน artboard";
+    ui.selectionThumbnailPlaceholder.hidden = false;
+    ui.selectionCropOverlay.setAttribute("hidden", "");
+    ui.selectionCropOverlay.replaceChildren();
+    ui.largeImageNotice.hidden = true;
+    ui.cropEditor.hidden = true;
+    ui.cropControls.hidden = true;
+  } else {
+    const matchingCapture = capture !== null && capture.selectionKey === selectionKey(selection) ? capture : null;
+    const title = document.createElement("strong");
+    title.textContent = selection.itemName || selection.itemType;
+    const detail = document.createElement("small");
+    const kind = selection.itemType === "GroupItem" ? "กลุ่ม" : selection.itemType === "PlacedItem" ? "linked" : selection.embedded ? "embedded" : "raster";
+    detail.textContent = selection.documentName + " · " + kind + " · " + Math.round(selection.widthPt) + " × " + Math.round(selection.heightPt) + " pt";
+    if (matchingCapture !== null) {
+      const rect = cropDraft?.rect ?? currentCropRect(matchingCapture);
+      const shownSize = rect === null ? matchingCapture.size : { width: rect.width, height: rect.height };
+      detail.textContent += " · " + cropStatsLabel(shownSize);
+    }
+    if (selection.fromResult) detail.textContent += " · แปลงซ้ำเป็นเวอร์ชันใหม่";
+    ui.selectionDetails.append(title, detail);
+
+    if (thumbnail.kind === "ready") {
+      const displayUrl = cropDraft !== null && matchingCapture !== null ? matchingCapture.fullDataUrl : thumbnail.dataUrl;
+      if (ui.selectionThumbnail.getAttribute("src") !== displayUrl) ui.selectionThumbnail.src = displayUrl;
+      ui.selectionThumbnail.alt = selection.itemName || "ภาพที่เลือก";
+      ui.selectionThumbnail.hidden = false;
+      ui.selectionThumbnailPlaceholder.hidden = true;
+    } else {
+      ui.selectionThumbnail.removeAttribute("src");
+      ui.selectionThumbnail.alt = "";
+      ui.selectionThumbnail.hidden = true;
+      ui.selectionThumbnailPlaceholder.textContent = thumbnail.kind === "loading" ? "กำลังอ่านภาพต้นฉบับ…" : "แสดงภาพตัวอย่างไม่ได้";
+      ui.selectionThumbnailPlaceholder.hidden = false;
+    }
+
+    const canCrop = matchingCapture !== null && thumbnail.kind === "ready" && requiresCropChoice(matchingCapture.size);
+    const needsChoice = canCrop && matchingCapture.choice.kind === "needs-choice";
+    ui.largeImageNotice.hidden = !needsChoice || cropDraft !== null;
+    if (matchingCapture !== null) {
+      ui.largeImageNoticeText.textContent = "ภาพใหญ่ (ประมาณ " + formatRasterMegapixels(matchingCapture.size) + " MP) อาจช้า — ครอปก่อนแปลงไหม?";
+    }
+    ui.cropEditor.hidden = cropDraft === null;
+    ui.cropControls.hidden = !canCrop || needsChoice || cropDraft !== null;
+    ui.cropAgain.textContent = matchingCapture?.choice.kind === "cropped" ? "แก้ครอป" : "ครอปภาพ";
+    ui.cropClear.hidden = matchingCapture?.choice.kind !== "cropped";
+    if (cropDraft !== null && matchingCapture !== null) {
+      drawCropOverlay(ui, matchingCapture.size, cropDraft.rect);
+      ui.selectionCropOverlay.removeAttribute("hidden");
+      ui.cropSizeLive.textContent = cropStatsLabel({ width: cropDraft.rect.width, height: cropDraft.rect.height });
+    } else {
+      ui.selectionCropOverlay.setAttribute("hidden", "");
+      ui.selectionCropOverlay.replaceChildren();
+    }
+  }
 }
 
 function currentSelection(state: State): Selection | null {
@@ -823,6 +1056,12 @@ function svgPoint(svg: SVGSVGElement, event: PointerEvent): { x: number; y: numb
 function start(): void {
   const ui = getUi();
   let state: State = { kind: "empty" };
+  let thumbnailState = initialThumbnailState();
+  let thumbnailGeneration = 0;
+  let cachedCapture: { readonly selectionKey: string; readonly job: Job } | null = null;
+  let capturedImage: CapturedImage | null = null;
+  let cropDraft: CropDraft | null = null;
+  let cropDrag: CropDrag | null = null;
   let view: "vector" | "pixels" = "vector";
   let zoom = 1;
   let tool: Tool = "none";
@@ -832,7 +1071,7 @@ function start(): void {
   let stopBatch = false;
   let pendingFocus: { pathIndex: number; anchorIndex: number } | null = null;
   let edited = false;
-  let selectedStep: LabStepId = "colors";
+  let selectedStep = initialActiveStep();
   let presetState: PresetState = emptyPresetState();
   let pendingPreset: TracePreset | null = null;
   const browserFixture = new URLSearchParams(window.location.search).get("fixture") === "1";
@@ -851,6 +1090,147 @@ function start(): void {
   let progressOperationLabel: string | null = null;
   let progressDone = false;
   let displayedProgress = -1;
+
+  function clearCachedCapture(): void {
+    if (cachedCapture === null) return;
+    cleanJob(cachedCapture.job);
+    cachedCapture = null;
+  }
+
+  function beginThumbnailCapture(): number {
+    thumbnailGeneration += 1;
+    thumbnailState = reduceThumbnailState(thumbnailState, { kind: "capture-started", generation: thumbnailGeneration });
+    render();
+    return thumbnailGeneration;
+  }
+
+  function completeThumbnailCapture(generation: number, dataUrl: string): boolean {
+    const next = reduceThumbnailState(thumbnailState, { kind: "capture-completed", generation, dataUrl });
+    if (next === thumbnailState) return false;
+    thumbnailState = next;
+    render();
+    return true;
+  }
+
+  function failThumbnailCapture(generation: number): boolean {
+    const next = reduceThumbnailState(thumbnailState, { kind: "capture-failed", generation });
+    if (next === thumbnailState) return false;
+    thumbnailState = next;
+    render();
+    return true;
+  }
+
+  function cropChoicePending(selection: Selection | null): boolean {
+    return selection !== null && capturedImage !== null && capturedImage.selectionKey === selectionKey(selection) && capturedImage.choice.kind === "needs-choice";
+  }
+
+  function recordCaptureThumbnail(selection: Selection, job: Job, generation: number): boolean {
+    if (!isCurrentThumbnailCapture(thumbnailState, generation)) return false;
+    const png = fs.readFileSync(job.pngPath);
+    const size = readPngDimensions(png);
+    if (size === null) throw new Error("อ่านขนาดภาพ PNG ไม่ได้");
+    const key = selectionKey(selection);
+    const previous = capturedImage;
+    const retainChoice = previous !== null && previous.selectionKey === key && previous.size.width === size.width && previous.size.height === size.height;
+    let choice: CropChoice;
+    if (retainChoice && previous !== null) choice = previous.choice;
+    else choice = requiresCropChoice(size) ? { kind: "needs-choice" } : { kind: "not-required" };
+    const fullDataUrl = "data:image/png;base64," + png.toString("base64");
+    const nextCapture: CapturedImage = { selectionKey: key, size, fullDataUrl, choice };
+    const displayedPng = choice.kind === "cropped" ? cropPngBytes(png, size, choice.rect) : png;
+    capturedImage = nextCapture;
+    if (!completeThumbnailCapture(generation, "data:image/png;base64," + displayedPng.toString("base64"))) {
+      capturedImage = previous;
+      return false;
+    }
+    return true;
+  }
+
+  async function ensureCurrentSelection(selection: Selection): Promise<boolean> {
+    if (host === null) return false;
+    try {
+      const liveSelection = parseSelection(await callHost(host, "VP_snapshot"));
+      if (sameSelectionSourceAndBounds(selection, liveSelection)) return true;
+      message("เปลี่ยนภาพที่เลือก · กำลังอ่านภาพใหม่");
+    } catch {
+      // Refresh clears the old crop even if the current selection cannot be captured.
+    }
+    await refresh();
+    return false;
+  }
+
+  function updateThumbnailDataUrl(dataUrl: string): void {
+    if (thumbnailState.kind !== "ready") return;
+    thumbnailState = { ...thumbnailState, dataUrl };
+  }
+
+  async function openCropEditor(): Promise<void> {
+    if (capturedImage === null || !requiresCropChoice(capturedImage.size)) return;
+    const selection = currentSelection(state);
+    if (selection === null || !(await ensureCurrentSelection(selection))) return;
+    if (capturedImage === null) return;
+    const existing = currentCropRect(capturedImage);
+    const rect = existing ?? clampCropRect({
+      x: capturedImage.size.width * 0.1,
+      y: capturedImage.size.height * 0.1,
+      width: capturedImage.size.width * 0.8,
+      height: capturedImage.size.height * 0.8
+    }, capturedImage.size);
+    cropDraft = { rect };
+    cropDrag = null;
+    render();
+  }
+
+  async function acceptFullImage(): Promise<void> {
+    if (capturedImage === null || capturedImage.choice.kind !== "needs-choice") return;
+    const selection = currentSelection(state);
+    if (selection === null || !(await ensureCurrentSelection(selection))) return;
+    if (capturedImage === null || capturedImage.choice.kind !== "needs-choice") return;
+    capturedImage = { ...capturedImage, choice: { kind: "full" } };
+    updateThumbnailDataUrl(capturedImage.fullDataUrl);
+    message("ใช้ทั้งภาพแล้ว · กดสร้างตัวอย่างเพื่อแปลง");
+    render();
+  }
+
+  function discardPreviewAfterCropChange(): void {
+    if (state.kind !== "preview") return;
+    if (state.job !== null) cleanJob(state.job);
+    state = { kind: "selected", selection: state.selection };
+    latestPlan = null;
+    latestSvgs = [];
+    latestVectors = null;
+    latestPreview = null;
+  }
+
+  async function applyCropSelection(): Promise<boolean> {
+    if (capturedImage === null || cropDraft === null) return false;
+    const selection = currentSelection(state);
+    if (selection === null || !(await ensureCurrentSelection(selection))) return false;
+    if (capturedImage === null || cropDraft === null) return false;
+    const rect = clampCropRect(cropDraft.rect, capturedImage.size);
+    const png = cropPngBytes(capturedPngBytes(capturedImage.fullDataUrl), capturedImage.size, rect);
+    discardPreviewAfterCropChange();
+    capturedImage = { ...capturedImage, choice: { kind: "cropped", rect } };
+    updateThumbnailDataUrl("data:image/png;base64," + png.toString("base64"));
+    cropDraft = null;
+    cropDrag = null;
+    render();
+    return true;
+  }
+
+  async function clearCropSelection(): Promise<void> {
+    if (capturedImage === null || capturedImage.choice.kind !== "cropped") return;
+    const selection = currentSelection(state);
+    if (selection === null || !(await ensureCurrentSelection(selection))) return;
+    if (capturedImage === null || capturedImage.choice.kind !== "cropped") return;
+    discardPreviewAfterCropChange();
+    capturedImage = { ...capturedImage, choice: { kind: "full" } };
+    updateThumbnailDataUrl(capturedImage.fullDataUrl);
+    cropDraft = null;
+    cropDrag = null;
+    message("ล้างครอปแล้ว · ใช้ภาพเต็ม");
+    render();
+  }
 
   function flushProgress(): void {
     progressTimer = 0;
@@ -916,7 +1296,7 @@ function start(): void {
     presetState = selected;
     pendingPreset = null;
     applyControls(ui, selected.controls);
-    selectedStep = "colors";
+    selectedStep = reduceActiveStep(selectedStep, { kind: "preset-selected" });
     render();
     if (host !== null) void trace();
     else runFixtureRetrace();
@@ -991,7 +1371,7 @@ function start(): void {
   function commitSvg(svgText: string, focus: { pathIndex: number; anchorIndex: number } | null = null): void {
     if (state.kind !== "preview") return;
     pendingFocus = focus;
-    if (state.job !== null) fs.writeFileSync(state.job.svgPath, svgText);
+    if (state.job !== null) writeResultSvgAtomically(state.job.svgPath, state.job.id, svgText, fs);
     state = { ...state, svgText, facts: scoreSvg(svgText), dataUrl: svgDataUrl(svgText) };
     latestPreview = state;
     render();
@@ -1146,12 +1526,18 @@ function start(): void {
 
   function render(): void {
     showStep();
-    showSelection(ui, currentSelection(state));
+    showSelection(ui, currentSelection(state), thumbnailState, capturedImage, cropDraft);
     const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying";
     updatePresetUi(busy);
     ui.refresh.disabled = busy;
-    ui.trace.disabled = busy || state.kind === "empty" || presetState.kind === "unselected";
-    ui.batch.disabled = busy || presetState.kind === "unselected";
+    ui.trace.disabled = busy || state.kind === "empty" || presetState.kind === "unselected" || cropDraft !== null || cropChoicePending(currentSelection(state));
+    ui.batch.disabled = busy || presetState.kind === "unselected" || cropChoicePending(currentSelection(state));
+    ui.cropStart.disabled = busy;
+    ui.useFullImage.disabled = busy;
+    ui.cropApply.disabled = busy;
+    ui.cropCancel.disabled = busy;
+    ui.cropAgain.disabled = busy;
+    ui.cropClear.disabled = busy;
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
     ui.apply.disabled = state.kind !== "preview" || state.job === null || !sameControls(state.job.controls, readControls(ui));
     ui.cancel.hidden = state.kind !== "planning" && state.kind !== "tracing" && !batching;
@@ -1389,7 +1775,7 @@ function start(): void {
     latestSvgs = svgs;
     latestVectors = vectorStagesForPlan(svgs, plan, job.controls, progress.report);
     const svgText = latestVectors.sealed;
-    fs.writeFileSync(job.svgPath, svgText);
+    writeResultSvgAtomically(job.svgPath, job.id, svgText, fs);
     const decoded = readRgbaPng(sourcePng);
     brushPixels = null;
     tool = "none";
@@ -1403,9 +1789,9 @@ function start(): void {
       pngUrl: pngDataUrl(sourcePng),
       svgText,
       raster: decoded === null ? null : { width: decoded.width, height: decoded.height, rgba: decoded.rgba },
+      placementBounds: job.placementBounds,
       facts: scoreSvg(svgText)
     };
-    selectedStep = "seal";
     latestPreview = state;
     liveControls = null;
     finishProgress(progress);
@@ -1420,21 +1806,52 @@ function start(): void {
     }
     if (state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying" || batching) return;
     if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+    clearCachedCapture();
+    capturedImage = null;
+    cropDraft = null;
+    cropDrag = null;
     latestPlan = null;
     latestSvgs = [];
     latestVectors = null;
     latestPreview = null;
     liveControls = null;
+    const generation = beginThumbnailCapture();
     const progress = beginProgress("capture", "ตรวจภาพ");
     state = { kind: "loading" };
     render();
     try {
       const selection = parseSelection(await callHost(host, "VP_snapshot"));
-      progress.report("capture", 1);
-      finishProgress(progress);
+      if (!isCurrentThumbnailCapture(thumbnailState, generation)) return;
+      let captureError: unknown = null;
+      let job: Job | null = null;
+      try {
+        const controls = readControls(ui);
+        job = newJob(settingsFromControls(controls), controls, selection);
+        await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+        if (!isCurrentThumbnailCapture(thumbnailState, generation)) {
+          cleanJob(job);
+          return;
+        }
+        if (!recordCaptureThumbnail(selection, job, generation)) {
+          cleanJob(job);
+          return;
+        }
+        cachedCapture = { selectionKey: selectionKey(selection), job };
+      } catch (error) {
+        if (job !== null) cleanJob(job);
+        if (!failThumbnailCapture(generation)) return;
+        captureError = error;
+      }
+      if (captureError === null) {
+        progress.report("capture", 1);
+        finishProgress(progress);
+      } else {
+        hideProgress();
+      }
       state = { kind: "selected", selection };
-      message("ภาพพร้อมแปลง");
+      message(captureError === null ? "ภาพพร้อมแปลง" : "อ่านภาพตัวอย่างไม่ได้: " + errorMessage(captureError), captureError !== null);
     } catch (error) {
+      if (!failThumbnailCapture(generation)) return;
       hideProgress();
       state = { kind: "empty" };
       message(errorMessage(error), true);
@@ -1449,6 +1866,18 @@ function start(): void {
     }
     if (state.kind !== "selected" && state.kind !== "preview") return;
     const selection = state.selection;
+    if (!(await ensureCurrentSelection(selection))) return;
+    if (state.kind !== "selected" && state.kind !== "preview") return;
+    if (cropDraft !== null) {
+      message("ใช้ครอปนี้หรือยกเลิกก่อนเริ่มแปลง", true);
+      render();
+      return;
+    }
+    if (cropChoicePending(selection)) {
+      message("เลือกครอปหรือใช้ทั้งภาพก่อนเริ่มแปลง", true);
+      render();
+      return;
+    }
     if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
     latestPlan = null;
     latestSvgs = [];
@@ -1456,13 +1885,39 @@ function start(): void {
     latestPreview = null;
     liveControls = null;
     const controls = readControls(ui);
-    let job = newJob(settingsFromControls(controls), controls);
+    const cached = cachedCapture;
+    cachedCapture = null;
+    let reusedCapture = false;
+    let job: Job;
+    if (cached !== null && cached.selectionKey === selectionKey(selection)) {
+      job = { ...cached.job, settings: settingsFromControls(controls), controls, cancelled: false };
+      reusedCapture = true;
+    } else {
+      if (cached !== null) cleanJob(cached.job);
+      job = newJob(settingsFromControls(controls), controls, selection);
+    }
     const progress = beginProgress("capture");
+    const thumbnailRequest = reusedCapture ? null : beginThumbnailCapture();
     try {
       state = { kind: "capturing", selection, job };
       message("กำลังอ่านภาพจาก Illustrator…");
       render();
-      await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+      if (!reusedCapture) {
+        await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+        if (thumbnailRequest !== null && !recordCaptureThumbnail(selection, job, thumbnailRequest)) return;
+        if (cropChoicePending(selection)) {
+          cachedCapture = { selectionKey: selectionKey(selection), job };
+          state = { kind: "selected", selection };
+          progress.report("capture", 1);
+          finishProgress(progress);
+          message("ภาพใหญ่ เลือกครอปหรือใช้ทั้งภาพก่อนเริ่มแปลง");
+          render();
+          return;
+        }
+      }
+      if (capturedImage !== null && capturedImage.selectionKey === selectionKey(selection)) {
+        job = cropJobInput(job, selection, capturedImage);
+      }
       progress.report("capture", 1);
       const capturedControls = readControls(ui);
       job = { ...job, settings: settingsFromControls(capturedControls), controls: capturedControls, cancelled: false };
@@ -1486,6 +1941,7 @@ function start(): void {
         await retraceFromCapture();
       }
     } catch (error) {
+      if (thumbnailRequest !== null) failThumbnailCapture(thumbnailRequest);
       if (!job.cancelled || !retraceQueued) hideProgress();
       cleanJob(job);
       state = { kind: "selected", selection };
@@ -1498,6 +1954,8 @@ function start(): void {
 
   async function apply(): Promise<boolean> {
     if (host === null || state.kind !== "preview" || state.job === null) return false;
+    if (!batching && !(await ensureCurrentSelection(state.selection))) return false;
+    if (state.kind !== "preview" || state.job === null) return false;
     if (!batching && !sameControls(state.job.controls, readControls(ui))) {
       message("กำลังปรับผลให้ตรงกับค่าล่าสุด…");
       scheduleRetrace();
@@ -1506,11 +1964,26 @@ function start(): void {
     }
     const preview = state;
     const job = state.job;
+    let svgFileText = "";
+    try {
+      const svgBytes = fs.readFileSync(job.svgPath);
+      svgFileText = svgBytes.toString("utf8");
+      if (!Buffer.from(svgFileText, "utf8").equals(svgBytes)) throw new Error("ไฟล์ไม่ใช่ UTF-8");
+    } catch {
+      message("วางลง Illustrator ไม่ได้: ไฟล์ผลลัพธ์ไม่สมบูรณ์ ลองสร้างตัวอย่างใหม่", true);
+      render();
+      return false;
+    }
+    if (validateSvgForPlacement(svgFileText, preview.svgText).kind === "invalid") {
+      message("วางลง Illustrator ไม่ได้: ไฟล์ผลลัพธ์ไม่สมบูรณ์ ลองสร้างตัวอย่างใหม่", true);
+      render();
+      return false;
+    }
     state = { ...preview, kind: "applying" };
     message("กำลังนำ path เข้า Illustrator…");
     render();
     try {
-      const result = await callHost(host, "VP_commit", [preview.selection.uuid, job.svgPath, job.id, settingsNote(job.settings), preview.selection.bounds.join(","), preview.selection.documentIdentity]);
+      const result = await callHost(host, "VP_commit", [preview.selection.uuid, job.svgPath, job.id, settingsNote(job.settings), preview.selection.bounds.join(","), preview.placementBounds.join(","), preview.selection.documentIdentity]);
       message("ใส่ผลแล้ว: " + (result[1] ?? "0") + " paths · ต้นฉบับยังอยู่");
       cleanJob(job);
       state = { kind: "selected", selection: preview.selection };
@@ -1518,10 +1991,10 @@ function start(): void {
       return true;
     } catch (error) {
       if (error instanceof HostTimeoutError) {
-        message("Illustrator ยังไม่ตอบกลับ ตรวจ Layers ก่อนเริ่มงานใหม่ เพื่อไม่สร้างผลซ้ำ", true);
+        message("วางลง Illustrator ไม่ได้: Illustrator ยังไม่ตอบกลับ ตรวจ Layers ก่อนเริ่มงานใหม่ เพื่อไม่สร้างผลซ้ำ", true);
         state = { kind: "selected", selection: preview.selection };
       } else {
-        message(errorMessage(error), true);
+        message("วางลง Illustrator ไม่ได้: " + errorMessage(error), true);
         state = preview;
       }
       render();
@@ -1536,6 +2009,7 @@ function start(): void {
     }
     if (batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying") return;
     if (state.kind === "preview" && state.job !== null) cleanJob(state.job);
+    clearCachedCapture();
     batching = true;
     stopBatch = false;
     render();
@@ -1558,19 +2032,22 @@ function start(): void {
           fromResult: false
         };
         const controls = readControls(ui);
-        const job = newJob(settingsFromControls(controls), controls);
+        const job = newJob(settingsFromControls(controls), controls, selection);
         const progress = beginProgress("capture");
         message("กำลังแปลงภาพ " + String(finished + 1) + "/" + String(list.items.length) + " · " + selection.itemName);
         state = { kind: "capturing", selection, job };
+        const thumbnailRequest = beginThumbnailCapture();
         render();
         try {
           await callHost(host, "VP_capture", [item.uuid, job.pngPath, list.documentIdentity, "1"]);
+          completeThumbnailCapture(thumbnailRequest, capturedPngDataUrl(job.pngPath));
           progress.report("capture", 1);
           await vectorize(selection, job, undefined, null, "colors", progress);
           const placed = await apply();
           if (!placed) return;
           finished += 1;
         } catch (error) {
+          failThumbnailCapture(thumbnailRequest);
           hideProgress();
           cleanJob(job);
           throw error;
@@ -1659,7 +2136,7 @@ function start(): void {
       progress.report("seal", 1);
     }
     latestVectors = vectors;
-    fs.writeFileSync(job.svgPath, vectors.sealed);
+    writeResultSvgAtomically(job.svgPath, job.id, vectors.sealed, fs);
     const nextPreview: Preview = { ...previous, job, svgText: vectors.sealed, facts: scoreSvg(vectors.sealed), dataUrl: svgDataUrl(vectors.sealed) };
     state = { kind: "preview", ...nextPreview };
     latestPreview = nextPreview;
@@ -1744,6 +2221,7 @@ function start(): void {
       svgPath: current.svgPath,
       settings: settingsFromControls(controls),
       controls,
+      placementBounds: current.placementBounds,
       cancelled: false
     };
     try {
@@ -1802,7 +2280,6 @@ function start(): void {
     const styled = styleLabVectors(svgText, readControls(ui), null, null);
     latestVectors = { trace: svgText, ...styled };
     fixtureControls = readControls(ui);
-    selectedStep = "seal";
     state = {
       kind: "preview",
       selection: {
@@ -1822,6 +2299,7 @@ function start(): void {
       pngUrl,
       svgText: styled.sealed,
       raster: { width, height, rgba },
+      placementBounds: [0, 100, 160, 0],
       facts: scoreSvg(styled.sealed)
     };
     latestPreview = state;
@@ -1830,6 +2308,73 @@ function start(): void {
   }
 
   ui.refresh.addEventListener("click", () => { void refresh(); });
+  ui.cropStart.addEventListener("click", () => { void openCropEditor(); });
+  ui.cropAgain.addEventListener("click", () => { void openCropEditor(); });
+  ui.useFullImage.addEventListener("click", () => { void acceptFullImage(); });
+  ui.cropApply.addEventListener("click", async () => {
+    try {
+      if (await applyCropSelection()) message("ใช้พื้นที่ครอปแล้ว · กดสร้างตัวอย่างเพื่อแปลง");
+    } catch (error) {
+      message(errorMessage(error), true);
+    }
+  });
+  ui.cropCancel.addEventListener("click", () => {
+    cropDraft = null;
+    cropDrag = null;
+    render();
+  });
+  ui.cropClear.addEventListener("click", () => { void clearCropSelection(); });
+  function cropPoint(event: PointerEvent): PixelPoint | null {
+    if (capturedImage === null) return null;
+    const bounds = ui.selectionCropOverlay.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return null;
+    return thumbnailPointToSourcePixels(
+      { x: event.clientX - bounds.left, y: event.clientY - bounds.top },
+      { width: bounds.width, height: bounds.height },
+      capturedImage.size
+    );
+  }
+  ui.selectionCropOverlay.addEventListener("pointerdown", (event) => {
+    if (cropDraft === null || capturedImage === null) return;
+    const point = cropPoint(event);
+    if (point === null) return;
+    const target = event.target instanceof SVGElement ? event.target : null;
+    const handle = target?.dataset.handle;
+    const initialRect = cropDraft.rect;
+    if (isCropHandle(handle)) {
+      cropDrag = { kind: "resize", pointerId: event.pointerId, start: point, initialRect, handle };
+    } else if (target !== null && target.closest(".crop-selection") !== null) {
+      cropDrag = { kind: "move", pointerId: event.pointerId, start: point, initialRect };
+    } else {
+      cropDrag = { kind: "draw", pointerId: event.pointerId, start: point, initialRect };
+    }
+    ui.selectionCropOverlay.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  ui.selectionCropOverlay.addEventListener("pointermove", (event) => {
+    if (cropDrag === null || cropDrag.pointerId !== event.pointerId || capturedImage === null) return;
+    const point = cropPoint(event);
+    if (point === null) return;
+    const deltaX = point.x - cropDrag.start.x;
+    const deltaY = point.y - cropDrag.start.y;
+    let rect: PixelRect;
+    if (cropDrag.kind === "draw") {
+      rect = clampCropRect({ x: cropDrag.start.x, y: cropDrag.start.y, width: deltaX, height: deltaY }, capturedImage.size);
+    } else if (cropDrag.kind === "move") {
+      rect = moveCropRect(cropDrag.initialRect, deltaX, deltaY, capturedImage.size);
+    } else {
+      rect = resizeCropRect(cropDrag.initialRect, cropDrag.handle, deltaX, deltaY, capturedImage.size);
+    }
+    cropDraft = { rect };
+    render();
+  });
+  function endCropDrag(event: PointerEvent): void {
+    if (cropDrag === null || cropDrag.pointerId !== event.pointerId) return;
+    cropDrag = null;
+    render();
+  }
+  ui.selectionCropOverlay.addEventListener("pointerup", endCropDrag);
+  ui.selectionCropOverlay.addEventListener("pointercancel", endCropDrag);
   for (const card of ui.presetCards) {
     card.addEventListener("click", () => {
       const option = PRESET_PRESENTATION.find((candidate) => candidate.preset === card.dataset.preset);
@@ -1902,9 +2447,9 @@ function start(): void {
   });
   for (const button of ui.stepButtons) {
     button.addEventListener("click", () => {
-      const step = LAB_STEPS.find((candidate) => candidate === button.dataset.step);
-      if (step === undefined) return;
-      selectedStep = step;
+      const step = button.dataset.step;
+      if (!isLabStep(step)) return;
+      selectedStep = reduceActiveStep(selectedStep, { kind: "tab-selected", step });
       render();
     });
   }

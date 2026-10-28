@@ -126,6 +126,35 @@ function VP_boundsMatch(actual, expectedText) {
   return true;
 }
 
+function VP_frameTransform(frameBounds, targetBounds) {
+  var frameWidth = Number(frameBounds[2]) - Number(frameBounds[0]);
+  var frameHeight = Number(frameBounds[1]) - Number(frameBounds[3]);
+  var targetWidth = Number(targetBounds[2]) - Number(targetBounds[0]);
+  var targetHeight = Number(targetBounds[1]) - Number(targetBounds[3]);
+  if (!isFinite(frameWidth) || !isFinite(frameHeight) || !isFinite(targetWidth) || !isFinite(targetHeight) || frameWidth <= 0 || frameHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+    throw new Error("ขนาดกรอบผลลัพธ์ไม่ถูกต้อง");
+  }
+  var scaleX = targetWidth / frameWidth;
+  var scaleY = targetHeight / frameHeight;
+  return {
+    scaleX: scaleX,
+    scaleY: scaleY,
+    translateX: Number(targetBounds[0]) - Number(frameBounds[0]) * scaleX,
+    translateY: Number(targetBounds[1]) - Number(frameBounds[1]) * scaleY
+  };
+}
+
+function VP_framePath(group) {
+  var paths = group.pathItems;
+  for (var i = 0; i < paths.length; i++) {
+    try { if (String(paths[i].name) === "vp-frame") return paths[i]; } catch (ignoredName) {}
+  }
+  for (var j = 0; j < paths.length; j++) {
+    try { if (paths[j].filled === false && paths[j].stroked === false) return paths[j]; } catch (ignoredAppearance) {}
+  }
+  throw new Error("Illustrator ไม่พบกรอบอ้างอิงของ SVG");
+}
+
 function VP_documentIdentity(documentRef) {
   try { return "file:" + documentRef.fullName.fsName; } catch (ignored) {}
   return "unsaved:" + documentRef.name;
@@ -262,7 +291,7 @@ function VP_capture(encodedUuid, encodedPath, encodedDocumentIdentity, encodedBa
   }
 }
 
-function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, encodedBounds, encodedDocumentIdentity) {
+function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, encodedBounds, encodedPlacementBounds, encodedDocumentIdentity) {
   var createdLayer = null;
   try {
     var uuid = decodeURIComponent(encodedUuid);
@@ -270,13 +299,28 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     var jobId = decodeURIComponent(encodedJobId);
     var settings = decodeURIComponent(encodedSettings);
     var boundsText = decodeURIComponent(encodedBounds);
+    var placementBoundsText = decodeURIComponent(encodedPlacementBounds);
     var documentIdentity = decodeURIComponent(encodedDocumentIdentity);
     if (!/^[0-9a-f]{16}$/.test(jobId)) throw new Error("รหัสงานไม่ถูกต้อง");
     if (app.documents.length === 0) throw new Error("เอกสาร Illustrator ถูกปิดแล้ว");
     var doc = app.activeDocument;
     if (VP_documentIdentity(doc) !== documentIdentity) throw new Error("เอกสารปัจจุบันเปลี่ยนไป กรุณาแปลงใหม่");
     var source = VP_pageItem(doc, uuid);
-    var bounds = VP_commitBounds(source, VP_recordedBounds(boundsText));
+    var recordedBounds = VP_recordedBounds(boundsText);
+    var requestedPlacementBounds = VP_recordedBounds(placementBoundsText);
+    if (recordedBounds[2] <= recordedBounds[0] || recordedBounds[1] <= recordedBounds[3]) throw new Error("ขนาดภาพต้นฉบับไม่ถูกต้อง");
+    var sourceBounds = VP_commitBounds(source, recordedBounds);
+    if (Number(sourceBounds[2]) <= Number(sourceBounds[0]) || Number(sourceBounds[1]) <= Number(sourceBounds[3])) throw new Error("ขนาดภาพต้นฉบับไม่ถูกต้อง");
+    var xScale = (Number(sourceBounds[2]) - Number(sourceBounds[0])) / (Number(recordedBounds[2]) - Number(recordedBounds[0]));
+    var yScale = (Number(sourceBounds[1]) - Number(sourceBounds[3])) / (Number(recordedBounds[1]) - Number(recordedBounds[3]));
+    var placementBounds = [
+      Number(sourceBounds[0]) + (Number(requestedPlacementBounds[0]) - Number(recordedBounds[0])) * xScale,
+      Number(sourceBounds[1]) - (Number(recordedBounds[1]) - Number(requestedPlacementBounds[1])) * yScale,
+      Number(sourceBounds[0]) + (Number(requestedPlacementBounds[2]) - Number(recordedBounds[0])) * xScale,
+      Number(sourceBounds[1]) - (Number(recordedBounds[1]) - Number(requestedPlacementBounds[3])) * yScale
+    ];
+    if (placementBounds[2] <= placementBounds[0] || placementBounds[1] <= placementBounds[3]) throw new Error("ตำแหน่งผลลัพธ์ไม่ถูกต้อง");
+    if (placementBounds[0] < Number(sourceBounds[0]) - 0.05 || placementBounds[1] > Number(sourceBounds[1]) + 0.05 || placementBounds[2] > Number(sourceBounds[2]) + 0.05 || placementBounds[3] < Number(sourceBounds[3]) - 0.05) throw new Error("ตำแหน่งครอปอยู่นอกภาพต้นฉบับ");
     var svgFile = new File(svgPath);
     if (!svgFile.exists || svgFile.length === 0) throw new Error("ไม่พบไฟล์เวกเตอร์จาก worker");
 
@@ -285,14 +329,19 @@ function VP_commit(encodedUuid, encodedSvgPath, encodedJobId, encodedSettings, e
     createdLayer.name = "Vector Panel " + jobId;
     var holder = createdLayer.groupItems.add();
     holder.name = "Trace " + jobId;
-    var placed = holder.placedItems.add();
-    placed.file = svgFile;
-    placed.width = Number(bounds[2]) - Number(bounds[0]);
-    placed.height = Number(bounds[1]) - Number(bounds[3]);
-    placed.position = [Number(bounds[0]), Number(bounds[1])];
-    placed.embed();
+    var imported = holder.groupItems.createFromFile(svgFile);
+    var frame = VP_framePath(imported);
+    var transform = VP_frameTransform(frame.geometricBounds, placementBounds);
+    imported.resize(transform.scaleX * 100, transform.scaleY * 100, true, true, true, true, true, Transformation.DOCUMENTORIGIN);
+    imported.translate(transform.translateX, transform.translateY);
+    // Retain the frame as a clip: trace paths can extend beyond the SVG viewBox,
+    // and clipping keeps both visible artwork and its bounds inside that viewBox.
+    frame.zOrder(ZOrderMethod.BRINGTOFRONT);
+    frame.filled = true;
+    frame.clipping = true;
+    imported.clipped = true;
 
-    var addedPaths = doc.pathItems.length - beforePaths;
+    var addedPaths = doc.pathItems.length - beforePaths - 1;
     if (addedPaths <= 0) throw new Error("Illustrator ไม่ได้แปลง SVG เป็น path ที่แก้ได้");
     holder.note = "VectorPanel/1|source=" + uuid + "|job=" + jobId + "|settings=" + encodeURIComponent(settings);
     if (source) {

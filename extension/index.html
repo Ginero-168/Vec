@@ -21,7 +21,34 @@
           <h2 id="selection-title">1 · ภาพที่เลือก</h2>
           <button id="refresh" class="text-button" type="button">ตรวจภาพ</button>
         </div>
-        <div id="selection" class="selection-box">เลือกภาพหรือกลุ่มบน artboard</div>
+        <div id="selection" class="selection-box">
+          <div class="selection-thumbnail">
+            <div id="selection-crop-stage" class="selection-crop-stage">
+              <img id="selection-thumbnail" alt="" hidden />
+              <svg id="selection-crop-overlay" class="selection-crop-overlay" hidden aria-label="ปรับกรอบครอป" role="img"></svg>
+            </div>
+            <span id="selection-thumbnail-placeholder">เลือกภาพหรือกลุ่มบน artboard</span>
+          </div>
+          <div id="selection-details"></div>
+          <div id="large-image-notice" class="crop-notice" hidden role="status" aria-live="polite">
+            <p id="large-image-notice-text"></p>
+            <div>
+              <button id="crop-start" class="secondary" type="button">ครอป</button>
+              <button id="use-full-image" class="text-button" type="button">ใช้ทั้งภาพ</button>
+            </div>
+          </div>
+          <div id="crop-editor" class="crop-editor" hidden>
+            <p>ลากกรอบหรือจุดจับเพื่อเลือกส่วนภาพ · <strong id="crop-size-live"></strong></p>
+            <div>
+              <button id="crop-apply" class="secondary" type="button">ใช้ครอปนี้</button>
+              <button id="crop-cancel" class="text-button" type="button">ยกเลิก</button>
+            </div>
+          </div>
+          <div id="crop-controls" class="crop-controls" hidden>
+            <button id="crop-again" class="text-button" type="button">ครอปอีกครั้ง</button>
+            <button id="crop-clear" class="text-button" type="button" hidden>ล้างครอป</button>
+          </div>
+        </div>
       </section>
 
       <section id="presets-section" class="section" aria-labelledby="presets-title" hidden>
