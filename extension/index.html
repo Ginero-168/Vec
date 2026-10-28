@@ -24,9 +24,41 @@
         <div id="selection" class="selection-box">เลือกภาพหรือกลุ่มบน artboard</div>
       </section>
 
-      <section class="section" aria-labelledby="settings-title">
-        <h2 id="settings-title">2 · ตั้งค่าการแปลง</h2>
-        <button id="reset-controls" class="text-button" type="button">Reset to preset</button>
+      <section id="presets-section" class="section" aria-labelledby="presets-title" hidden>
+        <h2 id="presets-title">2 · เลือก preset</h2>
+        <div id="preset-gallery" class="preset-gallery" role="group" aria-label="เลือก preset สำหรับแปลงภาพ">
+          <button class="preset-card" type="button" data-preset="logo" aria-pressed="false">
+            <img src="img/presets/logo.svg" alt="" />
+            <span class="preset-card-copy"><strong>โลโก้</strong><small>สีแบน · ตัดพื้นหลัง</small></span>
+          </button>
+          <button class="preset-card" type="button" data-preset="icon" aria-pressed="false">
+            <img src="img/presets/icon.svg" alt="" />
+            <span class="preset-card-copy"><strong>ไอคอน</strong><small>ขอบคม · รูปทรงชัด</small></span>
+          </button>
+          <button class="preset-card" type="button" data-preset="photo" aria-pressed="false">
+            <img src="img/presets/photo.svg" alt="" />
+            <span class="preset-card-copy"><strong>ภาพถ่าย</strong><small>หลายสี · เก็บรายละเอียด</small></span>
+          </button>
+          <button class="preset-card" type="button" data-preset="poster" aria-pressed="false">
+            <img src="img/presets/poster.svg" alt="" />
+            <span class="preset-card-copy"><strong>โปสเตอร์</strong><small>สีจำกัด · เส้นเด่น</small></span>
+          </button>
+        </div>
+        <div id="preset-confirm" class="preset-confirm" hidden role="group" aria-live="polite">
+          <p id="preset-confirm-text"></p>
+          <div>
+            <button id="preset-confirm-apply" class="secondary" type="button">เปลี่ยน preset</button>
+            <button id="preset-confirm-cancel" class="text-button" type="button">ยกเลิก</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="controls-section" class="section" aria-labelledby="settings-title" hidden>
+        <div class="section-heading">
+          <h2 id="settings-title">3 · ปรับ 8 ขั้น</h2>
+          <button id="reset-controls" class="text-button" type="button">คืนค่าทั้งหมด</button>
+        </div>
+        <p id="preset-origin" class="preset-origin" aria-live="polite"></p>
         <ol id="step-tabs" class="step-tabs" aria-label="ขั้นตอนการแปลง">
           <li><button type="button" data-step="capture" aria-pressed="true">1 ภาพ</button></li>
           <li><button type="button" data-step="colors" aria-pressed="false">2 สี</button></li>
@@ -44,12 +76,11 @@
           </fieldset>
           <fieldset id="fields-colors" hidden>
             <legend>จัดกลุ่มสี</legend>
-            <label for="preset">ลักษณะภาพ</label>
-            <select id="preset">
-              <option value="logo" selected>โลโก้ / สีแบน</option>
-              <option value="icon">ไอคอน / ขอบคม</option>
-              <option value="photo">ภาพหลายสี</option>
-              <option value="poster">โปสเตอร์ขาวดำ</option>
+            <select id="preset" hidden aria-hidden="true" tabindex="-1">
+              <option value="logo" selected>โลโก้</option>
+              <option value="icon">ไอคอน</option>
+              <option value="photo">ภาพถ่าย</option>
+              <option value="poster">โปสเตอร์</option>
             </select>
             <div class="field-row"><label for="max-colors">เพดานจำนวนสี</label><output id="max-colors-value" for="max-colors"></output></div>
             <input id="max-colors" type="range" min="0" max="32" step="1" value="8" />
@@ -109,7 +140,7 @@
 
       <section class="section" aria-labelledby="preview-title">
         <div class="section-heading">
-          <h2 id="preview-title">3 · ตัวอย่างขั้น</h2>
+          <h2 id="preview-title">4 · ตัวอย่างขั้น</h2>
           <div class="preview-tools">
             <button id="view-pixels" class="text-button" type="button" hidden aria-pressed="false">พิกเซล</button>
             <button id="view-vectors" class="text-button" type="button" hidden aria-pressed="true">เวกเตอร์</button>
@@ -117,6 +148,10 @@
             <button id="zoom-in" class="text-button" type="button" hidden aria-label="ซูมเข้า">+</button>
             <span id="phase" class="phase">พร้อม</span>
           </div>
+        </div>
+        <div id="progress-status" class="progress-status" hidden aria-live="polite">
+          <div class="progress-heading"><span id="progress-label">ตรวจภาพ</span><span id="progress-value">0%</span></div>
+          <progress id="progress-bar" max="100" value="0" aria-label="ความคืบหน้าการแปลงภาพ"></progress>
         </div>
         <div class="preview-frame" id="preview-frame">
           <img id="preview" alt="ตัวอย่างผลลัพธ์เวกเตอร์" hidden />

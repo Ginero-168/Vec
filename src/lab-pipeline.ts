@@ -1,13 +1,14 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
 import { flatPlates } from "./flat-trace.ts";
 import { controlsFor, type LabControls } from "./lab-model.ts";
-import { punchRgba, revealSentinel } from "./punch-rgba.ts";
+import { punchRgba, punchRgbaAsync, revealSentinel } from "./punch-rgba.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
-import { segmentBackdropStage, segmentColorStage, type SegmentColorStage } from "./segment.ts";
+import { segmentBackdropStage, segmentBackdropStageAsync, segmentColorStage, segmentColorStageAsync, type SegmentColorStage } from "./segment.ts";
 import { mergePlates, type PlacedPlate } from "./trace-finish.ts";
 
 export const LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"] as const;
 export type LabStepId = (typeof LAB_STEPS)[number];
+export type PipelineProgress = (step: LabStepId, fraction: number) => void;
 
 export type LabRasterStages = {
   readonly mode: LabControls["mode"];
@@ -75,7 +76,8 @@ export function buildLabRasterStages(
   height: number,
   controls: LabControls,
   previous: LabRasterStages | null = null,
-  from: LabStepId = "colors"
+  from: LabStepId = "colors",
+  onProgress?: PipelineProgress
 ): LabRasterStages {
   if (controls.mode === "logo" || controls.mode === "icon") {
     if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
@@ -97,6 +99,7 @@ export function buildLabRasterStages(
   const fromIndex = LAB_STEPS.indexOf(from);
   const sameMode = previous?.mode === controls.mode;
   const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== undefined && fromIndex > LAB_STEPS.indexOf("colors");
+  if (!canReuseColors) onProgress?.("colors", 0);
   const segmentation = canReuseColors && previous !== null
     ? previous.segmentation
     : segmentColorStage(source, width, height, {
@@ -106,12 +109,15 @@ export function buildLabRasterStages(
       speckArea: controls.speckArea,
       removeBackground: false,
       opaqueAt: controlsFor(controls.mode).opaqueAt
-    });
+    }, (fraction) => onProgress?.("colors", fraction));
+  if (!canReuseColors) onProgress?.("colors", 1);
   const colors = segmentation.colors;
   const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
+  if (!canReuseBackdrop) onProgress?.("backdrop", 0);
   const backdropStage = canReuseBackdrop
     ? { backdrop: previous.backdrop, punchInput: previous.punchInput }
-    : segmentBackdropStage(source, width, height, segmentation, controls.removeBackground, controls.backdropSpread);
+    : segmentBackdropStage(source, width, height, segmentation, controls.removeBackground, controls.backdropSpread, (fraction) => onProgress?.("backdrop", fraction));
+  if (!canReuseBackdrop) onProgress?.("backdrop", 1);
   const backdrop = backdropStage.backdrop;
   const punchInput = backdropStage.punchInput;
   const spread = segmentation.spread;
@@ -119,7 +125,68 @@ export function buildLabRasterStages(
   const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
   if (canReusePunch && previous !== null) return previous;
 
-  const punched = punchRgba(punchInput, width, height, controls.opaqueAt);
+  onProgress?.("punch", 0);
+  const punched = punchRgba(punchInput, width, height, controls.opaqueAt, (fraction) => onProgress?.("punch", fraction));
+  onProgress?.("punch", 1);
+  return {
+    mode: controls.mode,
+    colors,
+    backdrop,
+    punchInput,
+    punch: revealSentinel(punched.rgba, punched.droppedColor),
+    traceInput: punched.rgba,
+    droppedColor: punched.droppedColor,
+    spread,
+    paletteSize,
+    segmentation
+  };
+}
+
+export async function buildLabRasterStagesAsync(
+  source: Uint8Array,
+  width: number,
+  height: number,
+  controls: LabControls,
+  previous: LabRasterStages | null = null,
+  from: LabStepId = "colors",
+  onProgress?: PipelineProgress,
+  shouldCancel?: () => boolean
+): Promise<LabRasterStages> {
+  if (controls.mode === "logo" || controls.mode === "icon") {
+    if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
+    const colors = source;
+    return { mode: controls.mode, colors, backdrop: colors, punchInput: source, punch: colors, traceInput: source, droppedColor: null, spread: 0, paletteSize: 0, segmentation: null };
+  }
+  const fromIndex = LAB_STEPS.indexOf(from);
+  const sameMode = previous?.mode === controls.mode;
+  const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== undefined && fromIndex > LAB_STEPS.indexOf("colors");
+  if (!canReuseColors) onProgress?.("colors", 0);
+  const segmentation = canReuseColors && previous !== null
+    ? previous.segmentation
+    : await segmentColorStageAsync(source, width, height, {
+      mode: controls.mode,
+      maxColors: controls.maxColors,
+      snapBlends: controls.snapBlends,
+      speckArea: controls.speckArea,
+      removeBackground: false,
+      opaqueAt: controlsFor(controls.mode).opaqueAt
+    }, (fraction) => onProgress?.("colors", fraction), shouldCancel);
+  const colors = segmentation.colors;
+  const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
+  if (!canReuseBackdrop) onProgress?.("backdrop", 0);
+  const backdropStage = canReuseBackdrop
+    ? { backdrop: previous.backdrop, punchInput: previous.punchInput }
+    : await segmentBackdropStageAsync(source, width, height, segmentation, controls.removeBackground, controls.backdropSpread, (fraction) => onProgress?.("backdrop", fraction), shouldCancel);
+  const backdrop = backdropStage.backdrop;
+  const punchInput = backdropStage.punchInput;
+  if (!canReuseBackdrop) onProgress?.("backdrop", 1);
+  const spread = segmentation.spread;
+  const paletteSize = segmentation.palette.length;
+  const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
+  if (canReusePunch && previous !== null) return previous;
+  onProgress?.("punch", 0);
+  const punched = await punchRgbaAsync(punchInput, width, height, controls.opaqueAt, (fraction) => onProgress?.("punch", fraction), shouldCancel);
+  onProgress?.("punch", 1);
   return {
     mode: controls.mode,
     colors,
@@ -191,12 +258,19 @@ export function vectorStagesFromPlan(
   width: number,
   height: number,
   droppedColor: string | null,
-  controls: LabControls
+  controls: LabControls,
+  onProgress?: PipelineProgress
 ): LabVectorStages {
+  onProgress?.("fit", 0);
   const trace = mergePlates(svgs, plates, width, height, null, false, false);
   const fitted = mergePlates(svgs, plates, width, height, droppedColor, controls.dropPlate, controls.fitGeometry);
+  onProgress?.("fit", 1);
+  onProgress?.("fair", 0);
   const faired = fairLabVector(fitted, controls);
+  onProgress?.("fair", 1);
+  onProgress?.("seal", 0);
   const sealed = sealLabVector(faired, controls);
+  onProgress?.("seal", 1);
   return { trace, fitted, faired, sealed };
 }
 

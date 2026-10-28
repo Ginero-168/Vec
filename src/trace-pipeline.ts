@@ -1,7 +1,7 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
-import { cornerColor, flatPlates } from "./flat-trace.ts";
+import { cornerColor, flatPlates, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
 import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "./lab-model.ts";
-import { buildLabRasterStages, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId } from "./lab-pipeline.ts";
+import { buildLabRasterStages, buildLabRasterStagesAsync, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId, type PipelineProgress } from "./lab-pipeline.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps } from "./score.ts";
 import { segmentRaster } from "./segment.ts";
@@ -36,19 +36,56 @@ export function planTrace(
   settings: PipelineSettings,
   controls?: LabControls,
   previousStages: LabRasterStages | null = null,
-  from: LabStepId = "colors"
+  from: LabStepId = "colors",
+  onProgress?: PipelineProgress
 ): TracePlan | null {
   const decoded = readRgbaPng(source);
   if (decoded === null) return null;
   if (controls !== undefined) {
     if (settings.preset === "logo" || settings.preset === "icon") {
-      return planFlat(decoded.rgba, decoded.width, decoded.height, settings, controls);
+      onProgress?.("colors", 0);
+      const plan = planFlat(decoded.rgba, decoded.width, decoded.height, settings, controls, undefined, (fraction) => onProgress?.("colors", fraction * 0.95));
+      onProgress?.("colors", 1);
+      onProgress?.("backdrop", 1);
+      onProgress?.("punch", 1);
+      return plan;
     }
-    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from);
+    const rasterStages = buildLabRasterStages(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress);
     return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, rasterStages);
   }
   if (settings.preset === "logo" || settings.preset === "icon") return planFlat(decoded.rgba, decoded.width, decoded.height, settings);
   return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
+}
+
+export async function planTraceAsync(
+  source: Buffer,
+  settings: PipelineSettings,
+  controls?: LabControls,
+  previousStages: LabRasterStages | null = null,
+  from: LabStepId = "colors",
+  onProgress?: PipelineProgress,
+  shouldCancel?: () => boolean
+): Promise<TracePlan | null> {
+  if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
+  const decoded = readRgbaPng(source);
+  if (decoded === null) return null;
+  if (controls === undefined) {
+    return planTrace(source, settings, controls, previousStages, from, onProgress);
+  }
+  if (settings.preset !== "logo" && settings.preset !== "icon") {
+    const stages = await buildLabRasterStagesAsync(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, shouldCancel);
+    if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
+    return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, stages);
+  }
+  onProgress?.("colors", 0);
+  const plates = await flatPlatesAsync(decoded.rgba, decoded.width, decoded.height, settings.maxColors, undefined,
+    (fraction) => onProgress?.("colors", fraction * 0.95), shouldCancel);
+  if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
+  const plan = planFlat(decoded.rgba, decoded.width, decoded.height, settings, controls, plates);
+  onProgress?.("colors", 1);
+  onProgress?.("backdrop", 1);
+  onProgress?.("punch", 1);
+  return plan;
 }
 
 export function fittedPlan(svgs: readonly string[], plan: TracePlan, removeBackground: boolean): string {
@@ -93,8 +130,8 @@ export function traceRasterWithControls(
   return finishTrace(plan.plates.map((plate) => tracePlate(plate.png, plate.request)), plan, settings, controls);
 }
 
-export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, controls: LabControls) {
-  return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls);
+export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, controls: LabControls, onProgress?: PipelineProgress) {
+  return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
 }
 
 export function settingsFromControls(controls: LabControls): PipelineSettings {
@@ -146,8 +183,16 @@ export function styledTraceSvg(fitted: string, settings: PipelineSettings): stri
   return groupPathsByFill(sealGaps(fairPaths(fitted, { smoothness: settings.smoothness, cornerDegrees: settings.corner }), stroke));
 }
 
-function planFlat(rgba: Uint8Array, width: number, height: number, settings: PipelineSettings, controls?: LabControls): TracePlan {
-  const flat = flatPlates(rgba, width, height, settings.maxColors);
+function planFlat(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  settings: PipelineSettings,
+  controls?: LabControls,
+  preparedPlates?: readonly FlatPlate[],
+  onProgress?: (fraction: number) => void
+): TracePlan {
+  const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, undefined, onProgress);
   const plates = flat.map((plate) => ({
       png: encodeRgbaPng(plate.width, plate.height, plate.rgba),
       scale: plate.scale,
@@ -158,7 +203,7 @@ function planFlat(rgba: Uint8Array, width: number, height: number, settings: Pip
         ? flatRequest(settings, plate.palette, plate.scale)
         : flatRequestForControls(settings, plate.palette, plate.scale, controls)
     }));
-  const rasterStages = controls === undefined ? undefined : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates(flat, width, height));
+  const rasterStages = controls === undefined ? undefined : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
   return {
     width,
     height,

@@ -9,10 +9,25 @@ import { expandPrimitives, listAnchors, moveAnchor, paintDisc, paletteFromRaster
 import { encodeRgbaPng, readRgbaPng } from "./png-alpha";
 import { holeNote, scoreSvg, shapeNote, type TraceFacts } from "./score";
 import { controlsFor, type LabControls } from "./lab-model";
+import {
+  emptyPresetState,
+  hasPresetEdits,
+  modifiedPresetControlCount,
+  modifiedPresetControls,
+  PRESET_CONTROL_FIELDS,
+  PRESET_PRESENTATION,
+  resetPresetControl,
+  resetPresetControls,
+  selectPreset,
+  updatePresetControls,
+  type PresetControlField,
+  type PresetState
+} from "./preset-state";
 import { CONTROL_STEPS, earliestChangedStep, LAB_STEPS, fairLabVector, sealLabVector, styleLabVectors, type LabRasterStages, type LabStepId } from "./lab-pipeline";
+import { createProgressReporter, type ProgressReporter, type StepProgress } from "./progress";
 import type { SegmentColorStage } from "./segment";
-import { cappedPalette, planTrace, replanTracePlan, settingsFromControls, vectorStagesForPlan, type PipelineSettings, type PlannedPlate, type TracePlan } from "./trace-pipeline";
-import { resolveVtracer, vtracerArguments, type TraceRequest } from "./trace";
+import { cappedPalette, planTraceAsync, replanTracePlan, settingsFromControls, vectorStagesForPlan, type PipelineSettings, type PlannedPlate, type TracePlan } from "./trace-pipeline";
+import { resolveVtracer, vtracerArguments, type TracePreset, type TraceRequest } from "./trace";
 
 interface CepBridge {
   evalScript(script: string, callback: (result: string) => void): void;
@@ -65,6 +80,7 @@ type Preview = {
 
 type PlanWorkerMessage =
   | { readonly kind: "plan"; readonly plan: TracePlan | null }
+  | { readonly kind: "progress"; readonly progress: StepProgress }
   | { readonly kind: "error"; readonly error: string };
 
 type PlanRunner = { readonly cancel: () => void };
@@ -73,6 +89,16 @@ type WorkerConstructor = new (filename: string) => Worker;
 
 /** Longest a worker round trip may take before the panel gives up and shows an error. */
 const PLAN_TIMEOUT_MS = 180_000;
+const PROGRESS_LABELS: Readonly<Record<LabStepId, string>> = {
+  capture: "อ่านภาพ",
+  colors: "แยกสี",
+  backdrop: "ลบพื้นหลัง",
+  punch: "เจาะช่อง",
+  trace: "แปลงเวกเตอร์ (VTracer)",
+  fit: "ปรับเส้น",
+  fair: "เกลี่ยเส้น",
+  seal: "ปิดรอยต่อ"
+};
 
 let workerConstructor: WorkerConstructor | null | undefined;
 
@@ -131,6 +157,14 @@ type ControlElements = {
 function parsePlanWorkerMessage(value: unknown): PlanWorkerMessage | null {
   if (!isRecord(value)) return null;
   if (value.kind === "error" && typeof value.error === "string") return { kind: "error", error: value.error };
+  if (value.kind === "progress" && isRecord(value.progress)) {
+    const payload = value.progress;
+    const step = LAB_STEPS.find((candidate) => candidate === payload.step);
+    const fraction = payload.fraction;
+    const percent = payload.percent;
+    if (step === undefined || typeof fraction !== "number" || !Number.isFinite(fraction) || fraction < 0 || fraction > 1 || typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) return null;
+    return { kind: "progress", progress: { step, fraction, percent } };
+  }
   if (value.kind !== "plan") return null;
   const plan = parseTracePlan(value.plan);
   if (value.plan !== null && plan === null) return null;
@@ -243,10 +277,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+type ControlStatusUi = { readonly marker: HTMLElement; readonly reset: HTMLButtonElement };
+
+const PRESET_CONTROL_LABELS: Readonly<Record<PresetControlField, string>> = {
+  maxColors: "เพดานจำนวนสี",
+  snapBlends: "ยุบสีผสม",
+  speckArea: "ขนาดจุดฝุ่น",
+  removeBackground: "ลบพื้นหลัง",
+  backdropSpread: "เกณฑ์ขอบพื้นหลัง",
+  opaqueAt: "เกณฑ์ความทึบ",
+  traceColors: "จำนวนสีตอนลากเส้น",
+  lockPalette: "ล็อกชุดสี",
+  colorPrecision: "ความละเอียดสี",
+  filterSpeckle: "กรองจุดเล็ก",
+  clustering: "การแยกโซน",
+  watershedDetail: "รายละเอียด watershed",
+  simplify: "ความคลาดเคลื่อนของเส้น",
+  stacking: "การวางรูป",
+  dropPlate: "ทิ้งแผ่นสี",
+  fitGeometry: "จับรูปทรง",
+  smoothness: "ความเรียบ",
+  corner: "ความคมของมุม",
+  seal: "ถมรอยระหว่างชิ้น",
+  sealWidth: "ความหนาของรอยที่ถม"
+};
+
 type Ui = {
   readonly selection: HTMLElement;
+  readonly presetsSection: HTMLElement;
+  readonly presetCards: readonly HTMLButtonElement[];
+  readonly presetConfirm: HTMLElement;
+  readonly presetConfirmText: HTMLElement;
+  readonly presetConfirmApply: HTMLButtonElement;
+  readonly presetConfirmCancel: HTMLButtonElement;
+  readonly controlsSection: HTMLElement;
+  readonly presetOrigin: HTMLElement;
+  readonly controlStatus: ReadonlyMap<PresetControlField, ControlStatusUi>;
   readonly status: HTMLElement;
   readonly phase: HTMLElement;
+  readonly progressStatus: HTMLElement;
+  readonly progressBar: HTMLProgressElement;
+  readonly progressLabel: HTMLElement;
+  readonly progressValue: HTMLElement;
   readonly preview: HTMLImageElement;
   readonly previewEmpty: HTMLElement;
   readonly stage: HTMLElement;
@@ -306,6 +378,12 @@ function getOutput(id: string): HTMLOutputElement {
   return value;
 }
 
+function getProgress(id: string): HTMLProgressElement {
+  const value = getElement(id);
+  if (!(value instanceof HTMLProgressElement)) throw new Error("Expected progress bar: " + id);
+  return value;
+}
+
 function getUi(): Ui {
   const preview = getElement("preview");
   const preset = getElement("preset");
@@ -317,10 +395,66 @@ function getUi(): Ui {
   if (!(clustering instanceof HTMLSelectElement)) throw new Error("Expected clustering selector");
   const stacking = getElement("stacking");
   if (!(stacking instanceof HTMLSelectElement)) throw new Error("Expected stacking selector");
+  const controls: ControlElements = {
+    mode: preset,
+    maxColors: getInput("max-colors"),
+    snapBlends: getInput("snap"),
+    speckArea: getInput("speck"),
+    removeBackground: getInput("backdrop"),
+    backdropSpread: getInput("spread"),
+    opaqueAt: getInput("opaque"),
+    traceColors: getInput("trace-colors"),
+    lockPalette: getInput("lock"),
+    colorPrecision: getInput("precision"),
+    filterSpeckle: getInput("speckle"),
+    clustering,
+    watershedDetail: getInput("watershed"),
+    simplify: getInput("simplify"),
+    stacking,
+    dropPlate: getInput("drop-plate"),
+    fitGeometry: getInput("fit"),
+    smoothness: getInput("smooth"),
+    corner: getInput("corner"),
+    seal: getInput("seal"),
+    sealWidth: getInput("seal-width")
+  };
+  const controlStatus = new Map<PresetControlField, ControlStatusUi>();
+  for (const field of PRESET_CONTROL_FIELDS) {
+    const element = controls[field];
+    const label = element instanceof HTMLInputElement && element.type === "checkbox" ? element.closest("label") : null;
+    const anchor = label ?? element;
+    const marker = document.createElement("div");
+    marker.id = "control-state-" + field;
+    marker.className = "control-state";
+    marker.hidden = true;
+    const note = document.createElement("span");
+    note.textContent = "แก้ไขแล้ว";
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "control-reset";
+    reset.textContent = "คืนค่า preset";
+    reset.setAttribute("aria-label", "คืนค่า preset: " + PRESET_CONTROL_LABELS[field]);
+    marker.append(note, reset);
+    anchor.insertAdjacentElement("afterend", marker);
+    controlStatus.set(field, { marker, reset });
+  }
   return {
     selection: getElement("selection"),
+    presetsSection: getElement("presets-section"),
+    presetCards: Array.from(document.querySelectorAll<HTMLButtonElement>("#preset-gallery .preset-card")),
+    presetConfirm: getElement("preset-confirm"),
+    presetConfirmText: getElement("preset-confirm-text"),
+    presetConfirmApply: getButton("preset-confirm-apply"),
+    presetConfirmCancel: getButton("preset-confirm-cancel"),
+    controlsSection: getElement("controls-section"),
+    presetOrigin: getElement("preset-origin"),
+    controlStatus,
     status: getElement("status"),
     phase: getElement("phase"),
+    progressStatus: getElement("progress-status"),
+    progressBar: getProgress("progress-bar"),
+    progressLabel: getElement("progress-label"),
+    progressValue: getElement("progress-value"),
     preview,
     previewEmpty: getElement("preview-empty"),
     stage: getElement("vector-stage"),
@@ -334,29 +468,7 @@ function getUi(): Ui {
     reset: getButton("reset-controls"),
     stepButtons: Array.from(document.querySelectorAll<HTMLButtonElement>("#step-tabs button")),
     stepFields: Array.from(document.querySelectorAll<HTMLFieldSetElement>("#step-controls fieldset")),
-    controls: {
-      mode: preset,
-      maxColors: getInput("max-colors"),
-      snapBlends: getInput("snap"),
-      speckArea: getInput("speck"),
-      removeBackground: getInput("backdrop"),
-      backdropSpread: getInput("spread"),
-      opaqueAt: getInput("opaque"),
-      traceColors: getInput("trace-colors"),
-      lockPalette: getInput("lock"),
-      colorPrecision: getInput("precision"),
-      filterSpeckle: getInput("speckle"),
-      clustering,
-      watershedDetail: getInput("watershed"),
-      simplify: getInput("simplify"),
-      stacking,
-      dropPlate: getInput("drop-plate"),
-      fitGeometry: getInput("fit"),
-      smoothness: getInput("smooth"),
-      corner: getInput("corner"),
-      seal: getInput("seal"),
-      sealWidth: getInput("seal-width")
-    },
+    controls,
     facts: getElement("facts"),
     factPaths: getElement("fact-paths"),
     factAnchors: getElement("fact-anchors"),
@@ -721,6 +833,9 @@ function start(): void {
   let pendingFocus: { pathIndex: number; anchorIndex: number } | null = null;
   let edited = false;
   let selectedStep: LabStepId = "colors";
+  let presetState: PresetState = emptyPresetState();
+  let pendingPreset: TracePreset | null = null;
+  const browserFixture = new URLSearchParams(window.location.search).get("fixture") === "1";
   let latestPlan: TracePlan | null = null;
   let latestSvgs: string[] = [];
   let latestVectors: ReturnType<typeof vectorStagesForPlan> | null = null;
@@ -731,6 +846,133 @@ function start(): void {
   let liveControls: LabControls | null = null;
   const host = illustratorHost();
   const extensionPath = host === null ? "" : host.getSystemPath(SystemPath.EXTENSION);
+  let progressTimer = 0;
+  let pendingProgress: StepProgress | null = null;
+  let progressOperationLabel: string | null = null;
+  let progressDone = false;
+  let displayedProgress = -1;
+
+  function flushProgress(): void {
+    progressTimer = 0;
+    if (pendingProgress === null) return;
+    const progress = pendingProgress;
+    pendingProgress = null;
+    const percent = Math.min(100, Math.max(0, Math.round(progress.percent)));
+    ui.progressStatus.hidden = false;
+    ui.progressLabel.textContent = progressDone ? "เสร็จแล้ว" : progressOperationLabel ?? ("กำลัง" + PROGRESS_LABELS[progress.step]);
+    ui.progressValue.textContent = String(percent) + "%";
+    ui.progressBar.value = percent;
+    displayedProgress = percent;
+  }
+
+  function queueProgress(progress: StepProgress): void {
+    pendingProgress = progress;
+    if (displayedProgress < 0 || progress.percent >= 100) {
+      if (progressTimer !== 0) window.clearTimeout(progressTimer);
+      flushProgress();
+      return;
+    }
+    if (progressTimer === 0) progressTimer = window.setTimeout(flushProgress, 50);
+  }
+
+  function beginProgress(from: LabStepId, label: string | null = null): ProgressReporter {
+    if (progressTimer !== 0) window.clearTimeout(progressTimer);
+    progressTimer = 0;
+    pendingProgress = null;
+    progressOperationLabel = label;
+    progressDone = false;
+    displayedProgress = -1;
+    ui.progressStatus.hidden = false;
+    return createProgressReporter(from, queueProgress);
+  }
+
+  function finishProgress(progress: ProgressReporter): void {
+    progress.finish();
+    progressDone = true;
+    pendingProgress = { step: "seal", fraction: 1, percent: 100 };
+    flushProgress();
+  }
+
+  function hideProgress(): void {
+    if (progressTimer !== 0) window.clearTimeout(progressTimer);
+    progressTimer = 0;
+    pendingProgress = null;
+    progressDone = false;
+    displayedProgress = -1;
+    progressOperationLabel = null;
+    ui.progressStatus.hidden = true;
+  }
+
+  function presetName(preset: TracePreset): string {
+    return PRESET_PRESENTATION.find((option) => option.preset === preset)?.label ?? preset;
+  }
+
+  function runFixtureRetrace(): void {
+    if (browserFixture) scheduleRetrace();
+  }
+
+  function activatePreset(preset: TracePreset): void {
+    const selected = selectPreset(preset);
+    presetState = selected;
+    pendingPreset = null;
+    applyControls(ui, selected.controls);
+    selectedStep = "colors";
+    render();
+    if (host !== null) void trace();
+    else runFixtureRetrace();
+  }
+
+  function choosePreset(preset: TracePreset): void {
+    if (presetState.kind === "selected" && presetState.preset === preset) {
+      pendingPreset = null;
+      render();
+      if (host !== null) void trace();
+      else runFixtureRetrace();
+      return;
+    }
+    if (hasPresetEdits(presetState)) {
+      pendingPreset = preset;
+      render();
+      return;
+    }
+    activatePreset(preset);
+  }
+
+  function updatePresetUi(busy: boolean): void {
+    const selectionAvailable = currentSelection(state) !== null && state.kind !== "loading";
+    ui.presetsSection.hidden = !selectionAvailable;
+    ui.controlsSection.hidden = !selectionAvailable || presetState.kind === "unselected";
+    for (const card of ui.presetCards) {
+      card.disabled = busy || !selectionAvailable;
+      card.setAttribute("aria-pressed", presetState.kind === "selected" && card.dataset.preset === presetState.preset ? "true" : "false");
+    }
+    ui.presetConfirm.hidden = pendingPreset === null || busy;
+    if (pendingPreset !== null && presetState.kind === "selected") {
+      const count = modifiedPresetControlCount(presetState);
+      ui.presetConfirmText.textContent = "เปลี่ยนจาก " + presetName(presetState.preset) + " เป็น " + presetName(pendingPreset) + " และเริ่มด้วยค่า preset ใหม่หรือไม่? (แก้ไขแล้ว " + String(count) + " ค่า)";
+    }
+    if (presetState.kind === "selected") {
+      const count = modifiedPresetControlCount(presetState);
+      ui.presetOrigin.textContent = "จาก preset: " + presetName(presetState.preset) + (count === 0 ? " • ยังไม่แก้ไข" : " • แก้ไขแล้ว " + String(count) + " ค่า");
+    } else {
+      ui.presetOrigin.textContent = "";
+    }
+    const modified = new Set(modifiedPresetControls(presetState));
+    for (const field of PRESET_CONTROL_FIELDS) {
+      const isModified = modified.has(field);
+      const control = ui.controls[field];
+      const label = control instanceof HTMLInputElement && control.type === "checkbox" ? control.closest("label") : null;
+      control.classList.toggle("is-modified", isModified);
+      label?.classList.toggle("is-modified", isModified);
+      const status = ui.controlStatus.get(field);
+      if (status !== undefined) {
+        status.marker.hidden = !isModified;
+        if (isModified) control.setAttribute("aria-describedby", status.marker.id);
+        else control.removeAttribute("aria-describedby");
+      }
+    }
+    ui.reset.disabled = busy || !hasPresetEdits(presetState);
+  }
 
   function message(value: string, isError = false): void {
     ui.status.textContent = value;
@@ -906,9 +1148,10 @@ function start(): void {
     showStep();
     showSelection(ui, currentSelection(state));
     const busy = batching || state.kind === "loading" || state.kind === "capturing" || state.kind === "planning" || state.kind === "tracing" || state.kind === "applying";
+    updatePresetUi(busy);
     ui.refresh.disabled = busy;
-    ui.trace.disabled = busy || state.kind === "empty";
-    ui.batch.disabled = busy;
+    ui.trace.disabled = busy || state.kind === "empty" || presetState.kind === "unselected";
+    ui.batch.disabled = busy || presetState.kind === "unselected";
     ui.trace.textContent = currentSelection(state)?.fromResult ? "สร้างเวอร์ชันใหม่" : "สร้างตัวอย่าง";
     ui.apply.disabled = state.kind !== "preview" || state.job === null || !sameControls(state.job.controls, readControls(ui));
     ui.cancel.hidden = state.kind !== "planning" && state.kind !== "tracing" && !batching;
@@ -984,7 +1227,8 @@ function start(): void {
     job: Job,
     sourcePng: Buffer,
     previousPlan: TracePlan | null,
-    from: LabStepId
+    from: LabStepId,
+    progress: ProgressReporter
   ): Promise<TracePlan | null> {
     liveControls = job.controls;
     const Ctor = loadWorkerConstructor();
@@ -997,7 +1241,7 @@ function start(): void {
         worker = null;
       }
     }
-    if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from);
+    if (worker === null) return planInPanel(selection, job, sourcePng, previousPlan, from, progress);
     const activeWorker = worker;
     state = { kind: "planning", selection, job, runner: { cancel: () => { void activeWorker.terminate(); } }, from };
     message("กำลังจัดสีและเตรียมขั้นลากเส้น…");
@@ -1029,10 +1273,9 @@ function start(): void {
           reject(new Error("ยกเลิกแล้ว"));
           return;
         }
-        planInPanel(selection, job, sourcePng, previousPlan, from).then(resolve, reject);
+        planInPanel(selection, job, sourcePng, previousPlan, from, progress).then(resolve, reject);
       };
-      activeWorker.once("message", (value: unknown) => {
-        received = true;
+      activeWorker.on("message", (value: unknown) => {
         if (job.cancelled) {
           fail(new Error("ยกเลิกแล้ว"));
           return;
@@ -1040,9 +1283,13 @@ function start(): void {
         const result = parsePlanWorkerMessage(value);
         if (result === null) {
           fail(new Error("ผลจากขั้นจัดสีไม่ถูกต้อง"));
+        } else if (result.kind === "progress") {
+          progress.report(result.progress.step, result.progress.fraction);
         } else if (result.kind === "error") {
+          received = true;
           fail(new Error(result.error));
         } else {
+          received = true;
           finish(result.plan);
         }
       });
@@ -1076,15 +1323,17 @@ function start(): void {
     job: Job,
     sourcePng: Buffer,
     previousPlan: TracePlan | null,
-    from: LabStepId
+    from: LabStepId,
+    progress: ProgressReporter
   ): Promise<TracePlan | null> {
-    state = { kind: "planning", selection, job, runner: { cancel: () => undefined }, from };
-    message("กำลังจัดสีและเตรียมขั้นลากเส้น… (Panel อาจไม่ตอบสนองสักครู่)");
+    let cancelled = false;
+    state = { kind: "planning", selection, job, runner: { cancel: () => { cancelled = true; } }, from };
+    message("กำลังจัดสีและเตรียมขั้นลากเส้น…");
     render();
     await new Promise<void>((resolve) => { window.setTimeout(resolve, 50); });
     if (job.cancelled) throw new Error("ยกเลิกแล้ว");
-    const plan = planTrace(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from);
-    if (job.cancelled) throw new Error("ยกเลิกแล้ว");
+    const plan = await planTraceAsync(sourcePng, job.settings, job.controls, previousPlan?.rasterStages ?? null, from, (step, fraction) => progress.report(step, fraction), () => cancelled || job.cancelled);
+    if (job.cancelled || cancelled) throw new Error("ยกเลิกแล้ว");
     return plan;
   }
 
@@ -1093,20 +1342,28 @@ function start(): void {
     job: Job,
     palette?: readonly string[],
     previousPlan: TracePlan | null = null,
-    from: LabStepId = "colors"
+    from: LabStepId = "colors",
+    progress: ProgressReporter = beginProgress(from)
   ): Promise<void> {
     if (!fs.existsSync(job.pngPath) || fs.statSync(job.pngPath).size === 0) throw new Error("Illustrator ไม่ได้ส่งภาพ PNG กลับมา");
     const binary = resolveVtracer(path.join(extensionPath, "bin", process.platform === "win32" ? "vtracer.exe" : "vtracer"));
     if (!fs.existsSync(binary)) throw new Error("ไม่พบ VTracer ที่ " + binary);
     const sourcePng = fs.readFileSync(job.pngPath);
     liveControls = job.controls;
-    let plan = previousPlan !== null && from === "trace"
+    const flatMode = job.controls.mode === "logo" || job.controls.mode === "icon";
+    const reuseExistingPlan = previousPlan !== null && (from === "trace" || (flatMode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")));
+    let plan = reuseExistingPlan
       ? replanTracePlan(previousPlan, job.controls)
-      : await planInWorker(selection, job, sourcePng, previousPlan, from);
+      : await planInWorker(selection, job, sourcePng, previousPlan, from, progress);
+    if (reuseExistingPlan && flatMode) {
+      if (LAB_STEPS.indexOf(from) <= LAB_STEPS.indexOf("backdrop")) progress.report("backdrop", 1);
+      if (LAB_STEPS.indexOf(from) <= LAB_STEPS.indexOf("punch")) progress.report("punch", 1);
+    }
     const controls = liveControls ?? job.controls;
     job = { ...job, controls, settings: settingsFromControls(controls) };
     if (plan !== null) plan = replanTracePlan(plan, controls);
     if (plan === null || plan.plates.length === 0) throw new Error("อ่าน PNG ไม่ได้");
+    progress.report("trace", 0);
     message("กำลังแยกโซนสี แล้วสร้างเส้นเวกเตอร์…");
     const svgs: string[] = [];
     for (let index = 0; index < plan.plates.length; index += 1) {
@@ -1117,18 +1374,20 @@ function start(): void {
       fs.writeFileSync(pngPath, plate.png);
       const brushed = palette !== undefined && job.settings.preset !== "logo" && job.settings.preset !== "icon";
       const request = brushed ? { ...plate.request, maxColors: 0, palette: cappedPalette(palette, "#ff00ff") } : plate.request;
+      progress.report("trace", index / plan.plates.length);
       await runVtracer(binary, job, pngPath, svgPath, request, (child) => {
         state = { kind: "tracing", selection, job, child };
         render();
       });
       svgs.push(fs.readFileSync(svgPath, "utf8"));
+      progress.report("trace", (index + 1) / plan.plates.length);
     }
     const finishedControls = liveControls ?? job.controls;
     job = { ...job, controls: finishedControls, settings: settingsFromControls(finishedControls) };
     edited = false;
     latestPlan = plan;
     latestSvgs = svgs;
-    latestVectors = vectorStagesForPlan(svgs, plan, job.controls);
+    latestVectors = vectorStagesForPlan(svgs, plan, job.controls, progress.report);
     const svgText = latestVectors.sealed;
     fs.writeFileSync(job.svgPath, svgText);
     const decoded = readRgbaPng(sourcePng);
@@ -1149,6 +1408,7 @@ function start(): void {
     selectedStep = "seal";
     latestPreview = state;
     liveControls = null;
+    finishProgress(progress);
     message("เทียบพิกเซลกับเวกเตอร์ แล้วกดใส่ใน Illustrator");
     render();
   }
@@ -1165,13 +1425,17 @@ function start(): void {
     latestVectors = null;
     latestPreview = null;
     liveControls = null;
+    const progress = beginProgress("capture", "ตรวจภาพ");
     state = { kind: "loading" };
     render();
     try {
       const selection = parseSelection(await callHost(host, "VP_snapshot"));
+      progress.report("capture", 1);
+      finishProgress(progress);
       state = { kind: "selected", selection };
       message("ภาพพร้อมแปลง");
     } catch (error) {
+      hideProgress();
       state = { kind: "empty" };
       message(errorMessage(error), true);
     }
@@ -1193,17 +1457,19 @@ function start(): void {
     liveControls = null;
     const controls = readControls(ui);
     let job = newJob(settingsFromControls(controls), controls);
+    const progress = beginProgress("capture");
     try {
       state = { kind: "capturing", selection, job };
       message("กำลังอ่านภาพจาก Illustrator…");
       render();
       await callHost(host, "VP_capture", [selection.uuid, job.pngPath, selection.documentIdentity]);
+      progress.report("capture", 1);
       const capturedControls = readControls(ui);
       job = { ...job, settings: settingsFromControls(capturedControls), controls: capturedControls, cancelled: false };
       retraceQueued = false;
       while (true) {
         try {
-          await vectorize(selection, job);
+          await vectorize(selection, job, undefined, null, "colors", progress);
           break;
         } catch (error) {
           if (!job.cancelled || !retraceQueued) throw error;
@@ -1220,6 +1486,7 @@ function start(): void {
         await retraceFromCapture();
       }
     } catch (error) {
+      if (!job.cancelled || !retraceQueued) hideProgress();
       cleanJob(job);
       state = { kind: "selected", selection };
       latestPreview = null;
@@ -1292,22 +1559,26 @@ function start(): void {
         };
         const controls = readControls(ui);
         const job = newJob(settingsFromControls(controls), controls);
+        const progress = beginProgress("capture");
         message("กำลังแปลงภาพ " + String(finished + 1) + "/" + String(list.items.length) + " · " + selection.itemName);
         state = { kind: "capturing", selection, job };
         render();
         try {
           await callHost(host, "VP_capture", [item.uuid, job.pngPath, list.documentIdentity, "1"]);
-          await vectorize(selection, job);
+          progress.report("capture", 1);
+          await vectorize(selection, job, undefined, null, "colors", progress);
           const placed = await apply();
           if (!placed) return;
           finished += 1;
         } catch (error) {
+          hideProgress();
           cleanJob(job);
           throw error;
         }
       }
       message(stopBatch ? "หยุดที่ภาพ " + String(finished) : "แปลงครบ " + String(finished) + " ภาพ");
     } catch (error) {
+      hideProgress();
       message(errorMessage(error), true);
     } finally {
       batching = false;
@@ -1370,21 +1641,29 @@ function start(): void {
     const previous = state;
     const currentJob = previous.job;
     if (currentJob === null) return;
+    const progress = beginProgress(from);
     const job = { ...currentJob, settings: settingsFromControls(controls), controls };
     let vectors = latestVectors;
     if (from === "fit") {
-      vectors = vectorStagesForPlan(latestSvgs, latestPlan, controls);
+      vectors = vectorStagesForPlan(latestSvgs, latestPlan, controls, progress.report);
     } else if (from === "fair") {
+      progress.report("fair", 0);
       const faired = fairLabVector(vectors.fitted, controls);
+      progress.report("fair", 1);
+      progress.report("seal", 0);
       vectors = { ...vectors, faired, sealed: sealLabVector(faired, controls) };
+      progress.report("seal", 1);
     } else {
+      progress.report("seal", 0);
       vectors = { ...vectors, sealed: sealLabVector(vectors.faired, controls) };
+      progress.report("seal", 1);
     }
     latestVectors = vectors;
     fs.writeFileSync(job.svgPath, vectors.sealed);
     const nextPreview: Preview = { ...previous, job, svgText: vectors.sealed, facts: scoreSvg(vectors.sealed), dataUrl: svgDataUrl(vectors.sealed) };
     state = { kind: "preview", ...nextPreview };
     latestPreview = nextPreview;
+    finishProgress(progress);
     message("ปรับขั้น " + from + " แล้ว");
     render();
   }
@@ -1478,6 +1757,7 @@ function start(): void {
         await retraceFromCapture();
         return;
       }
+      hideProgress();
       liveControls = null;
       message(errorMessage(error), true);
       render();
@@ -1550,6 +1830,29 @@ function start(): void {
   }
 
   ui.refresh.addEventListener("click", () => { void refresh(); });
+  for (const card of ui.presetCards) {
+    card.addEventListener("click", () => {
+      const option = PRESET_PRESENTATION.find((candidate) => candidate.preset === card.dataset.preset);
+      if (option !== undefined) choosePreset(option.preset);
+    });
+  }
+  ui.presetConfirmApply.addEventListener("click", () => {
+    if (pendingPreset !== null) activatePreset(pendingPreset);
+  });
+  ui.presetConfirmCancel.addEventListener("click", () => {
+    pendingPreset = null;
+    render();
+  });
+  for (const [field, status] of ui.controlStatus) {
+    status.reset.addEventListener("click", () => {
+      if (presetState.kind === "unselected") return;
+      const reset = resetPresetControl(presetState, field);
+      presetState = reset;
+      if (reset.kind === "selected") applyControls(ui, reset.controls);
+      render();
+      scheduleRetrace();
+    });
+  }
   ui.trace.addEventListener("click", () => { void trace(); });
   ui.apply.addEventListener("click", () => { void apply(); });
   ui.batch.addEventListener("click", () => { void batch(); });
@@ -1561,6 +1864,7 @@ function start(): void {
       window.clearTimeout(retraceTimer);
       state.job.cancelled = true;
       state.runner.cancel();
+      hideProgress();
       message("กำลังยกเลิก…");
       return;
     }
@@ -1569,6 +1873,7 @@ function start(): void {
     window.clearTimeout(retraceTimer);
     state.job.cancelled = true;
     state.child.kill();
+    hideProgress();
     message("กำลังยกเลิก…");
   });
   const modeField = ui.controls.mode;
@@ -1577,25 +1882,21 @@ function start(): void {
     field.addEventListener("input", () => {
       if (field === ui.controls.stacking) ui.controls.sealWidth.value = field.value === "cutout" ? "2" : "0.8";
       syncOutputs();
+      presetState = updatePresetControls(presetState, readControls(ui));
       render();
       scheduleRetrace();
     });
     field.addEventListener("change", () => {
       if (field === ui.controls.stacking) ui.controls.sealWidth.value = field.value === "cutout" ? "2" : "0.8";
       syncOutputs();
+      presetState = updatePresetControls(presetState, readControls(ui));
       render();
       scheduleRetrace();
     });
   }
-  modeField.addEventListener("change", () => {
-    const mode = modeField.value;
-    if (mode !== "logo" && mode !== "icon" && mode !== "photo" && mode !== "poster") return;
-    applyControls(ui, controlsFor(mode));
-    render();
-    scheduleRetrace();
-  });
   ui.reset.addEventListener("click", () => {
-    applyControls(ui, controlsFor(readControls(ui).mode));
+    presetState = resetPresetControls(presetState);
+    if (presetState.kind === "selected") applyControls(ui, presetState.controls);
     render();
     scheduleRetrace();
   });
@@ -1652,12 +1953,18 @@ function start(): void {
     }
   });
 
-  applyControls(ui, controlsFor(readControls(ui).mode));
+  if (browserFixture) {
+    const selected = selectPreset("logo");
+    presetState = selected;
+    applyControls(ui, selected.controls);
+  } else {
+    applyControls(ui, controlsFor(readControls(ui).mode));
+  }
   if (host !== null) {
     cleanStaleJobs();
     render();
     void refresh();
-  } else if (new URLSearchParams(window.location.search).get("fixture") === "1") {
+  } else if (browserFixture) {
     loadFixture();
   } else {
     render();

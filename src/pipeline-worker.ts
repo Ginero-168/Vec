@@ -2,6 +2,7 @@ import { parentPort } from "node:worker_threads";
 import { planTrace, type PipelineSettings } from "./trace-pipeline.ts";
 import type { LabControls } from "./lab-model.ts";
 import type { LabRasterStages, LabStepId } from "./lab-pipeline.ts";
+import { createProgressReporter } from "./progress.ts";
 
 type PlanWorkerInput = {
   readonly sourcePng: Uint8Array;
@@ -15,7 +16,8 @@ if (parentPort === null) throw new Error("Pipeline worker requires a worker thre
 
 parentPort.on("message", (input: PlanWorkerInput) => {
   try {
-    const plan = planTrace(Buffer.from(input.sourcePng), input.settings, input.controls, input.previousStages, input.from);
+    const progress = createProgressReporter(input.from, (event) => parentPort?.postMessage({ kind: "progress", progress: event }));
+    const plan = planTrace(Buffer.from(input.sourcePng), input.settings, input.controls, input.previousStages, input.from, progress.report);
     parentPort?.postMessage({ kind: "plan", plan });
   } catch (error) {
     parentPort?.postMessage({ kind: "error", error: error instanceof Error ? error.message : String(error) });

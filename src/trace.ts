@@ -1,4 +1,5 @@
-export type TracePreset = "logo" | "icon" | "photo" | "poster";
+export const TRACE_PRESETS = ["logo", "icon", "photo", "poster"] as const;
+export type TracePreset = (typeof TRACE_PRESETS)[number];
 export type Stacking = "cutout" | "stacked";
 
 export type TraceRequest = {

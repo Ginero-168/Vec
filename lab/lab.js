@@ -792,9 +792,13 @@
   }
 
   // src/punch-rgba.ts
-  function punchRgba(rgba, width2, height2, opaqueAt = 128) {
+  function punchRgba(rgba, width2, height2, opaqueAt = 128, onProgress) {
+    onProgress?.(0);
     const count = width2 * height2;
-    if (rgba.length < count * 4) return { rgba, droppedColor: null };
+    if (rgba.length < count * 4) {
+      onProgress?.(1);
+      return { rgba, droppedColor: null };
+    }
     const cutoff = Math.min(255, Math.max(0, opaqueAt));
     const used = /* @__PURE__ */ new Set();
     let transparent = 0;
@@ -806,6 +810,7 @@
         continue;
       }
       used.add((rgba[offset] ?? 0) << 16 | (rgba[offset + 1] ?? 0) << 8 | (rgba[offset + 2] ?? 0));
+      if (index % 16384 === 0) onProgress?.(index / count * 0.45);
     }
     if (transparent === 0) {
       let needsFlattening = false;
@@ -815,9 +820,16 @@
           break;
         }
       }
-      if (!needsFlattening) return { rgba, droppedColor: null };
+      if (!needsFlattening) {
+        onProgress?.(1);
+        return { rgba, droppedColor: null };
+      }
       const opaque2 = new Uint8Array(rgba);
-      for (let index = 0; index < count; index += 1) opaque2[index * 4 + 3] = 255;
+      for (let index = 0; index < count; index += 1) {
+        opaque2[index * 4 + 3] = 255;
+        if (index % 16384 === 0) onProgress?.(0.45 + index / count * 0.55);
+      }
+      onProgress?.(1);
       return { rgba: opaque2, droppedColor: null };
     }
     const sentinel = unusedColor(used);
@@ -831,7 +843,9 @@
         next[offset + 2] = sentinel & 255;
       }
       next[offset + 3] = 255;
+      if (index % 16384 === 0) onProgress?.(0.45 + index / count * 0.55);
     }
+    onProgress?.(1);
     return { rgba: next, droppedColor: hex2(sentinel) };
   }
   function revealSentinel(rgba, droppedColor) {
@@ -1682,49 +1696,70 @@
   // src/segment.ts
   var MODE_CAP = { logo: 8, icon: 8, photo: 32, poster: 10 };
   var SPECK_AREA = { logo: 18, icon: 12, photo: 6, poster: 28 };
-  function segmentColorStage(rgba, width2, height2, options) {
+  function segmentColorStage(rgba, width2, height2, options, onProgress) {
+    let lastProgress = 0;
+    const report = (fraction) => {
+      lastProgress = Math.max(lastProgress, Math.min(1, fraction));
+      onProgress?.(lastProgress);
+    };
     const count = width2 * height2;
     if (width2 < 2 || height2 < 2 || rgba.length < count * 4) {
       const copy = rgba.slice();
       const labels2 = new Int16Array(count);
       labels2.fill(-1);
+      report(1);
       return { colors: copy, labels: labels2, punchLabels: labels2, palette: [], opaque: new Uint8Array(count), spread: 0 };
     }
     const source2 = rgba;
     const cutoff = Math.min(255, Math.max(0, Math.round(options.opaqueAt ?? 128)));
-    const samples = collectSamples(source2, width2, height2, cutoff);
-    const centroids = cluster(samples, colorCap(options));
+    report(0);
+    const samples = collectSamples(source2, width2, height2, cutoff, (fraction) => report(fraction * 0.08));
+    const centroids = cluster(samples, colorCap(options), (fraction) => report(0.08 + fraction * 0.12));
     const snapBlends = options.snapBlends ?? (options.mode === "logo" || options.mode === "icon");
     const areas = new Uint32Array(centroids.length);
     for (let index = 0; index < count; index += 1) {
       if ((source2[index * 4 + 3] ?? 0) < cutoff) continue;
       const label = nearest(pixelAt(source2, index), centroids);
       areas[label] = (areas[label] ?? 0) + 1;
+      if (index % Math.max(1, width2 * 4) === 0) report(0.2 + index / count * 0.12);
     }
+    report(0.32);
     const palette = snapBlends ? foldBlends(centroids, areas) : centroids;
     const labels = new Int16Array(count);
     labels.fill(-1);
     for (let index = 0; index < count; index += 1) {
       if ((source2[index * 4 + 3] ?? 0) < cutoff) continue;
       labels[index] = nearest(pixelAt(source2, index), palette);
+      if (index % Math.max(1, width2 * 4) === 0) report(0.32 + index / count * 0.16);
     }
-    cleanupEdges(labels, width2, height2);
-    mergeSpecks(labels, width2, height2, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])));
+    report(0.48);
+    cleanupEdges(labels, width2, height2, (fraction) => report(0.48 + fraction * 0.12));
+    mergeSpecks(labels, width2, height2, Math.max(0, Math.round(options.speckArea ?? SPECK_AREA[options.mode])), (fraction) => report(0.6 + fraction * 0.18));
     const punchLabels = new Int16Array(labels);
     for (let index = 0; index < count; index += 1) {
       if ((source2[index * 4 + 3] ?? 0) > 0 && (punchLabels[index] ?? -1) < 0) punchLabels[index] = nearest(pixelAt(source2, index), palette);
+      if (index % Math.max(1, width2 * 4) === 0) report(0.78 + index / count * 0.1);
     }
     const opaque2 = new Uint8Array(count);
-    for (let index = 0; index < count; index += 1) opaque2[index] = (source2[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
-    const colors = paintLabels(labels, palette, opaque2);
+    for (let index = 0; index < count; index += 1) {
+      opaque2[index] = (source2[index * 4 + 3] ?? 0) >= cutoff ? 255 : 0;
+      if (index % Math.max(1, width2 * 4) === 0) report(0.88 + index / count * 0.08);
+    }
+    const colors = paintLabels(labels, palette, opaque2, (fraction) => report(0.96 + fraction * 0.04));
+    report(1);
     return { colors, labels, punchLabels, palette, opaque: opaque2, spread: borderMeasure(source2, width2, height2)?.spread ?? 0 };
   }
-  function segmentBackdropStage(rgba, width2, height2, colors, removeBackground, spreadLimit) {
-    if (colors.palette.length === 0) return { backdrop: colors.colors.slice(), punchInput: rgba.slice() };
+  function segmentBackdropStage(rgba, width2, height2, colors, removeBackground, spreadLimit, onProgress) {
+    onProgress?.(0);
+    if (colors.palette.length === 0) {
+      onProgress?.(1);
+      return { backdrop: colors.colors.slice(), punchInput: rgba.slice() };
+    }
     const alpha = colors.opaque.slice();
     const punchAlpha = new Uint8Array(width2 * height2);
     for (let index = 0; index < punchAlpha.length; index += 1) {
       if ((colors.punchLabels[index] ?? -1) >= 0) punchAlpha[index] = rgba[index * 4 + 3] ?? 0;
+      if (index % Math.max(1, width2 * 4) === 0) onProgress?.(index / punchAlpha.length * 0.25);
     }
     const cleared = removeBackground ? flatBackdropMask(rgba, colors.labels, width2, height2, colors.palette, spreadLimit) : null;
     if (cleared !== null) {
@@ -1733,14 +1768,15 @@
           alpha[index] = 0;
           punchAlpha[index] = 0;
         }
+        if (index % Math.max(1, width2 * 4) === 0) onProgress?.(0.25 + index / cleared.length * 0.35);
       }
     }
     return {
-      backdrop: paintLabels(colors.labels, colors.palette, alpha),
-      punchInput: paintLabelsWithAlpha(colors.punchLabels, colors.palette, punchAlpha)
+      backdrop: paintLabels(colors.labels, colors.palette, alpha, (fraction) => onProgress?.(0.6 + fraction * 0.2)),
+      punchInput: paintLabelsWithAlpha(colors.punchLabels, colors.palette, punchAlpha, (fraction) => onProgress?.(0.8 + fraction * 0.2))
     };
   }
-  function paintLabels(labels, palette, alpha) {
+  function paintLabels(labels, palette, alpha, onProgress) {
     const next = new Uint8Array(alpha.length * 4);
     for (let index = 0; index < alpha.length; index += 1) {
       const offset = index * 4;
@@ -1750,10 +1786,12 @@
       next[offset + 1] = color.g;
       next[offset + 2] = color.b;
       next[offset + 3] = 255;
+      if (index % 16384 === 0) onProgress?.(index / alpha.length);
     }
+    onProgress?.(1);
     return next;
   }
-  function paintLabelsWithAlpha(labels, palette, alpha) {
+  function paintLabelsWithAlpha(labels, palette, alpha, onProgress) {
     const next = new Uint8Array(alpha.length * 4);
     for (let index = 0; index < alpha.length; index += 1) {
       const offset = index * 4;
@@ -1764,14 +1802,16 @@
       next[offset + 1] = color.g;
       next[offset + 2] = color.b;
       next[offset + 3] = opacity;
+      if (index % 16384 === 0) onProgress?.(index / alpha.length);
     }
+    onProgress?.(1);
     return next;
   }
   function colorCap(options) {
     const requested = options.maxColors > 0 ? options.maxColors : MODE_CAP[options.mode];
     return Math.min(32, Math.max(2, requested));
   }
-  function collectSamples(rgba, width2, height2, cutoff) {
+  function collectSamples(rgba, width2, height2, cutoff, onProgress) {
     const target = 8e3;
     const stride = Math.max(1, Math.floor(Math.sqrt(width2 * height2 / target)));
     const samples = [];
@@ -1781,10 +1821,11 @@
         if ((rgba[offset + 3] ?? 0) < cutoff) continue;
         samples.push({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
       }
+      onProgress?.(y / height2);
     }
     return samples.length > 0 ? samples : [{ r: 0, g: 0, b: 0 }];
   }
-  function cluster(samples, cap) {
+  function cluster(samples, cap, onProgress) {
     const centroids = seedCentroids(samples, cap);
     for (let round = 0; round < 8; round += 1) {
       const sums = centroids.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
@@ -1802,6 +1843,7 @@
         if (bin === void 0 || bin.n === 0) continue;
         centroids[index] = { r: Math.round(bin.r / bin.n), g: Math.round(bin.g / bin.n), b: Math.round(bin.b / bin.n) };
       }
+      onProgress?.((round + 1) / 8);
     }
     return centroids;
   }
@@ -1877,7 +1919,7 @@
     const projected = { r: a.r + t * abx, g: a.g + t * aby, b: a.b + t * abz };
     return distance2(color, projected) < 26 * 26 && distance2(color, a) > 18 * 18 && distance2(color, b) > 18 * 18;
   }
-  function cleanupEdges(labels, width2, height2) {
+  function cleanupEdges(labels, width2, height2, onProgress) {
     const original = new Int16Array(labels);
     for (let pass = 0; pass < 2; pass += 1) {
       for (let y = 1; y < height2 - 1; y += 1) {
@@ -1903,6 +1945,7 @@
           }
           if (bestCount >= 5) labels[index] = bestLabel;
         }
+        onProgress?.((pass + y / height2) / 2);
       }
       original.set(labels);
     }
@@ -1915,11 +1958,12 @@
     const down = (labels[index + width2] ?? -1) === label;
     return left && right && !up && !down || up && down && !left && !right;
   }
-  function mergeSpecks(labels, width2, height2, minArea) {
+  function mergeSpecks(labels, width2, height2, minArea, onProgress) {
     const count = width2 * height2;
     const seen = new Uint8Array(count);
     const queue = new Int32Array(count);
     for (let start = 0; start < count; start += 1) {
+      if (start % Math.max(1, width2 * 8) === 0) onProgress?.(start / count);
       if (seen[start] === 1) continue;
       const label = labels[start] ?? -1;
       if (label < 0) {
@@ -1955,6 +1999,7 @@
           tail += 1;
         }
       }
+      if (start % 4096 === 0) onProgress?.(start / count);
       const area = tail;
       const spanX = maxX - minX + 1;
       const spanY = maxY - minY + 1;
@@ -1987,6 +2032,7 @@
       if (replacement === label) continue;
       for (let cursor = 0; cursor < tail; cursor += 1) labels[queue[cursor] ?? 0] = replacement;
     }
+    onProgress?.(1);
   }
   function borderMeasure(rgba, width2, height2) {
     let red = 0;
@@ -2099,7 +2145,7 @@
 
   // src/lab-pipeline.ts
   var LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"];
-  function buildLabRasterStages(source2, width2, height2, controls, previous = null, from = "colors") {
+  function buildLabRasterStages(source2, width2, height2, controls, previous = null, from = "colors", onProgress) {
     if (controls.mode === "logo" || controls.mode === "icon") {
       if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
       const colors2 = source2;
@@ -2119,6 +2165,7 @@
     const fromIndex = LAB_STEPS.indexOf(from);
     const sameMode = previous?.mode === controls.mode;
     const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== void 0 && fromIndex > LAB_STEPS.indexOf("colors");
+    if (!canReuseColors) onProgress?.("colors", 0);
     const segmentation = canReuseColors && previous !== null ? previous.segmentation : segmentColorStage(source2, width2, height2, {
       mode: controls.mode,
       maxColors: controls.maxColors,
@@ -2126,17 +2173,22 @@
       speckArea: controls.speckArea,
       removeBackground: false,
       opaqueAt: controlsFor(controls.mode).opaqueAt
-    });
+    }, (fraction) => onProgress?.("colors", fraction));
+    if (!canReuseColors) onProgress?.("colors", 1);
     const colors = segmentation.colors;
     const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
-    const backdropStage = canReuseBackdrop ? { backdrop: previous.backdrop, punchInput: previous.punchInput } : segmentBackdropStage(source2, width2, height2, segmentation, controls.removeBackground, controls.backdropSpread);
+    if (!canReuseBackdrop) onProgress?.("backdrop", 0);
+    const backdropStage = canReuseBackdrop ? { backdrop: previous.backdrop, punchInput: previous.punchInput } : segmentBackdropStage(source2, width2, height2, segmentation, controls.removeBackground, controls.backdropSpread, (fraction) => onProgress?.("backdrop", fraction));
+    if (!canReuseBackdrop) onProgress?.("backdrop", 1);
     const backdrop2 = backdropStage.backdrop;
     const punchInput = backdropStage.punchInput;
     const spread2 = segmentation.spread;
     const paletteSize = segmentation.palette.length;
     const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
     if (canReusePunch && previous !== null) return previous;
-    const punched = punchRgba(punchInput, width2, height2, controls.opaqueAt);
+    onProgress?.("punch", 0);
+    const punched = punchRgba(punchInput, width2, height2, controls.opaqueAt, (fraction) => onProgress?.("punch", fraction));
+    onProgress?.("punch", 1);
     return {
       mode: controls.mode,
       colors,

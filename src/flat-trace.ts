@@ -42,14 +42,86 @@ export function flatPlates(
   width: number,
   height: number,
   maxColors: number,
-  preprocess: RasterPreprocess = identityRaster
+  preprocess: RasterPreprocess = identityRaster,
+  onProgress?: (fraction: number) => void
 ): FlatPlate[] {
-  const boxes = subjectBoxes(rgba, width, height);
-  return boxes.map((box) => plateFor(rgba, width, height, box, maxColors, preprocess));
+  const boxes = subjectBoxes(rgba, width, height, (fraction) => onProgress?.(fraction * 0.04));
+  onProgress?.(0.04);
+  return boxes.map((box, index) => plateFor(rgba, width, height, box, maxColors, preprocess, (fraction) => onProgress?.(0.04 + ((index + fraction) / boxes.length) * 0.96)));
 }
 
-export function subjectBoxes(rgba: Uint8Array, width: number, height: number): SubjectBox[] {
-  const found = enclosedBoxes(rgba, width, height);
+export async function flatPlatesAsync(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  maxColors: number,
+  preprocess: RasterPreprocess = identityRaster,
+  onProgress?: (fraction: number) => void,
+  shouldCancel?: () => boolean
+): Promise<FlatPlate[]> {
+  if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
+  const context = createCooperativeContext(shouldCancel);
+  onProgress?.(0);
+  const boxes = await subjectBoxesAsync(rgba, width, height, context, (fraction) => onProgress?.(fraction * 0.04));
+  onProgress?.(0.04);
+  const plates: FlatPlate[] = [];
+  for (let index = 0; index < boxes.length; index += 1) {
+    const box = boxes[index];
+    if (box === undefined) continue;
+    const base = index / boxes.length;
+    const span = 1 / boxes.length;
+    const cropW = box.width;
+    const cropH = box.height;
+    const crop = new Uint8Array(cropW * cropH * 4);
+    for (let y = 0; y < cropH; y += 1) {
+      const from = ((box.y + y) * width + box.x) * 4;
+      crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
+      if (y % 8 === 0) {
+        onProgress?.(0.04 + (base + span * 0.05 * (y + 1) / cropH) * 0.96);
+        await cooperate(context);
+      }
+    }
+    const painted = await labelImageAsync(crop, cropW, cropH, maxColors, preprocess, (fraction) => {
+      onProgress?.(0.04 + (base + span * (0.05 + fraction * 0.95)) * 0.96);
+    }, context);
+    plates.push({
+      rgba: painted.rgba,
+      width: painted.width,
+      height: painted.height,
+      scale: UP,
+      palette: painted.palette,
+      originX: box.x,
+      originY: box.y,
+      sourceWidth: cropW,
+      sourceHeight: cropH,
+      borderColor: cornerColor(crop, cropW, cropH)
+    });
+  }
+  onProgress?.(1);
+  return plates;
+}
+
+type CooperativeContext = { lastYield: number; readonly shouldCancel?: () => boolean };
+
+function createCooperativeContext(shouldCancel?: () => boolean): CooperativeContext {
+  return { lastYield: Date.now(), ...(shouldCancel === undefined ? {} : { shouldCancel }) };
+}
+
+async function cooperate(context: CooperativeContext): Promise<void> {
+  if (Date.now() - context.lastYield < 20) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  context.lastYield = Date.now();
+  if (context.shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
+}
+
+export function subjectBoxes(rgba: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): SubjectBox[] {
+  const found = enclosedBoxes(rgba, width, height, onProgress);
+  if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
+  return found;
+}
+
+async function subjectBoxesAsync(rgba: Uint8Array, width: number, height: number, context: CooperativeContext, onProgress: (fraction: number) => void): Promise<SubjectBox[]> {
+  const found = await enclosedBoxesAsync(rgba, width, height, context, onProgress);
   if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
   return found;
 }
@@ -60,7 +132,8 @@ function plateFor(
   height: number,
   box: SubjectBox,
   maxColors: number,
-  preprocess: RasterPreprocess
+  preprocess: RasterPreprocess,
+  onProgress?: (fraction: number) => void
 ): FlatPlate {
   const cropW = box.width;
   const cropH = box.height;
@@ -69,7 +142,7 @@ function plateFor(
     const from = ((box.y + y) * width + box.x) * 4;
     crop.set(rgba.subarray(from, from + cropW * 4), y * cropW * 4);
   }
-  const painted = labelImage(crop, cropW, cropH, maxColors, preprocess);
+  const painted = labelImage(crop, cropW, cropH, maxColors, preprocess, onProgress);
   return {
     rgba: painted.rgba,
     width: painted.width,
@@ -119,7 +192,8 @@ export function labelImage(
   width: number,
   height: number,
   maxColors: number,
-  preprocess: RasterPreprocess = identityRaster
+  preprocess: RasterPreprocess = identityRaster,
+  onProgress?: (fraction: number) => void
 ): Painted {
   const prepared = preprocess(rgba, width, height);
   const source = prepared.length === rgba.length ? prepared : rgba;
@@ -138,17 +212,421 @@ export function labelImage(
     linear[index * 3] = srgbToLinear(color.r);
     linear[index * 3 + 1] = srgbToLinear(color.g);
     linear[index * 3 + 2] = srgbToLinear(color.b);
+    if (index % Math.max(1, width * 2) === 0) onProgress?.(0.04 * index / count);
   }
-  let core = coreMask(lab, alpha, width, height, CORE_TAU);
-  if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08);
+  let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
+  if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = buildPalette(lab, core, width, height, userK);
-  const labels = assignLabels(linear, lab, core, alpha, width, height, centers);
-  const colors = fillColors(source, alpha, core, labels, width, height, centers);
-  return paintLabels(labels, colors, width * UP, height * UP);
+  const centers = buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08));
+  const labels = assignLabels(linear, lab, core, alpha, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
+  const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
+  const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
+  onProgress?.(1);
+  return painted;
 }
 
-function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, width: number, height: number, centers: Lab[]): Uint8Array {
+async function labelImageAsync(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  maxColors: number,
+  preprocess: RasterPreprocess,
+  onProgress: (fraction: number) => void,
+  context: CooperativeContext
+): Promise<Painted> {
+  const prepared = preprocess(rgba, width, height);
+  const source = prepared.length === rgba.length ? prepared : rgba;
+  const count = width * height;
+  const lab = new Float64Array(count * 3);
+  const linear = new Float64Array(count * 3);
+  const alpha = new Uint8Array(count);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const offset = index * 4;
+      const color = { r: source[offset] ?? 0, g: source[offset + 1] ?? 0, b: source[offset + 2] ?? 0 };
+      alpha[index] = (source[offset + 3] ?? 0) >= 128 ? 255 : 0;
+      const converted = rgbToOklab(color);
+      lab[index * 3] = converted.L;
+      lab[index * 3 + 1] = converted.a;
+      lab[index * 3 + 2] = converted.b;
+      linear[index * 3] = srgbToLinear(color.r);
+      linear[index * 3 + 1] = srgbToLinear(color.g);
+      linear[index * 3 + 2] = srgbToLinear(color.b);
+    }
+    onProgress(0.04 * (y + 1) / height);
+    await cooperate(context);
+  }
+  let core = await coreMaskAsync(lab, alpha, width, height, CORE_TAU, context);
+  if (countOf(core) < 8) core = await coreMaskAsync(lab, alpha, width, height, 0.08, context);
+  onProgress(0.14);
+  const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
+  const centers = buildPalette(lab, core, width, height, userK);
+  onProgress(0.26);
+  const labels = await assignLabelsAsync(linear, lab, core, alpha, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
+  const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
+  onProgress(0.94);
+  const painted = await paintLabelsAsync(labels, colors, width * UP, height * UP, context, (fraction) => onProgress(0.94 + fraction * 0.06));
+  onProgress(1);
+  return painted;
+}
+
+async function coreMaskAsync(lab: Float64Array, alpha: Uint8Array, width: number, height: number, tau: number, context: CooperativeContext): Promise<Uint8Array> {
+  const core = new Uint8Array(width * height);
+  const limit = tau * tau;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (alpha[index] === 0) continue;
+      const color = readLab(lab, index);
+      let worst = 0;
+      let flat = true;
+      for (let dy = -1; dy <= 1 && flat; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = Math.min(width - 1, Math.max(0, x + dx));
+          const ny = Math.min(height - 1, Math.max(0, y + dy));
+          const next = ny * width + nx;
+          if (alpha[next] === 0) {
+            flat = false;
+            break;
+          }
+          worst = Math.max(worst, labDistance2(color, readLab(lab, next)));
+          if (worst >= limit) flat = false;
+        }
+      }
+      if (flat && worst < limit) core[index] = 1;
+    }
+    await cooperate(context);
+  }
+  return core;
+}
+
+async function assignLabelsAsync(
+  linear: Float64Array,
+  lab: Float64Array,
+  core: Uint8Array,
+  alpha: Uint8Array,
+  width: number,
+  height: number,
+  centers: Lab[],
+  context: CooperativeContext,
+  onProgress: (fraction: number) => void
+): Promise<Uint8Array> {
+  const count = width * height;
+  const kCount = centers.length;
+  const coreLabel = new Int16Array(count);
+  coreLabel.fill(-1);
+  for (let index = 0; index < count; index += 1) {
+    if (core[index] === 1) coreLabel[index] = nearestLab(readLab(lab, index), centers);
+    if (index % 8192 === 0) await cooperate(context);
+  }
+  const allow = new Uint16Array(count);
+  const disk = diskOffsets(DILATE_RADIUS);
+  for (let index = 0; index < count; index += 1) {
+    const label = coreLabel[index] ?? -1;
+    if (label >= 0) {
+      const x = index % width;
+      const y = (index - x) / width;
+      for (const offset of disk) {
+        const nx = x + offset.x;
+        const ny = y + offset.y;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const at = ny * width + nx;
+        allow[at] = (allow[at] ?? 0) | (1 << label);
+      }
+    }
+    if (index % 4096 === 0) await cooperate(context);
+  }
+  const square = squareOffsets(1);
+  for (let index = 0; index < count; index += 1) {
+    if (alpha[index] !== 0) {
+      let near = 0;
+      const color = readLab(lab, index);
+      for (let label = 0; label < kCount; label += 1) {
+        const center = centers[label];
+        if (center === undefined) continue;
+        if (Math.sqrt(labDistance2(color, center)) < OWN_COLOR) near |= 1 << label;
+      }
+      if (near !== 0) {
+        const x = index % width;
+        const y = (index - x) / width;
+        for (const offset of square) {
+          const nx = x + offset.x;
+          const ny = y + offset.y;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const at = ny * width + nx;
+          allow[at] = (allow[at] ?? 0) | near;
+        }
+      }
+    }
+    if (index % 4096 === 0) await cooperate(context);
+  }
+  const nearestCore = await nearestCoreLabelAsync(coreLabel, width, height, context);
+  for (let index = 0; index < count; index += 1) {
+    if ((allow[index] ?? 0) === 0) {
+      const label = nearestCore[index] ?? -1;
+      if (label >= 0) allow[index] = 1 << label;
+    }
+    if (index % 8192 === 0) await cooperate(context);
+  }
+  onProgress(0.18);
+  const upW = width * UP;
+  const upH = height * UP;
+  const labels = new Uint8Array(upW * upH);
+  labels.fill(255);
+  const tile = 48;
+  for (let y0 = 0; y0 < height; y0 += tile) {
+    const y1 = Math.min(height, y0 + tile);
+    for (let y = y0; y < y1; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (alpha[y * width + x] === 0) continue;
+        const mask = allow[y * width + x] ?? 0;
+        const bits = bitList(mask, kCount);
+        for (let oy = 0; oy < UP; oy += 1) {
+          for (let ox = 0; ox < UP; ox += 1) {
+            const ux = x * UP + ox;
+            const uy = y * UP + oy;
+            const at = uy * upW + ux;
+            if (bits.length === 0) continue;
+            if (bits.length === 1) {
+              labels[at] = bits[0] ?? 0;
+              continue;
+            }
+            const sample = bicubicLab(linear, width, height, (ux + 0.5) / UP - 0.5, (uy + 0.5) / UP - 0.5);
+            labels[at] = explain(sample, bits, centers);
+          }
+        }
+      }
+      onProgress(0.18 + 0.25 * (y + 1) / height);
+      await cooperate(context);
+    }
+  }
+  await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
+  await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (alpha[y * width + x] !== 0) continue;
+      for (let oy = 0; oy < UP; oy += 1) {
+        for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
+      }
+    }
+    onProgress(0.91 + 0.09 * (y + 1) / height);
+    await cooperate(context);
+  }
+  return labels;
+}
+
+async function nearestCoreLabelAsync(coreLabel: Int16Array, width: number, height: number, context: CooperativeContext): Promise<Int16Array> {
+  const nearest = new Int16Array(coreLabel.length);
+  nearest.fill(-1);
+  const queue: number[] = [];
+  for (let index = 0; index < coreLabel.length; index += 1) {
+    const label = coreLabel[index] ?? -1;
+    if (label < 0) continue;
+    nearest[index] = label;
+    queue.push(index);
+    if (index % 8192 === 0) await cooperate(context);
+  }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const index = queue[cursor] ?? 0;
+    const label = nearest[index] ?? -1;
+    const x = index % width;
+    const y = (index - x) / width;
+    const steps = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+    for (const step of steps) {
+      const nx = step[0] ?? 0;
+      const ny = step[1] ?? 0;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const at = ny * width + nx;
+      if ((nearest[at] ?? -1) >= 0) continue;
+      nearest[at] = label;
+      queue.push(at);
+    }
+    if (cursor % 4096 === 0) await cooperate(context);
+  }
+  return nearest;
+}
+
+async function cleanLabelsAsync(labels: Uint8Array, width: number, height: number, kCount: number, minArea: number, context: CooperativeContext, onProgress: (fraction: number) => void): Promise<void> {
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let label = 0; label < kCount; label += 1) {
+      const mask = new Uint8Array(labels.length);
+      for (let index = 0; index < labels.length; index += 1) {
+        if (labels[index] === label) mask[index] = 1;
+        if (index % 16384 === 0) await cooperate(context);
+      }
+      const labeled = await componentsAsync(mask, width, height, context);
+      const small = new Uint8Array(labels.length);
+      let any = false;
+      for (let index = 0; index < labels.length; index += 1) {
+        const id = labeled.ids[index] ?? 0;
+        if (id > 0 && (labeled.sizes[id] ?? 0) < minArea) {
+          small[index] = 1;
+          any = true;
+        }
+        if (index % 16384 === 0) await cooperate(context);
+      }
+      if (any) {
+        const replacement = await nearestOutsideAsync(labels, small, width, height, context);
+        for (let index = 0; index < labels.length; index += 1) {
+          if (small[index] === 1) labels[index] = replacement[index] ?? label;
+          if (index % 16384 === 0) await cooperate(context);
+        }
+      }
+      onProgress((pass * kCount + label + 1) / (2 * Math.max(1, kCount)));
+    }
+  }
+}
+
+async function componentsAsync(mask: Uint8Array, width: number, height: number, context: CooperativeContext): Promise<{ readonly ids: Int32Array; readonly sizes: Int32Array; readonly count: number }> {
+  const ids = new Int32Array(mask.length);
+  const sizes: number[] = [0];
+  const stack: number[] = [];
+  let visits = 0;
+  for (let start = 0; start < mask.length; start += 1) {
+    if (mask[start] !== 1 || ids[start] !== 0) continue;
+    const id = sizes.length;
+    sizes.push(0);
+    stack.push(start);
+    ids[start] = id;
+    while (stack.length > 0) {
+      const index = stack.pop() ?? 0;
+      sizes[id] = (sizes[id] ?? 0) + 1;
+      const x = index % width;
+      const y = (index - x) / width;
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const next = ny * width + nx;
+          if (mask[next] !== 1 || ids[next] !== 0) continue;
+          ids[next] = id;
+          stack.push(next);
+        }
+      }
+      visits += 1;
+      if (visits % 4096 === 0) await cooperate(context);
+    }
+    if (start % 16384 === 0) await cooperate(context);
+  }
+  return { ids, sizes: Int32Array.from(sizes), count: sizes.length - 1 };
+}
+
+async function nearestOutsideAsync(labels: Uint8Array, small: Uint8Array, width: number, height: number, context: CooperativeContext): Promise<Uint8Array> {
+  const nearest = new Uint8Array(labels.length);
+  const seen = new Uint8Array(labels.length);
+  const queue: number[] = [];
+  for (let index = 0; index < small.length; index += 1) {
+    if (small[index] === 1) continue;
+    seen[index] = 1;
+    nearest[index] = labels[index] ?? 0;
+    queue.push(index);
+    if (index % 16384 === 0) await cooperate(context);
+  }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const index = queue[cursor] ?? 0;
+    const x = index % width;
+    const y = (index - x) / width;
+    const around = [index - 1, index + 1, index - width, index + width];
+    for (const next of around) {
+      if (next < 0 || next >= labels.length || seen[next] === 1) continue;
+      const nx = next % width;
+      if (Math.abs(nx - x) + Math.abs((next - nx) / width - y) !== 1) continue;
+      seen[next] = 1;
+      nearest[next] = nearest[index] ?? 0;
+      queue.push(next);
+    }
+    if (cursor % 4096 === 0) await cooperate(context);
+  }
+  return nearest;
+}
+
+async function smoothLabelsAsync(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, context: CooperativeContext, onProgress: (fraction: number) => void): Promise<void> {
+  if (!(sigma > 0)) return;
+  const kernel = gaussianKernel(sigma);
+  const best = new Float64Array(labels.length);
+  best.fill(-1);
+  const next = labels.slice();
+  const mask = new Float64Array(labels.length);
+  const blurred = new Float64Array(labels.length);
+  for (let label = 0; label < kCount; label += 1) {
+    for (let index = 0; index < labels.length; index += 1) {
+      mask[index] = labels[index] === label ? 1 : 0;
+      if (index % 16384 === 0) await cooperate(context);
+    }
+    await blurSeparableAsync(mask, blurred, width, height, kernel, context);
+    for (let index = 0; index < labels.length; index += 1) {
+      const value = blurred[index] ?? 0;
+      if (value > (best[index] ?? -1)) {
+        best[index] = value;
+        next[index] = label;
+      }
+      if (index % 16384 === 0) await cooperate(context);
+    }
+    onProgress((label + 1) / Math.max(1, kCount));
+  }
+  labels.set(next);
+}
+
+async function blurSeparableAsync(source: Float64Array, target: Float64Array, width: number, height: number, kernel: Float64Array, context: CooperativeContext): Promise<void> {
+  const radius = (kernel.length - 1) >> 1;
+  const temp = new Float64Array(source.length);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let sum = 0;
+      for (let tap = -radius; tap <= radius; tap += 1) sum += (source[y * width + reflect101(x + tap, width)] ?? 0) * (kernel[tap + radius] ?? 0);
+      temp[y * width + x] = sum;
+    }
+    await cooperate(context);
+  }
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let sum = 0;
+      for (let tap = -radius; tap <= radius; tap += 1) sum += (temp[reflect101(y + tap, height) * width + x] ?? 0) * (kernel[tap + radius] ?? 0);
+      target[y * width + x] = sum;
+    }
+    await cooperate(context);
+  }
+}
+
+async function paintLabelsAsync(labels: Uint8Array, colors: readonly RGB[], width: number, height: number, context: CooperativeContext, onProgress: (fraction: number) => void): Promise<Painted> {
+  const used = new Map<number, number>();
+  const palette: string[] = [];
+  const rgba = new Uint8Array(width * height * 4);
+  for (let index = 0; index < labels.length; index += 1) {
+    const label = labels[index] ?? 255;
+    if (label !== 255) {
+      let slot = used.get(label);
+      if (slot === undefined) {
+        const color = colors[label] ?? { r: 0, g: 0, b: 0 };
+        const paint = hex(color.r, color.g, color.b);
+        slot = palette.indexOf(paint);
+        if (slot < 0) {
+          slot = palette.length;
+          palette.push(paint);
+        }
+        used.set(label, slot);
+      }
+      const color = colors[label] ?? { r: 0, g: 0, b: 0 };
+      const offset = index * 4;
+      rgba[offset] = color.r;
+      rgba[offset + 1] = color.g;
+      rgba[offset + 2] = color.b;
+      rgba[offset + 3] = 255;
+    }
+    if (index % 16384 === 0) {
+      onProgress(index / labels.length);
+      await cooperate(context);
+    }
+  }
+  onProgress(1);
+  return { rgba, width, height, palette };
+}
+
+function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array, alpha: Uint8Array, width: number, height: number, centers: Lab[], onProgress?: (fraction: number) => void): Uint8Array {
   const count = width * height;
   const kCount = centers.length;
   const coreLabel = new Int16Array(count);
@@ -156,6 +634,7 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
   for (let index = 0; index < count; index += 1) {
     if (core[index] !== 1) continue;
     coreLabel[index] = nearestLab(readLab(lab, index), centers);
+    if (index % 16384 === 0) onProgress?.(0.12 * index / count);
   }
   const allow = new Uint16Array(count);
   const disk = diskOffsets(DILATE_RADIUS);
@@ -171,6 +650,7 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
       const at = ny * width + nx;
       allow[at] = (allow[at] ?? 0) | (1 << label);
     }
+    if (index % 16384 === 0) onProgress?.(0.12 + 0.16 * index / count);
   }
   const square = squareOffsets(1);
   for (let index = 0; index < count; index += 1) {
@@ -193,12 +673,14 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
       const at = ny * width + nx;
       allow[at] = (allow[at] ?? 0) | near;
     }
+    if (index % 16384 === 0) onProgress?.(0.28 + 0.16 * index / count);
   }
-  const nearestCore = nearestCoreLabel(coreLabel, width, height);
+  const nearestCore = nearestCoreLabel(coreLabel, width, height, (fraction) => onProgress?.(0.44 + fraction * 0.14));
   for (let index = 0; index < count; index += 1) {
     if ((allow[index] ?? 0) !== 0) continue;
     const label = nearestCore[index] ?? -1;
     if (label >= 0) allow[index] = 1 << label;
+    if (index % 16384 === 0) onProgress?.(0.58 + 0.07 * index / count);
   }
   const upW = width * UP;
   const upH = height * UP;
@@ -227,10 +709,11 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
           }
         }
       }
+      onProgress?.(0.65 + 0.12 * (y + 1) / height);
     }
   }
-  cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP));
-  smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP);
+  cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
+  smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       if (alpha[y * width + x] !== 0) continue;
@@ -238,11 +721,12 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
         for (let ox = 0; ox < UP; ox += 1) labels[(y * UP + oy) * upW + x * UP + ox] = 255;
       }
     }
+    onProgress?.(0.96 + 0.04 * (y + 1) / height);
   }
   return labels;
 }
 
-function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number): Int16Array {
+function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number, onProgress?: (fraction: number) => void): Int16Array {
   const nearest = new Int16Array(coreLabel.length);
   nearest.fill(-1);
   const queue: number[] = [];
@@ -251,6 +735,7 @@ function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number):
     if (label < 0) continue;
     nearest[index] = label;
     queue.push(index);
+    if (index % 16384 === 0) onProgress?.(0.4 * index / coreLabel.length);
   }
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
     const index = queue[cursor] ?? 0;
@@ -272,7 +757,9 @@ function nearestCoreLabel(coreLabel: Int16Array, width: number, height: number):
       nearest[at] = label;
       queue.push(at);
     }
+    if (cursor % 4096 === 0) onProgress?.(0.4 + 0.6 * cursor / Math.max(1, queue.length));
   }
+  onProgress?.(1);
   return nearest;
 }
 
@@ -306,7 +793,7 @@ function explain(sample: Lab, bits: readonly number[], centers: readonly Lab[]):
   return best;
 }
 
-function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, labels: Uint8Array, width: number, height: number, centers: readonly Lab[]): RGB[] {
+function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, labels: Uint8Array, width: number, height: number, centers: readonly Lab[], onProgress?: (fraction: number) => void): RGB[] {
   const sums = centers.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
   const upW = width * UP;
   const mid = UP >> 1;
@@ -323,6 +810,7 @@ function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, label
       bin.b += rgba[offset + 2] ?? 0;
       bin.n += 1;
     }
+    onProgress?.((y + 1) / height);
   }
   return centers.map((center, index) => {
     const bin = sums[index];
@@ -331,11 +819,12 @@ function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, label
   });
 }
 
-function paintLabels(labels: Uint8Array, colors: readonly RGB[], width: number, height: number): Painted {
+function paintLabels(labels: Uint8Array, colors: readonly RGB[], width: number, height: number, onProgress?: (fraction: number) => void): Painted {
   const used = new Map<number, number>();
   const palette: string[] = [];
   const rgba = new Uint8Array(width * height * 4);
   for (let index = 0; index < labels.length; index += 1) {
+    if (index % 16384 === 0) onProgress?.(index / labels.length);
     const label = labels[index] ?? 255;
     if (label === 255) continue;
     let slot = used.get(label);
@@ -356,10 +845,11 @@ function paintLabels(labels: Uint8Array, colors: readonly RGB[], width: number, 
     rgba[offset + 2] = color.b;
     rgba[offset + 3] = 255;
   }
+  onProgress?.(1);
   return { rgba, width, height, palette };
 }
 
-function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height: number, userK: number): Lab[] {
+function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height: number, userK: number, onProgress?: (fraction: number) => void): Lab[] {
   const bins = new Map<string, { x: number; y: number; z: number; n: number }>();
   for (let index = 0; index < core.length; index += 1) {
     if (core[index] !== 1) continue;
@@ -371,6 +861,7 @@ function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height
     bin.z += color.b;
     bin.n += 1;
     bins.set(key, bin);
+    if (index % 16384 === 0) onProgress?.(0.35 * index / core.length);
   }
   const samples: Lab[] = [];
   const weights: number[] = [];
@@ -380,14 +871,15 @@ function buildPalette(lab: Float64Array, core: Uint8Array, width: number, height
     weights.push(Math.log1p(bin.n));
   }
   if (samples.length === 0) return [{ L: 0, a: 0, b: 0 }];
-  const regions = regionMeans(lab, core, width, height);
+  const regions = regionMeans(lab, core, width, height, (fraction) => onProgress?.(0.35 + fraction * 0.4));
   const anchors = distinctAnchors(regions);
+  onProgress?.(0.75);
   const floorK = Math.max(2, anchors.length);
-  if (userK > 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(userK, anchors.length)), anchors);
-  if (regions.length === 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(2, Math.min(8, samples.length))));
-  let chosen = wkmeans(samples, weights, Math.min(floorK, samples.length), anchors);
+  if (userK > 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(userK, anchors.length)), anchors, (fraction) => onProgress?.(0.75 + fraction * 0.25));
+  if (regions.length === 0) return wkmeans(samples, weights, Math.min(K_MAX, Math.max(2, Math.min(8, samples.length))), [], (fraction) => onProgress?.(0.75 + fraction * 0.25));
+  let chosen = wkmeans(samples, weights, Math.min(floorK, samples.length), anchors, (fraction) => onProgress?.(0.75 + fraction * 0.1));
   for (let k = floorK; k <= Math.min(K_MAX, Math.max(samples.length, anchors.length)); k += 1) {
-    chosen = wkmeans(samples, weights, k, anchors);
+    chosen = wkmeans(samples, weights, k, anchors, (fraction) => onProgress?.(0.85 + fraction * 0.15));
     const missed = regions.some((region) => chosen.every((center) => Math.sqrt(labDistance2(center, region.mean)) > REGION_TOLERANCE));
     if (!missed) return chosen;
   }
@@ -404,7 +896,7 @@ function distinctAnchors(regions: readonly { readonly mean: Lab; readonly size: 
   return kept;
 }
 
-function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height: number): { mean: Lab; size: number }[] {
+function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): { mean: Lab; size: number }[] {
   const groups = new Map<number, number[]>();
   for (let index = 0; index < core.length; index += 1) {
     if (core[index] !== 1) continue;
@@ -413,12 +905,13 @@ function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height:
     const list = groups.get(key);
     if (list === undefined) groups.set(key, [index]);
     else list.push(index);
+    if (index % 16384 === 0) onProgress?.(0.35 * index / core.length);
   }
   const means: { mean: Lab; size: number }[] = [];
   for (const pixels of groups.values()) {
     const member = new Uint8Array(core.length);
     for (const index of pixels) member[index] = 1;
-    const labeled = components(member, width, height);
+    const labeled = components(member, width, height, (fraction) => onProgress?.(0.35 + 0.35 * fraction));
     for (let id = 1; id <= labeled.count; id += 1) {
       const size = labeled.sizes[id] ?? 0;
       if (size < 12) continue;
@@ -449,10 +942,11 @@ function regionMeans(lab: Float64Array, core: Uint8Array, width: number, height:
       if (spread < 0.015) means.push({ mean, size });
     }
   }
+  onProgress?.(1);
   return means;
 }
 
-function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: number, frozen: readonly Lab[] = []): Lab[] {
+function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: number, frozen: readonly Lab[] = [], onProgress?: (fraction: number) => void): Lab[] {
   const count = samples.length;
   const pinned = Math.min(frozen.length, K_MAX);
   const k = Math.max(1, Math.min(K_MAX, Math.max(kCount, pinned, count === 0 ? pinned : 1)));
@@ -517,16 +1011,17 @@ function wkmeans(samples: readonly Lab[], weights: readonly number[], kCount: nu
       if (bin === undefined || bin.w === 0) continue;
       centers[index] = { L: bin.L / bin.w, a: bin.a / bin.w, b: bin.b / bin.w };
     }
+    onProgress?.((round + 1) / 40);
   }
   return centers;
 }
 
-function cleanLabels(labels: Uint8Array, width: number, height: number, kCount: number, minArea: number): void {
+function cleanLabels(labels: Uint8Array, width: number, height: number, kCount: number, minArea: number, onProgress?: (fraction: number) => void): void {
   for (let pass = 0; pass < 2; pass += 1) {
     for (let label = 0; label < kCount; label += 1) {
       const mask = new Uint8Array(labels.length);
       for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mask[index] = 1;
-      const labeled = components(mask, width, height);
+      const labeled = components(mask, width, height, (fraction) => onProgress?.(((pass * kCount + label) / (2 * Math.max(1, kCount))) + fraction * 0.5 / Math.max(1, kCount)));
       const small = new Uint8Array(labels.length);
       let any = false;
       for (let index = 0; index < labels.length; index += 1) {
@@ -537,13 +1032,15 @@ function cleanLabels(labels: Uint8Array, width: number, height: number, kCount: 
         }
       }
       if (!any) continue;
-      const replacement = nearestOutside(labels, small, width, height);
+      const replacement = nearestOutside(labels, small, width, height, (fraction) => onProgress?.(((pass * kCount + label) / (2 * Math.max(1, kCount))) + 0.5 / Math.max(1, kCount) + fraction * 0.5 / Math.max(1, kCount)));
       for (let index = 0; index < labels.length; index += 1) if (small[index] === 1) labels[index] = replacement[index] ?? label;
+      onProgress?.((pass * kCount + label + 1) / (2 * Math.max(1, kCount)));
     }
   }
+  onProgress?.(1);
 }
 
-function nearestOutside(labels: Uint8Array, small: Uint8Array, width: number, height: number): Uint8Array {
+function nearestOutside(labels: Uint8Array, small: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): Uint8Array {
   const nearest = new Uint8Array(labels.length);
   const seen = new Uint8Array(labels.length);
   const queue: number[] = [];
@@ -566,11 +1063,12 @@ function nearestOutside(labels: Uint8Array, small: Uint8Array, width: number, he
       nearest[next] = nearest[index] ?? 0;
       queue.push(next);
     }
+    if (cursor % 16384 === 0) onProgress?.(cursor / Math.max(1, queue.length));
   }
   return nearest;
 }
 
-function smoothLabels(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number): void {
+function smoothLabels(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, onProgress?: (fraction: number) => void): void {
   if (!(sigma > 0)) return;
   const kernel = gaussianKernel(sigma);
   const best = new Float64Array(labels.length);
@@ -580,7 +1078,7 @@ function smoothLabels(labels: Uint8Array, width: number, height: number, kCount:
   const blurred = new Float64Array(labels.length);
   for (let label = 0; label < kCount; label += 1) {
     for (let index = 0; index < labels.length; index += 1) mask[index] = labels[index] === label ? 1 : 0;
-    blurSeparable(mask, blurred, width, height, kernel);
+    blurSeparable(mask, blurred, width, height, kernel, (fraction) => onProgress?.(((label + fraction) / Math.max(1, kCount)) * 0.9));
     for (let index = 0; index < labels.length; index += 1) {
       const value = blurred[index] ?? 0;
       if (value > (best[index] ?? -1)) {
@@ -588,11 +1086,12 @@ function smoothLabels(labels: Uint8Array, width: number, height: number, kCount:
         next[index] = label;
       }
     }
+    onProgress?.((label + 1) / Math.max(1, kCount));
   }
   labels.set(next);
 }
 
-function enclosedBoxes(rgba: Uint8Array, width: number, height: number): SubjectBox[] {
+function enclosedBoxes(rgba: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): SubjectBox[] {
   const count = width * height;
   if (width < 2 || height < 2 || rgba.length < count * 4) return [];
   const lab = new Float64Array(count * 3);
@@ -604,6 +1103,7 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number): Subject
     lab[index * 3] = color.L;
     lab[index * 3 + 1] = color.a;
     lab[index * 3 + 2] = color.b;
+    if (index % 16384 === 0) onProgress?.(0.2 * index / count);
   }
   const edge = new Uint8Array(count);
   for (let y = 0; y < height; y += 1) {
@@ -628,6 +1128,7 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number): Subject
       }
       if (strong) edge[index] = 1;
     }
+    onProgress?.(0.2 + 0.2 * (y + 1) / height);
   }
   const outside = new Uint8Array(count);
   const queue: number[] = [];
@@ -655,10 +1156,14 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number): Subject
       if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
       seedOutside(ny * width + nx, edge, outside, queue);
     }
+    if (cursor % 16384 === 0) onProgress?.(0.4 + 0.2 * cursor / Math.max(1, queue.length));
   }
   const object = new Uint8Array(count);
-  for (let index = 0; index < count; index += 1) if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
-  const labeled = components(object, width, height);
+  for (let index = 0; index < count; index += 1) {
+    if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
+    if (index % 16384 === 0) onProgress?.(0.6 + 0.1 * index / count);
+  }
+  const labeled = components(object, width, height, (fraction) => onProgress?.(0.7 + fraction * 0.2));
   const boxes: SubjectBox[] = [];
   for (let id = 1; id <= labeled.count; id += 1) {
     if ((labeled.sizes[id] ?? 0) < 400) continue;
@@ -674,12 +1179,126 @@ function enclosedBoxes(rgba: Uint8Array, width: number, height: number): Subject
       if (y < minY) minY = y;
       if (x > maxX) maxX = x;
       if (y > maxY) maxY = y;
+      if (index % 16384 === 0) onProgress?.(0.9 + 0.1 * (id - 1 + index / count) / Math.max(1, labeled.count));
     }
     const pad = 2;
     const x = Math.max(0, minX - pad);
     const y = Math.max(0, minY - pad);
     boxes.push({ x, y, width: Math.min(width, maxX + 1 + pad) - x, height: Math.min(height, maxY + 1 + pad) - y });
   }
+  onProgress?.(1);
+  return mergeBoxes(boxes, 8);
+}
+
+async function enclosedBoxesAsync(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  context: CooperativeContext,
+  onProgress: (fraction: number) => void
+): Promise<SubjectBox[]> {
+  const count = width * height;
+  if (width < 2 || height < 2 || rgba.length < count * 4) return [];
+  const lab = new Float64Array(count * 3);
+  const opaque = new Uint8Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const offset = index * 4;
+    opaque[index] = (rgba[offset + 3] ?? 0) >= 128 ? 1 : 0;
+    const color = rgbToOklab({ r: rgba[offset] ?? 0, g: rgba[offset + 1] ?? 0, b: rgba[offset + 2] ?? 0 });
+    lab[index * 3] = color.L;
+    lab[index * 3 + 1] = color.a;
+    lab[index * 3 + 2] = color.b;
+    if (index % 8192 === 0) {
+      onProgress(0.2 * index / count);
+      await cooperate(context);
+    }
+  }
+  const edge = new Uint8Array(count);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (opaque[index] !== 1) continue;
+      const color = readLab(lab, index);
+      let strong = false;
+      for (const step of [-1, 1, -width, width]) {
+        const next = index + step;
+        const nx = x + (step === -1 ? -1 : step === 1 ? 1 : 0);
+        const ny = y + (step === -width ? -1 : step === width ? 1 : 0);
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        if (opaque[next] !== 1) {
+          strong = true;
+          break;
+        }
+        if (Math.sqrt(labDistance2(color, readLab(lab, next))) > COLOR_FLOOR) {
+          strong = true;
+          break;
+        }
+      }
+      if (strong) edge[index] = 1;
+    }
+    onProgress(0.2 + 0.2 * (y + 1) / height);
+    await cooperate(context);
+  }
+  const outside = new Uint8Array(count);
+  const queue: number[] = [];
+  for (let x = 0; x < width; x += 1) {
+    seedOutside(x, edge, outside, queue);
+    seedOutside((height - 1) * width + x, edge, outside, queue);
+  }
+  for (let y = 0; y < height; y += 1) {
+    seedOutside(y * width, edge, outside, queue);
+    seedOutside(y * width + width - 1, edge, outside, queue);
+  }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const index = queue[cursor] ?? 0;
+    const x = index % width;
+    const y = (index - x) / width;
+    const steps = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+    for (const step of steps) {
+      const nx = step[0] ?? 0;
+      const ny = step[1] ?? 0;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      seedOutside(ny * width + nx, edge, outside, queue);
+    }
+    if (cursor % 4096 === 0) {
+      onProgress(0.4 + 0.2 * cursor / Math.max(1, queue.length));
+      await cooperate(context);
+    }
+  }
+  const object = new Uint8Array(count);
+  for (let index = 0; index < count; index += 1) {
+    if (opaque[index] === 1 && outside[index] !== 1) object[index] = 1;
+    if (index % 8192 === 0) {
+      onProgress(0.6 + 0.1 * index / count);
+      await cooperate(context);
+    }
+  }
+  const labeled = await componentsAsync(object, width, height, context);
+  const boxes: SubjectBox[] = [];
+  for (let id = 1; id <= labeled.count; id += 1) {
+    if ((labeled.sizes[id] ?? 0) < 400) continue;
+    let minX = width;
+    let minY = height;
+    let maxX = 0;
+    let maxY = 0;
+    for (let index = 0; index < count; index += 1) {
+      if ((labeled.ids[index] ?? 0) === id) {
+        const x = index % width;
+        const y = (index - x) / width;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+      if (index % 8192 === 0) await cooperate(context);
+    }
+    const pad = 2;
+    const x = Math.max(0, minX - pad);
+    const y = Math.max(0, minY - pad);
+    boxes.push({ x, y, width: Math.min(width, maxX + 1 + pad) - x, height: Math.min(height, maxY + 1 + pad) - y });
+    onProgress(0.7 + 0.3 * id / Math.max(1, labeled.count));
+  }
+  onProgress(1);
   return mergeBoxes(boxes, 8);
 }
 
@@ -714,7 +1333,7 @@ function mergeBoxes(boxes: SubjectBox[], gap: number): SubjectBox[] {
   return open;
 }
 
-function coreMask(lab: Float64Array, alpha: Uint8Array, width: number, height: number, tau: number): Uint8Array {
+function coreMask(lab: Float64Array, alpha: Uint8Array, width: number, height: number, tau: number, onProgress?: (fraction: number) => void): Uint8Array {
   const core = new Uint8Array(width * height);
   const limit = tau * tau;
   for (let y = 0; y < height; y += 1) {
@@ -740,14 +1359,16 @@ function coreMask(lab: Float64Array, alpha: Uint8Array, width: number, height: n
       }
       if (flat && worst < limit) core[index] = 1;
     }
+    onProgress?.((y + 1) / height);
   }
   return core;
 }
 
-function components(mask: Uint8Array, width: number, height: number): { readonly ids: Int32Array; readonly sizes: Int32Array; readonly count: number } {
+function components(mask: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): { readonly ids: Int32Array; readonly sizes: Int32Array; readonly count: number } {
   const ids = new Int32Array(mask.length);
   const sizes: number[] = [0];
   const stack: number[] = [];
+  let visited = 0;
   for (let start = 0; start < mask.length; start += 1) {
     if (mask[start] !== 1 || ids[start] !== 0) continue;
     const id = sizes.length;
@@ -771,8 +1392,12 @@ function components(mask: Uint8Array, width: number, height: number): { readonly
           stack.push(next);
         }
       }
+      visited += 1;
+      if (visited % 16384 === 0) onProgress?.(visited / mask.length);
     }
+    if (start % 16384 === 0) onProgress?.(start / mask.length);
   }
+  onProgress?.(1);
   return { ids, sizes: Int32Array.from(sizes), count: sizes.length - 1 };
 }
 
@@ -799,7 +1424,7 @@ function bicubicLab(linear: Float64Array, width: number, height: number, sx: num
   return rgbToOklab({ r: linearToSrgb(red), g: linearToSrgb(green), b: linearToSrgb(blue) });
 }
 
-function blurSeparable(source: Float64Array, target: Float64Array, width: number, height: number, kernel: Float64Array): void {
+function blurSeparable(source: Float64Array, target: Float64Array, width: number, height: number, kernel: Float64Array, onProgress?: (fraction: number) => void): void {
   const radius = (kernel.length - 1) >> 1;
   const temp = new Float64Array(source.length);
   for (let y = 0; y < height; y += 1) {
@@ -808,6 +1433,7 @@ function blurSeparable(source: Float64Array, target: Float64Array, width: number
       for (let tap = -radius; tap <= radius; tap += 1) sum += (source[y * width + reflect101(x + tap, width)] ?? 0) * (kernel[tap + radius] ?? 0);
       temp[y * width + x] = sum;
     }
+    onProgress?.(0.5 * (y + 1) / height);
   }
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
@@ -815,6 +1441,7 @@ function blurSeparable(source: Float64Array, target: Float64Array, width: number
       for (let tap = -radius; tap <= radius; tap += 1) sum += (temp[reflect101(y + tap, height) * width + x] ?? 0) * (kernel[tap + radius] ?? 0);
       target[y * width + x] = sum;
     }
+    onProgress?.(0.5 + 0.5 * (y + 1) / height);
   }
 }
 
