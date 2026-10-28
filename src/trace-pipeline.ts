@@ -1,5 +1,6 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
 import { cornerColor, flatPlates, hasClearPixel, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
+import { lossyCleanup } from "./jpeg-clean.ts";
 import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "./lab-model.ts";
 import { buildLabRasterStages, buildLabRasterStagesAsync, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId, type PipelineProgress } from "./lab-pipeline.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
@@ -78,7 +79,7 @@ export async function planTraceAsync(
     return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, stages);
   }
   onProgress?.("colors", 0);
-  const plates = await flatPlatesAsync(decoded.rgba, decoded.width, decoded.height, settings.maxColors, undefined,
+  const plates = await flatPlatesAsync(decoded.rgba, decoded.width, decoded.height, settings.maxColors, lossyCleanup(decoded.rgba, decoded.width, decoded.height),
     (fraction) => onProgress?.("colors", fraction * 0.95), shouldCancel);
   if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
   const plan = planFlat(decoded.rgba, decoded.width, decoded.height, settings, controls, plates);
@@ -192,7 +193,7 @@ function planFlat(
   preparedPlates?: readonly FlatPlate[],
   onProgress?: (fraction: number) => void
 ): TracePlan {
-  const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, undefined, onProgress);
+  const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
   const plates = flat.map((plate) => ({
       png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : plate.rgba),
       scale: plate.scale,

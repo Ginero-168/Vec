@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { cornerColor, hasClearPixel, labelImage, subjectBoxes } from "./flat-trace.ts";
 import { mergePlates } from "./trace-finish.ts";
+import { lossyCleanup, mergeNearCenters } from "./jpeg-clean.ts";
+import { rgbToOklab } from "./color.ts";
 import { encodeRgbaPng } from "./png-alpha.ts";
 import { cappedPalette, planTrace, punchBorderBackdrop } from "./trace-pipeline.ts";
 
@@ -315,4 +317,46 @@ test("a source is a cut-out only when it has see-through pixels", () => {
   assert.equal(hasClearPixel(opaque), false);
   opaque[7] = 0;
   assert.equal(hasClearPixel(opaque), true);
+});
+
+function centresWithPixels(inks: readonly (readonly [number, number, number, number])[]) {
+  const centers = inks.map(([r, g, b]) => rgbToOklab({ r, g, b }));
+  const total = inks.reduce((sum, ink) => sum + ink[3], 0);
+  const lab = new Float64Array(total * 3);
+  const core = new Uint8Array(total).fill(1);
+  let at = 0;
+  for (const [index, ink] of inks.entries()) {
+    for (let count = 0; count < ink[3]; count += 1, at += 1) {
+      const center = centers[index]!;
+      lab[at * 3] = center.L; lab[at * 3 + 1] = center.a; lab[at * 3 + 2] = center.b;
+    }
+  }
+  return { centers, lab, core };
+}
+
+test("JPEG palette cleanup folds near-identical inks and keeps distinct ones", () => {
+  // Two reds about ΔE2000 1 apart (one ink split by noise) and a blue.
+  const split = centresWithPixels([[220, 30, 40, 500], [222, 32, 41, 400], [30, 80, 200, 300]]);
+  const merged = mergeNearCenters(split.centers, split.lab, split.core);
+  assert.equal(merged.length, 2);
+  // The fold is the pixel-weighted mean, so it lies between the two reds.
+  const [red] = merged;
+  assert.ok(red!.L >= Math.min(split.centers[0]!.L, split.centers[1]!.L) && red!.L <= Math.max(split.centers[0]!.L, split.centers[1]!.L));
+  const distinct = centresWithPixels([[220, 30, 40, 500], [30, 80, 200, 300], [250, 200, 20, 200]]);
+  assert.deepEqual(mergeNearCenters(distinct.centers, distinct.lab, distinct.core), distinct.centers);
+});
+
+test("JPEG palette cleanup drops a small ringing centre between two inks", () => {
+  // Cream halfway between an orange star and the white backdrop, with few pixels: compression overshoot.
+  const ring = centresWithPixels([[255, 255, 255, 2000], [244, 144, 12, 1000], [250, 200, 134, 40]]);
+  const kept = mergeNearCenters(ring.centers, ring.lab, ring.core);
+  assert.equal(kept.length, 2);
+});
+
+test("JPEG cleanup is chosen once per source and never for clean or small rasters", () => {
+  const flat = (size: number) => new Uint8Array(size * size * 4).fill(255);
+  assert.equal(lossyCleanup(flat(128), 128, 128), undefined);
+  const noisy = flat(64);
+  for (let at = 0; at < noisy.length; at += 4) noisy[at] = 250 + ((at / 4) % 7);
+  assert.equal(lossyCleanup(noisy, 64, 64), undefined, "64 px sources trace as before");
 });

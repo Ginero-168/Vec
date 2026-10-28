@@ -1,4 +1,5 @@
 import { labDistance2, oklabToRgb, rgbToOklab, type Lab, type RGB } from "./color.ts";
+import { mergeNearCenters } from "./jpeg-clean.ts";
 
 export type FlatPlate = {
   readonly rgba: Uint8Array;
@@ -230,7 +231,9 @@ export function labelImage(
   let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
+  const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
+  // A preprocess that returned new pixels cleaned a lossy raster: fold the near-duplicate centres its noise split.
+  const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -276,10 +279,11 @@ async function labelImageAsync(
   if (countOf(core) < 8) core = await coreMaskAsync(lab, alpha, width, height, 0.08, context);
   onProgress(0.14);
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
+  const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
+  const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   onProgress(0.26);
   const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64));
-  const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
+  const colors = fillColors(source, alpha, core, labels, width, height, centers);
   onProgress(0.94);
   const painted = await paintLabelsAsync(labels, colors, width * UP, height * UP, context, (fraction) => onProgress(0.94 + fraction * 0.06));
   onProgress(1);

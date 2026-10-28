@@ -26,6 +26,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 var import_node_worker_threads = require("node:worker_threads");
 
 // src/color.ts
+var D65 = { x: 0.95047, y: 1, z: 1.08883 };
 function srgbChannelToLinear(channel) {
   const value = channel / 255;
   return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
@@ -34,6 +35,16 @@ function linearChannelToSrgb(channel) {
   const value = Math.min(1, Math.max(0, channel));
   const encoded = value <= 31308e-7 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
   return Math.round(Math.min(1, Math.max(0, encoded)) * 255);
+}
+function rgbToLab(color) {
+  const red = srgbChannelToLinear(color.r);
+  const green = srgbChannelToLinear(color.g);
+  const blue = srgbChannelToLinear(color.b);
+  const x = (0.4124564 * red + 0.3575761 * green + 0.1804375 * blue) / D65.x;
+  const y = (0.2126729 * red + 0.7151522 * green + 0.072175 * blue) / D65.y;
+  const z = (0.0193339 * red + 0.119192 * green + 0.9503041 * blue) / D65.z;
+  const fy = labPivot(y);
+  return { L: 116 * fy - 16, a: 500 * (labPivot(x) - fy), b: 200 * (fy - labPivot(z)) };
 }
 function rgbToOklab(color) {
   const red = srgbChannelToLinear(color.r);
@@ -66,6 +77,376 @@ function labDistance2(left, right) {
   const da = left.a - right.a;
   const db = left.b - right.b;
   return dL * dL + da * da + db * db;
+}
+function deltaE2000(left, right) {
+  const c1 = Math.hypot(left.a, left.b);
+  const c2 = Math.hypot(right.a, right.b);
+  const cBar = (c1 + c2) / 2;
+  const cBar7 = cBar ** 7;
+  const g = 0.5 * (1 - Math.sqrt(cBar7 / (cBar7 + 25 ** 7)));
+  const a1 = (1 + g) * left.a;
+  const a2 = (1 + g) * right.a;
+  const c1p = Math.hypot(a1, left.b);
+  const c2p = Math.hypot(a2, right.b);
+  const h1 = hueDegrees(left.b, a1);
+  const h2 = hueDegrees(right.b, a2);
+  const dl = right.L - left.L;
+  const dc = c2p - c1p;
+  let dh = 0;
+  if (c1p * c2p !== 0) {
+    dh = h2 - h1;
+    if (dh > 180) dh -= 360;
+    else if (dh < -180) dh += 360;
+  }
+  const dH = 2 * Math.sqrt(c1p * c2p) * Math.sin(dh * Math.PI / 360);
+  const lBar = (left.L + right.L) / 2;
+  const cBarP = (c1p + c2p) / 2;
+  let hBar = h1 + h2;
+  if (c1p * c2p !== 0) {
+    if (Math.abs(h1 - h2) <= 180) hBar = (h1 + h2) / 2;
+    else if (h1 + h2 < 360) hBar = (h1 + h2 + 360) / 2;
+    else hBar = (h1 + h2 - 360) / 2;
+  }
+  const hue = (degrees) => degrees * Math.PI / 180;
+  const t = 1 - 0.17 * Math.cos(hue(hBar - 30)) + 0.24 * Math.cos(hue(2 * hBar)) + 0.32 * Math.cos(hue(3 * hBar + 6)) - 0.2 * Math.cos(hue(4 * hBar - 63));
+  const theta = 30 * Math.exp(-(((hBar - 275) / 25) ** 2));
+  const cBarP7 = cBarP ** 7;
+  const rc = 2 * Math.sqrt(cBarP7 / (cBarP7 + 25 ** 7));
+  const sl = 1 + 0.015 * (lBar - 50) ** 2 / Math.sqrt(20 + (lBar - 50) ** 2);
+  const sc = 1 + 0.045 * cBarP;
+  const sh = 1 + 0.015 * cBarP * t;
+  const rt = -Math.sin(hue(2 * theta)) * rc;
+  return Math.sqrt((dl / sl) ** 2 + (dc / sc) ** 2 + (dH / sh) ** 2 + rt * (dc / sc) * (dH / sh));
+}
+function labPivot(value) {
+  const delta = 6 / 29;
+  return value > delta ** 3 ? Math.cbrt(value) : value / (3 * delta * delta) + 4 / 29;
+}
+function hueDegrees(b, a) {
+  if (a === 0 && b === 0) return 0;
+  const degrees = Math.atan2(b, a) * 180 / Math.PI;
+  return degrees < 0 ? degrees + 360 : degrees;
+}
+
+// src/denoise.ts
+var JPEG_BLOCK_SIZE = 8;
+var NOISY_SAMPLE_RESIDUAL = 2;
+var MIN_NOISY_FRACTION = 0.075;
+var MIN_MEAN_RESIDUAL = 0.5;
+var FLAT_BLOCK_VARIANCE = 256;
+var RANGE_SIGMA = 14;
+var SPATIAL_SIGMA = 1.35;
+var PASSES = 2;
+var MIN_SIDE = 48;
+var RADIUS = 2;
+function denoiseJpegArtifacts(rgba, width, height) {
+  if (!wouldDenoise(rgba, width, height)) return rgba;
+  let current = correctBlockOffsets(rgba, width, height);
+  for (let pass = 0; pass < PASSES; pass += 1) current = bilateralPass(current, width, height);
+  return current;
+}
+function wouldDenoise(rgba, width, height) {
+  if (Math.min(width, height) < MIN_SIDE) return false;
+  return isOpaqueRaster(rgba, width, height) && hasCompressionNoise(rgba, width, height);
+}
+function isOpaqueRaster(rgba, width, height) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 5 || height < 5 || rgba.length !== width * height * 4) return false;
+  const pixels = width * height;
+  let opaque = 0;
+  for (let offset = 3; offset < rgba.length; offset += 4) if ((rgba[offset] ?? 0) >= 250) opaque += 1;
+  return opaque >= pixels * 0.995;
+}
+function hasCompressionNoise(rgba, width, height) {
+  let residualSum = 0;
+  let noisySamples = 0;
+  let eligibleSamples = 0;
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const center = (y * width + x) * 4;
+      const left = center - 4;
+      const right = center + 4;
+      const up = center - width * 4;
+      const down = center + width * 4;
+      if (maxRgbGap(rgba, center, left) > 32 || maxRgbGap(rgba, center, right) > 32 || maxRgbGap(rgba, center, up) > 32 || maxRgbGap(rgba, center, down) > 32) continue;
+      let residual = 0;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const laplacian = 4 * (rgba[center + channel] ?? 0) - (rgba[left + channel] ?? 0) - (rgba[right + channel] ?? 0) - (rgba[up + channel] ?? 0) - (rgba[down + channel] ?? 0);
+        residual += Math.abs(laplacian) / 4;
+      }
+      residual /= 3;
+      residualSum += residual;
+      eligibleSamples += 1;
+      if (residual >= NOISY_SAMPLE_RESIDUAL) noisySamples += 1;
+    }
+  }
+  const residualNoise = eligibleSamples > 0 && noisySamples / eligibleSamples >= MIN_NOISY_FRACTION && residualSum / eligibleSamples >= MIN_MEAN_RESIDUAL;
+  return residualNoise || hasBlockBoundaryNoise(rgba, width, height);
+}
+function hasBlockBoundaryNoise(rgba, width, height) {
+  let boundarySum = 0;
+  let boundaryCount = 0;
+  let interiorSum = 0;
+  let interiorCount = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 1; x < width; x += 1) {
+      const right = (y * width + x) * 4;
+      const left = right - 4;
+      if (maxRgbGap(rgba, left, right) > 32) continue;
+      const gap = meanRgbGap(rgba, left, right);
+      if (x % JPEG_BLOCK_SIZE === 0) {
+        boundarySum += gap;
+        boundaryCount += 1;
+      } else {
+        interiorSum += gap;
+        interiorCount += 1;
+      }
+    }
+  }
+  for (let y = 1; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const down = (y * width + x) * 4;
+      const up = down - width * 4;
+      if (maxRgbGap(rgba, up, down) > 32) continue;
+      const gap = meanRgbGap(rgba, up, down);
+      if (y % JPEG_BLOCK_SIZE === 0) {
+        boundarySum += gap;
+        boundaryCount += 1;
+      } else {
+        interiorSum += gap;
+        interiorCount += 1;
+      }
+    }
+  }
+  if (boundaryCount === 0 || interiorCount === 0) return false;
+  const boundaryMean = boundarySum / boundaryCount;
+  const interiorMean = interiorSum / interiorCount;
+  return boundaryMean >= 2 && boundaryMean - interiorMean >= 1.25 && boundaryMean >= interiorMean * 1.25;
+}
+function meanRgbGap(rgba, a, b) {
+  return (Math.abs((rgba[a] ?? 0) - (rgba[b] ?? 0)) + Math.abs((rgba[a + 1] ?? 0) - (rgba[b + 1] ?? 0)) + Math.abs((rgba[a + 2] ?? 0) - (rgba[b + 2] ?? 0))) / 3;
+}
+function maxRgbGap(rgba, a, b) {
+  return Math.max(
+    Math.abs((rgba[a] ?? 0) - (rgba[b] ?? 0)),
+    Math.abs((rgba[a + 1] ?? 0) - (rgba[b + 1] ?? 0)),
+    Math.abs((rgba[a + 2] ?? 0) - (rgba[b + 2] ?? 0))
+  );
+}
+function correctBlockOffsets(source, width, height) {
+  const columns = Math.ceil(width / JPEG_BLOCK_SIZE);
+  const rows = Math.ceil(height / JPEG_BLOCK_SIZE);
+  const blockCount = columns * rows;
+  const means = new Float64Array(blockCount * 3);
+  const variances = new Float64Array(blockCount);
+  for (let blockY = 0; blockY < rows; blockY += 1) {
+    for (let blockX = 0; blockX < columns; blockX += 1) {
+      const block = blockY * columns + blockX;
+      const x0 = blockX * JPEG_BLOCK_SIZE;
+      const y0 = blockY * JPEG_BLOCK_SIZE;
+      const x1 = Math.min(width, x0 + JPEG_BLOCK_SIZE);
+      const y1 = Math.min(height, y0 + JPEG_BLOCK_SIZE);
+      let red = 0;
+      let green = 0;
+      let blue = 0;
+      let pixels = 0;
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const offset = (y * width + x) * 4;
+          red += source[offset] ?? 0;
+          green += source[offset + 1] ?? 0;
+          blue += source[offset + 2] ?? 0;
+          pixels += 1;
+        }
+      }
+      const meanOffset = block * 3;
+      const meanRed = red / pixels;
+      const meanGreen = green / pixels;
+      const meanBlue = blue / pixels;
+      means[meanOffset] = meanRed;
+      means[meanOffset + 1] = meanGreen;
+      means[meanOffset + 2] = meanBlue;
+      let variance = 0;
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const offset = (y * width + x) * 4;
+          variance += ((source[offset] ?? 0) - meanRed) ** 2;
+          variance += ((source[offset + 1] ?? 0) - meanGreen) ** 2;
+          variance += ((source[offset + 2] ?? 0) - meanBlue) ** 2;
+        }
+      }
+      variances[block] = variance / (pixels * 3);
+    }
+  }
+  const output = source.slice();
+  for (let blockY = 0; blockY < rows; blockY += 1) {
+    for (let blockX = 0; blockX < columns; blockX += 1) {
+      const block = blockY * columns + blockX;
+      if ((variances[block] ?? Number.POSITIVE_INFINITY) > FLAT_BLOCK_VARIANCE) continue;
+      const meanOffset = block * 3;
+      const red = means[meanOffset] ?? 0;
+      const green = means[meanOffset + 1] ?? 0;
+      const blue = means[meanOffset + 2] ?? 0;
+      let weightSum = 0;
+      let redSum = 0;
+      let greenSum = 0;
+      let blueSum = 0;
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const neighborY = blockY + dy;
+        if (neighborY < 0 || neighborY >= rows) continue;
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const neighborX = blockX + dx;
+          if (neighborX < 0 || neighborX >= columns) continue;
+          const neighbor = neighborY * columns + neighborX;
+          if ((variances[neighbor] ?? Number.POSITIVE_INFINITY) > FLAT_BLOCK_VARIANCE) continue;
+          const neighborOffset = neighbor * 3;
+          const neighborRed = means[neighborOffset] ?? 0;
+          const neighborGreen = means[neighborOffset + 1] ?? 0;
+          const neighborBlue = means[neighborOffset + 2] ?? 0;
+          const distance = (red - neighborRed) ** 2 + (green - neighborGreen) ** 2 + (blue - neighborBlue) ** 2;
+          if (distance > 64 * 64) continue;
+          const weight = Math.exp(-distance / (2 * 20 * 20)) / (1 + dx * dx + dy * dy);
+          weightSum += weight;
+          redSum += neighborRed * weight;
+          greenSum += neighborGreen * weight;
+          blueSum += neighborBlue * weight;
+        }
+      }
+      if (weightSum === 0) continue;
+      const redDelta = Math.max(-12, Math.min(12, redSum / weightSum - red));
+      const greenDelta = Math.max(-12, Math.min(12, greenSum / weightSum - green));
+      const blueDelta = Math.max(-12, Math.min(12, blueSum / weightSum - blue));
+      const x0 = blockX * JPEG_BLOCK_SIZE;
+      const y0 = blockY * JPEG_BLOCK_SIZE;
+      const x1 = Math.min(width, x0 + JPEG_BLOCK_SIZE);
+      const y1 = Math.min(height, y0 + JPEG_BLOCK_SIZE);
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const offset = (y * width + x) * 4;
+          output[offset] = clampByte((source[offset] ?? 0) + redDelta);
+          output[offset + 1] = clampByte((source[offset + 1] ?? 0) + greenDelta);
+          output[offset + 2] = clampByte((source[offset + 2] ?? 0) + blueDelta);
+        }
+      }
+    }
+  }
+  return output;
+}
+function bilateralPass(source, width, height) {
+  const output = source.slice();
+  const rangeWeights = makeRangeWeights();
+  const spatialWeights = makeSpatialWeights();
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const center = (y * width + x) * 4;
+      const red = source[center] ?? 0;
+      const green = source[center + 1] ?? 0;
+      const blue = source[center + 2] ?? 0;
+      let totalWeight = 0;
+      let redSum = 0;
+      let greenSum = 0;
+      let blueSum = 0;
+      for (let dy = -RADIUS; dy <= RADIUS; dy += 1) {
+        const sampleY = y + dy;
+        if (sampleY < 0 || sampleY >= height) continue;
+        for (let dx = -RADIUS; dx <= RADIUS; dx += 1) {
+          const sampleX = x + dx;
+          if (sampleX < 0 || sampleX >= width) continue;
+          const sample = (sampleY * width + sampleX) * 4;
+          const sampleRed = source[sample] ?? 0;
+          const sampleGreen = source[sample + 1] ?? 0;
+          const sampleBlue = source[sample + 2] ?? 0;
+          const distance = (red - sampleRed) ** 2 + (green - sampleGreen) ** 2 + (blue - sampleBlue) ** 2;
+          const rangeIndex = Math.min(rangeWeights.length - 1, Math.round(distance * 16 / (RANGE_SIGMA * RANGE_SIGMA)));
+          const spatialIndex = (dy + RADIUS) * (RADIUS * 2 + 1) + dx + RADIUS;
+          const weight = (spatialWeights[spatialIndex] ?? 0) * (rangeWeights[rangeIndex] ?? 0);
+          totalWeight += weight;
+          redSum += sampleRed * weight;
+          greenSum += sampleGreen * weight;
+          blueSum += sampleBlue * weight;
+        }
+      }
+      if (totalWeight === 0) continue;
+      output[center] = Math.round(redSum / totalWeight);
+      output[center + 1] = Math.round(greenSum / totalWeight);
+      output[center + 2] = Math.round(blueSum / totalWeight);
+    }
+  }
+  return output;
+}
+function makeRangeWeights() {
+  const weights = new Float32Array(2049);
+  for (let index = 0; index < weights.length; index += 1) weights[index] = Math.exp(-index / 32);
+  return weights;
+}
+function makeSpatialWeights() {
+  const diameter = RADIUS * 2 + 1;
+  const weights = new Float32Array(diameter * diameter);
+  for (let dy = -RADIUS; dy <= RADIUS; dy += 1) {
+    for (let dx = -RADIUS; dx <= RADIUS; dx += 1) {
+      weights[(dy + RADIUS) * diameter + dx + RADIUS] = Math.exp(-(dx * dx + dy * dy) / (2 * SPATIAL_SIGMA * SPATIAL_SIGMA));
+    }
+  }
+  return weights;
+}
+function clampByte(value) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+// src/jpeg-clean.ts
+function jpegCleanRaster(rgba, width, height) {
+  return denoiseJpegArtifacts(rgba, width, height);
+}
+var MIN_CLEAN_SIDE = 96;
+function lossyCleanup(rgba, width, height) {
+  return Math.min(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : void 0;
+}
+var MERGE_DELTA_E = 3;
+var MINOR_DELTA_E = 6;
+var MINOR_SHARE = 0.1;
+function mergeNearCenters(centers, lab, core) {
+  if (centers.length < 2) return [...centers];
+  const counts = new Float64Array(centers.length);
+  for (let index = 0; index < core.length; index += 1) {
+    if (core[index] !== 1) continue;
+    const L = lab[index * 3] ?? 0, a = lab[index * 3 + 1] ?? 0, b = lab[index * 3 + 2] ?? 0;
+    let best = 0;
+    let bestDistance = Infinity;
+    for (const [at, center] of centers.entries()) {
+      const distance = (center.L - L) ** 2 + (center.a - a) ** 2 + (center.b - b) ** 2;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = at;
+      }
+    }
+    counts[best] = (counts[best] ?? 0) + 1;
+  }
+  const cie = centers.map((center) => rgbToLab(oklabToRgb(center)));
+  const order = centers.map((_, at) => at).sort((left, right) => (counts[right] ?? 0) - (counts[left] ?? 0) || left - right);
+  const groups = [];
+  for (const at of order) {
+    const limit = (lead) => (counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E;
+    const home = (counts[at] ?? 0) === 0 ? void 0 : groups.find((group) => deltaE2000(cie[group.lead], cie[at]) < limit(group.lead));
+    if (home === void 0) groups.push({ lead: at, members: [at] });
+    else home.members.push(at);
+  }
+  const kept = groups.filter((group) => !groups.some((left) => groups.some((right) => left !== right && left !== group && right !== group && (counts[group.lead] ?? 0) < MINOR_SHARE * Math.min(counts[left.lead] ?? 0, counts[right.lead] ?? 0) && onSegment(centers[group.lead], centers[left.lead], centers[right.lead]))));
+  if (kept.length === centers.length) return [...centers];
+  groups.splice(0, groups.length, ...kept);
+  return groups.sort((left, right) => left.lead - right.lead).map((group) => {
+    const total = group.members.reduce((sum, at) => sum + Math.max(1, counts[at] ?? 0), 0);
+    const mix = (pick) => group.members.reduce((sum, at) => sum + pick(centers[at]) * Math.max(1, counts[at] ?? 0), 0) / total;
+    return { L: mix((center) => center.L), a: mix((center) => center.a), b: mix((center) => center.b) };
+  });
+}
+var RING_DISTANCE = 0.04;
+function onSegment(point, from, to) {
+  const span = { L: to.L - from.L, a: to.a - from.a, b: to.b - from.b };
+  const length = span.L ** 2 + span.a ** 2 + span.b ** 2;
+  if (length === 0) return false;
+  const t = ((point.L - from.L) * span.L + (point.a - from.a) * span.a + (point.b - from.b) * span.b) / length;
+  if (t <= 0 || t >= 1) return false;
+  const distance = Math.hypot(point.L - from.L - t * span.L, point.a - from.a - t * span.a, point.b - from.b - t * span.b);
+  return distance <= RING_DISTANCE;
 }
 
 // src/flat-trace.ts
@@ -169,7 +550,8 @@ function labelImage(rgba, width, height, maxColors, preprocess = identityRaster,
   let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const centers = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
+  const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
+  const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54));
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -1615,7 +1997,7 @@ function foldBlends(centroids, areas) {
         if (right === index) continue;
         const a = centroids[left];
         const b = centroids[right];
-        if (a === void 0 || b === void 0 || !onSegment(color, a, b)) continue;
+        if (a === void 0 || b === void 0 || !onSegment2(color, a, b)) continue;
         const fringe = areas[index] ?? 0;
         const parent = Math.min(areas[left] ?? 0, areas[right] ?? 0);
         if (fringe * 5 >= parent) continue;
@@ -1646,7 +2028,7 @@ function foldBlends(centroids, areas) {
   }
   return kept.length > 0 ? kept : centroids.slice();
 }
-function onSegment(color, a, b) {
+function onSegment2(color, a, b) {
   const abx = b.r - a.r;
   const aby = b.g - a.g;
   const abz = b.b - a.b;
@@ -2164,7 +2546,7 @@ function planTrace(source, settings, controls, previousStages = null, from = "co
   return planSegmented(decoded.rgba, decoded.width, decoded.height, settings);
 }
 function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
-  const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, void 0, onProgress);
+  const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
   const plates = flat.map((plate) => ({
     png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : plate.rgba),
     scale: plate.scale,
