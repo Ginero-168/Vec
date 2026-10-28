@@ -1100,31 +1100,169 @@
   var FIT_RESIDUAL = 0.3;
   var FIT_REACH = 2.5;
   var FIT_CONTRAST = 48;
+  var FIT_EXPOSED_AREA = 0.1;
+  var FIT_FOLLOW = 0.75;
+  var FIT_JOIN = 1;
+  var FIT_PAIR_GAP = [2, 6];
+  var FIT_PAIR_CLEAR = 0.75;
   function fitRasterCorners(svg, colourAt, confirm) {
-    return svg.replace(shapePattern(), (tag) => {
-      if (!/^<path\b/i.test(tag)) return tag;
-      const quoted = readD(tag);
-      if (quoted === null) return tag;
-      const parsed = parsePath(quoted.value);
-      if (parsed === null || parsed.length === 0) return tag;
-      const fill = /\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "";
-      const subpaths = parsed.map((subpath) => ({ cubics: [...subpath.cubics], closed: subpath.closed }));
-      let changed = false;
+    const shapes = [];
+    const pattern = shapePattern();
+    for (let match = pattern.exec(svg); match !== null; match = pattern.exec(svg)) {
+      const tag = match[0];
+      const fill = (/\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "").toLowerCase();
+      const shape = { tag, at: match.index, fill, subpaths: null, quoted: null, changed: false, rings: null, primitive: null };
+      if (/^<path\b/i.test(tag)) {
+        const quoted = readD(tag);
+        const parsed = quoted === null ? null : parsePath(quoted.value);
+        if (quoted !== null && parsed !== null && parsed.length > 0) {
+          shape.quoted = quoted;
+          shape.subpaths = parsed.map((subpath) => ({ cubics: [...subpath.cubics], closed: subpath.closed }));
+        }
+      } else shape.primitive = primitiveInside(tag);
+      shapes.push(shape);
+    }
+    for (let order = 0; order < shapes.length; order += 1) {
+      const shape = shapes[order];
+      const subpaths = shape?.subpaths;
+      if (shape === void 0 || subpaths === null || subpaths === void 0) continue;
+      const under = shapes.slice(0, order).filter((other) => other.fill !== shape.fill && (other.subpaths !== null || other.primitive !== null));
       for (let index = 0; index < subpaths.length; index += 1) {
         for (let guard = 0; guard < 16; guard += 1) {
           const subpath = subpaths[index];
           if (subpath === void 0) break;
           const rings = flatten(subpaths);
           const inside = (x, y) => insideFlat(rings, x, y);
-          const next = fitOneCorner(subpath, colourAt, (cap) => confirm(fill, cap, inside), inside);
+          const covers = (next2, cap, away, corner) => {
+            if (under.length === 0) return true;
+            const nextRings = flatten(subpaths.map((other, at) => at === index ? next2 : other));
+            const after = (x, y) => insideFlat(nextRings, x, y);
+            const exposed = exposedShapes(cap, inside, after, under, away);
+            if (exposed.length === 0) return true;
+            const edits = [];
+            for (const below of exposed) {
+              const followed = below.subpaths === null ? null : followCorner(below.subpaths, corner);
+              if (followed === null) continue;
+              edits.push({ shape: below, subpaths: followed });
+            }
+            const trial = new Map(edits.map((edit) => [edit.shape, flatten(edit.subpaths)]));
+            const still = exposedShapes(cap, inside, after, under, away, trial).filter((below) => trial.has(below));
+            if (still.length > 0) return false;
+            for (const edit of edits) {
+              edit.shape.subpaths = edit.subpaths;
+              edit.shape.rings = trial.get(edit.shape) ?? null;
+              edit.shape.changed = true;
+            }
+            return true;
+          };
+          const next = fitOneCorner(subpath, colourAt, (cap) => confirm(shape.fill, cap, inside), inside, covers);
           if (next === null) break;
           subpaths[index] = next;
-          changed = true;
+          shape.changed = true;
         }
       }
-      if (!changed) return tag;
-      return tag.slice(0, quoted.start) + serialize(subpaths) + tag.slice(quoted.end);
-    });
+      shape.rings = flatten(subpaths);
+    }
+    let out = "";
+    let cursor = 0;
+    for (const shape of shapes) {
+      if (!shape.changed || shape.subpaths === null || shape.quoted === null) continue;
+      out += svg.slice(cursor, shape.at) + shape.tag.slice(0, shape.quoted.start) + serialize(shape.subpaths) + shape.tag.slice(shape.quoted.end);
+      cursor = shape.at + shape.tag.length;
+    }
+    return out + svg.slice(cursor);
+  }
+  function shapeInside(shape, rings, x, y) {
+    if (shape.primitive !== null) return shape.primitive(x, y);
+    const flat = rings ?? shape.rings;
+    return flat !== null && insideFlat(flat, x, y);
+  }
+  function exposedShapes(cap, before, after, under, away, trial = /* @__PURE__ */ new Map()) {
+    const xs = cap.map((point2) => point2.x);
+    const ys = cap.map((point2) => point2.y);
+    const step = 0.125;
+    const area = /* @__PURE__ */ new Map();
+    for (let y = Math.floor(Math.min(...ys)) - 1 + step / 2; y < Math.max(...ys) + 1; y += step) {
+      for (let x = Math.floor(Math.min(...xs)) - 1 + step / 2; x < Math.max(...xs) + 1; x += step) {
+        if (!before(x, y) || after(x, y)) continue;
+        let shown;
+        for (let at = under.length - 1; at >= 0 && shown === void 0; at -= 1) {
+          const shape = under[at];
+          if (shape !== void 0 && shapeInside(shape, trial.get(shape), x, y)) shown = shape;
+        }
+        if (shown === void 0) continue;
+        const theirs = rgbOf(shown.fill);
+        if (theirs !== null && distanceRgb(theirs, away) <= FIT_CONTRAST) continue;
+        area.set(shown, (area.get(shown) ?? 0) + step * step);
+      }
+    }
+    return [...area].filter(([, value]) => value > FIT_EXPOSED_AREA).map(([shape]) => shape);
+  }
+  function followCorner(subpaths, corner) {
+    for (let index = 0; index < subpaths.length; index += 1) {
+      const subpath = subpaths[index];
+      if (subpath === void 0 || !subpath.closed || subpath.cubics.length < 2) continue;
+      const list = stations(subpath.cubics);
+      const last = list[list.length - 1];
+      const first = list[0];
+      if (last === void 0 || first === void 0) continue;
+      const total = last.at + distance(last.point, first.point);
+      const nearest2 = (point2) => {
+        let best = null;
+        for (const station of list) if (best === null || distance(station.point, point2) < distance(best.point, point2)) best = station;
+        return best !== null && distance(best.point, point2) <= FIT_FOLLOW ? best : null;
+      };
+      const start2 = nearest2(corner.start);
+      const end = nearest2(corner.end);
+      if (start2 === null || end === null) continue;
+      const forward = ((end.at - start2.at) % total + total) % total;
+      const reversed = forward > total / 2;
+      const from = reversed ? end : start2;
+      const to = reversed ? start2 : end;
+      const vertices = reversed ? [...corner.vertices].reverse() : corner.vertices;
+      const next = spliceCorner(subpath, from, to, vertices[0] ?? corner.start, (a, b) => {
+        const points = [a, ...vertices, b];
+        return points.slice(1).map((point2, at) => line(points[at], point2));
+      });
+      if (next === null) return null;
+      return subpaths.map((other, at) => at === index ? next : other);
+    }
+    return null;
+  }
+  function rgbOf(fill) {
+    const match = /^#([0-9a-f]{6})$/i.exec(fill);
+    if (match?.[1] === void 0) return null;
+    const value = Number.parseInt(match[1], 16);
+    return [value >> 16 & 255, value >> 8 & 255, value & 255];
+  }
+  function distanceRgb(a, b) {
+    return Math.hypot((a[0] ?? 0) - (b[0] ?? 0), (a[1] ?? 0) - (b[1] ?? 0), (a[2] ?? 0) - (b[2] ?? 0));
+  }
+  function primitiveInside(tag) {
+    if (/\btransform=/i.test(tag)) return null;
+    const number = (name) => {
+      const match = new RegExp("\\b" + name + '="([^"]*)"', "i").exec(tag);
+      const value = match?.[1] === void 0 ? Number.NaN : Number.parseFloat(match[1]);
+      return Number.isFinite(value) ? value : null;
+    };
+    if (/^<circle\b/i.test(tag)) {
+      const cx = number("cx") ?? 0;
+      const cy = number("cy") ?? 0;
+      const r = number("r");
+      return r === null ? null : (x, y) => (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
+    }
+    if (/^<ellipse\b/i.test(tag)) {
+      const cx = number("cx") ?? 0;
+      const cy = number("cy") ?? 0;
+      const rx = number("rx");
+      const ry = number("ry");
+      return rx === null || ry === null || rx <= 0 || ry <= 0 ? null : (x, y) => ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
+    }
+    const left = number("x") ?? 0;
+    const top = number("y") ?? 0;
+    const width = number("width");
+    const height = number("height");
+    return width === null || height === null ? null : (x, y) => x >= left && x <= left + width && y >= top && y <= top + height;
   }
   function stations(cubics) {
     const out = [];
@@ -1142,7 +1280,7 @@
     });
     return out;
   }
-  function fitOneCorner(subpath, colourAt, check, inside) {
+  function fitOneCorner(subpath, colourAt, check, inside, covers) {
     if (!subpath.closed || subpath.cubics.length < 2) return null;
     const list = stations(subpath.cubics);
     const last = list[list.length - 1];
@@ -1222,13 +1360,95 @@
         for (let at = centre.at - spanBefore; at <= centre.at + spanAfter; at += 0.2) cap.push(pointAt(at).point);
         cap.push(end.point, { ...meet });
         if (!check(cap)) continue;
-        return spliceCorner(subpath, start2, end, meet);
+        const onLine = (point2, side) => {
+          const t = (point2.x - side.origin.x) * side.direction.x + (point2.y - side.origin.y) * side.direction.y;
+          return { x: side.origin.x + side.direction.x * t, y: side.origin.y + side.direction.y * t };
+        };
+        let middle = null;
+        let vertices = [meet];
+        const lead = Math.min(FIT_JOIN, 0.5 * distance(start2.point, meet));
+        const trail = Math.min(FIT_JOIN, 0.5 * distance(end.point, meet));
+        const inPoint = onLine(pointAt(centre.at - spanBefore + lead).point, before);
+        const outPoint = onLine(pointAt(centre.at + spanAfter - trail).point, after);
+        const startTangent = unit({ x: pointAt(centre.at - spanBefore + 0.2).point.x - start2.point.x, y: pointAt(centre.at - spanBefore + 0.2).point.y - start2.point.y });
+        const endTangent = unit({ x: end.point.x - pointAt(centre.at + spanAfter - 0.2).point.x, y: end.point.y - pointAt(centre.at + spanAfter - 0.2).point.y });
+        if (startTangent !== null && endTangent !== null) {
+          const ease = (from, fromTangent, to, toTangent) => {
+            const k = distance(from, to) / 3;
+            return { p0: from, p1: { x: from.x + fromTangent.x * k, y: from.y + fromTangent.y * k }, p2: { x: to.x - toTangent.x * k, y: to.y - toTangent.y * k }, p3: to };
+          };
+          middle = (from, to) => [ease(from, startTangent, inPoint, before.direction), line(inPoint, meet), line(meet, outPoint), ease(outPoint, after.direction, to, endTangent)];
+          vertices = [inPoint, meet, outPoint];
+        }
+        const next = spliceCorner(subpath, start2, end, meet, middle);
+        if (next === null) return null;
+        const away = before.away.map((value, channel) => (value + after.away[channel]) / 2);
+        if (!covers(next, cap, away, { start: start2.point, end: end.point, vertices })) continue;
+        return next;
+      }
+    }
+    const bendFrom = (at, sign) => {
+      for (let reach = 0; reach <= FIT_BEND_MAX; reach += 0.125) if (localTurn(at + sign * reach) < FIT_STRAIGHT_TURN) return reach;
+      return FIT_BEND_MAX;
+    };
+    const pairs = [];
+    for (const index of candidates) {
+      const here = list[index];
+      if (here === void 0) continue;
+      for (const other of candidates) {
+        const there = list[other];
+        if (there !== void 0 && there !== here) pairs.push([here, there]);
+      }
+      for (let gap = FIT_PAIR_GAP[0]; gap <= FIT_PAIR_GAP[1]; gap += 0.5) {
+        pairs.push([here, pointAt(here.at + gap)], [pointAt(here.at - gap), here]);
+      }
+    }
+    for (const [first2, second] of pairs) {
+      const gap = ((second.at - first2.at) % total + total) % total;
+      if (gap < FIT_PAIR_GAP[0] || gap > FIT_PAIR_GAP[1]) continue;
+      if (breaks.some((at) => [first2.at, second.at].some((corner) => Math.min(Math.abs(at - corner), total - Math.abs(at - corner)) <= 1))) continue;
+      const bendBefore = bendFrom(first2.at, -1);
+      const bendAfter = bendFrom(first2.at + gap, 1);
+      const inner = gap - 2 * FIT_PAIR_CLEAR;
+      if (inner < 1) continue;
+      const middleOffsets = [0, 0.25, 0.5, 0.75, 1].map((share) => FIT_PAIR_CLEAR + share * inner);
+      const middle = sideLine(first2.at, 1, middleOffsets, pointAt, colourAt, inside);
+      if (middle === null) continue;
+      for (const scale of FIT_SCALES) {
+        const spanBefore = bendBefore + FIT_SPLIT * scale;
+        const spanAfter = bendAfter + FIT_SPLIT * scale;
+        if (total < 2 * (spanBefore + spanAfter + gap)) continue;
+        const before = sideLine(first2.at, -1, FIT_SIDE.map((offset) => bendBefore + offset * scale), pointAt, colourAt, inside);
+        const after = sideLine(first2.at + gap, 1, FIT_SIDE.map((offset) => bendAfter + offset * scale), pointAt, colourAt, inside);
+        if (before === null || after === null) continue;
+        if (angleBetween(before.direction, middle.direction) < 35 * Math.PI / 180) continue;
+        if (angleBetween(middle.direction, after.direction) < 35 * Math.PI / 180) continue;
+        const turnOf = (a, b) => a.x * b.y - a.y * b.x;
+        if (turnOf(before.direction, middle.direction) * turnOf(middle.direction, after.direction) <= 0) continue;
+        const one = intersectLines(before.origin, before.direction, middle.origin, middle.direction);
+        const two = intersectLines(middle.origin, middle.direction, after.origin, after.direction);
+        if (one === null || two === null) continue;
+        if (distance(one, first2.point) > FIT_REACH * scale + bendBefore || distance(two, second.point) > FIT_REACH * scale + bendAfter) continue;
+        const start2 = pointAt(first2.at - spanBefore);
+        const end = pointAt(first2.at + gap + spanAfter);
+        const ahead = (from, to, direction) => (to.x - from.x) * direction.x + (to.y - from.y) * direction.y > 0;
+        if (!ahead(start2.point, one, before.direction) || !ahead(one, two, middle.direction) || !ahead(two, end.point, after.direction)) continue;
+        const cap = [];
+        for (let at = first2.at - spanBefore; at <= first2.at + gap + spanAfter; at += 0.2) cap.push(pointAt(at).point);
+        cap.push(end.point, { ...two }, { ...one });
+        if (!check(cap)) continue;
+        const next = spliceCorner(subpath, start2, end, one, (from, to) => [line(from, one), line(one, two), line(two, to)]);
+        if (next === null) continue;
+        const away = [0, 1, 2].map((channel) => (before.away[channel] + after.away[channel]) / 2);
+        if (!covers(next, cap, away, { start: start2.point, end: end.point, vertices: [one, two] })) continue;
+        return next;
       }
     }
     return null;
   }
   function sideLine(centre, side, offsets, pointAt, colourAt, inside) {
     const snapped = [];
+    const outside = [0, 0, 0];
     for (const offset of offsets) {
       const here = pointAt(centre + side * offset).point;
       const a = pointAt(centre + side * offset - 0.3).point;
@@ -1246,6 +1466,7 @@
       const span = [away[0] - ink[0], away[1] - ink[1], away[2] - ink[2]];
       const spanSquared = span[0] ** 2 + span[1] ** 2 + span[2] ** 2;
       if (spanSquared < FIT_CONTRAST ** 2) return null;
+      for (let channel = 0; channel < 3; channel += 1) outside[channel] += away[channel] / offsets.length;
       const mix = (k) => {
         const colour = colourAt(here.x + normal.x * k, here.y + normal.y * k);
         if (colour === null) return null;
@@ -1286,9 +1507,10 @@
     if (firstPoint === void 0 || lastPoint === void 0) return null;
     const travel = side < 0 ? { x: firstPoint.x - lastPoint.x, y: firstPoint.y - lastPoint.y } : { x: lastPoint.x - firstPoint.x, y: lastPoint.y - firstPoint.y };
     if (travel.x * direction.x + travel.y * direction.y < 0) direction = { x: -direction.x, y: -direction.y };
-    return { origin: mean, direction };
+    return { origin: mean, direction, away: [outside[0], outside[1], outside[2]] };
   }
-  function spliceCorner(subpath, start2, end, meet) {
+  function spliceCorner(subpath, start2, end, meet, middle = null) {
+    const corner = (from, to) => middle === null ? [line(from, meet), line(meet, to)] : middle(from, to);
     const count = subpath.cubics.length;
     const rotated = [...subpath.cubics.slice(start2.cubic), ...subpath.cubics.slice(0, start2.cubic)];
     const endIndex = (end.cubic - start2.cubic + count) % count;
@@ -1301,7 +1523,7 @@
       const [kept, rest] = splitCubic(head, start2.t);
       const [, after] = splitCubic(rest, (end.t - start2.t) / (1 - start2.t));
       if (start2.t > 0) cubics.push(kept);
-      cubics.push(line(kept.p3, meet), line(meet, after.p0), after);
+      cubics.push(...corner(kept.p3, after.p0), after);
       for (let index = 1; index < count; index += 1) {
         const cubic = rotated[index];
         if (cubic !== void 0) cubics.push(cubic);
@@ -1310,7 +1532,7 @@
       const kept = splitCubic(head, start2.t)[0];
       const after = splitCubic(tail, end.t)[1];
       if (start2.t > 0) cubics.push(kept);
-      cubics.push(line(kept.p3, meet), line(meet, after.p0));
+      cubics.push(...corner(kept.p3, after.p0));
       if (end.t < 1) cubics.push(after);
       for (let index = endIndex + 1; index < count; index += 1) {
         const cubic = rotated[index];
@@ -1879,12 +2101,12 @@
   }
   function samePaint(fill, border) {
     if (fill === border) return true;
-    const left = rgbOf(fill);
-    const right = rgbOf(border);
+    const left = rgbOf2(fill);
+    const right = rgbOf2(border);
     if (left === null || right === null) return false;
     return Math.abs(left[0] - right[0]) <= 18 && Math.abs(left[1] - right[1]) <= 18 && Math.abs(left[2] - right[2]) <= 18;
   }
-  function rgbOf(fill) {
+  function rgbOf2(fill) {
     const match = /^#([0-9a-f]{6})$/i.exec(fill);
     if (match === null) return null;
     const hex3 = match[1] ?? "";
@@ -3598,7 +3820,7 @@
     if (cutOut) return sharpenCorners(fitted, fillet, 35, curl);
     const check = size >= MIN_CHECKED_SIDE ? sourceCheck(plates) : null;
     if (check === null) return fitted;
-    const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, check);
+    const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, sourceCheck(plates, true) ?? check);
     const colour = sourceColour(plates);
     return colour === null ? sharpened : fitRasterCorners(sharpened, colour, check);
   }
@@ -3622,7 +3844,7 @@
       return out;
     };
   }
-  function sourceCheck(plates) {
+  function sourceCheck(plates, ownInk = false) {
     const source = plates.find((plate) => plate.source !== void 0)?.source;
     if (source === void 0) return null;
     const { rgba, width, height } = source;
@@ -3661,6 +3883,20 @@
       }
       if (outsideCount === 0) return false;
       const away = outside.map((sum) => sum / outsideCount);
+      if (ownInk) {
+        const within = [0, 0, 0];
+        let withinCount = 0;
+        for (const pixel of pixels) {
+          if (pixel.round < 1 || pixel.sharp < 1) continue;
+          for (let channel = 0; channel < 3; channel += 1) within[channel] += rgba[pixel.at + channel] ?? 0;
+          withinCount += 1;
+        }
+        if (withinCount > 0) {
+          const mean = within.map((sum) => sum / withinCount);
+          const toInk = Math.hypot(...mean.map((value, channel) => value - ink[channel]));
+          if (toInk > OWN_INK * Math.hypot(...ink.map((value, channel) => value - away[channel]))) return false;
+        }
+      }
       const span = ink.map((value, channel) => value - away[channel]);
       const spanSquared = span.reduce((sum, value) => sum + value * value, 0);
       if (spanSquared < MIN_CONTRAST ** 2) return false;
@@ -3682,6 +3918,7 @@
   var SAMPLES = 8;
   var SHARP_MARGIN = 0.75;
   var MIN_CONTRAST = 48;
+  var OWN_INK = 0.5;
   function parseFill(fill) {
     const match = /^#([0-9a-f]{6})$/i.exec(fill);
     if (match?.[1] === void 0) return null;
@@ -4330,6 +4567,8 @@
   var MERGE_DELTA_E = 3;
   var MINOR_DELTA_E = 6;
   var MINOR_SHARE = 0.1;
+  var DARK_L = 12;
+  var DARK_DELTA_E = 10;
   function mergeNearCenters(centers, lab, core) {
     if (centers.length < 2) return [...centers];
     const counts = new Float64Array(centers.length);
@@ -4351,7 +4590,7 @@
     const order = centers.map((_, at) => at).sort((left, right) => (counts[right] ?? 0) - (counts[left] ?? 0) || left - right);
     const groups = [];
     for (const at of order) {
-      const limit = (lead) => (counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E;
+      const limit = (lead) => (cie[lead]?.L ?? 100) < DARK_L && (cie[at]?.L ?? 100) < DARK_L ? DARK_DELTA_E : (counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E;
       const home = (counts[at] ?? 0) === 0 ? void 0 : groups.find((group) => deltaE2000(cie[group.lead], cie[at]) < limit(group.lead));
       if (home === void 0) groups.push({ lead: at, members: [at] });
       else home.members.push(at);

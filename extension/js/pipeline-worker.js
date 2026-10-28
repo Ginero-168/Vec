@@ -403,6 +403,8 @@ function lossyCleanup(rgba, width, height) {
 var MERGE_DELTA_E = 3;
 var MINOR_DELTA_E = 6;
 var MINOR_SHARE = 0.1;
+var DARK_L = 12;
+var DARK_DELTA_E = 10;
 function mergeNearCenters(centers, lab, core) {
   if (centers.length < 2) return [...centers];
   const counts = new Float64Array(centers.length);
@@ -424,7 +426,7 @@ function mergeNearCenters(centers, lab, core) {
   const order = centers.map((_, at) => at).sort((left, right) => (counts[right] ?? 0) - (counts[left] ?? 0) || left - right);
   const groups = [];
   for (const at of order) {
-    const limit = (lead) => (counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E;
+    const limit = (lead) => (cie[lead]?.L ?? 100) < DARK_L && (cie[at]?.L ?? 100) < DARK_L ? DARK_DELTA_E : (counts[at] ?? 0) < MINOR_SHARE * (counts[lead] ?? 0) ? MINOR_DELTA_E : MERGE_DELTA_E;
     const home = (counts[at] ?? 0) === 0 ? void 0 : groups.find((group) => deltaE2000(cie[group.lead], cie[at]) < limit(group.lead));
     if (home === void 0) groups.push({ lead: at, members: [at] });
     else home.members.push(at);
