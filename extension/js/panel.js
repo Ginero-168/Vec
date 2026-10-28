@@ -1618,7 +1618,7 @@
     }
     return result;
   }
-  function fitShapes(svg) {
+  function fitShapes(svg, tuck = false) {
     const tags = pathTags(svg);
     if (tags.length === 0) return svg;
     const box = /viewBox="\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg);
@@ -1635,7 +1635,8 @@
     let cursor = 0;
     for (const [index, tag] of tags.entries()) {
       result += svg.slice(cursor, tag.index);
-      result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
+      const fitted = fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null);
+      result += fitted === null ? tag.source : tuck ? tuckUnderlay(fitted, tags.slice(index + 1)) : fitted;
       cursor = tag.index + tag.length;
     }
     return result + svg.slice(cursor);
@@ -1673,6 +1674,28 @@
     return result + svg.slice(cursor);
   }
   var NEAR_FILL = 2;
+  function tuckUnderlay(markup, above) {
+    const circle = /^<circle cx="([^"]+)" cy="([^"]+)" r="([^"]+)"/.exec(markup);
+    if (circle === null || above.length === 0) return markup;
+    const cx = Number(circle[1]), cy = Number(circle[2]), r = Number(circle[3]);
+    const rim = [];
+    const sectors = /* @__PURE__ */ new Set();
+    for (const tag of above) {
+      const data = elementName(tag.source) === "path" ? readAttr2(tagAttrs(tag.source), "d") : null;
+      if (data === null) continue;
+      for (const point2 of measurePath(data).samples) {
+        const distance3 = Math.hypot(point2.x - cx, point2.y - cy);
+        if (distance3 < r * 0.97 || distance3 > r + 1) continue;
+        rim.push(distance3);
+        sectors.add(Math.floor((Math.atan2(point2.y - cy, point2.x - cx) + Math.PI) / (2 * Math.PI) * 36));
+      }
+    }
+    if (sectors.size < 24) return markup;
+    rim.sort((left, right) => left - right);
+    const outline = rim[Math.floor(rim.length * 0.1)] ?? r;
+    if (outline >= r) return markup;
+    return markup.replace(/ r="[^"]+"/, ' r="' + fmt2(outline) + '"');
+  }
   function sealGaps(svg, strokeWidth = 0.8) {
     const width = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;
     return svg.replace(/<(path|circle|ellipse|rect)\b([^>]*?)\s*(\/?)\s*>/gi, (full, name, attrs, slash) => {
@@ -3308,7 +3331,7 @@
     const curl = size >= 128 ? Math.min(2, size / 128) : 0;
     if (!fitGeometry) return merged;
     const cutOut = plates.length > 0 && plates.every((plate) => plate.cutOut === true);
-    const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged);
+    const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged, cutOut);
     return cutOut ? sharpenCorners(fitted, fillet, 35, curl) : fitted;
   }
 

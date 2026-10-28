@@ -56,7 +56,9 @@ export function mergePlates(
   const cutOut = plates.length > 0 && plates.every((plate) => plate.cutOut === true);
   // Near-identical fills are an anti-aliasing fringe's palette slot on a cut-out; on an opaque backdrop they can be
   // real neighbouring shades (JPEG), and merging them raised MAE.
-  const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged);
+  // On a cut-out the rim of a backdrop disc is the cut's exact outline; it is tucked under the traced shapes above it.
+  // Opaque backdrops (white, JPEG) keep their fits.
+  const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged, cutOut);
   // Only cut-out (transparent-backdrop) sources: their edges come from the corner-preserving transparent cut. On an
   // opaque backdrop (white, JPEG) the traced bends follow anti-aliasing or compression noise, and sharpening them
   // made false corners (si-spotify-128-white-q60) and raised MAE (om-gear-32-white +1.0). The corner colour alone

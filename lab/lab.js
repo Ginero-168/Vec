@@ -1112,7 +1112,7 @@
     }
     return result;
   }
-  function fitShapes(svg2) {
+  function fitShapes(svg2, tuck = false) {
     const tags = pathTags(svg2);
     if (tags.length === 0) return svg2;
     const box = /viewBox="\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg2);
@@ -1129,10 +1129,33 @@
     let cursor = 0;
     for (const [index, tag] of tags.entries()) {
       result += svg2.slice(cursor, tag.index);
-      result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
+      const fitted = fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null);
+      result += fitted === null ? tag.source : tuck ? tuckUnderlay(fitted, tags.slice(index + 1)) : fitted;
       cursor = tag.index + tag.length;
     }
     return result + svg2.slice(cursor);
+  }
+  function tuckUnderlay(markup, above) {
+    const circle = /^<circle cx="([^"]+)" cy="([^"]+)" r="([^"]+)"/.exec(markup);
+    if (circle === null || above.length === 0) return markup;
+    const cx = Number(circle[1]), cy = Number(circle[2]), r = Number(circle[3]);
+    const rim = [];
+    const sectors = /* @__PURE__ */ new Set();
+    for (const tag of above) {
+      const data = elementName(tag.source) === "path" ? readAttr(tagAttrs(tag.source), "d") : null;
+      if (data === null) continue;
+      for (const point of measurePath(data).samples) {
+        const distance3 = Math.hypot(point.x - cx, point.y - cy);
+        if (distance3 < r * 0.97 || distance3 > r + 1) continue;
+        rim.push(distance3);
+        sectors.add(Math.floor((Math.atan2(point.y - cy, point.x - cx) + Math.PI) / (2 * Math.PI) * 36));
+      }
+    }
+    if (sectors.size < 24) return markup;
+    rim.sort((left, right) => left - right);
+    const outline = rim[Math.floor(rim.length * 0.1)] ?? r;
+    if (outline >= r) return markup;
+    return markup.replace(/ r="[^"]+"/, ' r="' + fmt2(outline) + '"');
   }
   function sealGaps(svg2, strokeWidth = 0.8) {
     const width2 = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;

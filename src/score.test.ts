@@ -217,3 +217,23 @@ test("a disc traced edge to edge is centred on the canvas so it reaches both sid
   assert.equal(Number(circle[2]), 64);
   assert.ok(Math.abs(Number(circle[3]) - 64) < 0.05, circle[3]);
 });
+
+test("a backdrop disc under segments that cover its rim stays inside their traced outline", () => {
+  // Four quarter wedges of radius 39.8 cover the rim of a radius-40 disc drawn under them.
+  const wedge = (from: number) => {
+    const points = [[60, 60]];
+    for (let step = 0; step <= 12; step += 1) {
+      const angle = ((from + step * 7.5) * Math.PI) / 180;
+      points.push([60 + 39.8 * Math.cos(angle), 60 + 39.8 * Math.sin(angle)]);
+    }
+    return "M" + points.map(([x, y]) => x!.toFixed(2) + "," + y!.toFixed(2)).join("L") + "Z";
+  };
+  const covered = '<svg width="120" height="120" viewBox="0 0 120 120"><path d="' + circlePath(60, 60, 40) + '" fill="#fbc016"/>'
+    + [0, 90, 180, 270].map((from, at) => '<path d="' + wedge(from) + '" fill="' + ["#229342", "#e23c2e", "#1a73e8", "#111111"][at] + '"/>').join("") + "</svg>";
+  const tucked = /<circle [^>]*r="([^"]+)" fill="#fbc016"/.exec(fitShapes(covered, true));
+  assert.ok(tucked !== null && Number(tucked[1]) <= 39.85, tucked?.[1]);
+  // A disc with a mark inside it keeps its own fit.
+  const marked = '<svg width="120" height="120" viewBox="0 0 120 120"><path d="' + circlePath(60, 60, 40) + '" fill="#1ed760"/><path d="M45,55 H75 V65 H45 Z" fill="#000000"/></svg>';
+  const kept = /<circle [^>]*r="([^"]+)" fill="#1ed760"/.exec(fitShapes(marked, true));
+  assert.ok(kept !== null && Math.abs(Number(kept[1]) - 40) < 0.6, kept?.[1]);
+});

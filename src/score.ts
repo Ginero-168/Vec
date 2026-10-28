@@ -277,7 +277,7 @@ export function dropFill(svg: string, fill: string): string {
   return result;
 }
 
-export function fitShapes(svg: string): string {
+export function fitShapes(svg: string, tuck = false): string {
   const tags = pathTags(svg);
   if (tags.length === 0) return svg;
   const box = /viewBox="\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg);
@@ -297,7 +297,8 @@ export function fitShapes(svg: string): string {
   let cursor = 0;
   for (const [index, tag] of tags.entries()) {
     result += svg.slice(cursor, tag.index);
-    result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
+    const fitted = fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null);
+    result += fitted === null ? tag.source : tuck ? tuckUnderlay(fitted, tags.slice(index + 1)) : fitted;
     cursor = tag.index + tag.length;
   }
   return result + svg.slice(cursor);
@@ -342,6 +343,37 @@ export function unifyNearFills(svg: string): string {
 }
 
 const NEAR_FILL = 2;
+
+/**
+ * A fitted disc painted under shapes that cover its rim (a logo's ring of segments over a backdrop disc) must not
+ * reach past their traced outline: the exact disc is a fraction of a pixel wider than VTracer's curves of the
+ * segments, and that sliver of the underlay shows as a thin ring of its colour all around (gl-chrome-256-alpha).
+ * Its radius is capped at the outline the covering shapes trace along the rim.
+ */
+function tuckUnderlay(markup: string, above: readonly PathTag[]): string {
+  const circle = /^<circle cx="([^"]+)" cy="([^"]+)" r="([^"]+)"/.exec(markup);
+  if (circle === null || above.length === 0) return markup;
+  const cx = Number(circle[1]), cy = Number(circle[2]), r = Number(circle[3]);
+  const rim: number[] = [];
+  const sectors = new Set<number>();
+  for (const tag of above) {
+    const data = elementName(tag.source) === "path" ? readAttr(tagAttrs(tag.source), "d") : null;
+    if (data === null) continue;
+    for (const point of measurePath(data).samples) {
+      const distance = Math.hypot(point.x - cx, point.y - cy);
+      if (distance < r * 0.97 || distance > r + 1) continue;
+      rim.push(distance);
+      sectors.add(Math.floor(((Math.atan2(point.y - cy, point.x - cx) + Math.PI) / (2 * Math.PI)) * 36));
+    }
+  }
+  // Only when the shapes above trace most of the rim; a disc with marks inside it (Spotify) keeps its fit.
+  if (sectors.size < 24) return markup;
+  rim.sort((left, right) => left - right);
+  // VTracer's curves bow inward between their nodes, so the outline is a low quantile of the sampled rim, not its median.
+  const outline = rim[Math.floor(rim.length * 0.1)] ?? r;
+  if (outline >= r) return markup;
+  return markup.replace(/ r="[^"]+"/, ' r="' + fmt(outline) + '"');
+}
 
 export function sealGaps(svg: string, strokeWidth = 0.8): string {
   const width = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;
