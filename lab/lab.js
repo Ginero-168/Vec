@@ -2,6 +2,7 @@
 (() => {
   // src/edit.ts
   var ARG_COUNT = { m: 2, l: 2, h: 1, v: 1, c: 6, z: 0 };
+  var sampledCubics = /* @__PURE__ */ new WeakMap();
   function shapePattern() {
     return /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
   }
@@ -348,10 +349,11 @@
   function farthest(samples, cubic) {
     let distanceWorst = 0;
     let index = 0;
+    const curveSamples = sampleCubic(cubic);
     for (let sampleIndex = 1; sampleIndex < samples.length - 1; sampleIndex += 1) {
       const point = samples[sampleIndex];
       if (point === void 0) continue;
-      const error = distanceToCubic(point, cubic);
+      const error = distanceToCubicSamples(point, curveSamples);
       if (error > distanceWorst) {
         distanceWorst = error;
         index = sampleIndex;
@@ -372,12 +374,23 @@
     const t = Math.min(1, Math.max(0, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
     return distance(point, { x: start.x + dx * t, y: start.y + dy * t });
   }
-  function distanceToCubic(point, cubic) {
-    let best = Infinity;
-    for (let step = 0; step <= 24; step += 1) {
-      best = Math.min(best, distance(point, bezier(cubic, step / 24)));
+  function sampleCubic(cubic) {
+    const cached = sampledCubics.get(cubic);
+    if (cached !== void 0) return cached;
+    const samples = [];
+    for (let step = 0; step <= 24; step += 1) samples.push(bezier(cubic, step / 24));
+    sampledCubics.set(cubic, samples);
+    return samples;
+  }
+  function distanceToCubicSamples(point, samples) {
+    let bestSquared = Infinity;
+    for (const sample of samples) {
+      const dx = point.x - sample.x;
+      const dy = point.y - sample.y;
+      const squared = dx * dx + dy * dy;
+      if (squared < bestSquared) bestSquared = squared;
     }
-    return best;
+    return Math.sqrt(bestSquared);
   }
   function tangentAt(samples, index) {
     const previous = samples[Math.max(0, index - 1)] ?? { x: 0, y: 0 };
@@ -411,7 +424,8 @@
   }
   function cubicError(samples, cubic) {
     let worst = 0;
-    for (const sample of samples) worst = Math.max(worst, distanceToCubic(sample, cubic));
+    const curveSamples = sampleCubic(cubic);
+    for (const sample of samples) worst = Math.max(worst, distanceToCubicSamples(sample, curveSamples));
     return worst;
   }
   function chordParameters(samples) {
@@ -787,6 +801,11 @@
     }
     return hex(Math.round(mean.r), Math.round(mean.g), Math.round(mean.b));
   }
+  function srgbToLinear(channel) {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  }
+  var SRGB_LINEAR = Float64Array.from({ length: 256 }, (_, channel) => srgbToLinear(channel));
   function hex(red, green, blue) {
     return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
   }
