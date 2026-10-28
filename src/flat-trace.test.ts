@@ -312,6 +312,35 @@ test("traced fillets are sharpened only on cut-out sources, never on an opaque b
   assert.ok(backdrop.includes("9.6,0"), backdrop);
 });
 
+test("on an opaque backdrop a traced fillet is sharpened only where the source pixels show a sharp corner", () => {
+  // Traced at 8x: a 0.4 px fillet at (10,0) in source pixels, on a 128 px canvas.
+  const traced = '<svg viewBox="0 0 1024 1024"><path d="M0,0L76.8,0C78.8,0 80,1.2 80,3.2L80,80L40,80L40,120L0,120Z" fill="#000000"/></svg>';
+  const source = (radius: number) => {
+    const rgba = new Uint8Array(128 * 128 * 4).fill(255);
+    for (let y = 0; y < 128; y += 1) {
+      for (let x = 0; x < 128; x += 1) {
+        let covered = 0;
+        for (let sy = 0; sy < 8; sy += 1) {
+          for (let sx = 0; sx < 8; sx += 1) {
+            const px = x + (sx + 0.5) / 8;
+            const py = y + (sy + 0.5) / 8;
+            const shape = (px < 10 && py < 10) || (px < 5 && py < 15);
+            const tip = radius > 0 && px > 10 - radius && py < radius && Math.hypot(px - (10 - radius), py - radius) > radius;
+            if (shape && !tip) covered += 1;
+          }
+        }
+        rgba.fill(Math.round(255 * (1 - covered / 64)), (y * 128 + x) * 4, (y * 128 + x) * 4 + 3);
+      }
+    }
+    return { rgba, width: 128, height: 128 };
+  };
+  const plate = (radius: number) => ({ scale: 8, originX: 0, originY: 0, borderColor: null, cutOut: false, source: source(radius) });
+  const sharp = mergePlates([traced], [plate(0)], 128, 128, null, false);
+  assert.ok(!sharp.includes("9.6,0"), sharp);
+  const round = mergePlates([traced], [plate(3)], 128, 128, null, false);
+  assert.ok(round.includes("9.6,0"), round);
+});
+
 test("a source is a cut-out only when it has see-through pixels", () => {
   const opaque = new Uint8Array(4 * 4).fill(255);
   assert.equal(hasClearPixel(opaque), false);
@@ -359,4 +388,8 @@ test("JPEG cleanup is chosen once per source and never for clean or small raster
   const noisy = flat(64);
   for (let at = 0; at < noisy.length; at += 4) noisy[at] = 250 + ((at / 4) % 7);
   assert.equal(lossyCleanup(noisy, 64, 64), undefined, "64 px sources trace as before");
+  // A tall 86x128 logo is judged by its long side (gl-figma-128-q60).
+  const tall = new Uint8Array(86 * 128 * 4).fill(255);
+  for (let at = 0; at < tall.length; at += 4) tall.fill(220 + (((at / 4) * 7919) % 29), at, at + 3);
+  assert.notEqual(lossyCleanup(tall, 86, 128), undefined);
 });

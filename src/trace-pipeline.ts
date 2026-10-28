@@ -201,6 +201,7 @@ function planFlat(
       originY: plate.originY,
       borderColor: plate.borderColor,
       cutOut: plate.cutOut,
+      source: { rgba, width, height },
       request: controls === undefined
         ? flatRequest(settings, plate.palette, plate.scale)
         : flatRequestForControls(settings, plate.palette, plate.scale, controls)

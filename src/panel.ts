@@ -237,8 +237,13 @@ function parsePlannedPlate(value: unknown): PlannedPlate | null {
     originY: value.originY,
     borderColor: value.borderColor,
     ...(value.cutOut === true ? { cutOut: true } : {}),
+    ...(isSourceRaster(value.source) ? { source: value.source } : {}),
     request
   };
+}
+
+function isSourceRaster(value: unknown): value is { readonly rgba: Uint8Array; readonly width: number; readonly height: number } {
+  return isRecord(value) && value.rgba instanceof Uint8Array && typeof value.width === "number" && typeof value.height === "number" && value.rgba.length === value.width * value.height * 4;
 }
 
 function parseTraceRequest(value: unknown): TraceRequest | null {

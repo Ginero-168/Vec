@@ -925,19 +925,46 @@
     return match[1] ?? match[2] ?? "";
   }
   function sharpenCorners(svg, fillet = 1.25, minTurn = 35, curl = fillet) {
+    return sharpenWith(svg, fillet, minTurn, curl, null);
+  }
+  function sharpenConfirmed(svg, fillet, minTurn, curl, confirm) {
+    return sharpenWith(svg, fillet, minTurn, curl, confirm);
+  }
+  function sharpenWith(svg, fillet, minTurn, curl, confirm) {
     return svg.replace(shapePattern(), (tag) => {
       if (!/^<path\b/i.test(tag)) return tag;
       const quoted = readD(tag);
       if (quoted === null) return tag;
       const parsed = parsePath(quoted.value);
       if (parsed === null || parsed.length === 0) return tag;
-      const sharpened = parsed.map((subpath) => sharpenSubpath(subpath, fillet, minTurn, curl));
+      const fill = /\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "";
+      let flat = null;
+      const inside = (x, y) => insideFlat(flat ??= flatten(parsed), x, y);
+      const check = confirm === null ? null : (cap) => confirm(fill, cap, inside);
+      const sharpened = parsed.map((subpath) => sharpenSubpath(subpath, fillet, minTurn, curl, check));
       const next = serialize(sharpened);
       if (next === quoted.value) return tag;
       return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
     });
   }
-  function sharpenSubpath(subpath, fillet, minTurn, curl) {
+  function flatten(subpaths) {
+    return subpaths.map((subpath) => subpath.cubics.flatMap((cubic) => [0, 1, 2, 3, 4, 5, 6, 7].map((step) => bezier(cubic, step / 8))));
+  }
+  function insideFlat(rings, x, y) {
+    let winding2 = 0;
+    for (const points of rings) {
+      for (let index = 0; index < points.length; index += 1) {
+        const a = points[index];
+        const b = points[(index + 1) % points.length];
+        if (a === void 0 || b === void 0) continue;
+        const side = (b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y);
+        if (a.y <= y && b.y > y && side > 0) winding2 += 1;
+        else if (a.y > y && b.y <= y && side < 0) winding2 -= 1;
+      }
+    }
+    return winding2 !== 0;
+  }
+  function sharpenSubpath(subpath, fillet, minTurn, curl, check) {
     if (!subpath.closed || subpath.cubics.length < 4) return subpath;
     const cubics = subpath.cubics.map((cubic) => ({ p0: { ...cubic.p0 }, p1: { ...cubic.p1 }, p2: { ...cubic.p2 }, p3: { ...cubic.p3 } }));
     const turnLimit = minTurn * Math.PI / 180;
@@ -961,6 +988,15 @@
         if (distance(before.p0, before.p3) < 2 * length || distance(after.p0, after.p3) < 2 * length) continue;
         const meet = intersectLines(before.p3, into, after.p0, out);
         if (meet === null || distance(meet, before.p3) > 2 * fillet || distance(meet, after.p0) > 2 * fillet) continue;
+        if (check !== null) {
+          const cap = [];
+          for (let piece2 = 0; piece2 < run; piece2 += 1) {
+            const cubic = cubics[(index + piece2) % cubics.length];
+            if (cubic !== void 0) for (let step = 0; step < 8; step += 1) cap.push(bezier(cubic, step / 8));
+          }
+          cap.push({ ...after.p0 }, { ...meet });
+          if (!check(cap)) continue;
+        }
         before.p2 = { x: before.p2.x + meet.x - before.p3.x, y: before.p2.y + meet.y - before.p3.y };
         before.p3 = { ...meet };
         after.p1 = { x: after.p1.x + meet.x - after.p0.x, y: after.p1.y + meet.y - after.p0.y };
@@ -974,11 +1010,11 @@
       }
       if (!replaced) index += 1;
     }
-    if (curl > 0) for (let joint = 0; joint < cubics.length; joint += 1) sharpenJoint(cubics, joint, curl, turnLimit);
+    if (curl > 0) for (let joint = 0; joint < cubics.length; joint += 1) sharpenJoint(cubics, joint, curl, turnLimit, check);
     return { cubics, closed: subpath.closed };
   }
   var STRAIGHT_TOLERANCE = 0.15;
-  function sharpenJoint(cubics, joint, fillet, turnLimit) {
+  function sharpenJoint(cubics, joint, fillet, turnLimit, check) {
     const before = cubics[(joint - 1 + cubics.length) % cubics.length];
     const after = cubics[joint];
     if (before === void 0 || after === void 0 || before === after) return;
@@ -997,6 +1033,13 @@
     if (meet === null || distance(meet, corner) > fillet) return;
     if ((meet.x - from.x) * into.x + (meet.y - from.y) * into.y < -0.05) return;
     if ((to.x - meet.x) * head.direction.x + (to.y - meet.y) * head.direction.y < -0.05) return;
+    if (check !== null) {
+      const cap = [];
+      for (let step = 0; step <= 8; step += 1) cap.push(bezier(before, 1 - tail.t + tail.t * step / 8));
+      for (let step = 1; step <= 8; step += 1) cap.push(bezier(after, head.t * step / 8));
+      cap.push({ ...meet });
+      if (!check(cap)) return;
+    }
     const kept = splitCubic(before, 1 - tail.t)[0];
     const rest = splitCubic(after, head.t)[1];
     before.p0 = kept.p0;
@@ -3323,7 +3366,84 @@
     if (!fitGeometry) return merged;
     const cutOut = plates.length > 0 && plates.every((plate) => plate.cutOut === true);
     const fitted = fitShapes(cutOut ? unifyNearFills(merged) : merged);
-    return cutOut ? sharpenCorners(fitted, fillet, 35, curl) : fitted;
+    if (cutOut) return sharpenCorners(fitted, fillet, 35, curl);
+    const check = size >= MIN_CHECKED_SIDE ? sourceCheck(plates) : null;
+    return check === null ? fitted : sharpenConfirmed(fitted, fillet, 35, curl, check);
+  }
+  function sourceCheck(plates) {
+    const source = plates.find((plate) => plate.source !== void 0)?.source;
+    if (source === void 0) return null;
+    const { rgba, width, height } = source;
+    return (fill, cap, inside) => {
+      const ink = parseFill(fill);
+      if (ink === null || cap.length < 3) return false;
+      const xs = cap.map((point2) => point2.x);
+      const ys = cap.map((point2) => point2.y);
+      const left = Math.max(0, Math.floor(Math.min(...xs)) - REACH);
+      const right = Math.min(width - 1, Math.floor(Math.max(...xs)) + REACH);
+      const top = Math.max(0, Math.floor(Math.min(...ys)) - REACH);
+      const bottom = Math.min(height - 1, Math.floor(Math.max(...ys)) + REACH);
+      const pixels = [];
+      for (let y = top; y <= bottom; y += 1) {
+        for (let x = left; x <= right; x += 1) {
+          let round = 0;
+          let sharp = 0;
+          for (let sy = 0; sy < SAMPLES; sy += 1) {
+            for (let sx = 0; sx < SAMPLES; sx += 1) {
+              const px = x + (sx + 0.5) / SAMPLES;
+              const py = y + (sy + 0.5) / SAMPLES;
+              const covered = inside(px, py);
+              if (covered) round += 1;
+              if (covered !== insidePolygon(cap, px, py)) sharp += 1;
+            }
+          }
+          pixels.push({ at: (y * width + x) * 4, round: round / SAMPLES ** 2, sharp: sharp / SAMPLES ** 2 });
+        }
+      }
+      const outside = [0, 0, 0];
+      let outsideCount = 0;
+      for (const pixel of pixels) {
+        if (pixel.round > 0 || pixel.sharp > 0) continue;
+        for (let channel = 0; channel < 3; channel += 1) outside[channel] += rgba[pixel.at + channel] ?? 0;
+        outsideCount += 1;
+      }
+      if (outsideCount === 0) return false;
+      const away = outside.map((sum) => sum / outsideCount);
+      const span = ink.map((value, channel) => value - away[channel]);
+      const spanSquared = span.reduce((sum, value) => sum + value * value, 0);
+      if (spanSquared < MIN_CONTRAST ** 2) return false;
+      let roundError = 0;
+      let sharpError = 0;
+      for (const pixel of pixels) {
+        if (pixel.round === pixel.sharp) continue;
+        let dot = 0;
+        for (let channel = 0; channel < 3; channel += 1) dot += ((rgba[pixel.at + channel] ?? 0) - away[channel]) * span[channel];
+        const coverage = Math.max(0, Math.min(1, dot / spanSquared));
+        roundError += (coverage - pixel.round) ** 2;
+        sharpError += (coverage - pixel.sharp) ** 2;
+      }
+      return sharpError < roundError;
+    };
+  }
+  var MIN_CHECKED_SIDE = 96;
+  var REACH = 2;
+  var SAMPLES = 8;
+  var MIN_CONTRAST = 48;
+  function parseFill(fill) {
+    const match = /^#([0-9a-f]{6})$/i.exec(fill);
+    if (match?.[1] === void 0) return null;
+    const value = Number.parseInt(match[1], 16);
+    return [value >> 16 & 255, value >> 8 & 255, value & 255];
+  }
+  function insidePolygon(points, x, y) {
+    let inside = false;
+    for (let index = 0, previous = points.length - 1; index < points.length; previous = index, index += 1) {
+      const a = points[index];
+      const b = points[previous];
+      if (a === void 0 || b === void 0) continue;
+      if (a.y > y !== b.y > y && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
   }
 
   // src/lab-pipeline.ts
@@ -3952,7 +4072,7 @@
   }
   var MIN_CLEAN_SIDE = 96;
   function lossyCleanup(rgba, width, height) {
-    return Math.min(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : void 0;
+    return Math.max(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : void 0;
   }
   var MERGE_DELTA_E = 3;
   var MINOR_DELTA_E = 6;
@@ -6370,6 +6490,7 @@
       originY: plate.originY,
       borderColor: plate.borderColor,
       cutOut: plate.cutOut,
+      source: { rgba, width, height },
       request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
     }));
     const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
@@ -7364,8 +7485,12 @@
       originY: value.originY,
       borderColor: value.borderColor,
       ...value.cutOut === true ? { cutOut: true } : {},
+      ...isSourceRaster(value.source) ? { source: value.source } : {},
       request
     };
+  }
+  function isSourceRaster(value) {
+    return isRecord(value) && value.rgba instanceof Uint8Array && typeof value.width === "number" && typeof value.height === "number" && value.rgba.length === value.width * value.height * 4;
   }
   function parseTraceRequest(value) {
     if (!isRecord(value)) return null;

@@ -1001,20 +1001,64 @@ function readAttr(attrs: string, name: string): string | null {
  * the tangent intersection. Longer bends are real rounded corners and stay.
  */
 export function sharpenCorners(svg: string, fillet = 1.25, minTurn = 35, curl = fillet): string {
+  return sharpenWith(svg, fillet, minTurn, curl, null);
+}
+
+/**
+ * The cap a sharpening would toggle: the region between the traced rounded corner and the sharp corner it becomes,
+ * as a closed polygon in path coordinates. `confirm` receives the path's fill, the cap, and the path's current
+ * nonzero fill test; it answers whether the source raster is better explained by the sharp corner.
+ */
+export type CornerCheck = (
+  fill: string,
+  cap: readonly { readonly x: number; readonly y: number }[],
+  inside: (x: number, y: number) => boolean
+) => boolean;
+
+/** sharpenCorners, but each corner is only sharpened when `confirm` says the raster fills its cap. */
+export function sharpenConfirmed(svg: string, fillet: number, minTurn: number, curl: number, confirm: CornerCheck): string {
+  return sharpenWith(svg, fillet, minTurn, curl, confirm);
+}
+
+function sharpenWith(svg: string, fillet: number, minTurn: number, curl: number, confirm: CornerCheck | null): string {
   return svg.replace(shapePattern(), (tag) => {
     if (!/^<path\b/i.test(tag)) return tag;
     const quoted = readD(tag);
     if (quoted === null) return tag;
     const parsed = parsePath(quoted.value);
     if (parsed === null || parsed.length === 0) return tag;
-    const sharpened = parsed.map((subpath) => sharpenSubpath(subpath, fillet, minTurn, curl));
+    const fill = /\bfill="([^"]*)"/i.exec(tag)?.[1] ?? "";
+    let flat: Point[][] | null = null;
+    const inside = (x: number, y: number) => insideFlat((flat ??= flatten(parsed)), x, y);
+    const check = confirm === null ? null : (cap: readonly Point[]) => confirm(fill, cap, inside);
+    const sharpened = parsed.map((subpath) => sharpenSubpath(subpath, fillet, minTurn, curl, check));
     const next = serialize(sharpened);
     if (next === quoted.value) return tag;
     return tag.slice(0, quoted.start) + next + tag.slice(quoted.end);
   });
 }
 
-function sharpenSubpath(subpath: Subpath, fillet: number, minTurn: number, curl: number): Subpath {
+function flatten(subpaths: readonly Subpath[]): Point[][] {
+  return subpaths.map((subpath) => subpath.cubics.flatMap((cubic) => [0, 1, 2, 3, 4, 5, 6, 7].map((step) => bezier(cubic, step / 8))));
+}
+
+/** Nonzero-rule fill test against flattened subpaths. */
+function insideFlat(rings: readonly Point[][], x: number, y: number): boolean {
+  let winding = 0;
+  for (const points of rings) {
+    for (let index = 0; index < points.length; index += 1) {
+      const a = points[index];
+      const b = points[(index + 1) % points.length];
+      if (a === undefined || b === undefined) continue;
+      const side = (b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y);
+      if (a.y <= y && b.y > y && side > 0) winding += 1;
+      else if (a.y > y && b.y <= y && side < 0) winding -= 1;
+    }
+  }
+  return winding !== 0;
+}
+
+function sharpenSubpath(subpath: Subpath, fillet: number, minTurn: number, curl: number, check: ((cap: readonly Point[]) => boolean) | null): Subpath {
   if (!subpath.closed || subpath.cubics.length < 4) return subpath;
   const cubics = subpath.cubics.map((cubic) => ({ p0: { ...cubic.p0 }, p1: { ...cubic.p1 }, p2: { ...cubic.p2 }, p3: { ...cubic.p3 } }));
   const turnLimit = (minTurn * Math.PI) / 180;
@@ -1039,6 +1083,15 @@ function sharpenSubpath(subpath: Subpath, fillet: number, minTurn: number, curl:
       if (distance(before.p0, before.p3) < 2 * length || distance(after.p0, after.p3) < 2 * length) continue;
       const meet = intersectLines(before.p3, into, after.p0, out);
       if (meet === null || distance(meet, before.p3) > 2 * fillet || distance(meet, after.p0) > 2 * fillet) continue;
+      if (check !== null) {
+        const cap: Point[] = [];
+        for (let piece = 0; piece < run; piece += 1) {
+          const cubic = cubics[(index + piece) % cubics.length];
+          if (cubic !== undefined) for (let step = 0; step < 8; step += 1) cap.push(bezier(cubic, step / 8));
+        }
+        cap.push({ ...after.p0 }, { ...meet });
+        if (!check(cap)) continue;
+      }
       before.p2 = { x: before.p2.x + meet.x - before.p3.x, y: before.p2.y + meet.y - before.p3.y };
       before.p3 = { ...meet };
       after.p1 = { x: after.p1.x + meet.x - after.p0.x, y: after.p1.y + meet.y - after.p0.y };
@@ -1052,7 +1105,7 @@ function sharpenSubpath(subpath: Subpath, fillet: number, minTurn: number, curl:
     }
     if (!replaced) index += 1;
   }
-  if (curl > 0) for (let joint = 0; joint < cubics.length; joint += 1) sharpenJoint(cubics, joint, curl, turnLimit);
+  if (curl > 0) for (let joint = 0; joint < cubics.length; joint += 1) sharpenJoint(cubics, joint, curl, turnLimit, check);
   return { cubics, closed: subpath.closed };
 }
 
@@ -1063,7 +1116,7 @@ const STRAIGHT_TOLERANCE = 0.15;
  * pixel or two. When each has a straight body that turns by at least `turnLimit` into the other, and the bodies'
  * lines meet within `fillet` of the joint, the curls are cut off and both bodies run straight to the meeting point.
  */
-function sharpenJoint(cubics: Cubic[], joint: number, fillet: number, turnLimit: number): void {
+function sharpenJoint(cubics: Cubic[], joint: number, fillet: number, turnLimit: number, check: ((cap: readonly Point[]) => boolean) | null): void {
   const before = cubics[(joint - 1 + cubics.length) % cubics.length];
   const after = cubics[joint];
   if (before === undefined || after === undefined || before === after) return;
@@ -1085,6 +1138,13 @@ function sharpenJoint(cubics: Cubic[], joint: number, fillet: number, turnLimit:
   if (meet === null || distance(meet, corner) > fillet) return;
   if ((meet.x - from.x) * into.x + (meet.y - from.y) * into.y < -0.05) return;
   if ((to.x - meet.x) * head.direction.x + (to.y - meet.y) * head.direction.y < -0.05) return;
+  if (check !== null) {
+    const cap: Point[] = [];
+    for (let step = 0; step <= 8; step += 1) cap.push(bezier(before, 1 - tail.t + (tail.t * step) / 8));
+    for (let step = 1; step <= 8; step += 1) cap.push(bezier(after, (head.t * step) / 8));
+    cap.push({ ...meet });
+    if (!check(cap)) return;
+  }
   const kept = splitCubic(before, 1 - tail.t)[0];
   const rest = splitCubic(after, head.t)[1];
   before.p0 = kept.p0;

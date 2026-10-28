@@ -398,7 +398,7 @@ function jpegCleanRaster(rgba, width, height) {
 }
 var MIN_CLEAN_SIDE = 96;
 function lossyCleanup(rgba, width, height) {
-  return Math.min(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : void 0;
+  return Math.max(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : void 0;
 }
 var MERGE_DELTA_E = 3;
 var MINOR_DELTA_E = 6;
@@ -2851,6 +2851,7 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
     originY: plate.originY,
     borderColor: plate.borderColor,
     cutOut: plate.cutOut,
+    source: { rgba, width, height },
     request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
   }));
   const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));

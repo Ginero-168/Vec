@@ -1,4 +1,4 @@
-import { fairPaths, relaxPaths, sharpenCorners } from "./edit.ts";
+import { fairPaths, relaxPaths, sharpenConfirmed, sharpenCorners, type CornerCheck } from "./edit.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps, unifyNearFills } from "./score.ts";
 import { scaleSvg, translateSvg } from "./svg-scale.ts";
 import type { Stacking, TracePreset } from "./trace.ts";
@@ -10,7 +10,11 @@ export type PlacedPlate = {
   readonly borderColor: string | null;
   /** Set when the plate's source has transparent pixels (see FlatPlate.cutOut). */
   readonly cutOut?: boolean;
+  /** The source raster the plate was cut from, when the caller still has it; lets sharpening check corners. */
+  readonly source?: SourceRaster;
 };
+
+export type SourceRaster = { readonly rgba: Uint8Array; readonly width: number; readonly height: number };
 
 const SHAPE = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
 
@@ -61,7 +65,100 @@ export function mergePlates(
   // opaque backdrop (white, JPEG) the traced bends follow anti-aliasing or compression noise, and sharpening them
   // made false corners (si-spotify-128-white-q60) and raised MAE (om-gear-32-white +1.0). The corner colour alone
   // does not tell: a logo filling its crop has four different opaque corners and no border colour either.
-  return cutOut ? sharpenCorners(fitted, fillet, 35, curl) : fitted;
+  if (cutOut) return sharpenCorners(fitted, fillet, 35, curl);
+  // Below 96 px (the JPEG cleanup's line too) a bend of a pixel or two is the icon's own geometry and a corner's
+  // pixels are shared with its neighbours: sharpening there cost om-gear-32-white +1.0 MAE and om-grinning-64-q60 +0.14.
+  const check = size >= MIN_CHECKED_SIDE ? sourceCheck(plates) : null;
+  return check === null ? fitted : sharpenConfirmed(fitted, fillet, 35, curl, check);
+}
+
+/**
+ * On an opaque backdrop the traced bends cannot be trusted alone (anti-aliasing and JPEG noise bend them), so a
+ * corner is sharpened only when the source pixels around it are better explained by the sharp corner than by the
+ * traced rounding. Each source pixel's coverage by the path is measured both ways (8x8 samples, the cap toggled for
+ * the sharp corner) and compared with the pixel's own mix between the path's ink and the colour outside it. The
+ * label map cannot decide this: its upsampling rounds every corner, convex and concave, by about a source pixel.
+ */
+function sourceCheck(plates: readonly PlacedPlate[]): CornerCheck | null {
+  const source = plates.find((plate) => plate.source !== undefined)?.source;
+  if (source === undefined) return null;
+  const { rgba, width, height } = source;
+  return (fill, cap, inside) => {
+    const ink = parseFill(fill);
+    if (ink === null || cap.length < 3) return false;
+    const xs = cap.map((point) => point.x);
+    const ys = cap.map((point) => point.y);
+    const left = Math.max(0, Math.floor(Math.min(...xs)) - REACH);
+    const right = Math.min(width - 1, Math.floor(Math.max(...xs)) + REACH);
+    const top = Math.max(0, Math.floor(Math.min(...ys)) - REACH);
+    const bottom = Math.min(height - 1, Math.floor(Math.max(...ys)) + REACH);
+    const pixels: { at: number; round: number; sharp: number }[] = [];
+    for (let y = top; y <= bottom; y += 1) {
+      for (let x = left; x <= right; x += 1) {
+        let round = 0;
+        let sharp = 0;
+        for (let sy = 0; sy < SAMPLES; sy += 1) {
+          for (let sx = 0; sx < SAMPLES; sx += 1) {
+            const px = x + (sx + 0.5) / SAMPLES;
+            const py = y + (sy + 0.5) / SAMPLES;
+            const covered = inside(px, py);
+            if (covered) round += 1;
+            if (covered !== insidePolygon(cap, px, py)) sharp += 1;
+          }
+        }
+        pixels.push({ at: (y * width + x) * 4, round: round / SAMPLES ** 2, sharp: sharp / SAMPLES ** 2 });
+      }
+    }
+    // The colour outside the path here: the mean of nearby pixels neither version covers.
+    const outside = [0, 0, 0];
+    let outsideCount = 0;
+    for (const pixel of pixels) {
+      if (pixel.round > 0 || pixel.sharp > 0) continue;
+      for (let channel = 0; channel < 3; channel += 1) outside[channel]! += rgba[pixel.at + channel] ?? 0;
+      outsideCount += 1;
+    }
+    if (outsideCount === 0) return false;
+    const away = outside.map((sum) => sum / outsideCount);
+    const span = ink.map((value, channel) => value - away[channel]!);
+    const spanSquared = span.reduce((sum, value) => sum + value * value, 0);
+    if (spanSquared < MIN_CONTRAST ** 2) return false;
+    let roundError = 0;
+    let sharpError = 0;
+    for (const pixel of pixels) {
+      if (pixel.round === pixel.sharp) continue;
+      let dot = 0;
+      for (let channel = 0; channel < 3; channel += 1) dot += ((rgba[pixel.at + channel] ?? 0) - away[channel]!) * span[channel]!;
+      const coverage = Math.max(0, Math.min(1, dot / spanSquared));
+      roundError += (coverage - pixel.round) ** 2;
+      sharpError += (coverage - pixel.sharp) ** 2;
+    }
+    return sharpError < roundError;
+  };
+}
+
+const MIN_CHECKED_SIDE = 96;
+/** Source pixels searched around a cap, beyond its bounds. */
+const REACH = 2;
+const SAMPLES = 8;
+/** Ink and outside colours closer than this (RGB distance) cannot be told apart by coverage. */
+const MIN_CONTRAST = 48;
+
+function parseFill(fill: string): readonly [number, number, number] | null {
+  const match = /^#([0-9a-f]{6})$/i.exec(fill);
+  if (match?.[1] === undefined) return null;
+  const value = Number.parseInt(match[1], 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+}
+
+function insidePolygon(points: readonly { readonly x: number; readonly y: number }[], x: number, y: number): boolean {
+  let inside = false;
+  for (let index = 0, previous = points.length - 1; index < points.length; previous = index, index += 1) {
+    const a = points[index];
+    const b = points[previous];
+    if (a === undefined || b === undefined) continue;
+    if (a.y > y !== b.y > y && x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
 }
 
 export function assembleTrace(

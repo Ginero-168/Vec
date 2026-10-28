@@ -21,7 +21,9 @@ const MIN_CLEAN_SIDE = 96;
  * full image: single crops of a clean screenshot (an app icon's gradient) can read as noisy on their own.
  */
 export function lossyCleanup(rgba: Uint8Array, width: number, height: number): typeof jpegCleanRaster | undefined {
-  return Math.min(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : undefined;
+  // The long side: a tall or wide 128 px logo (gl-figma-128-q60 is 86x128) is as detailed as a square one, and its
+  // short side alone kept it out. 64 px sources stay out; cleaning them lost their thin features.
+  return Math.max(width, height) >= MIN_CLEAN_SIDE && wouldDenoise(rgba, width, height) ? jpegCleanRaster : undefined;
 }
 
 const MERGE_DELTA_E = 3;
