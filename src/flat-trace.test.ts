@@ -225,6 +225,20 @@ test("a thin faint stroke and a small faint hole survive the transparent cut", (
   assert.ok(open.length >= 3 && open.length <= 6, "a 61% hole stays open: " + open.join(","));
 });
 
+test("the backdrop punch peels a halo where the subject runs into the canvas frame", () => {
+  // A red subject runs off the left edge; its anti-aliased rim on the frame column is a light mix (a quarter red) with no
+  // backdrop beside it except at its two ends (si-spotify's disc meets the frame the same way).
+  const width = 48;
+  const image = fill(width, width, 255, 255, 255, 255);
+  paint(image, width, 0, 8, 30, 32, 233, 84, 32);
+  paint(image, width, 0, 8, 1, 32, 250, 212, 199);
+  const out = punchBorderBackdrop(image.rgba, width, width, "#ffffff", 8);
+  const alpha = (x: number, y: number) => out[(y * width + x) * 4 + 3];
+  assert.equal(alpha(0, 24), 0, "halo on the frame, 16 px from the backdrop along it");
+  assert.equal(alpha(1, 24), 255, "subject next to it");
+  assert.equal(alpha(40, 24), 0, "backdrop");
+});
+
 test("the backdrop punch peels a pale anti-aliasing halo but keeps pale content beyond one source pixel", () => {
   const width = 96;
   const image = fill(width, width, 255, 255, 255, 255);

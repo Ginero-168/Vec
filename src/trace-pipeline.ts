@@ -267,6 +267,16 @@ export function punchBorderBackdrop(rgba: Uint8Array, width: number, height: num
   if (halo.size > 0) {
     let frontier: number[] = [];
     for (let pixel = 0; pixel < width * height; pixel += 1) if (seen[pixel] === 1) frontier.push(pixel);
+    // The backdrop also continues past the canvas frame. Where the subject runs into the frame there is no punched
+    // backdrop between them, so a halo pixel on the frame is peeled from the frame side too.
+    const fromFrame = (pixel: number) => {
+      if (seen[pixel] === 1 || !isHalo(pixel)) return;
+      seen[pixel] = 1;
+      out[pixel * 4 + 3] = 0;
+      frontier.push(pixel);
+    };
+    for (let x = 0; x < width; x += 1) { fromFrame(x); fromFrame((height - 1) * width + x); }
+    for (let y = 0; y < height; y += 1) { fromFrame(y * width); fromFrame(y * width + width - 1); }
     for (let depth = 0; depth < haloReach && frontier.length > 0; depth += 1) {
       const next: number[] = [];
       for (const pixel of frontier) {
