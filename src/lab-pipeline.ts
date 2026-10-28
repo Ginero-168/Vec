@@ -152,7 +152,8 @@ export async function buildLabRasterStagesAsync(
   previous: LabRasterStages | null = null,
   from: LabStepId = "colors",
   onProgress?: PipelineProgress,
-  shouldCancel?: () => boolean
+  shouldCancel?: () => boolean,
+  substituteColors?: SegmentColorStage | null
 ): Promise<LabRasterStages> {
   if (controls.mode === "logo" || controls.mode === "icon") {
     if (previous?.mode === controls.mode && LAB_STEPS.indexOf(from) > LAB_STEPS.indexOf("colors")) return previous;
@@ -161,9 +162,10 @@ export async function buildLabRasterStagesAsync(
   }
   const fromIndex = LAB_STEPS.indexOf(from);
   const sameMode = previous?.mode === controls.mode;
-  const canReuseColors = sameMode && previous?.segmentation !== null && previous?.segmentation !== undefined && fromIndex > LAB_STEPS.indexOf("colors");
-  if (!canReuseColors) onProgress?.("colors", 0);
-  const segmentation = canReuseColors && previous !== null
+  const hasSubstitute = substituteColors !== undefined && substituteColors !== null;
+  const canReuseColors = !hasSubstitute && sameMode && previous?.segmentation !== null && previous?.segmentation !== undefined && fromIndex > LAB_STEPS.indexOf("colors");
+  if (!canReuseColors && !hasSubstitute) onProgress?.("colors", 0);
+  const segmentation = (hasSubstitute ? substituteColors : null) ?? (canReuseColors && previous !== null
     ? previous.segmentation
     : await segmentColorStageAsync(source, width, height, {
       mode: controls.mode,
@@ -172,9 +174,9 @@ export async function buildLabRasterStagesAsync(
       speckArea: controls.speckArea,
       removeBackground: false,
       opaqueAt: controlsFor(controls.mode).opaqueAt
-    }, (fraction) => onProgress?.("colors", fraction), shouldCancel);
+    }, (fraction) => onProgress?.("colors", fraction), shouldCancel));
   const colors = segmentation.colors;
-  const canReuseBackdrop = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
+  const canReuseBackdrop = !hasSubstitute && sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("backdrop");
   if (!canReuseBackdrop) onProgress?.("backdrop", 0);
   const backdropStage = canReuseBackdrop
     ? { backdrop: previous.backdrop, punchInput: previous.punchInput }
@@ -184,7 +186,7 @@ export async function buildLabRasterStagesAsync(
   if (!canReuseBackdrop) onProgress?.("backdrop", 1);
   const spread = segmentation.spread;
   const paletteSize = segmentation.palette.length;
-  const canReusePunch = sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
+  const canReusePunch = !hasSubstitute && sameMode && previous !== null && fromIndex > LAB_STEPS.indexOf("punch");
   if (canReusePunch && previous !== null) return previous;
   onProgress?.("punch", 0);
   const punched = await punchRgbaAsync(punchInput, width, height, controls.opaqueAt, (fraction) => onProgress?.("punch", fraction), shouldCancel);

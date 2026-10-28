@@ -65,16 +65,17 @@ export async function planTraceAsync(
   previousStages: LabRasterStages | null = null,
   from: LabStepId = "colors",
   onProgress?: PipelineProgress,
-  shouldCancel?: () => boolean
+  shouldCancel?: () => boolean,
+  substituteColors?: SegmentColorStage | null
 ): Promise<TracePlan | null> {
   if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
   const decoded = readRgbaPng(source);
   if (decoded === null) return null;
   if (controls === undefined) {
-    return planTrace(source, settings, controls, previousStages, from, onProgress);
+    return planTrace(source, settings, controls, previousStages, from, onProgress, substituteColors);
   }
   if (settings.preset !== "logo" && settings.preset !== "icon") {
-    const stages = await buildLabRasterStagesAsync(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, shouldCancel);
+    const stages = await buildLabRasterStagesAsync(decoded.rgba, decoded.width, decoded.height, controls, previousStages, from, onProgress, shouldCancel, substituteColors);
     if (shouldCancel?.() === true) throw new Error("ยกเลิกแล้ว");
     return planSegmentedWithControls(decoded.rgba, decoded.width, decoded.height, settings, controls, stages);
   }

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { controlsFor } from "./lab-model.ts";
-import { buildLabRasterStages } from "./lab-pipeline.ts";
+import { buildLabRasterStages, buildLabRasterStagesAsync } from "./lab-pipeline.ts";
 import {
   applyEdits,
   applyHide,
@@ -312,7 +312,20 @@ test("pipeline hook substituteColors feeds edited colors downstream to backdrop 
   const initialStages = buildLabRasterStages(stage.sourceRgba!, 4, 4, controls);
 
   const edited = applyRecolor(stage, 0, "#ff00ff");
-  const substitutedStages = buildLabRasterStages(stage.sourceRgba!, 4, 4, controls, initialStages, "backdrop", edited);
+  const substitutedStages = buildLabRasterStages(stage.sourceRgba!, 4, 4, controls, initialStages, "backdrop", undefined, edited);
+
+  assert.strictEqual(substitutedStages.segmentation, edited);
+  assert.strictEqual(substitutedStages.colors, edited.colors);
+  assert.notStrictEqual(substitutedStages.backdrop, initialStages.backdrop);
+});
+
+test("async pipeline hook substituteColors feeds edited colors downstream", async () => {
+  const stage = createMockStage();
+  const controls = controlsFor("photo");
+  const initialStages = await buildLabRasterStagesAsync(stage.sourceRgba!, 4, 4, controls);
+
+  const edited = applyRecolor(stage, 0, "#ff00ff");
+  const substitutedStages = await buildLabRasterStagesAsync(stage.sourceRgba!, 4, 4, controls, initialStages, "backdrop", undefined, undefined, edited);
 
   assert.strictEqual(substitutedStages.segmentation, edited);
   assert.strictEqual(substitutedStages.colors, edited.colors);
