@@ -164,3 +164,16 @@ test("a raster corner fit that pulls the outline in gives the underlay below the
   assert.ok(nearCorner(grey ?? ""), grey);
   assert.ok(!(grey ?? "").includes("60.3,60.3"), grey);
 });
+
+test("a short band end traced as one round bend is refitted as its two corners", () => {
+  // Source: a black band 4 px tall ending square at x = 60 on white; the trace rounds the whole end.
+  const colourAt = (x: number, y: number): readonly [number, number, number] => {
+    const overlap = (centre: number, low: number, high: number) => Math.max(0, Math.min(centre + 0.5, high) - Math.max(centre - 0.5, low));
+    const value = 255 * (1 - overlap(x, 20, 60) * overlap(y, 40, 44));
+    return [value, value, value];
+  };
+  const svg = '<svg viewBox="0 0 128 128"><path d="M20,40L57,40C60.2,40 60.2,44 57,44L20,44Z" fill="#000000"/></svg>';
+  const out = fitRasterCorners(svg, colourAt, () => true);
+  const near = (x: number, y: number) => [...out.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].some((match) => Math.hypot(Number(match[1]) - x, Number(match[2]) - y) < 0.15);
+  assert.ok(near(60, 40) && near(60, 44), out);
+});

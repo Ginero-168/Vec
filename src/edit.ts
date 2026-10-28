@@ -1226,6 +1226,10 @@ const FIT_EXPOSED_AREA = 0.1;
 const FIT_FOLLOW = 0.75;
 /** Length (px) of the curve easing from the old outline onto a fitted side line. */
 const FIT_JOIN = 1;
+/** Arc length (px) between the two bends of a short end fitted as two corners. */
+const FIT_PAIR_GAP = [2, 6] as const;
+/** Distance (px) the end's edge samples keep from each bend. */
+const FIT_PAIR_CLEAR = 0.75;
 
 /**
  * Corners VTracer traced as one long wobbly curve (a teardrop tip, the end of a band). Where the outline turns
@@ -1567,6 +1571,71 @@ function fitOneCorner(
       if (next === null) return null;
       const away = before.away.map((value, channel) => (value + after.away[channel]!) / 2);
       if (!covers(next, cap, away, { start: start.point, end: end.point, vertices })) continue;
+      return next;
+    }
+  }
+  // A short end (a tooth band's end, 2-6 px) holds two corners: the bend in from one side, the end's own edge, and
+  // the bend out. Neither corner fits alone, since each one's far side runs into the other. Three lines are fitted
+  // instead (both sides beyond the end, and the end's edge between the two bends) and spliced in as two corners,
+  // under the same source check.
+  const bendFrom = (at: number, sign: -1 | 1): number => {
+    for (let reach = 0; reach <= FIT_BEND_MAX; reach += 0.125) if (localTurn(at + sign * reach) < FIT_STRAIGHT_TURN) return reach;
+    return FIT_BEND_MAX;
+  };
+  // Pairs: two detected bends, or one detected bend and a point a few pixels along the outline either way (the
+  // second bend of a short end is often a soft sweep with no sharp turn of its own).
+  const pairs: [Station, Station][] = [];
+  for (const index of candidates) {
+    const here = list[index];
+    if (here === undefined) continue;
+    for (const other of candidates) {
+      const there = list[other];
+      if (there !== undefined && there !== here) pairs.push([here, there]);
+    }
+    for (let gap = FIT_PAIR_GAP[0]; gap <= FIT_PAIR_GAP[1]; gap += 0.5) {
+      pairs.push([here, pointAt(here.at + gap)], [pointAt(here.at - gap), here]);
+    }
+  }
+  for (const [first, second] of pairs) {
+    const gap = (((second.at - first.at) % total) + total) % total;
+    if (gap < FIT_PAIR_GAP[0] || gap > FIT_PAIR_GAP[1]) continue;
+    if (breaks.some((at) => [first.at, second.at].some((corner) => Math.min(Math.abs(at - corner), total - Math.abs(at - corner)) <= 1))) continue;
+    const bendBefore = bendFrom(first.at, -1);
+    const bendAfter = bendFrom(first.at + gap, 1);
+    // The end's edge: samples between the two bends, clear of each by FIT_PAIR_CLEAR.
+    const inner = gap - 2 * FIT_PAIR_CLEAR;
+    if (inner < 1) continue;
+    const middleOffsets = [0, 0.25, 0.5, 0.75, 1].map((share) => FIT_PAIR_CLEAR + share * inner);
+    const middle = sideLine(first.at, 1, middleOffsets, pointAt, colourAt, inside);
+    if (middle === null) continue;
+    for (const scale of FIT_SCALES) {
+      const spanBefore = bendBefore + FIT_SPLIT * scale;
+      const spanAfter = bendAfter + FIT_SPLIT * scale;
+      if (total < 2 * (spanBefore + spanAfter + gap)) continue;
+      const before = sideLine(first.at, -1, FIT_SIDE.map((offset) => bendBefore + offset * scale), pointAt, colourAt, inside);
+      const after = sideLine(first.at + gap, 1, FIT_SIDE.map((offset) => bendAfter + offset * scale), pointAt, colourAt, inside);
+      if (before === null || after === null) continue;
+      if (angleBetween(before.direction, middle.direction) < (35 * Math.PI) / 180) continue;
+      if (angleBetween(middle.direction, after.direction) < (35 * Math.PI) / 180) continue;
+      // Both corners turn the same way.
+      const turnOf = (a: Point, b: Point) => a.x * b.y - a.y * b.x;
+      if (turnOf(before.direction, middle.direction) * turnOf(middle.direction, after.direction) <= 0) continue;
+      const one = intersectLines(before.origin, before.direction, middle.origin, middle.direction);
+      const two = intersectLines(middle.origin, middle.direction, after.origin, after.direction);
+      if (one === null || two === null) continue;
+      if (distance(one, first.point) > FIT_REACH * scale + bendBefore || distance(two, second.point) > FIT_REACH * scale + bendAfter) continue;
+      const start = pointAt(first.at - spanBefore);
+      const end = pointAt(first.at + gap + spanAfter);
+      const ahead = (from: Point, to: Point, direction: Point) => (to.x - from.x) * direction.x + (to.y - from.y) * direction.y > 0;
+      if (!ahead(start.point, one, before.direction) || !ahead(one, two, middle.direction) || !ahead(two, end.point, after.direction)) continue;
+      const cap: Point[] = [];
+      for (let at = first.at - spanBefore; at <= first.at + gap + spanAfter; at += 0.2) cap.push(pointAt(at).point);
+      cap.push(end.point, { ...two }, { ...one });
+      if (!check(cap)) continue;
+      const next = spliceCorner(subpath, start, end, one, (from, to) => [line(from, one), line(one, two), line(two, to)]);
+      if (next === null) continue;
+      const away = [0, 1, 2].map((channel) => (before.away[channel]! + after.away[channel]!) / 2);
+      if (!covers(next, cap, away, { start: start.point, end: end.point, vertices: [one, two] })) continue;
       return next;
     }
   }
