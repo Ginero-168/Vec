@@ -775,6 +775,7 @@
   }
 
   // src/flat-trace.ts
+  var UP = 8;
   function cornerColor(rgba, width2, height2) {
     const points = [
       [0, 0],
@@ -805,6 +806,7 @@
   var AXIS_SNAP_NEAR = 30 * Math.PI / 180;
   var AXIS_FLAT = 3 * Math.PI / 180;
   var CORNER_TILT = 20 * Math.PI / 180;
+  var FINE_SIGMA = UP / 2;
   function srgbToLinear(channel) {
     const value = channel / 255;
     return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;

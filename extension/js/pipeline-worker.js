@@ -611,7 +611,8 @@ function labelImage(rgba, width, height, maxColors, preprocess = identityRaster,
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
-  const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
+  const filled = fillColors(rgba, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
+  const colors = shareTracerLayers(filled, source, alpha, core, labels, width, height);
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
   return painted;
@@ -709,7 +710,13 @@ function assignLabels(linear, lab, core, alpha, opacity, width, height, centers,
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
   if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
-  else if (edges !== void 0) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+  else {
+    fillUnlabelled(labels, upW, upH);
+    if (edges !== void 0) {
+      foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+      if (Math.min(width, height) >= MIN_SIDE) fineSmooth(labels, upW, upH, kCount, opacity, width);
+    }
+  }
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
   return labels;
@@ -1005,7 +1012,6 @@ var LOSSY_SRGB_WEIGHT = 0.5;
 function edgeRule(rgba, source, width, height, centers, sampled) {
   if (source !== rgba) return lossyEdges(source, width * height, centers);
   if (wouldDenoise(rgba, width, height)) return void 0;
-  for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return void 0;
   return { ...lossyEdges(source, width * height, centers, 1), sampled };
 }
 function smoothsLabels(edges) {
@@ -1143,7 +1149,7 @@ function explain(sample, bits, centers, mix) {
   return best;
 }
 function fillColors(rgba, alpha, core, labels, width, height, centers, onProgress) {
-  const sums = centers.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
+  const histograms = centers.map(() => ({ counts: new Uint32Array(3 * 256), n: 0 }));
   const upW = width * UP;
   const mid = UP >> 1;
   for (let y = 0; y < height; y += 1) {
@@ -1151,21 +1157,81 @@ function fillColors(rgba, alpha, core, labels, width, height, centers, onProgres
       const index = y * width + x;
       if (alpha[index] === 0 || core[index] !== 1) continue;
       const label = labels[(y * UP + mid) * upW + x * UP + mid] ?? 255;
-      const bin = sums[label];
+      const bin = histograms[label];
       if (bin === void 0) continue;
       const offset = index * 4;
-      bin.r += rgba[offset] ?? 0;
-      bin.g += rgba[offset + 1] ?? 0;
-      bin.b += rgba[offset + 2] ?? 0;
+      const counts = bin.counts;
+      const r = rgba[offset] ?? 0, g = 256 + (rgba[offset + 1] ?? 0), b = 512 + (rgba[offset + 2] ?? 0);
+      counts[r] = (counts[r] ?? 0) + 1;
+      counts[g] = (counts[g] ?? 0) + 1;
+      counts[b] = (counts[b] ?? 0) + 1;
       bin.n += 1;
     }
     onProgress?.((y + 1) / height);
   }
   return centers.map((center, index) => {
-    const bin = sums[index];
-    if (bin !== void 0 && bin.n > 4) return { r: Math.round(bin.r / bin.n), g: Math.round(bin.g / bin.n), b: Math.round(bin.b / bin.n) };
-    return oklabToRgb(center);
+    const bin = histograms[index];
+    if (bin === void 0 || bin.n <= 4) return oklabToRgb(center);
+    return { r: channelFill(bin.counts, 0, bin.n), g: channelFill(bin.counts, 256, bin.n), b: channelFill(bin.counts, 512, bin.n) };
   });
+}
+var TRACER_LAYER_DIFFERENCE = 16;
+function shareTracerLayers(fills, source, alpha, core, labels, width, height) {
+  const sums = fills.map(() => [0, 0, 0, 0]);
+  const upW = width * UP;
+  const mid = UP >> 1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (alpha[index] === 0 || core[index] !== 1) continue;
+      const sum = sums[labels[(y * UP + mid) * upW + x * UP + mid] ?? 255];
+      if (sum === void 0) continue;
+      const offset = index * 4;
+      sum[0] = (sum[0] ?? 0) + (source[offset] ?? 0);
+      sum[1] = (sum[1] ?? 0) + (source[offset + 1] ?? 0);
+      sum[2] = (sum[2] ?? 0) + (source[offset + 2] ?? 0);
+      sum[3] = (sum[3] ?? 0) + 1;
+    }
+  }
+  const means = sums.map((sum) => {
+    const n = sum[3] ?? 0;
+    return n > 4 ? [Math.round((sum[0] ?? 0) / n), Math.round((sum[1] ?? 0) / n), Math.round((sum[2] ?? 0) / n)] : null;
+  });
+  const order = fills.map((_, index) => index).sort((left, right) => (sums[right]?.[3] ?? 0) - (sums[left]?.[3] ?? 0) || left - right);
+  const shared = [...fills];
+  const kept = [];
+  for (const label of order) {
+    const mean = means[label];
+    if (mean === null || mean === void 0) continue;
+    let owner = -1, closest = TRACER_LAYER_DIFFERENCE + 1;
+    for (const other of kept) {
+      const theirs = means[other];
+      const difference = Math.abs(mean[0] - theirs[0]) + Math.abs(mean[1] - theirs[1]) + Math.abs(mean[2] - theirs[2]);
+      if (difference < closest) {
+        closest = difference;
+        owner = other;
+      }
+    }
+    if (owner < 0) kept.push(label);
+    else shared[label] = shared[owner];
+  }
+  return shared;
+}
+function channelFill(counts, base, n) {
+  if ((counts[base] ?? 0) > 0 || (counts[base + 255] ?? 0) > 0) return channelMedian(counts, base, n);
+  let sum = 0;
+  for (let value = 1; value < 255; value += 1) sum += value * (counts[base + value] ?? 0);
+  return Math.round(sum / n);
+}
+function channelMedian(counts, base, n) {
+  const lowRank = Math.floor((n - 1) / 2), highRank = Math.floor(n / 2);
+  let seen = 0, low = -1;
+  for (let value = 0; value < 256; value += 1) {
+    seen += counts[base + value] ?? 0;
+    if (low < 0 && seen > lowRank) low = value;
+    if (seen > highRank) return Math.round((low + value) / 2);
+  }
+  return 255;
 }
 function paintLabels(labels, colors, width, height, onProgress) {
   const used = /* @__PURE__ */ new Map();
@@ -1502,6 +1568,247 @@ function nearestOutside(labels, small, smallPixels, width, height, onProgress) {
   }
   return nearest2;
 }
+var FINE_SIGMA = UP / 2;
+var FINE_BAND = 1;
+function fineSmooth(labels, width, height, kCount, opacity, sourceWidth) {
+  const runs = labelRuns(labels, width, height);
+  const wide = squareOpening(runs, width, height, UP);
+  const sourceHeight = Math.floor(opacity.length / sourceWidth);
+  const nearClear = (x, y) => {
+    const sx = Math.floor(x / UP), sy = Math.floor(y / UP);
+    for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+      const xx = sx + dx, yy = sy + dy;
+      if (xx >= 0 && yy >= 0 && xx < sourceWidth && yy < sourceHeight && (opacity[yy * sourceWidth + xx] ?? 255) !== 255) return true;
+    }
+    return false;
+  };
+  const kept = (x, y) => {
+    for (let yy = Math.max(0, y - FINE_BAND); yy <= Math.min(height - 1, y + FINE_BAND); yy += 1) {
+      if (!covers(wide[yy], Math.max(0, x - FINE_BAND), Math.min(width - 1, x + FINE_BAND))) return false;
+    }
+    return !nearClear(x, y);
+  };
+  const voters = [];
+  for (let y = 0; y < height; y += 1) {
+    const band = edgeBand(runs, y, width, height);
+    for (let at = 0; at < band.length; at += 2) {
+      for (let x = band[at]; x < band[at + 1]; x += 1) if (kept(x, y)) voters.push(y * width + x);
+    }
+  }
+  const winners = fineVotes(labels, runs, width, height, kCount, voters);
+  for (let at = 0; at < voters.length; at += 1) if (winners[at] >= 0) labels[voters[at]] = winners[at];
+}
+function labelRuns(labels, width, height) {
+  const first = new Int32Array(height + 1);
+  let start = new Int32Array(Math.max(16, height * 4)), end = new Int32Array(start.length), label = new Uint8Array(start.length);
+  let count = 0;
+  for (let y = 0; y < height; y += 1) {
+    first[y] = count;
+    const row = y * width;
+    let from = 0;
+    for (let x = 1; x <= width; x += 1) {
+      if (x < width && labels[row + x] === labels[row + from]) continue;
+      if (count === start.length) {
+        const grow = (array) => {
+          const next = new Int32Array(array.length * 2);
+          next.set(array);
+          return next;
+        };
+        start = grow(start);
+        end = grow(end);
+        const labelNext = new Uint8Array(label.length * 2);
+        labelNext.set(label);
+        label = labelNext;
+      }
+      start[count] = from;
+      end[count] = x;
+      label[count] = labels[row + from];
+      count += 1;
+      from = x;
+    }
+  }
+  first[height] = count;
+  return { first, start, end, label };
+}
+function squareOpening(runs, width, height, radius) {
+  const eroded = [];
+  for (let y = 0; y < height; y += 1) {
+    const row = [];
+    for (let run = runs.first[y]; run < runs.first[y + 1]; run += 1) {
+      const from = runs.start[run] + radius, to = runs.end[run] - radius;
+      if (from < to) row.push(from, to, runs.label[run]);
+    }
+    eroded.push(row);
+  }
+  const centres = [];
+  for (let y = 0; y < height; y += 1) {
+    if (y < radius || y >= height - radius) {
+      centres.push([]);
+      continue;
+    }
+    let common = eroded[y - radius];
+    for (let yy = y - radius + 1; yy <= y + radius && common.length > 0; yy += 1) common = intersectLabelled(common, eroded[yy]);
+    centres.push(common);
+  }
+  const wide = [];
+  for (let y = 0; y < height; y += 1) {
+    const pieces = [];
+    for (let yy = Math.max(0, y - radius); yy <= Math.min(height - 1, y + radius); yy += 1) {
+      const centre = centres[yy];
+      for (let at = 0; at < centre.length; at += 3) pieces.push(Math.max(0, centre[at] - radius), Math.min(width, centre[at + 1] + radius));
+    }
+    wide.push(mergeIntervals(pieces));
+  }
+  return wide;
+}
+function intersectLabelled(left, right) {
+  const out = [];
+  let i = 0, j = 0;
+  while (i < left.length && j < right.length) {
+    const from = Math.max(left[i], right[j]), to = Math.min(left[i + 1], right[j + 1]);
+    if (from < to && left[i + 2] === right[j + 2]) out.push(from, to, left[i + 2]);
+    if (left[i + 1] < right[j + 1]) i += 3;
+    else j += 3;
+  }
+  return out;
+}
+function mergeIntervals(pieces) {
+  const order = [];
+  for (let at = 0; at < pieces.length; at += 2) order.push(at);
+  order.sort((a, b) => pieces[a] - pieces[b]);
+  const out = [];
+  for (const at of order) {
+    const from = pieces[at], to = pieces[at + 1];
+    if (out.length > 0 && from <= out[out.length - 1]) out[out.length - 1] = Math.max(out[out.length - 1], to);
+    else out.push(from, to);
+  }
+  return out;
+}
+function covers(row, from, to) {
+  let low = 0, high = row.length / 2 - 1;
+  while (low <= high) {
+    const mid = low + high >> 1;
+    if (row[mid * 2] <= from) {
+      if (row[mid * 2 + 1] > to) return true;
+      low = mid + 1;
+    } else high = mid - 1;
+  }
+  return false;
+}
+function edgeBand(runs, y, width, height) {
+  const pieces = [];
+  const first = runs.first[y], last = runs.first[y + 1];
+  for (let run = first + 1; run < last; run += 1) pieces.push(runs.start[run] - 1, runs.start[run] + 1);
+  for (const other of [y - 1, y + 1]) {
+    if (other < 0 || other >= height) continue;
+    const same = [];
+    let j = runs.first[other];
+    const otherLast = runs.first[other + 1];
+    for (let run = first; run < last; run += 1) {
+      const from = runs.start[run], to = runs.end[run];
+      while (j < otherLast && runs.end[j] <= from) j += 1;
+      for (let k = j; k < otherLast && runs.start[k] < to; k += 1) {
+        if (runs.label[k] !== runs.label[run]) continue;
+        const inFrom = runs.start[k] === 0 ? 0 : runs.start[k] + 1, inTo = runs.end[k] === width ? width : runs.end[k] - 1;
+        const s = Math.max(from, inFrom), e = Math.min(to, inTo);
+        if (s < e) same.push(s, e);
+      }
+    }
+    let at = 0;
+    for (let k = 0; k < same.length; k += 2) {
+      if (same[k] > at) pieces.push(at, same[k]);
+      at = same[k + 1];
+    }
+    if (at < width) pieces.push(at, width);
+  }
+  return mergeIntervals(pieces);
+}
+function fineVotes(labels, runs, width, height, kCount, voters) {
+  const winners = new Int16Array(voters.length).fill(-1);
+  const kernel = gaussianKernel(FINE_SIGMA);
+  const taps = kernel.length;
+  const radius = taps - 1 >> 1;
+  const present = new Uint8Array(Math.max(1, kCount));
+  for (let run = 0; run < runs.first[height]; run += 1) if (runs.label[run] < kCount) present[runs.label[run]] = 1;
+  const activeLabels = [];
+  if (kCount > 0) activeLabels.push(0);
+  for (let label = 1; label < kCount; label += 1) if (present[label] === 1) activeLabels.push(label);
+  const channels = activeLabels.length;
+  if (channels === 0) return winners;
+  const slots = new Int16Array(Math.max(1, kCount)).fill(-1);
+  activeLabels.forEach((label, channel) => {
+    slots[label] = channel;
+  });
+  let whole = 0;
+  for (let tap = 0; tap < taps; tap += 1) whole += kernel[tap];
+  const perColumn = new Int32Array(width + 1);
+  for (const voter of voters) perColumn[voter % width + 1] = perColumn[voter % width + 1] + 1;
+  for (let x = 0; x < width; x += 1) perColumn[x + 1] = perColumn[x + 1] + perColumn[x];
+  const order = new Int32Array(voters.length);
+  const fill = perColumn.slice(0, width);
+  voters.forEach((voter, at) => {
+    const x = voter % width;
+    order[fill[x]] = at;
+    fill[x] = fill[x] + 1;
+  });
+  const scored = new Int32Array(height).fill(-1);
+  const scores = new Float64Array(height * channels);
+  const xs = new Int32Array(taps);
+  const ys = new Int32Array(taps);
+  const sums = new Float64Array(channels);
+  let column = -1;
+  for (const at of order) {
+    const voter = voters[at];
+    const x = voter % width, y = (voter - x) / width;
+    if (x !== column) {
+      column = x;
+      for (let tap = 0; tap < taps; tap += 1) xs[tap] = reflect101(x + tap - radius, width);
+    }
+    for (let tap = 0; tap < taps; tap += 1) ys[tap] = reflect101(y + tap - radius, height);
+    sums.fill(0);
+    for (let tap = 0; tap < taps; tap += 1) {
+      const sampleY = ys[tap];
+      const offset = sampleY * channels;
+      if (scored[sampleY] !== x) {
+        scored[sampleY] = x;
+        scores.fill(0, offset, offset + channels);
+        const run = runAt(runs, sampleY, x);
+        if (runs.start[run] <= x - radius && x + radius < runs.end[run]) {
+          const channel = runs.label[run] < kCount ? slots[runs.label[run]] : -1;
+          if (channel >= 0) scores[offset + channel] = whole;
+        } else {
+          const base = sampleY * width;
+          for (let along = 0; along < taps; along += 1) {
+            const label = labels[base + xs[along]];
+            if (label >= kCount) continue;
+            const channel = slots[label];
+            if (channel >= 0) scores[offset + channel] = scores[offset + channel] + kernel[along];
+          }
+        }
+      }
+      const weight = kernel[tap];
+      for (let channel = 0; channel < channels; channel += 1) sums[channel] = sums[channel] + scores[offset + channel] * weight;
+    }
+    let winner = activeLabels[0], best = -1;
+    for (let channel = 0; channel < channels; channel += 1) {
+      if (sums[channel] > best) {
+        best = sums[channel];
+        winner = activeLabels[channel];
+      }
+    }
+    winners[at] = winner;
+  }
+  return winners;
+}
+function runAt(runs, y, x) {
+  let low = runs.first[y], high = runs.first[y + 1] - 1;
+  while (low < high) {
+    const mid = low + high + 1 >> 1;
+    if (runs.start[mid] <= x) low = mid;
+    else high = mid - 1;
+  }
+  return low;
+}
 function smoothLabels(labels, width, height, kCount, sigma, onProgress) {
   if (!(sigma > 0)) return;
   const kernel = gaussianKernel(sigma);
@@ -1543,6 +1850,39 @@ function smoothLabels(labels, width, height, kCount, sigma, onProgress) {
     if (candidates[index] === 0 && labels[index] === 255) next[index] = 0;
   }
   labels.set(next);
+}
+function fillUnlabelled(labels, width, height) {
+  let labelled = false, unlabelled = 0;
+  for (let index = 0; index < labels.length; index += 1) {
+    if (labels[index] === 255) unlabelled += 1;
+    else labelled = true;
+  }
+  if (!labelled) {
+    labels.fill(0);
+    return;
+  }
+  if (unlabelled === 0) return;
+  const queue = new Int32Array(Math.min(labels.length, 5 * unlabelled));
+  let head = 0, tail = 0;
+  for (let index = 0; index < labels.length; index += 1) {
+    if (labels[index] === 255) continue;
+    const x = index % width;
+    if (x > 0 && labels[index - 1] === 255 || x < width - 1 && labels[index + 1] === 255 || index >= width && labels[index - width] === 255 || index < labels.length - width && labels[index + width] === 255) queue[tail++] = index;
+  }
+  while (head < tail) {
+    const index = queue[head++];
+    const label = labels[index];
+    const x = index % width;
+    const visit = (next) => {
+      if (labels[next] !== 255) return;
+      labels[next] = label;
+      queue[tail++] = next;
+    };
+    if (x > 0) visit(index - 1);
+    if (x < width - 1) visit(index + 1);
+    if (index >= width) visit(index - width);
+    if (index < labels.length - width) visit(index + width);
+  }
 }
 var BACKDROP_LAB = 0.1;
 var SUBJECT_ON_BORDER = 16;
