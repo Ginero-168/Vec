@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cornerColor, hasClearPixel, labelImage, subjectBoxes } from "./flat-trace.ts";
+import { cornerColor, foldThinMixes, hasClearPixel, labelImage, subjectBoxes } from "./flat-trace.ts";
 import { mergePlates } from "./trace-finish.ts";
 import { lossyCleanup, mergeNearCenters } from "./jpeg-clean.ts";
 import { rgbToOklab } from "./color.ts";
@@ -482,6 +482,40 @@ test("a lossy edge splits a half-covered pixel at its sRGB midpoint, not the OKL
   // blue 5/8 of the column).
   const clean = blueRun(labelImage(image.rgba, 32, 16, 2));
   assert.ok(Math.abs(clean - 16.5) < 1 / 16, `clean edge at ${clean}`);
+});
+
+test("a pale anti-aliasing ring folds into its two ends; a real colour that is a mix stays", () => {
+  // Sub-pixel labels (UP = 8 per source pixel) of cyan | pale mix | white, as gl-slack-256-white's #36C5F0 / #50CCF2 /
+  // white. A pale band 2 source px (16 sub-pixels) wide and nowhere wider is anti-aliasing and is split between its
+  // ends by `split` (here: at its middle). The same colour with a 3 px (24 sub-pixel) block somewhere is a real colour
+  // (om-gear's greys are all mixes of black and white) and stays, as does one recovered from thin strokes (index >=
+  // sampled) and a colour that is no mix of two centres.
+  const width = 160, height = 40;
+  const centers = [{ r: 54, g: 197, b: 240 }, { r: 80, g: 204, b: 242 }, { r: 255, g: 255, b: 255 }];
+  const paint = (block: boolean) => {
+    const labels = new Uint8Array(width * height);
+    for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+      labels[y * width + x] = x < 40 ? 0 : x < 56 ? 1 : block && x >= 100 && x < 124 ? 1 : 2;
+    }
+    return labels;
+  };
+  const split = (x: number, _y: number, ends: readonly number[]) => (x < 48 ? ends[0]! : ends[1]!);
+  const ring = paint(false);
+  foldThinMixes(ring, width, height, centers, 3, split);
+  const row = 20 * width;
+  assert.equal(ring[row + 44], 0, "inner half of the ring joins the cyan");
+  assert.equal(ring[row + 52], 2, "outer half joins the white");
+  assert.ok(!ring.includes(1), "no pale label is left");
+  // A near-duplicate of a solid colour (k-means split it off along the edge) is that colour, whatever the split says.
+  const twin = paint(false);
+  foldThinMixes(twin, width, height, [centers[0]!, { r: 58, g: 199, b: 238 }, centers[2]!], 3, () => 2);
+  assert.ok(!twin.includes(1) && !twin.slice(0, 56).includes(2), "the near-duplicate band joins the cyan");
+  for (const [palette, sampled, block] of [[centers, 3, true], [centers, 1, false], [[centers[0]!, { r: 200, g: 60, b: 90 }, centers[2]!], 3, false]] as const) {
+    const labels = paint(block);
+    const kept = labels.slice();
+    foldThinMixes(kept, width, height, palette, sampled, split);
+    assert.deepEqual(kept, labels);
+  }
 });
 
 test("a clean anti-aliased disc keeps its area on the plate", () => {

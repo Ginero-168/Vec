@@ -235,10 +235,11 @@ export function labelImage(
   let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
   if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
+  const sampled = buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08));
+  const found = recoverThinColors(lab, alpha, core, width, height, sampled);
   // A preprocess that returned new pixels cleaned a lossy raster: fold the near-duplicate centres its noise split.
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-  const edges = edgeRule(rgba, source, width, height, centers);
+  const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -287,10 +288,11 @@ async function labelImageAsync(
   if (countOf(core) < 8) core = await coreMaskAsync(lab, alpha, width, height, 0.08, context);
   onProgress(0.14);
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-  const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
+  const sampled = buildPalette(lab, core, width, height, userK);
+  const found = recoverThinColors(lab, alpha, core, width, height, sampled);
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   onProgress(0.26);
-  const edges = edgeRule(rgba, source, width, height, centers);
+  const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers);
   onProgress(0.94);
@@ -449,6 +451,7 @@ async function assignLabelsAsync(
   }
   await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
   if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
+  else if (edges !== undefined) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
   cutTransparent(labels, opacity, width, height);
   onProgress(1);
   return labels;
@@ -802,6 +805,7 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
   if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
+  else if (edges !== undefined) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
   return labels;
@@ -1147,13 +1151,13 @@ const LOSSY_SRGB_WEIGHT = 0.5;
  * the old rule, since its luma quantisation was never measured against the sRGB split; so does a raster with
  * transparency (below), which also keeps alpha output unchanged.
  */
-function edgeRule(rgba: Uint8Array, source: Uint8Array, width: number, height: number, centers: readonly Lab[]): LossyEdges | undefined {
+function edgeRule(rgba: Uint8Array, source: Uint8Array, width: number, height: number, centers: readonly Lab[], sampled: number): LossyEdges | undefined {
   if (source !== rgba) return lossyEdges(source, width * height, centers);
   if (wouldDenoise(rgba, width, height)) return undefined;
   // A raster with transparency keeps the old rule: the sRGB split reads colour alone, and a pixel's coverage of the
   // transparent backdrop lives in its alpha (a lone 39 % stroke has the same colour as the clear pixels around it).
   for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return undefined;
-  return lossyEdges(source, width * height, centers, 1);
+  return { ...lossyEdges(source, width * height, centers, 1), sampled };
 }
 
 /**
@@ -1166,7 +1170,96 @@ function smoothsLabels(edges: LossyEdges | undefined): boolean {
   return edges === undefined || edges.weight !== 1;
 }
 
-type LossyEdges = { readonly srgb: Float64Array; readonly centers: readonly RGB[]; readonly weight: number };
+// How far (sRGB units) a centre may sit off the line between two others and still be their mix: the tolerance the
+// backdrop halo peel uses for the same question (trace-pipeline HALO_RESIDUAL).
+const MIX_RESIDUAL = 16;
+
+/**
+ * What a ring label folds into. A centre within MIX_RESIDUAL of a solid label is that colour (a near-duplicate
+ * k-means split off along its anti-aliased edge: gl-chrome's #FBC525 beside #FBC116, tw-pizza's second red and
+ * white), so it is that label alone. Otherwise the two solid labels it mixes: the pair whose sRGB segment passes
+ * within MIX_RESIDUAL of its centre (closest first), or null.
+ */
+function ringEnds(centers: readonly RGB[], label: number, solid: readonly boolean[]): readonly number[] | null {
+  const color = centers[label]!;
+  let twin = -1, nearest = MIX_RESIDUAL;
+  centers.forEach((other, index) => {
+    const distance = Math.hypot(other.r - color.r, other.g - color.g, other.b - color.b);
+    if (solid[index] && distance <= nearest) [twin, nearest] = [index, distance];
+  });
+  if (twin >= 0) return [twin];
+  let ends: readonly [number, number] | null = null, smallest = Infinity;
+  for (let a = 0; a < centers.length; a += 1) for (let b = a + 1; b < centers.length; b += 1) {
+    if (!solid[a] || !solid[b]) continue;
+    const from = centers[a]!, to = centers[b]!;
+    const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
+    const length = dr * dr + dg * dg + db * db;
+    if (length === 0) continue;
+    const t = Math.min(1, Math.max(0, ((color.r - from.r) * dr + (color.g - from.g) * dg + (color.b - from.b) * db) / length));
+    const residual = Math.hypot(color.r - from.r - t * dr, color.g - from.g - t * dg, color.b - from.b - t * db);
+    if (residual <= MIX_RESIDUAL && residual < smallest) {
+      smallest = residual;
+      ends = [a, b];
+    }
+  }
+  return ends;
+}
+
+/**
+ * On the unsmoothed clean-raster path, a label is an anti-aliasing ring when no part of it is wider than the band an
+ * edge leaves in the sub-pixel labels, and its centre is an sRGB mix of two solid labels. A rasteriser mixes one pixel
+ * row; the labels are decided on the bicubic interpolant, whose step response rises between the pixel centres either
+ * side of that row, so the band is at most two source pixels (2 UP sub-pixels) wide (si-mcdonalds-128-white's frame
+ * column: 11 sub-pixels). A label with any part that contains a square of side 2 UP + 1 (survives an erosion by it) is
+ * solid: a real colour even when it is a mix of two others (om-gear's greys all lie on the black-white line). Centres
+ * recovered from thin strokes (index >= `sampled`) are never rings: recoverThinColors already rejected pixels that
+ * mix their two sides, and om-gear-32's one-pixel #888888 ring is real. Each sub-pixel of a ring is split again
+ * between its two ends alone (`split`, the same sRGB midpoint rule), so the edge lands at 50 % coverage instead of at
+ * the far side of the ring. The majority-vote smoothing used to erase such rings; without it they were traced as a
+ * separate pale layer along every light ink (gl-slack-256-white's #50CCF2, si-mcdonalds-128-white).
+ */
+export function foldThinMixes(labels: Uint8Array, width: number, height: number, centers: readonly RGB[], sampled: number, split: (x: number, y: number, ends: readonly number[]) => number): void {
+  const masks = centers.map((_, label) => {
+    const mine = new Uint8Array(labels.length);
+    for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mine[index] = 1;
+    return mine;
+  });
+  const present = masks.map((mine) => mine.includes(1));
+  const solid = masks.map((mine, label) => present[label] === true && (label >= sampled || squareFilter(mine, width, height, UP, true).includes(1)));
+  const rings = masks.flatMap((mine, label) => {
+    if (!present[label] || solid[label]) return [];
+    const ends = ringEnds(centers, label, solid);
+    return ends === null ? [] : [{ ends, mine }];
+  });
+  for (const { ends, mine } of rings) {
+    for (let index = 0; index < labels.length; index += 1) {
+      if (mine[index] === 1) labels[index] = ends.length === 1 ? ends[0]! : split(index % width, Math.floor(index / width), ends);
+    }
+  }
+}
+
+/** Separable square erosion (all set within `radius`) or dilation (any set), by row then column prefix counts. Cells
+ * beyond the image count as unset, so a one-pixel anti-aliased column along the frame is thin as well. */
+function squareFilter(mask: Uint8Array, width: number, height: number, radius: number, erode: boolean): Uint8Array {
+  const pass = (input: Uint8Array, length: number, lines: number, at: (line: number, step: number) => number): Uint8Array => {
+    const output = new Uint8Array(input.length);
+    const prefix = new Int32Array(length + 1);
+    for (let line = 0; line < lines; line += 1) {
+      for (let step = 0; step < length; step += 1) prefix[step + 1] = prefix[step]! + input[at(line, step)]!;
+      for (let step = 0; step < length; step += 1) {
+        const low = Math.max(0, step - radius), high = Math.min(length - 1, step + radius);
+        const set = prefix[high + 1]! - prefix[low]!;
+        output[at(line, step)] = erode ? (set === 2 * radius + 1 ? 1 : 0) : (set > 0 ? 1 : 0);
+      }
+    }
+    return output;
+  };
+  const rows = pass(mask, width, height, (line, step) => line * width + step);
+  return pass(rows, height, width, (line, step) => step * width + line);
+}
+
+// `sampled`: how many leading centres buildPalette took from flat core pixels; the rest are recovered thin strokes.
+type LossyEdges = { readonly srgb: Float64Array; readonly centers: readonly RGB[]; readonly weight: number; readonly sampled?: number };
 
 function lossyEdges(source: Uint8Array, count: number, centers: readonly Lab[], weight = LOSSY_SRGB_WEIGHT): LossyEdges {
   const srgb = new Float64Array(count * 3);
