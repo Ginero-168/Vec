@@ -522,11 +522,7 @@ async function assignLabelsAsync(
   if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
   else if (edges !== undefined) {
     foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
-    const before = labels.slice();
-    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) {
-      await smoothLabelsAsync(labels, upW, upH, kCount, FINE_SIGMA, context, () => {});
-      keepFineDetail(before, labels, upW, upH);
-    }
+    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) await smoothLabelsAsync(labels, upW, upH, kCount, FINE_SIGMA, context, () => {}, fineBand(labels, upW, upH));
   }
   cutTransparent(labels, opacity, width, height);
   onProgress(1);
@@ -707,11 +703,11 @@ async function nearestOutsideAsync(labels: Uint8Array, small: Uint8Array, smallP
   return nearest;
 }
 
-async function smoothLabelsAsync(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, context: CooperativeContext, onProgress: (fraction: number) => void): Promise<void> {
+async function smoothLabelsAsync(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, context: CooperativeContext, onProgress: (fraction: number) => void, only?: Uint8Array): Promise<void> {
   if (!(sigma > 0)) return;
   const kernel = gaussianKernel(sigma);
   const radius = (kernel.length - 1) >> 1;
-  const { candidates, candidateSpans, neededSpans, xSamples, ySamples, activeLabels } = await smoothingMasksAsync(labels, width, height, radius, kCount, context);
+  const { candidates, candidateSpans, neededSpans, xSamples, ySamples, activeLabels } = await smoothingMasksAsync(labels, width, height, radius, kCount, context, only);
   const { horizontalScores, scoreOffsets, vertical } = await smoothingScoresAsync(labels, width, kCount, kernel, activeLabels, candidateSpans, neededSpans, xSamples, ySamples, context);
   const next = labels.slice();
   const taps = kernel.length;
@@ -746,7 +742,7 @@ async function smoothLabelsAsync(labels: Uint8Array, width: number, height: numb
     await cooperate(context);
   }
   for (let index = 0; index < labels.length; index += 1) {
-    if (candidates[index] === 0 && labels[index] === 255) next[index] = 0;
+    if (only === undefined && candidates[index] === 0 && labels[index] === 255) next[index] = 0;
     if (index % 16384 === 0) await cooperate(context);
   }
   labels.set(next);
@@ -883,11 +879,7 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
   if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
   else if (edges !== undefined) {
     foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
-    const before = labels.slice();
-    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) {
-      smoothLabels(labels, upW, upH, kCount, FINE_SIGMA);
-      keepFineDetail(before, labels, upW, upH);
-    }
+    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) smoothLabels(labels, upW, upH, kCount, FINE_SIGMA, undefined, fineBand(labels, upW, upH));
   }
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
@@ -1817,29 +1809,49 @@ function nearestOutside(labels: Uint8Array, small: Uint8Array, smallPixels: Uint
  *   own side only, the wide neighbour's vote fattened it instead.
  * - It runs only where the JPEG test can judge the raster (short side >= denoise MIN_SIDE): a smaller JPEG reads as
  *   clean, and the vote then evens its noise into the edges (gl-figma-64-q60 is 43 px wide).
+ * The vote is computed only on the sub-pixels the first two limits leave it (fineBand), not on the 3 sigma band around
+ * every edge: elsewhere its result was thrown away.
  */
 const FINE_SIGMA = UP / 2;
 const FINE_BAND = 1;
 
-function keepFineDetail(before: Uint8Array, labels: Uint8Array, width: number, height: number): void {
-  const wide = openedBySquare(before, width, height, 2 * UP + 1);
-  for (let index = 0; index < labels.length; index += 1) {
-    if (labels[index] === before[index]) continue;
-    const own = before[index]!;
-    const x = index % width, y = (index - x) / width;
-    let edge = false, thin = wide[index] !== 1;
-    for (let dy = -FINE_BAND; dy <= FINE_BAND && !thin; dy += 1) {
-      const yy = y + dy;
-      if (yy < 0 || yy >= height) continue;
-      for (let dx = -FINE_BAND; dx <= FINE_BAND; dx += 1) {
-        const xx = x + dx;
-        if (xx < 0 || xx >= width) continue;
-        if (before[yy * width + xx] !== own) edge = true;
-        if (wide[yy * width + xx] !== 1) { thin = true; break; }
+/**
+ * The sub-pixels where the light vote may change a label: within FINE_BAND of a sub-pixel of another label, with no
+ * sub-pixel within FINE_BAND outside the label's 2 UP + 1 square opening (openedBySquare). The vote runs only there:
+ * anywhere else its result was dropped.
+ */
+function fineBand(labels: Uint8Array, width: number, height: number): Uint8Array {
+  const wide = openedBySquare(labels, width, height, 2 * UP + 1);
+  // Sub-pixels with a differing 8-neighbour: each unequal pair is marked at both ends.
+  const band = new Uint8Array(labels.length);
+  for (let y = 0, index = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1, index += 1) {
+      const own = labels[index]!;
+      if (x + 1 < width && labels[index + 1] !== own) band[index] = band[index + 1] = 1;
+      if (y + 1 < height) {
+        const below = index + width;
+        if (labels[below] !== own) band[index] = band[below] = 1;
+        if (x + 1 < width && labels[below + 1] !== own) band[index] = band[below + 1] = 1;
+        if (x > 0 && labels[below - 1] !== own) band[index] = band[below - 1] = 1;
       }
     }
-    if (thin || !edge) labels[index] = own;
   }
+  for (let y = 0, index = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1, index += 1) {
+      if (band[index] !== 1) continue;
+      let thin = false;
+      for (let dy = -FINE_BAND; dy <= FINE_BAND && !thin; dy += 1) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= height) continue;
+        for (let dx = -FINE_BAND; dx <= FINE_BAND; dx += 1) {
+          const xx = x + dx;
+          if (xx >= 0 && xx < width && wide[yy * width + xx] !== 1) { thin = true; break; }
+        }
+      }
+      if (thin) band[index] = 0;
+    }
+  }
+  return band;
 }
 
 /** 1 where a pixel lies in a side x side square that one label fills: the label's morphological opening. */
@@ -1855,18 +1867,20 @@ function openedBySquare(labels: Uint8Array, width: number, height: number, side:
       start = x;
     }
   }
+  // The vertical runs, scanned row by row (one open run per column).
   const centre = new Uint8Array(labels.length);
-  for (let x = 0; x < width; x += 1) {
-    let start = 0;
-    for (let y = 1; y <= height; y += 1) {
+  const runStart = new Int32Array(width);
+  for (let y = 1; y <= height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
       const here = y * width + x, above = here - width;
       if (y < height && row[here] === 1 && row[above] === 1 && labels[here] === labels[above]) continue;
+      const start = runStart[x]!;
       if (row[start * width + x] === 1) for (let at = start + radius; at < y - radius; at += 1) centre[at * width + x] = 1;
-      start = y;
+      runStart[x] = y;
     }
   }
   // Dilation by the same square (separable): every pixel of a fitted square, which holds that one label.
-  return dilateLine(dilateLine(centre, width, height, radius, 1, width), height, width, radius, width, 1);
+  return dilateVertically(dilateLine(centre, width, height, radius, 1, width), width, height, radius);
 }
 
 /** Binary dilation along one axis: `count` lines of `length` pixels, `step` apart along a line, `stride` between lines. */
@@ -1883,11 +1897,11 @@ function dilateLine(mask: Uint8Array, length: number, count: number, radius: num
   return out;
 }
 
-function smoothLabels(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, onProgress?: (fraction: number) => void): void {
+function smoothLabels(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, onProgress?: (fraction: number) => void, only?: Uint8Array): void {
   if (!(sigma > 0)) return;
   const kernel = gaussianKernel(sigma);
   const radius = (kernel.length - 1) >> 1;
-  const { candidates, candidateSpans, ySamples, activeLabels, neededSpans, xSamples } = smoothingMasks(labels, width, height, radius, kCount);
+  const { candidates, candidateSpans, ySamples, activeLabels, neededSpans, xSamples } = smoothingMasks(labels, width, height, radius, kCount, only);
   const { horizontalScores, scoreOffsets, vertical } = smoothingScores(labels, width, kCount, kernel, activeLabels, candidateSpans, neededSpans, xSamples, ySamples);
   const next = labels.slice();
   const taps = kernel.length;
@@ -1921,7 +1935,7 @@ function smoothLabels(labels: Uint8Array, width: number, height: number, kCount:
     onProgress?.((span + 3) / Math.max(3, candidateSpans.length));
   }
   for (let index = 0; index < labels.length; index += 1) {
-    if (candidates[index] === 0 && labels[index] === 255) next[index] = 0;
+    if (only === undefined && candidates[index] === 0 && labels[index] === 255) next[index] = 0;
   }
   labels.set(next);
 }
@@ -2665,7 +2679,9 @@ async function smoothingScoresAsync(
   return { horizontalScores, scoreOffsets, vertical };
 }
 
-function smoothingMasks(labels: Uint8Array, width: number, height: number, radius: number, kCount: number): SmoothingMasks {
+/** `only`: vote at these sub-pixels alone (each must lie within `radius` of an edge, where the full vote would run). */
+function smoothingMasks(labels: Uint8Array, width: number, height: number, radius: number, kCount: number, only?: Uint8Array): SmoothingMasks {
+  if (only !== undefined) return votingMasks(labels, width, height, radius, kCount, only, dilateVertically(only, width, height, radius));
   const length = labels.length;
   const edges = new Uint8Array(length);
   const present = new Uint8Array(kCount);
@@ -2721,7 +2737,8 @@ function smoothingMasks(labels: Uint8Array, width: number, height: number, radiu
   return { candidates, needed, candidateSpans, neededSpans, xSamples, ySamples, activeLabels };
 }
 
-async function smoothingMasksAsync(labels: Uint8Array, width: number, height: number, radius: number, kCount: number, context: CooperativeContext): Promise<SmoothingMasks> {
+async function smoothingMasksAsync(labels: Uint8Array, width: number, height: number, radius: number, kCount: number, context: CooperativeContext, only?: Uint8Array): Promise<SmoothingMasks> {
+  if (only !== undefined) return votingMasks(labels, width, height, radius, kCount, only, await dilateVerticallyAsync(only, width, height, radius, context));
   const length = labels.length;
   const edges = new Uint8Array(length);
   const present = new Uint8Array(kCount);
@@ -2779,6 +2796,24 @@ async function smoothingMasksAsync(labels: Uint8Array, width: number, height: nu
     await cooperate(context);
   }
   return { candidates, needed, candidateSpans, neededSpans, xSamples, ySamples, activeLabels };
+}
+
+/** smoothingMasks for a given candidate set: the labels present, spans and reflected tap positions, as the full vote. */
+function votingMasks(labels: Uint8Array, width: number, height: number, radius: number, kCount: number, candidates: Uint8Array, needed: Uint8Array): SmoothingMasks {
+  const present = new Uint8Array(kCount);
+  for (let index = 0; index < labels.length; index += 1) {
+    const label = labels[index]!;
+    if (label < kCount) present[label] = 1;
+  }
+  const taps = radius * 2 + 1;
+  const activeLabels: number[] = [];
+  if (kCount > 0) activeLabels.push(0);
+  for (let label = 1; label < kCount; label += 1) if (present[label] === 1) activeLabels.push(label);
+  const xSamples = new Int32Array(width * taps);
+  const ySamples = new Int32Array(height * taps);
+  for (let x = 0; x < width; x += 1) for (let tap = 0; tap < taps; tap += 1) xSamples[x * taps + tap] = reflect101(x + tap - radius, width);
+  for (let y = 0; y < height; y += 1) for (let tap = 0; tap < taps; tap += 1) ySamples[y * taps + tap] = reflect101(y + tap - radius, height);
+  return { candidates, needed, candidateSpans: maskSpans(candidates, width, height), neededSpans: maskSpans(needed, width, height), xSamples, ySamples, activeLabels };
 }
 
 function gaussianKernel(sigma: number): Float64Array {
