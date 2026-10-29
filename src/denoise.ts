@@ -6,7 +6,7 @@ const FLAT_BLOCK_VARIANCE = 256;
 const RANGE_SIGMA = 14;
 const SPATIAL_SIGMA = 1.35;
 const PASSES = 2;
-const MIN_SIDE = 48;
+export const MIN_SIDE = 48;
 const RADIUS = 2;
 
 /** Remove low-amplitude JPEG-like noise while leaving clean and transparent rasters alone. */

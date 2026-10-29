@@ -1,5 +1,5 @@
 import { labDistance2, oklabToRgb, rgbToOklab, type Lab, type RGB } from "./color.ts";
-import { wouldDenoise } from "./denoise.ts";
+import { MIN_SIDE as NOISE_JUDGED_SIDE, wouldDenoise } from "./denoise.ts";
 import { mergeNearCenters } from "./jpeg-clean.ts";
 
 export type FlatPlate = {
@@ -520,7 +520,14 @@ async function assignLabelsAsync(
   }
   await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
   if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
-  else if (edges !== undefined) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+  else if (edges !== undefined) {
+    foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+    const before = labels.slice();
+    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) {
+      await smoothLabelsAsync(labels, upW, upH, kCount, FINE_SIGMA, context, () => {});
+      keepFineDetail(before, labels, upW, upH);
+    }
+  }
   cutTransparent(labels, opacity, width, height);
   onProgress(1);
   return labels;
@@ -874,7 +881,14 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
   if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
-  else if (edges !== undefined) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+  else if (edges !== undefined) {
+    foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+    const before = labels.slice();
+    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) {
+      smoothLabels(labels, upW, upH, kCount, FINE_SIGMA);
+      keepFineDetail(before, labels, upW, upH);
+    }
+  }
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
   return labels;
@@ -1790,6 +1804,83 @@ function nearestOutside(labels: Uint8Array, small: Uint8Array, smallPixels: Uint
     if (cursor % 16384 === 0) onProgress?.(cursor / Math.max(1, tail));
   }
   return nearest;
+}
+
+/**
+ * The clean-raster (sRGB split) path's light smoothing: a majority vote with sigma half a source pixel, against the
+ * per-sub-pixel stair-steps the split leaves along a straight or round edge. Two limits keep it to that job.
+ * - It moves an edge by one sub-pixel at most (FINE_BAND): the split already put the edge within a sub-pixel of 50 %
+ *   coverage, so a larger move is the vote overriding the coverage.
+ * - It leaves the parts of a label no wider than the band an edge leaves (2 UP sub-pixels, the AA-ring bound in
+ *   foldThinMixes), on both sides of their edge: there the vote reads both of the part's edges at once and eats it,
+ *   so a tip or a hairline at 32-64 px shrank (si-spotify-32-white's arcs, om-grinning-64-white's eyes); kept on its
+ *   own side only, the wide neighbour's vote fattened it instead.
+ * - It runs only where the JPEG test can judge the raster (short side >= denoise MIN_SIDE): a smaller JPEG reads as
+ *   clean, and the vote then evens its noise into the edges (gl-figma-64-q60 is 43 px wide).
+ */
+const FINE_SIGMA = UP / 2;
+const FINE_BAND = 1;
+
+function keepFineDetail(before: Uint8Array, labels: Uint8Array, width: number, height: number): void {
+  const wide = openedBySquare(before, width, height, 2 * UP + 1);
+  for (let index = 0; index < labels.length; index += 1) {
+    if (labels[index] === before[index]) continue;
+    const own = before[index]!;
+    const x = index % width, y = (index - x) / width;
+    let edge = false, thin = wide[index] !== 1;
+    for (let dy = -FINE_BAND; dy <= FINE_BAND && !thin; dy += 1) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= height) continue;
+      for (let dx = -FINE_BAND; dx <= FINE_BAND; dx += 1) {
+        const xx = x + dx;
+        if (xx < 0 || xx >= width) continue;
+        if (before[yy * width + xx] !== own) edge = true;
+        if (wide[yy * width + xx] !== 1) { thin = true; break; }
+      }
+    }
+    if (thin || !edge) labels[index] = own;
+  }
+}
+
+/** 1 where a pixel lies in a side x side square that one label fills: the label's morphological opening. */
+function openedBySquare(labels: Uint8Array, width: number, height: number, side: number): Uint8Array {
+  const radius = (side - 1) / 2;
+  // Erosion: a run of `side` equal labels centred on the pixel, horizontally, then vertically over those rows.
+  const row = new Uint8Array(labels.length);
+  for (let y = 0; y < height; y += 1) {
+    let start = 0;
+    for (let x = 1; x <= width; x += 1) {
+      if (x < width && labels[y * width + x] === labels[y * width + start]) continue;
+      for (let at = start + radius; at < x - radius; at += 1) row[y * width + at] = 1;
+      start = x;
+    }
+  }
+  const centre = new Uint8Array(labels.length);
+  for (let x = 0; x < width; x += 1) {
+    let start = 0;
+    for (let y = 1; y <= height; y += 1) {
+      const here = y * width + x, above = here - width;
+      if (y < height && row[here] === 1 && row[above] === 1 && labels[here] === labels[above]) continue;
+      if (row[start * width + x] === 1) for (let at = start + radius; at < y - radius; at += 1) centre[at * width + x] = 1;
+      start = y;
+    }
+  }
+  // Dilation by the same square (separable): every pixel of a fitted square, which holds that one label.
+  return dilateLine(dilateLine(centre, width, height, radius, 1, width), height, width, radius, width, 1);
+}
+
+/** Binary dilation along one axis: `count` lines of `length` pixels, `step` apart along a line, `stride` between lines. */
+function dilateLine(mask: Uint8Array, length: number, count: number, radius: number, step: number, stride: number): Uint8Array {
+  const out = new Uint8Array(mask.length);
+  const prefix = new Int32Array(length + 1);
+  for (let line = 0; line < count; line += 1) {
+    const base = line * stride;
+    for (let at = 0; at < length; at += 1) prefix[at + 1] = prefix[at]! + mask[base + at * step]!;
+    for (let at = 0; at < length; at += 1) {
+      if (prefix[Math.min(length, at + radius + 1)]! - prefix[Math.max(0, at - radius)]! > 0) out[base + at * step] = 1;
+    }
+  }
+  return out;
 }
 
 function smoothLabels(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, onProgress?: (fraction: number) => void): void {

@@ -48,6 +48,17 @@ test("a hard color split lands within half a pixel of the middle", () => {
   assert.ok(Math.abs(cross / 8 - 16) <= 0.5);
 });
 
+test("the clean-raster smoothing leaves a two-pixel bar's ends square", () => {
+  // A 2 px black bar on white at 64 px: as wide as the band an edge leaves (2 UP sub-pixels), so the light smoothing
+  // must not round its ends. The split alone may move each 16-sub-pixel end by one sub-pixel row.
+  const W = 64, rgba = new Uint8Array(W * W * 4).fill(255);
+  for (let y = 4; y < 28; y += 1) for (let x = 15; x < 17; x += 1) rgba.fill(0, (y * W + x) * 4, (y * W + x) * 4 + 3);
+  const painted = labelImage(rgba, W, W, 2);
+  let dark = 0;
+  for (let index = 0; index < painted.width * painted.height; index += 1) if ((painted.rgba[index * 4] ?? 255) < 128) dark += 1;
+  assert.ok(dark >= 16 * 24 * 8 - 2 * 16, `bar covers ${dark} sub-pixels`);
+});
+
 test("a forced single color still keeps a dark red flat off brown", () => {
   const image = fill(36, 36, 83, 70, 59, 255);
   paint(image, 36, 8, 8, 20, 20, 46, 4, 2);
