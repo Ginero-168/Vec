@@ -4782,9 +4782,10 @@
     let core = coreMask(lab, alpha, width, height, CORE_TAU, (fraction) => onProgress?.(0.04 + fraction * 0.1));
     if (countOf(core) < 8) core = coreMask(lab, alpha, width, height, 0.08, (fraction) => onProgress?.(0.14 + fraction * 0.1));
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-    const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
+    const sampled = buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08));
+    const found = recoverThinColors(lab, alpha, core, width, height, sampled);
     const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-    const edges = edgeRule(rgba, source, width, height, centers);
+    const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
     const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
     const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
     const painted = paintLabels2(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -4824,10 +4825,11 @@
     if (countOf(core) < 8) core = await coreMaskAsync(lab, alpha, width, height, 0.08, context);
     onProgress(0.14);
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
-    const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
+    const sampled = buildPalette(lab, core, width, height, userK);
+    const found = recoverThinColors(lab, alpha, core, width, height, sampled);
     const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
     onProgress(0.26);
-    const edges = edgeRule(rgba, source, width, height, centers);
+    const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
     const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
     const colors = fillColors(source, alpha, core, labels, width, height, centers);
     onProgress(0.94);
@@ -4970,6 +4972,7 @@
     }
     await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
     if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
+    else if (edges !== void 0) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
     cutTransparent(labels, opacity, width, height);
     onProgress(1);
     return labels;
@@ -5310,6 +5313,7 @@
     }
     cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
     if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
+    else if (edges !== void 0) foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
     cutTransparent(labels, opacity, width, height);
     onProgress?.(1);
     return labels;
@@ -5602,14 +5606,75 @@
     return nearest2;
   }
   var LOSSY_SRGB_WEIGHT = 0.5;
-  function edgeRule(rgba, source, width, height, centers) {
+  function edgeRule(rgba, source, width, height, centers, sampled) {
     if (source !== rgba) return lossyEdges(source, width * height, centers);
     if (wouldDenoise(rgba, width, height)) return void 0;
     for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return void 0;
-    return lossyEdges(source, width * height, centers, 1);
+    return { ...lossyEdges(source, width * height, centers, 1), sampled };
   }
   function smoothsLabels(edges) {
     return edges === void 0 || edges.weight !== 1;
+  }
+  var MIX_RESIDUAL = 16;
+  function ringEnds(centers, label, solid) {
+    const color = centers[label];
+    let twin = -1, nearest2 = MIX_RESIDUAL;
+    centers.forEach((other, index) => {
+      const distance3 = Math.hypot(other.r - color.r, other.g - color.g, other.b - color.b);
+      if (solid[index] && distance3 <= nearest2) [twin, nearest2] = [index, distance3];
+    });
+    if (twin >= 0) return [twin];
+    let ends = null, smallest = Infinity;
+    for (let a = 0; a < centers.length; a += 1) for (let b = a + 1; b < centers.length; b += 1) {
+      if (!solid[a] || !solid[b]) continue;
+      const from = centers[a], to = centers[b];
+      const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
+      const length = dr * dr + dg * dg + db * db;
+      if (length === 0) continue;
+      const t = Math.min(1, Math.max(0, ((color.r - from.r) * dr + (color.g - from.g) * dg + (color.b - from.b) * db) / length));
+      const residual = Math.hypot(color.r - from.r - t * dr, color.g - from.g - t * dg, color.b - from.b - t * db);
+      if (residual <= MIX_RESIDUAL && residual < smallest) {
+        smallest = residual;
+        ends = [a, b];
+      }
+    }
+    return ends;
+  }
+  function foldThinMixes(labels, width, height, centers, sampled, split) {
+    const masks = centers.map((_, label) => {
+      const mine = new Uint8Array(labels.length);
+      for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mine[index] = 1;
+      return mine;
+    });
+    const present = masks.map((mine) => mine.includes(1));
+    const solid = masks.map((mine, label) => present[label] === true && (label >= sampled || squareFilter(mine, width, height, UP, true).includes(1)));
+    const rings = masks.flatMap((mine, label) => {
+      if (!present[label] || solid[label]) return [];
+      const ends = ringEnds(centers, label, solid);
+      return ends === null ? [] : [{ ends, mine }];
+    });
+    for (const { ends, mine } of rings) {
+      for (let index = 0; index < labels.length; index += 1) {
+        if (mine[index] === 1) labels[index] = ends.length === 1 ? ends[0] : split(index % width, Math.floor(index / width), ends);
+      }
+    }
+  }
+  function squareFilter(mask, width, height, radius, erode) {
+    const pass = (input, length, lines, at) => {
+      const output = new Uint8Array(input.length);
+      const prefix = new Int32Array(length + 1);
+      for (let line2 = 0; line2 < lines; line2 += 1) {
+        for (let step = 0; step < length; step += 1) prefix[step + 1] = prefix[step] + input[at(line2, step)];
+        for (let step = 0; step < length; step += 1) {
+          const low = Math.max(0, step - radius), high = Math.min(length - 1, step + radius);
+          const set = prefix[high + 1] - prefix[low];
+          output[at(line2, step)] = erode ? set === 2 * radius + 1 ? 1 : 0 : set > 0 ? 1 : 0;
+        }
+      }
+      return output;
+    };
+    const rows = pass(mask, width, height, (line2, step) => line2 * width + step);
+    return pass(rows, height, width, (line2, step) => step * width + line2);
   }
   function lossyEdges(source, count, centers, weight = LOSSY_SRGB_WEIGHT) {
     const srgb = new Float64Array(count * 3);
