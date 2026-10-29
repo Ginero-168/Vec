@@ -2955,16 +2955,20 @@ function planTrace(source, settings, controls, previousStages = null, from = "co
 }
 function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
-  const plates = flat.map((plate) => ({
-    png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : plate.rgba),
-    scale: plate.scale,
-    originX: plate.originX,
-    originY: plate.originY,
-    borderColor: plate.borderColor,
-    cutOut: plate.cutOut,
-    source: { rgba, width, height },
-    request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
-  }));
+  const plates = flat.map((plate) => {
+    const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
+    return {
+      png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
+      scale: plate.scale,
+      originX: plate.originX,
+      originY: plate.originY,
+      // A border colour that is the subject is no canvas plate either: dropCanvasBackground must keep it.
+      borderColor: punched.borderIsSubject ? null : plate.borderColor,
+      cutOut: plate.cutOut,
+      source: { rgba, width, height },
+      request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
+    };
+  });
   const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
   return {
     width,
@@ -2977,10 +2981,10 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
 var BACKDROP_TOLERANCE = 24;
 var HALO_MIX = 0.35;
 var HALO_RESIDUAL = 16;
-function punchBorderBackdrop(rgba, width, height, sourceBorder, haloReach = 8) {
-  if (sourceBorder === null) return rgba;
+function punchBackdrop(rgba, width, height, sourceBorder, haloReach) {
+  if (sourceBorder === null) return { rgba, borderIsSubject: false };
   const corner = cornerColor(rgba, width, height);
-  if (corner === null) return rgba;
+  if (corner === null) return { rgba, borderIsSubject: false };
   const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);
   const halo = haloColors(rgba, [tr, tg, tb]);
   const near = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
@@ -3012,7 +3016,8 @@ function punchBorderBackdrop(rgba, width, height, sourceBorder, haloReach = 8) {
     if (pixel >= width) push(pixel - width);
     if (pixel < (height - 1) * width) push(pixel + width);
   }
-  if (punched === width * height) return rgba;
+  if (punched === width * height) return { rgba, borderIsSubject: false };
+  if (!leavesVisibleSubject(rgba, seen)) return { rgba, borderIsSubject: true };
   if (halo.size > 0) {
     let frontier = [];
     for (let pixel = 0; pixel < width * height; pixel += 1) if (seen[pixel] === 1) frontier.push(pixel);
@@ -3044,7 +3049,14 @@ function punchBorderBackdrop(rgba, width, height, sourceBorder, haloReach = 8) {
       frontier = next;
     }
   }
-  return out;
+  return { rgba: out, borderIsSubject: false };
+}
+function leavesVisibleSubject(rgba, seen) {
+  for (let pixel = 0; pixel < seen.length; pixel += 1) {
+    if (seen[pixel] === 1 || (rgba[pixel * 4 + 3] ?? 0) < 250) continue;
+    if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
+  }
+  return false;
 }
 function haloColors(rgba, backdrop) {
   const counts = /* @__PURE__ */ new Map();
