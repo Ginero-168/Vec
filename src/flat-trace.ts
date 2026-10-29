@@ -520,9 +520,12 @@ async function assignLabelsAsync(
   }
   await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
   if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
-  else if (edges !== undefined) {
-    foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
-    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) await smoothLabelsAsync(labels, upW, upH, kCount, FINE_SIGMA, context, () => {}, fineBand(labels, upW, upH));
+  else {
+    fillUnlabelled(labels, upW, upH);
+    if (edges !== undefined) {
+      foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+      if (Math.min(width, height) >= NOISE_JUDGED_SIDE) await smoothLabelsAsync(labels, upW, upH, kCount, FINE_SIGMA, context, () => {}, fineBand(labels, upW, upH, opacity, width));
+    }
   }
   cutTransparent(labels, opacity, width, height);
   onProgress(1);
@@ -877,9 +880,12 @@ function assignLabels(linear: Float64Array, lab: Float64Array, core: Uint8Array,
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
   if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
-  else if (edges !== undefined) {
-    foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
-    if (Math.min(width, height) >= NOISE_JUDGED_SIDE) smoothLabels(labels, upW, upH, kCount, FINE_SIGMA, undefined, fineBand(labels, upW, upH));
+  else {
+    fillUnlabelled(labels, upW, upH);
+    if (edges !== undefined) {
+      foldThinMixes(labels, upW, upH, edges.centers, edges.sampled ?? edges.centers.length, (ux, uy, ends) => explainLossy(edges, width, bicubic, ux, uy, ends, centers));
+      if (Math.min(width, height) >= NOISE_JUDGED_SIDE) smoothLabels(labels, upW, upH, kCount, FINE_SIGMA, undefined, fineBand(labels, upW, upH, opacity, width));
+    }
   }
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
@@ -1223,15 +1229,12 @@ const LOSSY_SRGB_WEIGHT = 0.5;
  * rule, linear-light interpolation and the OKLab midpoint, put the switch away from 50 % coverage by an amount that
  * depends on the two colours: the 8x plate sat up to 1.5 plate px outside (si-spotify) or 1.6 px inside (si-ubuntu)
  * the ground truth. A lossy raster that was cleaned keeps LOSSY_SRGB_WEIGHT; one too small to clean (< 96 px) keeps
- * the old rule, since its luma quantisation was never measured against the sRGB split; so does a raster with
- * transparency (below), which also keeps alpha output unchanged.
+ * the old rule, since its luma quantisation was never measured against the sRGB split. Transparency does not change
+ * this: the split decides between inks, and coverage of the clear backdrop is cut from alpha by cutTransparent.
  */
 function edgeRule(rgba: Uint8Array, source: Uint8Array, width: number, height: number, centers: readonly Lab[], sampled: number): LossyEdges | undefined {
   if (source !== rgba) return lossyEdges(source, width * height, centers);
   if (wouldDenoise(rgba, width, height)) return undefined;
-  // A raster with transparency keeps the old rule: the sRGB split reads colour alone, and a pixel's coverage of the
-  // transparent backdrop lives in its alpha (a lone 39 % stroke has the same colour as the clear pixels around it).
-  for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return undefined;
   return { ...lossyEdges(source, width * height, centers, 1), sampled };
 }
 
@@ -1837,9 +1840,12 @@ function nearestOutside(labels: Uint8Array, small: Uint8Array, smallPixels: Uint
  *   foldThinMixes), on both sides of their edge: there the vote reads both of the part's edges at once and eats it,
  *   so a tip or a hairline at 32-64 px shrank (si-spotify-32-white's arcs, om-grinning-64-white's eyes); kept on its
  *   own side only, the wide neighbour's vote fattened it instead.
+ * - It leaves the sub-pixels within one source pixel of a pixel that is not fully opaque. There the outline is cut from
+ *   alpha (cutTransparent, bilinear, so it reaches one source pixel), not from the labels; the vote reads the clear
+ *   pixels' label as an ink and drags the junctions of two inks along the outline (gl-figma-256-alpha lost a corner).
  * - It runs only where the JPEG test can judge the raster (short side >= denoise MIN_SIDE): a smaller JPEG reads as
  *   clean, and the vote then evens its noise into the edges (gl-figma-64-q60 is 43 px wide).
- * The vote is computed only on the sub-pixels the first two limits leave it (fineBand), not on the 3 sigma band around
+ * The vote is computed only on the sub-pixels the first three limits leave it (fineBand), not on the 3 sigma band around
  * every edge: elsewhere its result was thrown away.
  */
 const FINE_SIGMA = UP / 2;
@@ -1847,11 +1853,20 @@ const FINE_BAND = 1;
 
 /**
  * The sub-pixels where the light vote may change a label: within FINE_BAND of a sub-pixel of another label, with no
- * sub-pixel within FINE_BAND outside the label's 2 UP + 1 square opening (openedBySquare). The vote runs only there:
- * anywhere else its result was dropped.
+ * sub-pixel within FINE_BAND outside the label's 2 UP + 1 square opening (openedBySquare), and not within one source
+ * pixel of a source pixel that is not fully opaque. The vote runs only there: anywhere else its result was dropped.
  */
-function fineBand(labels: Uint8Array, width: number, height: number): Uint8Array {
+function fineBand(labels: Uint8Array, width: number, height: number, opacity: Uint8Array, sourceWidth: number): Uint8Array {
   const wide = openedBySquare(labels, width, height, 2 * UP + 1);
+  const sourceHeight = Math.floor(opacity.length / sourceWidth);
+  const nearClear = (x: number, y: number) => {
+    const sx = Math.floor(x / UP), sy = Math.floor(y / UP);
+    for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+      const xx = sx + dx, yy = sy + dy;
+      if (xx >= 0 && yy >= 0 && xx < sourceWidth && yy < sourceHeight && (opacity[yy * sourceWidth + xx] ?? 255) !== 255) return true;
+    }
+    return false;
+  };
   // Sub-pixels with a differing 8-neighbour: each unequal pair is marked at both ends.
   const band = new Uint8Array(labels.length);
   for (let y = 0, index = 0; y < height; y += 1) {
@@ -1878,7 +1893,7 @@ function fineBand(labels: Uint8Array, width: number, height: number): Uint8Array
           if (xx >= 0 && xx < width && wide[yy * width + xx] !== 1) { thin = true; break; }
         }
       }
-      if (thin) band[index] = 0;
+      if (thin || nearClear(x, y)) band[index] = 0;
     }
   }
   return band;
@@ -1968,6 +1983,36 @@ function smoothLabels(labels: Uint8Array, width: number, height: number, kCount:
     if (only === undefined && candidates[index] === 0 && labels[index] === 255) next[index] = 0;
   }
   labels.set(next);
+}
+
+/**
+ * Gives every sub-pixel no label reached (the parts of source pixels under 50 % opacity) the label of its nearest
+ * labelled sub-pixel, by a multi-source breadth-first fill; cutTransparent then cuts them to their coverage. The label
+ * smoothing did this as a side effect (it set them to label 0), so without it a raster with transparency lost every
+ * partly covered edge pixel, and a faint 1 px stroke entirely.
+ */
+function fillUnlabelled(labels: Uint8Array, width: number, height: number): void {
+  const queue = new Int32Array(labels.length);
+  let head = 0, tail = 0;
+  for (let index = 0; index < labels.length; index += 1) if (labels[index] !== 255) queue[tail++] = index;
+  if (tail === 0) {
+    labels.fill(0);
+    return;
+  }
+  while (head < tail) {
+    const index = queue[head++]!;
+    const label = labels[index]!;
+    const x = index % width;
+    const visit = (next: number) => {
+      if (labels[next] !== 255) return;
+      labels[next] = label;
+      queue[tail++] = next;
+    };
+    if (x > 0) visit(index - 1);
+    if (x < width - 1) visit(index + 1);
+    if (index >= width) visit(index - width);
+    if (index < labels.length - width) visit(index + width);
+  }
 }
 
 const BACKDROP_LAB = 0.1;

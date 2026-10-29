@@ -633,6 +633,25 @@ test("a lossy fill takes the median of its own pixels, so gamut-edge noise clipp
   assert.deepEqual([...painted.palette].sort(), ["#000000", "#ffffff"]);
 });
 
+test("a raster with transparency splits two inks at their sRGB midpoint too", () => {
+  // The split test's blue/white edge on an image whose bottom rows are clear: the coverage of the clear area lives in
+  // alpha, the edge between the inks is still the sRGB midpoint of the half-covered column (16.5 px).
+  const blue = [26, 188, 254] as const;
+  const image = fill(32, 20, 255, 255, 255, 255);
+  for (let y = 0; y < 20; y += 1) {
+    for (let x = 0; x < 32; x += 1) {
+      if (y >= 16) setPixel(image, 32, x, y, 0, 0, 0, 0);
+      else if (x < 16) setPixel(image, 32, x, y, blue[0], blue[1], blue[2], 255);
+      else if (x === 16) setPixel(image, 32, x, y, Math.round((blue[0] + 255) / 2), Math.round((blue[1] + 255) / 2), 255, 255);
+    }
+  }
+  const painted = labelImage(image.rgba, 32, 20, 2);
+  const row = 8 * 8 + 4;
+  let count = 0;
+  for (let x = 0; x < painted.width; x += 1) if ((painted.rgba[(row * painted.width + x) * 4] ?? 255) < 140 && (painted.rgba[(row * painted.width + x) * 4 + 3] ?? 0) > 0) count += 1;
+  assert.ok(Math.abs(count / 8 - 16.5) < 1 / 16, `edge at ${count / 8}`);
+});
+
 test("a clean anti-aliased disc keeps its area on the plate", () => {
   // A disc rendered the way resvg renders it: coverage from 16x16 supersampling, mixed in sRGB. Without label smoothing
   // the plate follows the 50 % isoline; the majority vote pulled a boundary toward its centre of curvature.
