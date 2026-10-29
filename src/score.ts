@@ -445,6 +445,58 @@ function roundRectError(measured: MeasuredPath, radius: number): number | null {
   return arc && side ? maxError : null;
 }
 
+// A traced corner bends the outline by its exterior angle within the one-pixel anti-aliasing band; a
+// disc bends by arc length / radius everywhere. cornerExcess reports the largest turning between two
+// chords of length radius/2 placed on either side of a CORNER_GAP window, minus what a disc of the
+// fitted radius turns over the same span ((gap + chord) / radius). A teardrop (disc with one quadrant
+// squared off) has straight arms of length radius meeting at a right angle, so its excess there is
+// pi/2 - (gap + chord) / radius; a disc's is 0. fitCircle rejects above the midpoint of the two.
+function cornerExcess(samples: readonly Point[], radius: number): number {
+  const points = samples.filter((point, index) => {
+    const prev = samples[(index - 1 + samples.length) % samples.length]!;
+    return Math.hypot(point.x - prev.x, point.y - prev.y) > 1e-6;
+  });
+  const count = points.length;
+  if (count < 3) return 0;
+  const along: number[] = [0];
+  for (let index = 1; index <= count; index += 1) {
+    const prev = points[index - 1]!, here = points[index % count]!;
+    along.push(along[index - 1]! + Math.hypot(here.x - prev.x, here.y - prev.y));
+  }
+  const perimeter = along[count]!;
+  const chord = Math.min(radius * CORNER_CHORD, perimeter / 8);
+  const gap = Math.min(CORNER_GAP, perimeter / 8);
+  const at = (distance: number): Point => {
+    const wrapped = ((distance % perimeter) + perimeter) % perimeter;
+    let low = 0, high = count;
+    while (high - low > 1) {
+      const mid = (low + high) >> 1;
+      if (along[mid]! <= wrapped) low = mid; else high = mid;
+    }
+    const from = points[low]!, to = points[(low + 1) % count]!;
+    const length = along[low + 1]! - along[low]!;
+    const t = length > 0 ? (wrapped - along[low]!) / length : 0;
+    return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+  };
+  const disc = (gap + chord) / radius;
+  let worst = 0;
+  const steps = Math.max(count, Math.ceil(perimeter / 0.25));
+  for (let step = 0; step < steps; step += 1) {
+    const middle = (step / steps) * perimeter;
+    const inStart = at(middle - gap / 2 - chord), inEnd = at(middle - gap / 2);
+    const outStart = at(middle + gap / 2), outEnd = at(middle + gap / 2 + chord);
+    const inX = inEnd.x - inStart.x, inY = inEnd.y - inStart.y, outX = outEnd.x - outStart.x, outY = outEnd.y - outStart.y;
+    const turn = Math.abs(Math.atan2(inX * outY - inY * outX, inX * outX + inY * outY));
+    worst = Math.max(worst, turn - disc);
+  }
+  return worst;
+}
+
+// One source pixel: the anti-aliasing band a pixel-sharp corner is rounded over.
+const CORNER_GAP = 1;
+// Half of a squared quadrant's straight arm (length radius), so gap/2 + chord stays on the arm.
+const CORNER_CHORD = 0.5;
+
 function fitCircle(measured: MeasuredPath, canvas: Canvas | null = null, grow = false): { readonly cx: number; readonly cy: number; readonly r: number } | null {
   const points = measured.samples;
   if (points.length < 8) return null;
@@ -489,6 +541,7 @@ function fitCircle(measured: MeasuredPath, canvas: Canvas | null = null, grow = 
   let maxError = 0;
   for (const point of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point.x - cx, point.y - cy) - radius));
   if (maxError > Math.max(1.25, radius * 0.04)) return null;
+  if (cornerExcess(points, radius) > (Math.PI / 2 - (CORNER_GAP + radius * CORNER_CHORD) / radius) / 2) return null;
   const expected = Math.PI * radius * radius;
   if (Math.abs(measured.area - expected) / expected > 0.12) return null;
   // Area-matched radius: the traced outline of a convex disc sits a little outside it.

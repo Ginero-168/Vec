@@ -144,6 +144,27 @@ test("a traced circle and rectangle become real shapes with fewer anchors", () =
   assert.ok(Math.abs(Number(circle?.[1]) - 40) < 0.6);
 });
 
+test("a disc with one squared-off quadrant stays a path", () => {
+  // gl-slack's teardrops are discs with one quadrant replaced by a square corner. Traced at 32 and 64 px the corner is
+  // rounded by about one pixel, which pulls the least-squares error under the disc limit; the corner still bends the
+  // outline by most of a right angle between straight arms, which a disc never does.
+  const teardrop = (cx: number, cy: number, radius: number, round: number): string => {
+    const points: string[] = [];
+    for (let step = 0; step <= 48; step += 1) {
+      const angle = Math.PI / 2 + (step / 48) * 1.5 * Math.PI;
+      points.push((cx + radius * Math.cos(angle)).toFixed(2) + "," + (cy + radius * Math.sin(angle)).toFixed(2));
+    }
+    points.push((cx + radius).toFixed(2) + "," + (cy + radius - round).toFixed(2), (cx + radius - round).toFixed(2) + "," + (cy + radius).toFixed(2));
+    return "M" + points.join(" L") + " Z";
+  };
+  for (const [radius, round] of [[3.5, 1], [7, 2]] as const) {
+    const shape = '<svg width="40" height="40"><path d="' + teardrop(20, 20, radius, round) + '" fill="#e01e5a"/></svg>';
+    assert.doesNotMatch(fitShapes(shape), /<circle /, "teardrop r " + radius);
+    const disc = '<svg width="40" height="40"><path d="' + circlePath(20, 20, radius) + '" fill="#e01e5a"/></svg>';
+    assert.match(fitShapes(disc), /<circle /, "disc r " + radius);
+  }
+});
+
 test("a disc that runs into the canvas frame keeps its true radius", () => {
   // The trace of a radius-16 disc in a 32 px canvas runs along the frame near each tangent point, 4.75 px either side
   // of it in gl-chrome-32-white (where the disc comes within 0.75 px of the frame), with a vertex per pixel step there
