@@ -1911,31 +1911,67 @@ const FINE_BAND = 1;
  */
 function fineSmooth(labels: Uint8Array, width: number, height: number, kCount: number, opacity: Uint8Array, sourceWidth: number): void {
   const runs = labelRuns(labels, width, height);
-  const wide = squareOpening(runs, width, height, UP);
-  const sourceHeight = Math.floor(opacity.length / sourceWidth);
-  const nearClear = (x: number, y: number) => {
-    const sx = Math.floor(x / UP), sy = Math.floor(y / UP);
-    for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
-      const xx = sx + dx, yy = sy + dy;
-      if (xx >= 0 && yy >= 0 && xx < sourceWidth && yy < sourceHeight && (opacity[yy * sourceWidth + xx] ?? 255) !== 255) return true;
-    }
-    return false;
-  };
-  const kept = (x: number, y: number) => {
-    for (let yy = Math.max(0, y - FINE_BAND); yy <= Math.min(height - 1, y + FINE_BAND); yy += 1) {
-      if (!covers(wide[yy]!, Math.max(0, x - FINE_BAND), Math.min(width - 1, x + FINE_BAND))) return false;
-    }
-    return !nearClear(x, y);
-  };
+  const inner = squareOpening(runs, width, height, UP).map((row) => shrunk(row, width, FINE_BAND));
+  const clear = nearClearPixels(opacity, sourceWidth);
   const voters: number[] = [];
   for (let y = 0; y < height; y += 1) {
-    const band = edgeBand(runs, y, width, height);
-    for (let at = 0; at < band.length; at += 2) {
-      for (let x = band[at]!; x < band[at + 1]!; x += 1) if (kept(x, y)) voters.push(y * width + x);
+    let allowed = inner[y]!;
+    for (let yy = Math.max(0, y - FINE_BAND); yy <= Math.min(height - 1, y + FINE_BAND) && allowed.length > 0; yy += 1) {
+      if (yy !== y) allowed = intersectIntervals(allowed, inner[yy]!);
+    }
+    if (allowed.length === 0) continue;
+    const candidates = subtractIntervals(allowed, bandInterior(runs, y, width, height));
+    const clearRow = clear === null ? -1 : Math.floor(y / UP) * sourceWidth;
+    for (let at = 0; at < candidates.length; at += 2) {
+      for (let x = candidates[at]!; x < candidates[at + 1]!; x += 1) {
+        if (clear !== null && clear[clearRow + Math.floor(x / UP)] === 1) continue;
+        voters.push(y * width + x);
+      }
     }
   }
   const winners = fineVotes(labels, runs, width, height, kCount, voters);
   for (let at = 0; at < voters.length; at += 1) if (winners[at]! >= 0) labels[voters[at]!] = winners[at]!;
+}
+
+/**
+ * The x whose [x - band, x + band] (clamped to the row) one merged interval of the row covers, as sorted intervals: an
+ * interval [s, e) covers it from s + band (from 0 when it starts the row) to e - band (to the row's end when it ends it).
+ */
+function shrunk(row: readonly number[], width: number, band: number): number[] {
+  const out: number[] = [];
+  for (let at = 0; at < row.length; at += 2) {
+    const from = row[at] === 0 ? 0 : row[at]! + band, to = row[at + 1] === width ? width : row[at + 1]! - band;
+    if (from < to) out.push(from, to);
+  }
+  return out;
+}
+
+/** The overlap of two sorted lists of disjoint intervals [s, e, ...]. */
+function intersectIntervals(left: readonly number[], right: readonly number[]): number[] {
+  const out: number[] = [];
+  let i = 0, j = 0;
+  while (i < left.length && j < right.length) {
+    const from = Math.max(left[i]!, right[j]!), to = Math.min(left[i + 1]!, right[j + 1]!);
+    if (from < to) out.push(from, to);
+    if (left[i + 1]! < right[j + 1]!) i += 2;
+    else j += 2;
+  }
+  return out;
+}
+
+/** Per source pixel, 1 where it or one of its 8 neighbours is not fully opaque; null when every pixel is opaque. */
+function nearClearPixels(opacity: Uint8Array, sourceWidth: number): Uint8Array | null {
+  const sourceHeight = Math.floor(opacity.length / sourceWidth);
+  let mask: Uint8Array | null = null;
+  for (let index = 0; index < sourceWidth * sourceHeight; index += 1) {
+    if (opacity[index] === 255) continue;
+    mask ??= new Uint8Array(sourceWidth * sourceHeight);
+    const sx = index % sourceWidth, sy = (index - sx) / sourceWidth;
+    for (let yy = Math.max(0, sy - 1); yy <= Math.min(sourceHeight - 1, sy + 1); yy += 1) {
+      for (let xx = Math.max(0, sx - 1); xx <= Math.min(sourceWidth - 1, sx + 1); xx += 1) mask[yy * sourceWidth + xx] = 1;
+    }
+  }
+  return mask;
 }
 
 /** Each row's runs of one label: row y holds runs first[y] .. first[y + 1] - 1, run k spanning [start[k], end[k]). */
@@ -1944,7 +1980,8 @@ type LabelRuns = { readonly first: Int32Array; readonly start: Int32Array; reado
 function labelRuns(labels: Uint8Array, width: number, height: number): LabelRuns {
   const words = labels.byteOffset % 4 === 0 ? new Uint32Array(labels.buffer, labels.byteOffset, labels.length >> 2) : null;
   const first = new Int32Array(height + 1);
-  let start = new Int32Array(Math.max(16, height * 4)), end = new Int32Array(start.length), label = new Uint8Array(start.length);
+  // Room for 32 runs a row: growing mid-scan costs the optimised scan a recompile, more than the larger allocation.
+  let start = new Int32Array(Math.max(16, height * 32)), end = new Int32Array(start.length), label = new Uint8Array(start.length);
   let count = 0;
   for (let y = 0; y < height; y += 1) {
     first[y] = count;
@@ -1985,7 +2022,7 @@ function labelRuns(labels: Uint8Array, width: number, height: number): LabelRuns
  * fills (the labels' morphological opening): erode each row's runs, intersect 2 radius + 1 rows of the same label,
  * then dilate across and down.
  */
-function squareOpening(runs: LabelRuns, width: number, height: number, radius: number): number[][] {
+function squareOpening(runs: LabelRuns, width: number, height: number, radius: number): (readonly number[])[] {
   const eroded: number[][] = [];
   for (let y = 0; y < height; y += 1) {
     const row: number[] = [];
@@ -1995,25 +2032,39 @@ function squareOpening(runs: LabelRuns, width: number, height: number, radius: n
     }
     eroded.push(row);
   }
-  const centres: number[][] = [];
-  for (let y = 0; y < height; y += 1) {
-    if (y < radius || y >= height - radius) { centres.push([]); continue; }
-    let common = eroded[y - radius]!;
-    for (let yy = y - radius + 1; yy <= y + radius && common.length > 0; yy += 1) common = intersectLabelled(common, eroded[yy]!);
-    centres.push(common);
-  }
+  // Rows y - radius .. y + radius in common (each list is its set's sorted, separated intervals, so the set decides
+  // the list whichever way the rows are combined).
+  const commons = rowBlocks(eroded, 2 * radius + 1, intersectLabelled);
+  const centres: (readonly number[])[] = [];
+  for (let y = 0; y < height; y += 1) centres.push(y < radius || y >= height - radius ? [] : commons(y - radius, y + radius));
   const across = centres.map((centre) => {
     const pieces: number[] = [];
     for (let at = 0; at < centre.length; at += 3) pieces.push(Math.max(0, centre[at]! - radius), Math.min(width, centre[at + 1]! + radius));
     return unionSorted(pieces, []);
   });
-  const wide: number[][] = [];
-  for (let y = 0; y < height; y += 1) {
-    let union: number[] = [];
-    for (let yy = Math.max(0, y - radius); yy <= Math.min(height - 1, y + radius); yy += 1) if (across[yy]!.length > 0) union = unionSorted(union, across[yy]!);
-    wide.push(union);
-  }
+  const unions = rowBlocks(across, 2 * radius + 1, unionSorted);
+  const wide: (readonly number[])[] = [];
+  for (let y = 0; y < height; y += 1) wide.push(unions(Math.max(0, y - radius), Math.min(height - 1, y + radius)));
   return wide;
+}
+
+/**
+ * For an associative row combination (intersection or union of interval lists), a lookup of rows from .. to combined,
+ * for ranges of at most `span` rows: within blocks of `span` rows, each row holds the combination from its block's
+ * start (prefix) and to its block's end (suffix), so a range is one suffix and one prefix, or one of them (van Herk).
+ */
+function rowBlocks(rows: readonly (readonly number[])[], span: number, combine: (left: readonly number[], right: readonly number[]) => number[]): (from: number, to: number) => readonly number[] {
+  const prefix: (readonly number[])[] = [], suffix: (readonly number[])[] = new Array(rows.length);
+  for (let y = 0; y < rows.length; y += 1) prefix.push(y % span === 0 ? rows[y]! : combine(prefix[y - 1]!, rows[y]!));
+  for (let y = rows.length - 1; y >= 0; y -= 1) suffix[y] = y % span === span - 1 || y === rows.length - 1 ? rows[y]! : combine(rows[y]!, suffix[y + 1]!);
+  return (from, to) => {
+    if (Math.floor(from / span) !== Math.floor(to / span)) return combine(suffix[from]!, prefix[to]!);
+    if (from % span === 0) return prefix[to]!;
+    if (to === rows.length - 1 || to % span === span - 1) return suffix[from]!;
+    let out: readonly number[] = rows[from]!;
+    for (let y = from + 1; y <= to; y += 1) out = combine(out, rows[y]!);
+    return out;
+  };
 }
 
 /** The parts of two rows' labelled intervals [s, e, label, ...] that overlap with the same label. */
@@ -2043,51 +2094,65 @@ function unionSorted(left: readonly number[], right: readonly number[]): number[
   return out;
 }
 
-/** Whether one merged interval of the row covers [from, to] (inclusive). */
-function covers(row: readonly number[], from: number, to: number): boolean {
-  let low = 0, high = row.length / 2 - 1;
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    if (row[mid * 2]! <= from) {
-      if (row[mid * 2 + 1]! > to) return true;
-      low = mid + 1;
-    } else high = mid - 1;
+/**
+ * Row y's sub-pixels whose 8 neighbours all share their label (the complement of the edge band), as sorted intervals:
+ * within each run, the part away from its ends (a run's end at the row's end is no edge), cut to where the rows above
+ * and below hold a run of the same label that reaches one sub-pixel past it on both sides.
+ */
+function bandInterior(runs: LabelRuns, y: number, width: number, height: number): number[] {
+  const runFirst = runs.first, runStart = runs.start, runEnd = runs.end, runLabel = runs.label;
+  // Each run's part away from its ends, cut to the row above: [s, e, label, ...].
+  const middle: number[] = [];
+  let other = y > 0 ? runFirst[y - 1]! : 0;
+  const otherEnd = y > 0 ? runFirst[y]! : 0;
+  for (let run = runFirst[y]!; run < runFirst[y + 1]!; run += 1) {
+    const from = runStart[run] === 0 ? 0 : runStart[run]! + 1, to = runEnd[run] === width ? width : runEnd[run]! - 1, label = runLabel[run]!;
+    if (from >= to) continue;
+    if (y === 0) { middle.push(from, to, label); continue; }
+    while (other < otherEnd && runEnd[other]! <= from) other += 1;
+    for (let k = other; k < otherEnd && runStart[k]! < to; k += 1) {
+      if (runLabel[k] !== label) continue;
+      const s = Math.max(from, runStart[k] === 0 ? 0 : runStart[k]! + 1), e = Math.min(to, runEnd[k] === width ? width : runEnd[k]! - 1);
+      if (s < e) middle.push(s, e, label);
+    }
   }
-  return false;
+  if (y + 1 >= height) {
+    const out: number[] = [];
+    for (let at = 0; at < middle.length; at += 3) out.push(middle[at]!, middle[at + 1]!);
+    return out;
+  }
+  // Then to the row below.
+  const out: number[] = [];
+  let below = runFirst[y + 1]!;
+  const belowEnd = runFirst[y + 2]!;
+  for (let at = 0; at < middle.length; at += 3) {
+    const from = middle[at]!, to = middle[at + 1]!, label = middle[at + 2]!;
+    while (below < belowEnd && runEnd[below]! <= from) below += 1;
+    for (let k = below; k < belowEnd && runStart[k]! < to; k += 1) {
+      if (runLabel[k] !== label) continue;
+      const s = Math.max(from, runStart[k] === 0 ? 0 : runStart[k]! + 1), e = Math.min(to, runEnd[k] === width ? width : runEnd[k]! - 1);
+      if (s < e) out.push(s, e);
+    }
+  }
+  return out;
 }
 
-/** Row y's sub-pixels with an 8-neighbour of another label, as sorted, merged intervals. */
-function edgeBand(runs: LabelRuns, y: number, width: number, height: number): number[] {
-  const first = runs.first[y]!, last = runs.first[y + 1]!;
-  const boundaries: number[] = [];
-  for (let run = first + 1; run < last; run += 1) boundaries.push(runs.start[run]! - 1, runs.start[run]! + 1);
-  let band = unionSorted(boundaries, []);
-  for (const other of [y - 1, y + 1]) {
-    if (other < 0 || other >= height) continue;
-    // Where all of x-1..x+1 in the other row lie in one run of this pixel's label; the band is the rest.
-    const same: number[] = [];
-    let j = runs.first[other]!;
-    const otherLast = runs.first[other + 1]!;
-    for (let run = first; run < last; run += 1) {
-      const from = runs.start[run]!, to = runs.end[run]!;
-      while (j < otherLast && runs.end[j]! <= from) j += 1;
-      for (let k = j; k < otherLast && runs.start[k]! < to; k += 1) {
-        if (runs.label[k] !== runs.label[run]) continue;
-        const inFrom = runs.start[k] === 0 ? 0 : runs.start[k]! + 1, inTo = runs.end[k] === width ? width : runs.end[k]! - 1;
-        const s = Math.max(from, inFrom), e = Math.min(to, inTo);
-        if (s < e) same.push(s, e);
-      }
+/** The parts of sorted, disjoint intervals [s, e, ...] outside another such list. */
+function subtractIntervals(left: readonly number[], right: readonly number[]): number[] {
+  const out: number[] = [];
+  let j = 0;
+  for (let i = 0; i < left.length; i += 2) {
+    let from = left[i]!;
+    const to = left[i + 1]!;
+    while (j < right.length && right[j + 1]! <= from) j += 2;
+    for (let k = j; k < right.length && right[k]! < to; k += 2) {
+      if (right[k]! > from) out.push(from, right[k]!);
+      from = Math.max(from, right[k + 1]!);
+      if (from >= to) break;
     }
-    const rest: number[] = [];
-    let at = 0;
-    for (let k = 0; k < same.length; k += 2) {
-      if (same[k]! > at) rest.push(at, same[k]!);
-      at = same[k + 1]!;
-    }
-    if (at < width) rest.push(at, width);
-    band = unionSorted(band, rest);
+    if (from < to) out.push(from, to);
   }
-  return band;
+  return out;
 }
 
 /**
@@ -2098,12 +2163,13 @@ function edgeBand(runs: LabelRuns, y: number, width: number, height: number): nu
  * label alone.
  */
 function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: number, kCount: number, voters: readonly number[]): Int16Array {
+  const runFirst = runs.first, runStart = runs.start, runEnd = runs.end, runLabel = runs.label;
   const winners = new Int16Array(voters.length).fill(-1);
   const kernel = gaussianKernel(FINE_SIGMA);
   const taps = kernel.length;
   const radius = (taps - 1) >> 1;
   const present = new Uint8Array(Math.max(1, kCount));
-  for (let run = 0; run < runs.first[height]!; run += 1) if (runs.label[run]! < kCount) present[runs.label[run]!] = 1;
+  for (let run = 0; run < runFirst[height]!; run += 1) if (runLabel[run]! < kCount) present[runLabel[run]!] = 1;
   const activeLabels: number[] = [];
   if (kCount > 0) activeLabels.push(0);
   for (let label = 1; label < kCount; label += 1) if (present[label] === 1) activeLabels.push(label);
@@ -2125,9 +2191,14 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
     fill[x] = fill[x]! + 1;
   });
   const scored = new Int32Array(height).fill(-1);
+  const cursor = runFirst.slice(0, height);
   const scores = new Float64Array(height * channels);
-  // The one channel a row's scores hold (-1: several); adding the others' zero scores leaves the sums as they are.
+  // The channels a row's scores are non-zero on: single[row] of them in listed[row * LISTED ..] (-1: more than LISTED,
+  // so all; -2: none). Adding the other channels' zero scores leaves the sums as they are.
+  const LISTED = 4;
   const single = new Int32Array(height);
+  const listed = new Int32Array(height * LISTED);
+  const seen = new Uint8Array(channels);
   const xs = new Int32Array(taps);
   const ys = new Int32Array(taps);
   const sums = new Float64Array(channels);
@@ -2148,26 +2219,70 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
       if (scored[sampleY] !== x) {
         scored[sampleY] = x;
         scores.fill(0, offset, offset + channels);
-        const run = runAt(runs, sampleY, x);
-        if (runs.start[run]! <= x - radius && x + radius < runs.end[run]!) {
-          const channel = runs.label[run]! < kCount ? slots[runs.label[run]!]! : -1;
-          if (channel >= 0) scores[offset + channel] = whole;
-          single[sampleY] = channel >= 0 ? channel : -2;
+        // Columns come in ascending order, so each row's run at x only moves right.
+        let run = cursor[sampleY]!;
+        while (runEnd[run]! <= x) run += 1;
+        cursor[sampleY] = run;
+        const list = sampleY * LISTED;
+        if (runStart[run]! <= x - radius && x + radius < runEnd[run]!) {
+          const channel = runLabel[run]! < kCount ? slots[runLabel[run]!]! : -1;
+          if (channel >= 0) {
+            scores[offset + channel] = whole;
+            listed[list] = channel;
+            single[sampleY] = 1;
+          } else single[sampleY] = -2;
         } else {
-          single[sampleY] = -1;
-          const base = sampleY * width;
-          for (let along = 0; along < taps; along += 1) {
-            const label = labels[base + xs[along]!]!;
-            if (label >= kCount) continue;
-            const channel = slots[label]!;
-            if (channel >= 0) scores[offset + channel] = scores[offset + channel]! + kernel[along]!;
+          let count = 0;
+          if (x >= radius && x + radius < width) {
+            // The window's runs in order: each channel adds its taps in the order the per-sub-pixel loop below does.
+            let k = run;
+            while (runStart[k]! > x - radius) k -= 1;
+            for (; k < runFirst[sampleY + 1]! && runStart[k]! <= x + radius; k += 1) {
+              const label = runLabel[k]!;
+              if (label >= kCount) continue;
+              const channel = slots[label]!;
+              if (channel < 0) continue;
+              const to = Math.min(runEnd[k]!, x + radius + 1) - (x - radius);
+              let score = scores[offset + channel]!;
+              for (let along = Math.max(runStart[k]!, x - radius) - (x - radius); along < to; along += 1) score += kernel[along]!;
+              scores[offset + channel] = score;
+              if (seen[channel] === 0) {
+                seen[channel] = 1;
+                if (count < LISTED) listed[list + count] = channel;
+                count += 1;
+              }
+            }
+          } else {
+            const base = sampleY * width;
+            for (let along = 0; along < taps; along += 1) {
+              const label = labels[base + xs[along]!]!;
+              if (label >= kCount) continue;
+              const channel = slots[label]!;
+              if (channel < 0) continue;
+              scores[offset + channel] = scores[offset + channel]! + kernel[along]!;
+              if (seen[channel] === 0) {
+                seen[channel] = 1;
+                if (count < LISTED) listed[list + count] = channel;
+                count += 1;
+              }
+            }
           }
+          if (count <= LISTED) for (let slot = 0; slot < count; slot += 1) seen[listed[list + slot]!] = 0;
+          else seen.fill(0);
+          if (count === 0) single[sampleY] = -2;
+          else if (count > LISTED) single[sampleY] = -1;
+          else single[sampleY] = count;
         }
       }
       const weight = kernel[tap]!;
-      const only = single[sampleY]!;
-      if (only >= 0) sums[only] = sums[only]! + scores[offset + only]! * weight;
-      else if (only === -1) for (let channel = 0; channel < channels; channel += 1) sums[channel] = sums[channel]! + scores[offset + channel]! * weight;
+      const count = single[sampleY]!;
+      if (count > 0) {
+        const list = sampleY * LISTED;
+        for (let slot = 0; slot < count; slot += 1) {
+          const channel = listed[list + slot]!;
+          sums[channel] = sums[channel]! + scores[offset + channel]! * weight;
+        }
+      } else if (count === -1) for (let channel = 0; channel < channels; channel += 1) sums[channel] = sums[channel]! + scores[offset + channel]! * weight;
     }
     let winner = activeLabels[0]!, best = -1;
     for (let channel = 0; channel < channels; channel += 1) {
@@ -2179,17 +2294,6 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
     winners[at] = winner;
   }
   return winners;
-}
-
-/** The run of row y holding column x. */
-function runAt(runs: LabelRuns, y: number, x: number): number {
-  let low = runs.first[y]!, high = runs.first[y + 1]! - 1;
-  while (low < high) {
-    const mid = (low + high + 1) >> 1;
-    if (runs.start[mid]! <= x) low = mid;
-    else high = mid - 1;
-  }
-  return low;
 }
 
 function smoothLabels(labels: Uint8Array, width: number, height: number, kCount: number, sigma: number, onProgress?: (fraction: number) => void): void {
