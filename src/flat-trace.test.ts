@@ -4,7 +4,7 @@ import { cornerColor, foldThinMixes, hasClearPixel, labelImage, subjectBoxes } f
 import { mergePlates } from "./trace-finish.ts";
 import { lossyCleanup, mergeNearCenters } from "./jpeg-clean.ts";
 import { rgbToOklab } from "./color.ts";
-import { encodeRgbaPng } from "./png-alpha.ts";
+import { encodeRgbaPng, readRgbaPng } from "./png-alpha.ts";
 import { cappedPalette, planTrace, punchBorderBackdrop } from "./trace-pipeline.ts";
 
 test("a full palette keeps the sentinel in the last slot", () => {
@@ -223,6 +223,28 @@ test("a thin faint stroke and a small faint hole survive the transparent cut", (
   const holeRow = 10 * 8 + 4;
   const open = [...Array(8).keys()].filter((dx) => (hole.rgba[(holeRow * hole.width + 80 + dx) * 4 + 3] ?? 0) === 0);
   assert.ok(open.length >= 3 && open.length <= 6, "a 61% hole stays open: " + open.join(","));
+});
+
+test("a full-bleed mark is the subject, not the backdrop", () => {
+  // si-javascript: a yellow square to every edge with its letters white (white raster) or cut out (alpha raster). Its
+  // yellow is the only border colour; dropping it as the backdrop left white letters or an empty plate (VTracer then
+  // divided by zero). The yellow must stay opaque on the plate and must not be named the canvas border.
+  for (const cutOut of [false, true]) {
+    const image = fill(32, 32, 247, 223, 30, 255);
+    for (let y = 14; y < 28; y += 1) for (let x = 14; x < 28; x += 1) setPixel(image, 32, x, y, 255, 255, 255, cutOut ? 0 : 255);
+    const plan = planTrace(encodeRgbaPng(32, 32, image.rgba), { preset: "logo", maxColors: 0, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "cutout" });
+    const plate = plan?.plates[0];
+    assert.ok(plate !== undefined);
+    assert.equal(plate.borderColor, null);
+    const decoded = readRgbaPng(plate.png);
+    assert.ok(decoded !== null);
+    assert.equal(decoded.rgba[(2 * decoded.width + 2) * 4 + 3], 255, cutOut ? "alpha" : "white");
+  }
+  // A mark on a white backdrop is still punched.
+  const framed = fill(32, 32, 255, 255, 255, 255);
+  for (let y = 8; y < 24; y += 1) for (let x = 8; x < 24; x += 1) setPixel(framed, 32, x, y, 247, 223, 30, 255);
+  const out = punchBorderBackdrop(framed.rgba, 32, 32, "#ffffff", 8);
+  assert.equal(out[3], 0);
 });
 
 test("the backdrop punch peels a halo where the subject runs into the canvas frame", () => {

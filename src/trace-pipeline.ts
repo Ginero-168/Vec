@@ -194,18 +194,22 @@ function planFlat(
   onProgress?: (fraction: number) => void
 ): TracePlan {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
-  const plates = flat.map((plate) => ({
-      png: encodeRgbaPng(plate.width, plate.height, settings.removeBackground ? punchBorderBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : plate.rgba),
+  const plates = flat.map((plate) => {
+    const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
+    return {
+      png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
       scale: plate.scale,
       originX: plate.originX,
       originY: plate.originY,
-      borderColor: plate.borderColor,
+      // A border colour that is the subject is no canvas plate either: dropCanvasBackground must keep it.
+      borderColor: punched.borderIsSubject ? null : plate.borderColor,
       cutOut: plate.cutOut,
       source: { rgba, width, height },
       request: controls === undefined
         ? flatRequest(settings, plate.palette, plate.scale)
         : flatRequestForControls(settings, plate.palette, plate.scale, controls)
-    }));
+    };
+  });
   const rasterStages = controls === undefined ? undefined : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
   return {
     width,
@@ -228,10 +232,15 @@ const HALO_RESIDUAL = 16;
  * No-op unless the source corners are opaque and agree (plate.borderColor) and the painted corners agree too.
  */
 export function punchBorderBackdrop(rgba: Uint8Array, width: number, height: number, sourceBorder: string | null, haloReach = 8): Uint8Array {
+  return punchBackdrop(rgba, width, height, sourceBorder, haloReach).rgba;
+}
+
+/** punchBorderBackdrop, also saying when the border colour was kept because it is the subject (leavesVisibleSubject). */
+function punchBackdrop(rgba: Uint8Array, width: number, height: number, sourceBorder: string | null, haloReach: number): { rgba: Uint8Array; borderIsSubject: boolean } {
   // Gate on the SOURCE corners (plate.borderColor): the painted label map is opaque even where the input was transparent.
-  if (sourceBorder === null) return rgba;
+  if (sourceBorder === null) return { rgba, borderIsSubject: false };
   const corner = cornerColor(rgba, width, height);
-  if (corner === null) return rgba;
+  if (corner === null) return { rgba, borderIsSubject: false };
   const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);
   const halo = haloColors(rgba, [tr, tg, tb]);
   const near = (pixel: number) => (rgba[pixel * 4 + 3] ?? 0) >= 250
@@ -261,7 +270,8 @@ export function punchBorderBackdrop(rgba: Uint8Array, width: number, height: num
     if (pixel >= width) push(pixel - width);
     if (pixel < (height - 1) * width) push(pixel + width);
   }
-  if (punched === width * height) return rgba;
+  if (punched === width * height) return { rgba, borderIsSubject: false };
+  if (!leavesVisibleSubject(rgba, seen)) return { rgba, borderIsSubject: true };
   // Peel the halo: halo-coloured pixels within haloReach (about one source pixel) of the punched backdrop. The reach
   // keeps real light content that merely touches the backdrop, such as a pale fill behind a broken outline.
   if (halo.size > 0) {
@@ -291,7 +301,23 @@ export function punchBorderBackdrop(rgba: Uint8Array, width: number, height: num
       frontier = next;
     }
   }
-  return out;
+  return { rgba: out, borderIsSubject: false };
+}
+
+/**
+ * Whether punching the `seen` backdrop leaves something to see on the white artboard Vec's output is placed on: an
+ * opaque pixel that is not near white (BACKDROP_TOLERANCE, the tolerance the backdrop itself is matched with). A
+ * full-bleed mark (si-javascript: a yellow square to every edge, its letters white or cut out) has no other border
+ * colour, so its own ink looked like the backdrop; dropping it left white letters only (white raster) or no opaque
+ * pixel at all (alpha raster, where VTracer then divided by zero on an empty plate). Then the border colour is the
+ * subject and is kept.
+ */
+function leavesVisibleSubject(rgba: Uint8Array, seen: Uint8Array): boolean {
+  for (let pixel = 0; pixel < seen.length; pixel += 1) {
+    if (seen[pixel] === 1 || (rgba[pixel * 4 + 3] ?? 0) < 250) continue;
+    if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
+  }
+  return false;
 }
 
 /**
