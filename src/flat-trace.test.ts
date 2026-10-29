@@ -247,6 +247,23 @@ test("a full-bleed mark is the subject, not the backdrop", () => {
   assert.equal(out[3], 0);
 });
 
+test("a border colour that is not the artboard and fills most of the canvas is the subject", () => {
+  // A yellow square with dark letters (the usual JS logo) and a white glyph on a dark tile: what is left after punching
+  // the border colour is visible on the white artboard, so the old test called the border colour a backdrop and dropped
+  // the square. Their border colour is not white and covers more of the canvas than everything else together.
+  for (const [ink, glyph] of [[[247, 223, 30], [50, 51, 48]], [[32, 33, 36], [255, 255, 255]]] as const) {
+    const image = fill(32, 32, ink[0], ink[1], ink[2], 255);
+    paint(image, 32, 12, 12, 14, 14, glyph[0], glyph[1], glyph[2]);
+    const out = punchBorderBackdrop(image.rgba, 32, 32, "#" + ink.map((v) => v.toString(16).padStart(2, "0")).join(""), 8);
+    assert.equal(out[3], 255, "square " + ink.join(","));
+  }
+  // A two-pixel coloured frame round a white canvas covers far less than the rest: it is still punched.
+  const framed = fill(32, 32, 255, 255, 255, 255);
+  for (const [x, y, w, h] of [[0, 0, 32, 2], [0, 30, 32, 2], [0, 0, 2, 32], [30, 0, 2, 32]] as const) paint(framed, 32, x, y, w, h, 37, 99, 235);
+  paint(framed, 32, 10, 10, 12, 12, 220, 38, 38);
+  assert.equal(punchBorderBackdrop(framed.rgba, 32, 32, "#2563eb", 8)[3], 0);
+});
+
 test("the backdrop punch peels a halo where the subject runs into the canvas frame", () => {
   // A red subject runs off the left edge; its anti-aliased rim on the frame column is a light mix (a quarter red) with no
   // backdrop beside it except at its two ends (si-spotify's disc meets the frame the same way).

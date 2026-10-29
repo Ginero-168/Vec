@@ -163,6 +163,62 @@ function plateFor(
   };
 }
 
+/** How far (per sRGB channel) a pixel may sit from the corner colour and still be the backdrop; JPEG backdrops paint
+ * as several near-white labels. */
+export const BACKDROP_TOLERANCE = 24;
+
+/** The opaque pixels within BACKDROP_TOLERANCE of `color` that are 4-connected to the frame: the backdrop flood. */
+export function floodBorder(rgba: Uint8Array, width: number, height: number, color: readonly [number, number, number]): { readonly seen: Uint8Array; readonly count: number } {
+  const [tr, tg, tb] = color;
+  const near = (pixel: number) => (rgba[pixel * 4 + 3] ?? 0) >= 250
+    && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE
+    && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE
+    && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
+  const seen = new Uint8Array(width * height);
+  const stack: number[] = [];
+  const push = (pixel: number) => {
+    if (seen[pixel] === 1 || !near(pixel)) return;
+    seen[pixel] = 1;
+    stack.push(pixel);
+  };
+  for (let x = 0; x < width; x += 1) { push(x); push((height - 1) * width + x); }
+  for (let y = 0; y < height; y += 1) { push(y * width); push(y * width + width - 1); }
+  let count = 0;
+  while (stack.length > 0) {
+    const pixel = stack.pop() ?? 0;
+    count += 1;
+    const x = pixel % width;
+    if (x > 0) push(pixel - 1);
+    if (x < width - 1) push(pixel + 1);
+    if (pixel >= width) push(pixel - width);
+    if (pixel < (height - 1) * width) push(pixel + width);
+  }
+  return { seen, count };
+}
+
+/**
+ * Whether the border colour `color`, flooded as `seen` (`count` pixels), is the subject rather than a backdrop. Vec's
+ * output is placed on a white artboard, and removing the backdrop is meant to remove the canvas the mark sits on.
+ * - Nothing visible would be left on that artboard: no opaque pixel outside the flood is more than BACKDROP_TOLERANCE
+ *   from white (si-javascript: a yellow square to every edge, its letters white or cut out).
+ * - Or the border colour is not the artboard (more than BACKDROP_TOLERANCE from white on some channel) and covers more
+ *   of the canvas than everything else together: the mark's own plate runs to every edge (a yellow square with dark
+ *   letters, a white glyph on a dark tile). A coloured frame round a white canvas covers far less and stays a backdrop.
+ */
+export function borderIsSubject(rgba: Uint8Array, width: number, height: number, color: readonly [number, number, number], seen: Uint8Array, count: number): boolean {
+  if (!leavesVisibleSubject(rgba, seen)) return true;
+  const white = color.every((channel) => 255 - channel <= BACKDROP_TOLERANCE);
+  return !white && count * 2 > width * height;
+}
+
+function leavesVisibleSubject(rgba: Uint8Array, seen: Uint8Array): boolean {
+  for (let pixel = 0; pixel < seen.length; pixel += 1) {
+    if (seen[pixel] === 1 || (rgba[pixel * 4 + 3] ?? 0) < 250) continue;
+    if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
+  }
+  return false;
+}
+
 /** Whether any pixel is (almost) fully transparent, i.e. the image is a cut-out rather than art on a backdrop. */
 export function hasClearPixel(rgba: Uint8Array): boolean {
   for (let offset = 3; offset < rgba.length; offset += 4) if ((rgba[offset] ?? 0) <= CLEAR_OPACITY) return true;

@@ -1,5 +1,5 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
-import { cornerColor, flatPlates, hasClearPixel, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
+import { BACKDROP_TOLERANCE, borderIsSubject, cornerColor, flatPlates, floodBorder, hasClearPixel, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
 import { lossyCleanup } from "./jpeg-clean.ts";
 import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "./lab-model.ts";
 import { buildLabRasterStages, buildLabRasterStagesAsync, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId, type PipelineProgress } from "./lab-pipeline.ts";
@@ -220,7 +220,6 @@ function planFlat(
   };
 }
 
-const BACKDROP_TOLERANCE = 24;
 const HALO_MIX = 0.35;
 const HALO_RESIDUAL = 16;
 
@@ -235,7 +234,7 @@ export function punchBorderBackdrop(rgba: Uint8Array, width: number, height: num
   return punchBackdrop(rgba, width, height, sourceBorder, haloReach).rgba;
 }
 
-/** punchBorderBackdrop, also saying when the border colour was kept because it is the subject (leavesVisibleSubject). */
+/** punchBorderBackdrop, also saying when the border colour was kept because it is the subject (borderIsSubject). */
 function punchBackdrop(rgba: Uint8Array, width: number, height: number, sourceBorder: string | null, haloReach: number): { rgba: Uint8Array; borderIsSubject: boolean } {
   // Gate on the SOURCE corners (plate.borderColor): the painted label map is opaque even where the input was transparent.
   if (sourceBorder === null) return { rgba, borderIsSubject: false };
@@ -243,35 +242,13 @@ function punchBackdrop(rgba: Uint8Array, width: number, height: number, sourceBo
   if (corner === null) return { rgba, borderIsSubject: false };
   const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);
   const halo = haloColors(rgba, [tr, tg, tb]);
-  const near = (pixel: number) => (rgba[pixel * 4 + 3] ?? 0) >= 250
-    && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE
-    && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE
-    && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
   const isHalo = (pixel: number) => (rgba[pixel * 4 + 3] ?? 0) >= 250
     && halo.has(((rgba[pixel * 4] ?? 0) << 16) | ((rgba[pixel * 4 + 1] ?? 0) << 8) | (rgba[pixel * 4 + 2] ?? 0));
+  const { seen, count: punched } = floodBorder(rgba, width, height, [tr, tg, tb]);
   const out = new Uint8Array(rgba);
-  const seen = new Uint8Array(width * height);
-  const stack: number[] = [];
-  const push = (pixel: number) => {
-    if (seen[pixel] === 1 || !near(pixel)) return;
-    seen[pixel] = 1;
-    stack.push(pixel);
-  };
-  for (let x = 0; x < width; x += 1) { push(x); push((height - 1) * width + x); }
-  for (let y = 0; y < height; y += 1) { push(y * width); push(y * width + width - 1); }
-  let punched = 0;
-  while (stack.length > 0) {
-    const pixel = stack.pop() ?? 0;
-    out[pixel * 4 + 3] = 0;
-    punched += 1;
-    const x = pixel % width;
-    if (x > 0) push(pixel - 1);
-    if (x < width - 1) push(pixel + 1);
-    if (pixel >= width) push(pixel - width);
-    if (pixel < (height - 1) * width) push(pixel + width);
-  }
+  for (let pixel = 0; pixel < seen.length; pixel += 1) if (seen[pixel] === 1) out[pixel * 4 + 3] = 0;
   if (punched === width * height) return { rgba, borderIsSubject: false };
-  if (!leavesVisibleSubject(rgba, seen)) return { rgba, borderIsSubject: true };
+  if (borderIsSubject(rgba, width, height, [tr, tg, tb], seen, punched)) return { rgba, borderIsSubject: true };
   // Peel the halo: halo-coloured pixels within haloReach (about one source pixel) of the punched backdrop. The reach
   // keeps real light content that merely touches the backdrop, such as a pale fill behind a broken outline.
   if (halo.size > 0) {
@@ -302,22 +279,6 @@ function punchBackdrop(rgba: Uint8Array, width: number, height: number, sourceBo
     }
   }
   return { rgba: out, borderIsSubject: false };
-}
-
-/**
- * Whether punching the `seen` backdrop leaves something to see on the white artboard Vec's output is placed on: an
- * opaque pixel that is not near white (BACKDROP_TOLERANCE, the tolerance the backdrop itself is matched with). A
- * full-bleed mark (si-javascript: a yellow square to every edge, its letters white or cut out) has no other border
- * colour, so its own ink looked like the backdrop; dropping it left white letters only (white raster) or no opaque
- * pixel at all (alpha raster, where VTracer then divided by zero on an empty plate). Then the border colour is the
- * subject and is kept.
- */
-function leavesVisibleSubject(rgba: Uint8Array, seen: Uint8Array): boolean {
-  for (let pixel = 0; pixel < seen.length; pixel += 1) {
-    if (seen[pixel] === 1 || (rgba[pixel * 4 + 3] ?? 0) < 250) continue;
-    if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
-  }
-  return false;
 }
 
 /**
