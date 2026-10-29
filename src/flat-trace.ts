@@ -310,7 +310,8 @@ export function labelImage(
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
-  const colors = fillColors(rgba, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
+  const filled = fillColors(rgba, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
+  const colors = shareTracerLayers(filled, source, alpha, core, labels, width, height);
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
   return painted;
@@ -363,7 +364,8 @@ async function labelImageAsync(
   onProgress(0.26);
   const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
-  const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
+  const filled = fillColors(rgba, alpha, core, labels, width, height, centers);
+  const colors = shareTracerLayers(filled, source, alpha, core, labels, width, height);
   onProgress(0.94);
   const painted = await paintLabelsAsync(labels, colors, width * UP, height * UP, context, (fraction) => onProgress(0.94 + fraction * 0.06));
   onProgress(1);
@@ -1450,6 +1452,56 @@ function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, label
     if (bin === undefined || bin.n <= 4) return oklabToRgb(center);
     return { r: channelFill(bin.counts, 0, bin.n), g: channelFill(bin.counts, 256, bin.n), b: channelFill(bin.counts, 512, bin.n) };
   });
+}
+
+/**
+ * The tracer's colour tolerance: two flat regions whose colours differ by at most its layer difference (vtracer's poster
+ * preset: 16, summed over R, G and B; on two flat squares, 16 apart trace as one and 17 apart as two) are one layer to
+ * it. Before fills were read from the raw input, the inks a JPEG's noise split in two were filled from the cleaned
+ * pixels' mean and mostly landed within that tolerance. The raw medians sit further apart (chroma bleed keeps its offset
+ * through a median, and a clamped channel moves to 0 or 255), so the split ink traced as islands of two colours:
+ * gl-react-256-q60 went from 4 paths to 25. A label whose mean is within the tolerance of a larger label's mean is the
+ * same ink to the tracer, so it takes that label's fill.
+ */
+export const TRACER_LAYER_DIFFERENCE = 16;
+
+export function shareTracerLayers(fills: readonly RGB[], source: Uint8Array, alpha: Uint8Array, core: Uint8Array, labels: Uint8Array, width: number, height: number): RGB[] {
+  const sums = fills.map(() => [0, 0, 0, 0]);
+  const upW = width * UP;
+  const mid = UP >> 1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (alpha[index] === 0 || core[index] !== 1) continue;
+      const sum = sums[labels[(y * UP + mid) * upW + x * UP + mid] ?? 255];
+      if (sum === undefined) continue;
+      const offset = index * 4;
+      sum[0] = (sum[0] ?? 0) + (source[offset] ?? 0);
+      sum[1] = (sum[1] ?? 0) + (source[offset + 1] ?? 0);
+      sum[2] = (sum[2] ?? 0) + (source[offset + 2] ?? 0);
+      sum[3] = (sum[3] ?? 0) + 1;
+    }
+  }
+  const means = sums.map((sum) => {
+    const n = sum[3] ?? 0;
+    return n > 4 ? [Math.round((sum[0] ?? 0) / n), Math.round((sum[1] ?? 0) / n), Math.round((sum[2] ?? 0) / n)] : null;
+  });
+  const order = fills.map((_, index) => index).sort((left, right) => (sums[right]?.[3] ?? 0) - (sums[left]?.[3] ?? 0) || left - right);
+  const shared = [...fills];
+  const kept: number[] = [];
+  for (const label of order) {
+    const mean = means[label];
+    if (mean === null || mean === undefined) continue;
+    let owner = -1, closest = TRACER_LAYER_DIFFERENCE + 1;
+    for (const other of kept) {
+      const theirs = means[other]!;
+      const difference = Math.abs(mean[0]! - theirs[0]!) + Math.abs(mean[1]! - theirs[1]!) + Math.abs(mean[2]! - theirs[2]!);
+      if (difference < closest) { closest = difference; owner = other; }
+    }
+    if (owner < 0) kept.push(label);
+    else shared[label] = shared[owner]!;
+  }
+  return shared;
 }
 
 function channelFill(counts: Uint32Array, base: number, n: number): number {

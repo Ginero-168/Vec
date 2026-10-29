@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cornerColor, foldThinMixes, hasClearPixel, labelImage, subjectBoxes } from "./flat-trace.ts";
+import { cornerColor, foldThinMixes, hasClearPixel, labelImage, shareTracerLayers, subjectBoxes } from "./flat-trace.ts";
 import { mergePlates } from "./trace-finish.ts";
 import { lossyCleanup, mergeNearCenters } from "./jpeg-clean.ts";
 import { rgbToOklab } from "./color.ts";
@@ -672,4 +672,23 @@ test("a clean anti-aliased disc keeps its area on the plate", () => {
   const area = cells / 64;
   const expected = Math.PI * radius * radius;
   assert.ok(Math.abs(area - expected) / expected < 0.01, `plate area ${area.toFixed(2)} vs ${expected.toFixed(2)}`);
+});
+
+test("on a cleaned lossy raster, a label the tracer would have grouped by its cleaned mean takes the larger label's fill", () => {
+  // Columns (UP = 8): three of label 0, one of label 1 (cleaned mean within 16 of label 0's), one of label 2 (white).
+  const width = 5, up = 8;
+  const pixel = [[2, 215, 255], [2, 215, 255], [2, 215, 255], [4, 219, 248], [255, 255, 255]];
+  const source = new Uint8Array(pixel.flatMap(([r, g, b]) => [r!, g!, b!, 255]));
+  const labels = new Uint8Array(width * up * up);
+  const owner = [0, 0, 0, 1, 2];
+  for (let y = 0; y < up; y += 1) for (let x = 0; x < width * up; x += 1) labels[y * width * up + x] = owner[Math.floor(x / up)]!;
+  const fills = [{ r: 2, g: 215, b: 255 }, { r: 0, g: 221, b: 243 }, { r: 255, g: 255, b: 255 }];
+  // Each label needs more than 4 core pixels to have a mean; repeat the row.
+  const tall = 5, rows = new Uint8Array(width * tall * 4), alphaT = new Uint8Array(width * tall).fill(255), coreT = new Uint8Array(width * tall).fill(1);
+  for (let y = 0; y < tall; y += 1) rows.set(source, y * width * 4);
+  const labelsT = new Uint8Array(width * up * tall * up);
+  for (let y = 0; y < tall * up; y += 1) labelsT.set(labels.subarray(0, width * up), y * width * up);
+  const shared = shareTracerLayers(fills, rows, alphaT, coreT, labelsT, width, tall);
+  assert.deepEqual(shared[1], fills[0]);
+  assert.deepEqual(shared[2], fills[2]);
 });
