@@ -506,6 +506,25 @@ test("a lossy edge splits a half-covered pixel at its sRGB midpoint, not the OKL
   assert.ok(Math.abs(clean - 16.5) < 1 / 16, `clean edge at ${clean}`);
 });
 
+test("a mix label is solid exactly when it holds a 2 UP + 1 square, wherever that square sits", () => {
+  // The ring test asks whether any part of the label survives an erosion by a (2 UP + 1)-sided square (UP = 8). A
+  // block of 17 x 17 sub-pixels does, one of 17 x 16 or 16 x 17 does not, also when it touches the frame or sits in
+  // a label spread over the whole map.
+  const width = 96, height = 64;
+  const centers = [{ r: 54, g: 197, b: 240 }, { r: 80, g: 204, b: 242 }, { r: 255, g: 255, b: 255 }];
+  for (const [x0, y0, w, h, solid] of [[40, 20, 17, 17, true], [40, 20, 17, 16, false], [40, 20, 16, 17, false], [79, 47, 17, 17, true], [79, 48, 17, 16, false]] as const) {
+    const labels = new Uint8Array(width * height);
+    for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+      const inBlock = x >= x0 && x < x0 + w && y >= y0 && y < y0 + h;
+      // Scattered one-sub-pixel specks of the mix far from the block stretch its bounding box over the whole map.
+      labels[y * width + x] = inBlock || (x === 2 && y === 2) || (x === 2 && y === 60) ? 1 : x < 24 ? 0 : 2;
+    }
+    const kept = labels.slice();
+    foldThinMixes(kept, width, height, centers, 3, (x) => (x < 24 ? 0 : 2));
+    assert.equal(kept.includes(1), solid, `${w} x ${h} at ${x0},${y0}`);
+  }
+});
+
 test("a pale anti-aliasing ring folds into its two ends; a real colour that is a mix stays", () => {
   // Sub-pixel labels (UP = 8 per source pixel) of cyan | pale mix | white, as gl-slack-256-white's #36C5F0 / #50CCF2 /
   // white. A pale band 2 source px (16 sub-pixels) wide and nowhere wider is anti-aliasing and is split between its

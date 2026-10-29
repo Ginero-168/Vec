@@ -1042,20 +1042,57 @@ function flatten(subpaths: readonly Subpath[]): Point[][] {
   return subpaths.map((subpath) => subpath.cubics.flatMap((cubic) => [0, 1, 2, 3, 4, 5, 6, 7].map((step) => bezier(cubic, step / 8))));
 }
 
-/** Nonzero-rule fill test against flattened subpaths. */
+/**
+ * Nonzero-rule fill test against flattened subpaths. Only edges whose y-span holds y can cross the scanline, and
+ * only edges right of x count, so each ring keeps its edges bucketed by y (ringIndex) and is skipped whole when y
+ * is outside its span or x is right of it: the same crossings as walking every edge.
+ */
 function insideFlat(rings: readonly Point[][], x: number, y: number): boolean {
   let winding = 0;
   for (const points of rings) {
-    for (let index = 0; index < points.length; index += 1) {
-      const a = points[index];
-      const b = points[(index + 1) % points.length];
-      if (a === undefined || b === undefined) continue;
+    const index = ringIndex(points);
+    if (!(y >= index.minY && y < index.maxY) || x > index.maxX) continue;
+    const band = index.bands[Math.min(index.bands.length - 1, Math.floor((y - index.minY) / index.step))]!;
+    for (const edge of band) {
+      const a = points[edge]!;
+      const b = points[(edge + 1) % points.length]!;
       const side = (b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y);
       if (a.y <= y && b.y > y && side > 0) winding += 1;
       else if (a.y > y && b.y <= y && side < 0) winding -= 1;
     }
   }
   return winding !== 0;
+}
+
+type RingIndex = { readonly minY: number; readonly maxY: number; readonly maxX: number; readonly step: number; readonly bands: readonly number[][] };
+
+const ringIndexes = new WeakMap<readonly Point[], RingIndex>();
+
+function ringIndex(points: readonly Point[]): RingIndex {
+  const known = ringIndexes.get(points);
+  if (known !== undefined) return known;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let maxX = -Infinity;
+  for (const point of points) {
+    if (point.y < minY) minY = point.y;
+    if (point.y > maxY) maxY = point.y;
+    if (point.x > maxX) maxX = point.x;
+  }
+  // About sqrt(n) bands keeps both the build (each edge spans few bands) and each query short.
+  const count = Math.max(1, Math.ceil(Math.sqrt(points.length)));
+  const step = maxY > minY ? (maxY - minY) / count : 1;
+  const bands: number[][] = Array.from({ length: count }, () => []);
+  for (let edge = 0; edge < points.length; edge += 1) {
+    const a = points[edge]!;
+    const b = points[(edge + 1) % points.length]!;
+    const low = Math.min(count - 1, Math.floor((Math.min(a.y, b.y) - minY) / step));
+    const high = Math.min(count - 1, Math.floor((Math.max(a.y, b.y) - minY) / step));
+    for (let band = low; band <= high; band += 1) bands[band]!.push(edge);
+  }
+  const index = { minY, maxY, maxX, step, bands };
+  ringIndexes.set(points, index);
+  return index;
 }
 
 function sharpenSubpath(subpath: Subpath, fillet: number, minTurn: number, curl: number, check: ((cap: readonly Point[]) => boolean) | null): Subpath {

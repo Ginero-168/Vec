@@ -1219,43 +1219,49 @@ function ringEnds(centers: readonly RGB[], label: number, solid: readonly boolea
  * separate pale layer along every light ink (gl-slack-256-white's #50CCF2, si-mcdonalds-128-white).
  */
 export function foldThinMixes(labels: Uint8Array, width: number, height: number, centers: readonly RGB[], sampled: number, split: (x: number, y: number, ends: readonly number[]) => number): void {
-  const masks = centers.map((_, label) => {
-    const mine = new Uint8Array(labels.length);
-    for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mine[index] = 1;
-    return mine;
-  });
-  const present = masks.map((mine) => mine.includes(1));
-  const solid = masks.map((mine, label) => present[label] === true && (label >= sampled || squareFilter(mine, width, height, UP, true).includes(1)));
-  const rings = masks.flatMap((mine, label) => {
-    if (!present[label] || solid[label]) return [];
-    const ends = ringEnds(centers, label, solid);
-    return ends === null ? [] : [{ ends, mine }];
-  });
-  for (const { ends, mine } of rings) {
-    for (let index = 0; index < labels.length; index += 1) {
-      if (mine[index] === 1) labels[index] = ends.length === 1 ? ends[0]! : split(index % width, Math.floor(index / width), ends);
+  // One pass for each label's bounding box; a label narrower or shorter than the square cannot contain it.
+  const count = centers.length;
+  const minX = new Int32Array(count).fill(width), minY = new Int32Array(count).fill(height);
+  const maxX = new Int32Array(count).fill(-1), maxY = new Int32Array(count).fill(-1);
+  for (let y = 0, index = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1, index += 1) {
+      const label = labels[index]!;
+      if (label >= count) continue;
+      if (x < minX[label]!) minX[label] = x;
+      if (x > maxX[label]!) maxX[label] = x;
+      if (y < minY[label]!) minY[label] = y;
+      if (y > maxY[label]!) maxY[label] = y;
     }
+  }
+  const side = 2 * UP + 1;
+  const present = centers.map((_, label) => maxX[label]! >= 0);
+  const solid = centers.map((_, label) => present[label] === true && (label >= sampled || containsSquare(labels, width, label, minX[label]!, minY[label]!, maxX[label]!, maxY[label]!, side)));
+  const ringOf: (readonly number[] | null)[] = centers.map((_, label) => (!present[label] || solid[label] ? null : ringEnds(centers, label, solid)));
+  if (!ringOf.some((ends) => ends !== null)) return;
+  for (let index = 0; index < labels.length; index += 1) {
+    const ends = ringOf[labels[index]!];
+    if (ends === null || ends === undefined) continue;
+    labels[index] = ends.length === 1 ? ends[0]! : split(index % width, Math.floor(index / width), ends);
   }
 }
 
-/** Separable square erosion (all set within `radius`) or dilation (any set), by row then column prefix counts. Cells
- * beyond the image count as unset, so a one-pixel anti-aliased column along the frame is thin as well. */
-function squareFilter(mask: Uint8Array, width: number, height: number, radius: number, erode: boolean): Uint8Array {
-  const pass = (input: Uint8Array, length: number, lines: number, at: (line: number, step: number) => number): Uint8Array => {
-    const output = new Uint8Array(input.length);
-    const prefix = new Int32Array(length + 1);
-    for (let line = 0; line < lines; line += 1) {
-      for (let step = 0; step < length; step += 1) prefix[step + 1] = prefix[step]! + input[at(line, step)]!;
-      for (let step = 0; step < length; step += 1) {
-        const low = Math.max(0, step - radius), high = Math.min(length - 1, step + radius);
-        const set = prefix[high + 1]! - prefix[low]!;
-        output[at(line, step)] = erode ? (set === 2 * radius + 1 ? 1 : 0) : (set > 0 ? 1 : 0);
-      }
+/** Whether `label` holds a side x side square of sub-pixels inside its bounding box (an erosion by it leaves a cell). */
+function containsSquare(labels: Uint8Array, width: number, label: number, x0: number, y0: number, x1: number, y1: number, side: number): boolean {
+  if (x1 - x0 + 1 < side || y1 - y0 + 1 < side) return false;
+  const span = x1 - x0 + 1;
+  const column = new Int32Array(span);
+  for (let y = y0; y <= y1; y += 1) {
+    let run = 0;
+    const row = y * width;
+    for (let x = x0; x <= x1; x += 1) {
+      run = labels[row + x] === label ? run + 1 : 0;
+      const at = x - x0;
+      // column[at]: consecutive rows, ending here, whose horizontal run ending at x is at least `side`.
+      column[at] = run >= side ? column[at]! + 1 : 0;
+      if (column[at]! >= side) return true;
     }
-    return output;
-  };
-  const rows = pass(mask, width, height, (line, step) => line * width + step);
-  return pass(rows, height, width, (line, step) => step * width + line);
+  }
+  return false;
 }
 
 // `sampled`: how many leading centres buildPalette took from flat core pixels; the rest are recovered thin strokes.
