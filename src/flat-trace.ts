@@ -1942,6 +1942,7 @@ function fineSmooth(labels: Uint8Array, width: number, height: number, kCount: n
 type LabelRuns = { readonly first: Int32Array; readonly start: Int32Array; readonly end: Int32Array; readonly label: Uint8Array };
 
 function labelRuns(labels: Uint8Array, width: number, height: number): LabelRuns {
+  const words = labels.byteOffset % 4 === 0 ? new Uint32Array(labels.buffer, labels.byteOffset, labels.length >> 2) : null;
   const first = new Int32Array(height + 1);
   let start = new Int32Array(Math.max(16, height * 4)), end = new Int32Array(start.length), label = new Uint8Array(start.length);
   let count = 0;
@@ -1950,7 +1951,16 @@ function labelRuns(labels: Uint8Array, width: number, height: number): LabelRuns
     const row = y * width;
     let from = 0;
     for (let x = 1; x <= width; x += 1) {
-      if (x < width && labels[row + x] === labels[row + from]) continue;
+      if (x < width && labels[row + x] === labels[row + from]) {
+        // Four equal labels at once where the row is word-aligned (a word of four copies of this run's label).
+        if (words !== null && ((row + x) & 3) === 0) {
+          const repeated = labels[row + from]! * 0x01010101;
+          let next = x;
+          while (next + 4 <= width && words[(row + next) >> 2] === repeated) next += 4;
+          if (next > x) x = next - 1;
+        }
+        continue;
+      }
       if (count === start.length) {
         const grow = (array: Int32Array) => { const next = new Int32Array(array.length * 2); next.set(array); return next; };
         start = grow(start);
@@ -1992,14 +2002,16 @@ function squareOpening(runs: LabelRuns, width: number, height: number, radius: n
     for (let yy = y - radius + 1; yy <= y + radius && common.length > 0; yy += 1) common = intersectLabelled(common, eroded[yy]!);
     centres.push(common);
   }
+  const across = centres.map((centre) => {
+    const pieces: number[] = [];
+    for (let at = 0; at < centre.length; at += 3) pieces.push(Math.max(0, centre[at]! - radius), Math.min(width, centre[at + 1]! + radius));
+    return unionSorted(pieces, []);
+  });
   const wide: number[][] = [];
   for (let y = 0; y < height; y += 1) {
-    const pieces: number[] = [];
-    for (let yy = Math.max(0, y - radius); yy <= Math.min(height - 1, y + radius); yy += 1) {
-      const centre = centres[yy]!;
-      for (let at = 0; at < centre.length; at += 3) pieces.push(Math.max(0, centre[at]! - radius), Math.min(width, centre[at + 1]! + radius));
-    }
-    wide.push(mergeIntervals(pieces));
+    let union: number[] = [];
+    for (let yy = Math.max(0, y - radius); yy <= Math.min(height - 1, y + radius); yy += 1) if (across[yy]!.length > 0) union = unionSorted(union, across[yy]!);
+    wide.push(union);
   }
   return wide;
 }
@@ -2017,15 +2029,15 @@ function intersectLabelled(left: readonly number[], right: readonly number[]): n
   return out;
 }
 
-/** Sorted, merged union of intervals [s, e, ...]; touching intervals join. */
-function mergeIntervals(pieces: readonly number[]): number[] {
-  const order: number[] = [];
-  for (let at = 0; at < pieces.length; at += 2) order.push(at);
-  order.sort((a, b) => pieces[a]! - pieces[b]!);
+/** The merged union of two interval lists [s, e, ...], each sorted by start (overlaps allowed); touching intervals join. */
+function unionSorted(left: readonly number[], right: readonly number[]): number[] {
   const out: number[] = [];
-  for (const at of order) {
-    const from = pieces[at]!, to = pieces[at + 1]!;
-    if (out.length > 0 && from <= out[out.length - 1]!) out[out.length - 1] = Math.max(out[out.length - 1]!, to);
+  let i = 0, j = 0;
+  while (i < left.length || j < right.length) {
+    let from: number, to: number;
+    if (j >= right.length || (i < left.length && left[i]! <= right[j]!)) { from = left[i]!; to = left[i + 1]!; i += 2; }
+    else { from = right[j]!; to = right[j + 1]!; j += 2; }
+    if (out.length > 0 && from <= out[out.length - 1]!) { if (to > out[out.length - 1]!) out[out.length - 1] = to; }
     else out.push(from, to);
   }
   return out;
@@ -2046,9 +2058,10 @@ function covers(row: readonly number[], from: number, to: number): boolean {
 
 /** Row y's sub-pixels with an 8-neighbour of another label, as sorted, merged intervals. */
 function edgeBand(runs: LabelRuns, y: number, width: number, height: number): number[] {
-  const pieces: number[] = [];
   const first = runs.first[y]!, last = runs.first[y + 1]!;
-  for (let run = first + 1; run < last; run += 1) pieces.push(runs.start[run]! - 1, runs.start[run]! + 1);
+  const boundaries: number[] = [];
+  for (let run = first + 1; run < last; run += 1) boundaries.push(runs.start[run]! - 1, runs.start[run]! + 1);
+  let band = unionSorted(boundaries, []);
   for (const other of [y - 1, y + 1]) {
     if (other < 0 || other >= height) continue;
     // Where all of x-1..x+1 in the other row lie in one run of this pixel's label; the band is the rest.
@@ -2065,14 +2078,16 @@ function edgeBand(runs: LabelRuns, y: number, width: number, height: number): nu
         if (s < e) same.push(s, e);
       }
     }
+    const rest: number[] = [];
     let at = 0;
     for (let k = 0; k < same.length; k += 2) {
-      if (same[k]! > at) pieces.push(at, same[k]!);
+      if (same[k]! > at) rest.push(at, same[k]!);
       at = same[k + 1]!;
     }
-    if (at < width) pieces.push(at, width);
+    if (at < width) rest.push(at, width);
+    band = unionSorted(band, rest);
   }
-  return mergeIntervals(pieces);
+  return band;
 }
 
 /**
@@ -2111,6 +2126,8 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
   });
   const scored = new Int32Array(height).fill(-1);
   const scores = new Float64Array(height * channels);
+  // The one channel a row's scores hold (-1: several); adding the others' zero scores leaves the sums as they are.
+  const single = new Int32Array(height);
   const xs = new Int32Array(taps);
   const ys = new Int32Array(taps);
   const sums = new Float64Array(channels);
@@ -2122,7 +2139,8 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
       column = x;
       for (let tap = 0; tap < taps; tap += 1) xs[tap] = reflect101(x + tap - radius, width);
     }
-    for (let tap = 0; tap < taps; tap += 1) ys[tap] = reflect101(y + tap - radius, height);
+    if (y >= radius && y + radius < height) for (let tap = 0; tap < taps; tap += 1) ys[tap] = y + tap - radius;
+    else for (let tap = 0; tap < taps; tap += 1) ys[tap] = reflect101(y + tap - radius, height);
     sums.fill(0);
     for (let tap = 0; tap < taps; tap += 1) {
       const sampleY = ys[tap]!;
@@ -2134,7 +2152,9 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
         if (runs.start[run]! <= x - radius && x + radius < runs.end[run]!) {
           const channel = runs.label[run]! < kCount ? slots[runs.label[run]!]! : -1;
           if (channel >= 0) scores[offset + channel] = whole;
+          single[sampleY] = channel >= 0 ? channel : -2;
         } else {
+          single[sampleY] = -1;
           const base = sampleY * width;
           for (let along = 0; along < taps; along += 1) {
             const label = labels[base + xs[along]!]!;
@@ -2145,7 +2165,9 @@ function fineVotes(labels: Uint8Array, runs: LabelRuns, width: number, height: n
         }
       }
       const weight = kernel[tap]!;
-      for (let channel = 0; channel < channels; channel += 1) sums[channel] = sums[channel]! + scores[offset + channel]! * weight;
+      const only = single[sampleY]!;
+      if (only >= 0) sums[only] = sums[only]! + scores[offset + only]! * weight;
+      else if (only === -1) for (let channel = 0; channel < channels; channel += 1) sums[channel] = sums[channel]! + scores[offset + channel]! * weight;
     }
     let winner = activeLabels[0]!, best = -1;
     for (let channel = 0; channel < channels; channel += 1) {
@@ -2221,6 +2243,7 @@ function smoothLabels(labels: Uint8Array, width: number, height: number, kCount:
  */
 function fillUnlabelled(labels: Uint8Array, width: number, height: number): void {
   // Only labelled sub-pixels beside an unlabelled one can reach any; seeded in index order, the fill is the same.
+  if (labels.indexOf(255) < 0) return;
   let labelled = false, unlabelled = 0;
   for (let index = 0; index < labels.length; index += 1) {
     if (labels[index] === 255) unlabelled += 1;
