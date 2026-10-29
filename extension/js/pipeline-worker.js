@@ -557,7 +557,7 @@ function labelImage(rgba, width, height, maxColors, preprocess = identityRaster,
   const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
   const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-  const edges = source !== rgba ? lossyEdges(source, count, centers) : void 0;
+  const edges = edgeRule(rgba, source, width, height, centers);
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
   const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -656,7 +656,7 @@ function assignLabels(linear, lab, core, alpha, opacity, width, height, centers,
     }
   }
   cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
-  smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
+  if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
   cutTransparent(labels, opacity, width, height);
   onProgress?.(1);
   return labels;
@@ -949,14 +949,23 @@ function nearestCoreLabel(coreLabel, width, height, onProgress) {
   return nearest2;
 }
 var LOSSY_SRGB_WEIGHT = 0.5;
-function lossyEdges(source, count, centers) {
+function edgeRule(rgba, source, width, height, centers) {
+  if (source !== rgba) return lossyEdges(source, width * height, centers);
+  if (wouldDenoise(rgba, width, height)) return void 0;
+  for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return void 0;
+  return lossyEdges(source, width * height, centers, 1);
+}
+function smoothsLabels(edges) {
+  return edges === void 0 || edges.weight !== 1;
+}
+function lossyEdges(source, count, centers, weight = LOSSY_SRGB_WEIGHT) {
   const srgb = new Float64Array(count * 3);
   for (let index = 0; index < count; index += 1) {
     srgb[index * 3] = source[index * 4] ?? 0;
     srgb[index * 3 + 1] = source[index * 4 + 1] ?? 0;
     srgb[index * 3 + 2] = source[index * 4 + 2] ?? 0;
   }
-  return { srgb, centers: centers.map((center) => oklabToRgb(center)) };
+  return { srgb, centers: centers.map((center) => oklabToRgb(center)), weight };
 }
 function explainLossy(edges, width, table, x, y, bits, centers) {
   const xOffset = x * 4;
@@ -982,7 +991,7 @@ function explainLossy(edges, width, table, x, y, bits, centers) {
     const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
     const length = dr * dr + dg * dg + db * db;
     const srgb = length === 0 ? oklab : ((rgb.r - from.r) * dr + (rgb.g - from.g) * dg + (rgb.b - from.b) * db) / length;
-    return LOSSY_SRGB_WEIGHT * srgb + (1 - LOSSY_SRGB_WEIGHT) * oklab;
+    return edges.weight * srgb + (1 - edges.weight) * oklab;
   });
 }
 function explain(sample, bits, centers, mix) {
@@ -2944,6 +2953,20 @@ function punchBorderBackdrop(rgba, width, height, sourceBorder, haloReach = 8) {
   if (halo.size > 0) {
     let frontier = [];
     for (let pixel = 0; pixel < width * height; pixel += 1) if (seen[pixel] === 1) frontier.push(pixel);
+    const fromFrame = (pixel) => {
+      if (seen[pixel] === 1 || !isHalo(pixel)) return;
+      seen[pixel] = 1;
+      out[pixel * 4 + 3] = 0;
+      frontier.push(pixel);
+    };
+    for (let x = 0; x < width; x += 1) {
+      fromFrame(x);
+      fromFrame((height - 1) * width + x);
+    }
+    for (let y = 0; y < height; y += 1) {
+      fromFrame(y * width);
+      fromFrame(y * width + width - 1);
+    }
     for (let depth = 0; depth < haloReach && frontier.length > 0; depth += 1) {
       const next = [];
       for (const pixel of frontier) {

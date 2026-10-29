@@ -2143,7 +2143,7 @@
     let cursor = 0;
     for (const [index, tag] of tags.entries()) {
       result += svg.slice(cursor, tag.index);
-      result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
+      result += fittedMarkup(tag, canvas, touching[index] === true && touchCount === 1) ?? tag.source;
       cursor = tag.index + tag.length;
     }
     return result + svg.slice(cursor);
@@ -2191,7 +2191,7 @@
       return "<" + name + attrs + ' stroke="' + fill.replace(/"/g, "") + '" stroke-width="' + String(width) + '" stroke-linejoin="round"' + (slash === "/" ? "/" : "") + ">";
     });
   }
-  function fittedMarkup(tag, canvas = null) {
+  function fittedMarkup(tag, canvas = null, grow = false) {
     if (elementName(tag.source) !== "path") return null;
     const attrs = tagAttrs(tag.source);
     const data = readAttr2(attrs, "d");
@@ -2204,7 +2204,7 @@
     if (rect !== null) return '<rect x="' + fmt2(rect.x) + '" y="' + fmt2(rect.y) + '" width="' + fmt2(rect.width) + '" height="' + fmt2(rect.height) + '"' + fillAttr + "/>";
     const round = fitRoundRect(measured);
     if (round !== null) return '<rect x="' + fmt2(round.x) + '" y="' + fmt2(round.y) + '" width="' + fmt2(round.width) + '" height="' + fmt2(round.height) + '" rx="' + fmt2(round.r) + '" ry="' + fmt2(round.r) + '"' + fillAttr + "/>";
-    const circle = fitCircle(measured, canvas);
+    const circle = fitCircle(measured, canvas, grow);
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
@@ -2276,7 +2276,7 @@
     }
     return arc && side ? maxError : null;
   }
-  function fitCircle(measured, canvas = null) {
+  function fitCircle(measured, canvas = null, grow = false) {
     const points = measured.samples;
     if (points.length < 8) return null;
     let sumX = 0;
@@ -2329,12 +2329,18 @@
       const edge = 0.05;
       const left = measured.minX <= canvas.x + edge, right = measured.maxX >= canvas.x + canvas.width - edge;
       const top = measured.minY <= canvas.y + edge, bottom = measured.maxY >= canvas.y + canvas.height - edge;
-      if (left && right) centreX = canvas.x + canvas.width / 2;
-      if (top && bottom) centreY = canvas.y + canvas.height / 2;
-      if (left) chosen = Math.max(chosen, centreX - canvas.x);
-      if (top) chosen = Math.max(chosen, centreY - canvas.y);
-      if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
-      if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+      const span = Math.min(left && right ? canvas.width / 2 : Infinity, top && bottom ? canvas.height / 2 : Infinity);
+      if (Number.isFinite(span) && Math.abs(chosen - span) <= 1) {
+        if (left && right) centreX = canvas.x + canvas.width / 2;
+        if (top && bottom) centreY = canvas.y + canvas.height / 2;
+        chosen = span;
+      }
+      if (grow) {
+        if (left) chosen = Math.max(chosen, centreX - canvas.x);
+        if (top) chosen = Math.max(chosen, centreY - canvas.y);
+        if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
+        if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+      }
     }
     return { cx: centreX, cy: centreY, r: chosen };
   }
@@ -4778,7 +4784,7 @@
     const userK = maxColors > 0 ? Math.min(K_MAX, Math.max(2, Math.round(maxColors))) : 0;
     const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK, (fraction) => onProgress?.(0.24 + fraction * 0.08)));
     const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
-    const edges = source !== rgba ? lossyEdges(source, count, centers) : void 0;
+    const edges = edgeRule(rgba, source, width, height, centers);
     const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
     const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
     const painted = paintLabels2(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
@@ -4821,7 +4827,7 @@
     const found = recoverThinColors(lab, alpha, core, width, height, buildPalette(lab, core, width, height, userK));
     const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
     onProgress(0.26);
-    const edges = source !== rgba ? lossyEdges(source, count, centers) : void 0;
+    const edges = edgeRule(rgba, source, width, height, centers);
     const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
     const colors = fillColors(source, alpha, core, labels, width, height, centers);
     onProgress(0.94);
@@ -4963,7 +4969,7 @@
       }
     }
     await cleanLabelsAsync(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), context, (fraction) => onProgress(0.43 + fraction * 0.2));
-    await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
+    if (smoothsLabels(edges)) await smoothLabelsAsync(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, context, (fraction) => onProgress(0.63 + fraction * 0.28));
     cutTransparent(labels, opacity, width, height);
     onProgress(1);
     return labels;
@@ -5303,7 +5309,7 @@
       }
     }
     cleanLabels(labels, upW, upH, kCount, Math.floor(SPECK_SOURCE * UP * UP), (fraction) => onProgress?.(0.77 + fraction * 0.09));
-    smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
+    if (smoothsLabels(edges)) smoothLabels(labels, upW, upH, kCount, SMOOTH_SOURCE * UP, (fraction) => onProgress?.(0.86 + fraction * 0.1));
     cutTransparent(labels, opacity, width, height);
     onProgress?.(1);
     return labels;
@@ -5596,14 +5602,23 @@
     return nearest2;
   }
   var LOSSY_SRGB_WEIGHT = 0.5;
-  function lossyEdges(source, count, centers) {
+  function edgeRule(rgba, source, width, height, centers) {
+    if (source !== rgba) return lossyEdges(source, width * height, centers);
+    if (wouldDenoise(rgba, width, height)) return void 0;
+    for (let index = 3; index < rgba.length; index += 4) if ((rgba[index] ?? 0) !== 255) return void 0;
+    return lossyEdges(source, width * height, centers, 1);
+  }
+  function smoothsLabels(edges) {
+    return edges === void 0 || edges.weight !== 1;
+  }
+  function lossyEdges(source, count, centers, weight = LOSSY_SRGB_WEIGHT) {
     const srgb = new Float64Array(count * 3);
     for (let index = 0; index < count; index += 1) {
       srgb[index * 3] = source[index * 4] ?? 0;
       srgb[index * 3 + 1] = source[index * 4 + 1] ?? 0;
       srgb[index * 3 + 2] = source[index * 4 + 2] ?? 0;
     }
-    return { srgb, centers: centers.map((center) => oklabToRgb(center)) };
+    return { srgb, centers: centers.map((center) => oklabToRgb(center)), weight };
   }
   function explainLossy(edges, width, table, x, y, bits, centers) {
     const xOffset = x * 4;
@@ -5629,7 +5644,7 @@
       const dr = to.r - from.r, dg = to.g - from.g, db = to.b - from.b;
       const length = dr * dr + dg * dg + db * db;
       const srgb = length === 0 ? oklab : ((rgb.r - from.r) * dr + (rgb.g - from.g) * dg + (rgb.b - from.b) * db) / length;
-      return LOSSY_SRGB_WEIGHT * srgb + (1 - LOSSY_SRGB_WEIGHT) * oklab;
+      return edges.weight * srgb + (1 - edges.weight) * oklab;
     });
   }
   function explain(sample, bits, centers, mix) {
@@ -7073,6 +7088,20 @@
     if (halo.size > 0) {
       let frontier = [];
       for (let pixel = 0; pixel < width * height; pixel += 1) if (seen[pixel] === 1) frontier.push(pixel);
+      const fromFrame = (pixel) => {
+        if (seen[pixel] === 1 || !isHalo(pixel)) return;
+        seen[pixel] = 1;
+        out[pixel * 4 + 3] = 0;
+        frontier.push(pixel);
+      };
+      for (let x = 0; x < width; x += 1) {
+        fromFrame(x);
+        fromFrame((height - 1) * width + x);
+      }
+      for (let y = 0; y < height; y += 1) {
+        fromFrame(y * width);
+        fromFrame(y * width + width - 1);
+      }
       for (let depth = 0; depth < haloReach && frontier.length > 0; depth += 1) {
         const next = [];
         for (const pixel of frontier) {

@@ -1148,7 +1148,7 @@
     let cursor = 0;
     for (const [index, tag] of tags.entries()) {
       result += svg2.slice(cursor, tag.index);
-      result += fittedMarkup(tag, touching[index] === true && touchCount === 1 ? canvas : null) ?? tag.source;
+      result += fittedMarkup(tag, canvas, touching[index] === true && touchCount === 1) ?? tag.source;
       cursor = tag.index + tag.length;
     }
     return result + svg2.slice(cursor);
@@ -1163,7 +1163,7 @@
       return "<" + name + attrs + ' stroke="' + fill.replace(/"/g, "") + '" stroke-width="' + String(width2) + '" stroke-linejoin="round"' + (slash === "/" ? "/" : "") + ">";
     });
   }
-  function fittedMarkup(tag, canvas = null) {
+  function fittedMarkup(tag, canvas = null, grow = false) {
     if (elementName(tag.source) !== "path") return null;
     const attrs = tagAttrs(tag.source);
     const data = readAttr(attrs, "d");
@@ -1176,7 +1176,7 @@
     if (rect !== null) return '<rect x="' + fmt2(rect.x) + '" y="' + fmt2(rect.y) + '" width="' + fmt2(rect.width) + '" height="' + fmt2(rect.height) + '"' + fillAttr + "/>";
     const round = fitRoundRect(measured);
     if (round !== null) return '<rect x="' + fmt2(round.x) + '" y="' + fmt2(round.y) + '" width="' + fmt2(round.width) + '" height="' + fmt2(round.height) + '" rx="' + fmt2(round.r) + '" ry="' + fmt2(round.r) + '"' + fillAttr + "/>";
-    const circle = fitCircle(measured, canvas);
+    const circle = fitCircle(measured, canvas, grow);
     if (circle !== null) return '<circle cx="' + fmt2(circle.cx) + '" cy="' + fmt2(circle.cy) + '" r="' + fmt2(circle.r) + '"' + fillAttr + "/>";
     const ellipse = fitEllipse(measured);
     if (ellipse !== null) return '<ellipse cx="' + fmt2(ellipse.cx) + '" cy="' + fmt2(ellipse.cy) + '" rx="' + fmt2(ellipse.rx) + '" ry="' + fmt2(ellipse.ry) + '"' + fillAttr + "/>";
@@ -1248,7 +1248,7 @@
     }
     return arc && side ? maxError : null;
   }
-  function fitCircle(measured, canvas = null) {
+  function fitCircle(measured, canvas = null, grow = false) {
     const points = measured.samples;
     if (points.length < 8) return null;
     let sumX = 0;
@@ -1301,12 +1301,18 @@
       const edge = 0.05;
       const left = measured.minX <= canvas.x + edge, right = measured.maxX >= canvas.x + canvas.width - edge;
       const top = measured.minY <= canvas.y + edge, bottom = measured.maxY >= canvas.y + canvas.height - edge;
-      if (left && right) centreX = canvas.x + canvas.width / 2;
-      if (top && bottom) centreY = canvas.y + canvas.height / 2;
-      if (left) chosen = Math.max(chosen, centreX - canvas.x);
-      if (top) chosen = Math.max(chosen, centreY - canvas.y);
-      if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
-      if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+      const span = Math.min(left && right ? canvas.width / 2 : Infinity, top && bottom ? canvas.height / 2 : Infinity);
+      if (Number.isFinite(span) && Math.abs(chosen - span) <= 1) {
+        if (left && right) centreX = canvas.x + canvas.width / 2;
+        if (top && bottom) centreY = canvas.y + canvas.height / 2;
+        chosen = span;
+      }
+      if (grow) {
+        if (left) chosen = Math.max(chosen, centreX - canvas.x);
+        if (top) chosen = Math.max(chosen, centreY - canvas.y);
+        if (right) chosen = Math.max(chosen, canvas.x + canvas.width - centreX);
+        if (bottom) chosen = Math.max(chosen, canvas.y + canvas.height - centreY);
+      }
     }
     return { cx: centreX, cy: centreY, r: chosen };
   }
