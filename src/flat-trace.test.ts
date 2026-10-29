@@ -264,6 +264,21 @@ test("a border colour that is not the artboard and fills most of the canvas is t
   assert.equal(punchBorderBackdrop(framed.rgba, 32, 32, "#2563eb", 8)[3], 0);
 });
 
+test("a full-bleed mark is one subject at any size", () => {
+  // From 300 px up the letters of si-javascript are enclosed by the yellow like separate logos on a backdrop, and each
+  // became its own plate with a box of yellow behind it; the rest of the square was lost (512 px white MAE 67).
+  const size = 320;
+  const image = fill(size, size, 247, 223, 30, 255);
+  paint(image, size, 60, 140, 60, 120, 255, 255, 255);
+  paint(image, size, 200, 140, 60, 120, 255, 255, 255);
+  assert.deepEqual(subjectBoxes(image.rgba, size, size), [{ x: 0, y: 0, width: size, height: size }]);
+  // Two marks on a white backdrop are still two subjects.
+  const apart = fill(size, size, 255, 255, 255, 255);
+  paint(apart, size, 60, 140, 60, 120, 247, 223, 30);
+  paint(apart, size, 200, 140, 60, 120, 247, 223, 30);
+  assert.equal(subjectBoxes(apart.rgba, size, size).length, 2);
+});
+
 test("the backdrop punch peels a halo where the subject runs into the canvas frame", () => {
   // A red subject runs off the left edge; its anti-aliased rim on the frame column is a light mix (a quarter red) with no
   // backdrop beside it except at its two ends (si-spotify's disc meets the frame the same way).

@@ -120,12 +120,16 @@ async function cooperate(context: CooperativeContext): Promise<void> {
 }
 
 export function subjectBoxes(rgba: Uint8Array, width: number, height: number, onProgress?: (fraction: number) => void): SubjectBox[] {
+  // The letters of a full-bleed mark are enclosed by its border colour like separate logos on a backdrop; split into
+  // per-letter plates, each kept its square of the mark's colour and the rest of the square was lost.
+  if (fullBleed(rgba, width, height)) return [{ x: 0, y: 0, width, height }];
   const found = enclosedBoxes(rgba, width, height, onProgress);
   if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
   return found;
 }
 
 async function subjectBoxesAsync(rgba: Uint8Array, width: number, height: number, context: CooperativeContext, onProgress: (fraction: number) => void): Promise<SubjectBox[]> {
+  if (fullBleed(rgba, width, height)) return [{ x: 0, y: 0, width, height }];
   const found = await enclosedBoxesAsync(rgba, width, height, context, onProgress);
   if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
   return found;
@@ -217,6 +221,15 @@ function leavesVisibleSubject(rgba: Uint8Array, seen: Uint8Array): boolean {
     if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
   }
   return false;
+}
+
+/** borderIsSubject on the source raster, before it is split into subjects: a full-bleed mark is one subject. */
+function fullBleed(rgba: Uint8Array, width: number, height: number): boolean {
+  const corner = cornerColor(rgba, width, height);
+  if (corner === null) return false;
+  const color = [parseInt(corner.slice(1, 3), 16), parseInt(corner.slice(3, 5), 16), parseInt(corner.slice(5, 7), 16)] as const;
+  const { seen, count } = floodBorder(rgba, width, height, color);
+  return count < width * height && borderIsSubject(rgba, width, height, color, seen, count);
 }
 
 /** Whether any pixel is (almost) fully transparent, i.e. the image is a cut-out rather than art on a backdrop. */
