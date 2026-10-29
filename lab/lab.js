@@ -1248,6 +1248,49 @@
     }
     return arc && side ? maxError : null;
   }
+  function cornerExcess(samples, radius) {
+    const points = samples.filter((point, index) => {
+      const prev = samples[(index - 1 + samples.length) % samples.length];
+      return Math.hypot(point.x - prev.x, point.y - prev.y) > 1e-6;
+    });
+    const count = points.length;
+    if (count < 3) return 0;
+    const along = [0];
+    for (let index = 1; index <= count; index += 1) {
+      const prev = points[index - 1], here = points[index % count];
+      along.push(along[index - 1] + Math.hypot(here.x - prev.x, here.y - prev.y));
+    }
+    const perimeter = along[count];
+    const chord2 = Math.min(radius * CORNER_CHORD, perimeter / 8);
+    const gap = Math.min(CORNER_GAP, perimeter / 8);
+    const at = (distance3) => {
+      const wrapped = (distance3 % perimeter + perimeter) % perimeter;
+      let low = 0, high = count;
+      while (high - low > 1) {
+        const mid = low + high >> 1;
+        if (along[mid] <= wrapped) low = mid;
+        else high = mid;
+      }
+      const from = points[low], to = points[(low + 1) % count];
+      const length = along[low + 1] - along[low];
+      const t = length > 0 ? (wrapped - along[low]) / length : 0;
+      return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+    };
+    const disc = (gap + chord2) / radius;
+    let worst = 0;
+    const steps = Math.max(count, Math.ceil(perimeter / 0.25));
+    for (let step = 0; step < steps; step += 1) {
+      const middle = step / steps * perimeter;
+      const inStart = at(middle - gap / 2 - chord2), inEnd = at(middle - gap / 2);
+      const outStart = at(middle + gap / 2), outEnd = at(middle + gap / 2 + chord2);
+      const inX = inEnd.x - inStart.x, inY = inEnd.y - inStart.y, outX = outEnd.x - outStart.x, outY = outEnd.y - outStart.y;
+      const turn = Math.abs(Math.atan2(inX * outY - inY * outX, inX * outX + inY * outY));
+      worst = Math.max(worst, turn - disc);
+    }
+    return worst;
+  }
+  var CORNER_GAP = 1;
+  var CORNER_CHORD = 0.5;
   function fitCircle(measured, canvas = null, grow = false) {
     const points = measured.samples;
     if (points.length < 8) return null;
@@ -1292,6 +1335,7 @@
     let maxError = 0;
     for (const point of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point.x - cx, point.y - cy) - radius));
     if (maxError > Math.max(1.25, radius * 0.04)) return null;
+    if (cornerExcess(points, radius) > (Math.PI / 2 - (CORNER_GAP + radius * CORNER_CHORD) / radius) / 2) return null;
     const expected = Math.PI * radius * radius;
     if (Math.abs(measured.area - expected) / expected > 0.12) return null;
     const areaRadius = Math.sqrt(measured.area / Math.PI);

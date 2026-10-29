@@ -953,16 +953,44 @@
   function insideFlat(rings, x, y) {
     let winding2 = 0;
     for (const points of rings) {
-      for (let index = 0; index < points.length; index += 1) {
-        const a = points[index];
-        const b = points[(index + 1) % points.length];
-        if (a === void 0 || b === void 0) continue;
+      const index = ringIndex(points);
+      if (!(y >= index.minY && y < index.maxY) || x > index.maxX) continue;
+      const band = index.bands[Math.min(index.bands.length - 1, Math.floor((y - index.minY) / index.step))];
+      for (const edge of band) {
+        const a = points[edge];
+        const b = points[(edge + 1) % points.length];
         const side = (b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y);
         if (a.y <= y && b.y > y && side > 0) winding2 += 1;
         else if (a.y > y && b.y <= y && side < 0) winding2 -= 1;
       }
     }
     return winding2 !== 0;
+  }
+  var ringIndexes = /* @__PURE__ */ new WeakMap();
+  function ringIndex(points) {
+    const known = ringIndexes.get(points);
+    if (known !== void 0) return known;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let maxX = -Infinity;
+    for (const point2 of points) {
+      if (point2.y < minY) minY = point2.y;
+      if (point2.y > maxY) maxY = point2.y;
+      if (point2.x > maxX) maxX = point2.x;
+    }
+    const count = Math.max(1, Math.ceil(Math.sqrt(points.length)));
+    const step = maxY > minY ? (maxY - minY) / count : 1;
+    const bands = Array.from({ length: count }, () => []);
+    for (let edge = 0; edge < points.length; edge += 1) {
+      const a = points[edge];
+      const b = points[(edge + 1) % points.length];
+      const low = Math.min(count - 1, Math.floor((Math.min(a.y, b.y) - minY) / step));
+      const high = Math.min(count - 1, Math.floor((Math.max(a.y, b.y) - minY) / step));
+      for (let band = low; band <= high; band += 1) bands[band].push(edge);
+    }
+    const index = { minY, maxY, maxX, step, bands };
+    ringIndexes.set(points, index);
+    return index;
   }
   function sharpenSubpath(subpath, fillet, minTurn, curl, check) {
     if (!subpath.closed || subpath.cubics.length < 4) return subpath;
@@ -2276,6 +2304,49 @@
     }
     return arc && side ? maxError : null;
   }
+  function cornerExcess(samples, radius) {
+    const points = samples.filter((point2, index) => {
+      const prev = samples[(index - 1 + samples.length) % samples.length];
+      return Math.hypot(point2.x - prev.x, point2.y - prev.y) > 1e-6;
+    });
+    const count = points.length;
+    if (count < 3) return 0;
+    const along = [0];
+    for (let index = 1; index <= count; index += 1) {
+      const prev = points[index - 1], here = points[index % count];
+      along.push(along[index - 1] + Math.hypot(here.x - prev.x, here.y - prev.y));
+    }
+    const perimeter = along[count];
+    const chord2 = Math.min(radius * CORNER_CHORD, perimeter / 8);
+    const gap = Math.min(CORNER_GAP, perimeter / 8);
+    const at = (distance3) => {
+      const wrapped = (distance3 % perimeter + perimeter) % perimeter;
+      let low = 0, high = count;
+      while (high - low > 1) {
+        const mid = low + high >> 1;
+        if (along[mid] <= wrapped) low = mid;
+        else high = mid;
+      }
+      const from = points[low], to = points[(low + 1) % count];
+      const length = along[low + 1] - along[low];
+      const t = length > 0 ? (wrapped - along[low]) / length : 0;
+      return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+    };
+    const disc = (gap + chord2) / radius;
+    let worst = 0;
+    const steps = Math.max(count, Math.ceil(perimeter / 0.25));
+    for (let step = 0; step < steps; step += 1) {
+      const middle = step / steps * perimeter;
+      const inStart = at(middle - gap / 2 - chord2), inEnd = at(middle - gap / 2);
+      const outStart = at(middle + gap / 2), outEnd = at(middle + gap / 2 + chord2);
+      const inX = inEnd.x - inStart.x, inY = inEnd.y - inStart.y, outX = outEnd.x - outStart.x, outY = outEnd.y - outStart.y;
+      const turn = Math.abs(Math.atan2(inX * outY - inY * outX, inX * outX + inY * outY));
+      worst = Math.max(worst, turn - disc);
+    }
+    return worst;
+  }
+  var CORNER_GAP = 1;
+  var CORNER_CHORD = 0.5;
   function fitCircle(measured, canvas = null, grow = false) {
     const points = measured.samples;
     if (points.length < 8) return null;
@@ -2320,6 +2391,7 @@
     let maxError = 0;
     for (const point2 of points) maxError = Math.max(maxError, Math.abs(Math.hypot(point2.x - cx, point2.y - cy) - radius));
     if (maxError > Math.max(1.25, radius * 0.04)) return null;
+    if (cornerExcess(points, radius) > (Math.PI / 2 - (CORNER_GAP + radius * CORNER_CHORD) / radius) / 2) return null;
     const expected = Math.PI * radius * radius;
     if (Math.abs(measured.area - expected) / expected > 0.12) return null;
     const areaRadius = Math.sqrt(measured.area / Math.PI);
@@ -4692,11 +4764,13 @@
     if (context.shouldCancel?.() === true) throw new Error("\u0E22\u0E01\u0E40\u0E25\u0E34\u0E01\u0E41\u0E25\u0E49\u0E27");
   }
   function subjectBoxes(rgba, width, height, onProgress) {
+    if (fullBleed(rgba, width, height)) return [{ x: 0, y: 0, width, height }];
     const found = enclosedBoxes(rgba, width, height, onProgress);
     if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
     return found;
   }
   async function subjectBoxesAsync(rgba, width, height, context, onProgress) {
+    if (fullBleed(rgba, width, height)) return [{ x: 0, y: 0, width, height }];
     const found = await enclosedBoxesAsync(rgba, width, height, context, onProgress);
     if (found.length <= 1) return [{ x: 0, y: 0, width, height }];
     return found;
@@ -4723,6 +4797,56 @@
       borderColor: cornerColor(crop, cropW, cropH),
       cutOut: hasClearPixel(crop)
     };
+  }
+  var BACKDROP_TOLERANCE = 24;
+  function floodBorder(rgba, width, height, color) {
+    const [tr, tg, tb] = color;
+    const near = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
+    const seen = new Uint8Array(width * height);
+    const stack = [];
+    const push = (pixel) => {
+      if (seen[pixel] === 1 || !near(pixel)) return;
+      seen[pixel] = 1;
+      stack.push(pixel);
+    };
+    for (let x = 0; x < width; x += 1) {
+      push(x);
+      push((height - 1) * width + x);
+    }
+    for (let y = 0; y < height; y += 1) {
+      push(y * width);
+      push(y * width + width - 1);
+    }
+    let count = 0;
+    while (stack.length > 0) {
+      const pixel = stack.pop() ?? 0;
+      count += 1;
+      const x = pixel % width;
+      if (x > 0) push(pixel - 1);
+      if (x < width - 1) push(pixel + 1);
+      if (pixel >= width) push(pixel - width);
+      if (pixel < (height - 1) * width) push(pixel + width);
+    }
+    return { seen, count };
+  }
+  function borderIsSubject(rgba, width, height, color, seen, count) {
+    if (!leavesVisibleSubject(rgba, seen)) return true;
+    const white = color.every((channel) => 255 - channel <= BACKDROP_TOLERANCE);
+    return !white && count * 2 > width * height;
+  }
+  function leavesVisibleSubject(rgba, seen) {
+    for (let pixel = 0; pixel < seen.length; pixel += 1) {
+      if (seen[pixel] === 1 || (rgba[pixel * 4 + 3] ?? 0) < 250) continue;
+      if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
+    }
+    return false;
+  }
+  function fullBleed(rgba, width, height) {
+    const corner = cornerColor(rgba, width, height);
+    if (corner === null) return false;
+    const color = [parseInt(corner.slice(1, 3), 16), parseInt(corner.slice(3, 5), 16), parseInt(corner.slice(5, 7), 16)];
+    const { seen, count } = floodBorder(rgba, width, height, color);
+    return count < width * height && borderIsSubject(rgba, width, height, color, seen, count);
   }
   function hasClearPixel(rgba) {
     for (let offset = 3; offset < rgba.length; offset += 4) if ((rgba[offset] ?? 0) <= CLEAR_OPACITY) return true;
@@ -5641,40 +5765,45 @@
     return ends;
   }
   function foldThinMixes(labels, width, height, centers, sampled, split) {
-    const masks = centers.map((_, label) => {
-      const mine = new Uint8Array(labels.length);
-      for (let index = 0; index < labels.length; index += 1) if (labels[index] === label) mine[index] = 1;
-      return mine;
-    });
-    const present = masks.map((mine) => mine.includes(1));
-    const solid = masks.map((mine, label) => present[label] === true && (label >= sampled || squareFilter(mine, width, height, UP, true).includes(1)));
-    const rings = masks.flatMap((mine, label) => {
-      if (!present[label] || solid[label]) return [];
-      const ends = ringEnds(centers, label, solid);
-      return ends === null ? [] : [{ ends, mine }];
-    });
-    for (const { ends, mine } of rings) {
-      for (let index = 0; index < labels.length; index += 1) {
-        if (mine[index] === 1) labels[index] = ends.length === 1 ? ends[0] : split(index % width, Math.floor(index / width), ends);
+    const count = centers.length;
+    const minX = new Int32Array(count).fill(width), minY = new Int32Array(count).fill(height);
+    const maxX = new Int32Array(count).fill(-1), maxY = new Int32Array(count).fill(-1);
+    for (let y = 0, index = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1, index += 1) {
+        const label = labels[index];
+        if (label >= count) continue;
+        if (x < minX[label]) minX[label] = x;
+        if (x > maxX[label]) maxX[label] = x;
+        if (y < minY[label]) minY[label] = y;
+        if (y > maxY[label]) maxY[label] = y;
       }
     }
+    const side = 2 * UP + 1;
+    const present = centers.map((_, label) => maxX[label] >= 0);
+    const solid = centers.map((_, label) => present[label] === true && (label >= sampled || containsSquare(labels, width, label, minX[label], minY[label], maxX[label], maxY[label], side)));
+    const ringOf = centers.map((_, label) => !present[label] || solid[label] ? null : ringEnds(centers, label, solid));
+    if (!ringOf.some((ends) => ends !== null)) return;
+    for (let index = 0; index < labels.length; index += 1) {
+      const ends = ringOf[labels[index]];
+      if (ends === null || ends === void 0) continue;
+      labels[index] = ends.length === 1 ? ends[0] : split(index % width, Math.floor(index / width), ends);
+    }
   }
-  function squareFilter(mask, width, height, radius, erode) {
-    const pass = (input, length, lines, at) => {
-      const output = new Uint8Array(input.length);
-      const prefix = new Int32Array(length + 1);
-      for (let line2 = 0; line2 < lines; line2 += 1) {
-        for (let step = 0; step < length; step += 1) prefix[step + 1] = prefix[step] + input[at(line2, step)];
-        for (let step = 0; step < length; step += 1) {
-          const low = Math.max(0, step - radius), high = Math.min(length - 1, step + radius);
-          const set = prefix[high + 1] - prefix[low];
-          output[at(line2, step)] = erode ? set === 2 * radius + 1 ? 1 : 0 : set > 0 ? 1 : 0;
-        }
+  function containsSquare(labels, width, label, x0, y0, x1, y1, side) {
+    if (x1 - x0 + 1 < side || y1 - y0 + 1 < side) return false;
+    const span = x1 - x0 + 1;
+    const column = new Int32Array(span);
+    for (let y = y0; y <= y1; y += 1) {
+      let run = 0;
+      const row = y * width;
+      for (let x = x0; x <= x1; x += 1) {
+        run = labels[row + x] === label ? run + 1 : 0;
+        const at = x - x0;
+        column[at] = run >= side ? column[at] + 1 : 0;
+        if (column[at] >= side) return true;
       }
-      return output;
-    };
-    const rows = pass(mask, width, height, (line2, step) => line2 * width + step);
-    return pass(rows, height, width, (line2, step) => step * width + line2);
+    }
+    return false;
   }
   function lossyEdges(source, count, centers, weight = LOSSY_SRGB_WEIGHT) {
     const srgb = new Float64Array(count * 3);
@@ -7115,7 +7244,6 @@
       ...rasterStages === void 0 ? {} : { rasterStages }
     };
   }
-  var BACKDROP_TOLERANCE = 24;
   var HALO_MIX = 0.35;
   var HALO_RESIDUAL = 16;
   function punchBackdrop(rgba, width, height, sourceBorder, haloReach) {
@@ -7124,37 +7252,12 @@
     if (corner === null) return { rgba, borderIsSubject: false };
     const tr = parseInt(corner.slice(1, 3), 16), tg = parseInt(corner.slice(3, 5), 16), tb = parseInt(corner.slice(5, 7), 16);
     const halo = haloColors(rgba, [tr, tg, tb]);
-    const near = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && Math.abs((rgba[pixel * 4] ?? 0) - tr) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 1] ?? 0) - tg) <= BACKDROP_TOLERANCE && Math.abs((rgba[pixel * 4 + 2] ?? 0) - tb) <= BACKDROP_TOLERANCE;
     const isHalo = (pixel) => (rgba[pixel * 4 + 3] ?? 0) >= 250 && halo.has((rgba[pixel * 4] ?? 0) << 16 | (rgba[pixel * 4 + 1] ?? 0) << 8 | (rgba[pixel * 4 + 2] ?? 0));
+    const { seen, count: punched } = floodBorder(rgba, width, height, [tr, tg, tb]);
     const out = new Uint8Array(rgba);
-    const seen = new Uint8Array(width * height);
-    const stack = [];
-    const push = (pixel) => {
-      if (seen[pixel] === 1 || !near(pixel)) return;
-      seen[pixel] = 1;
-      stack.push(pixel);
-    };
-    for (let x = 0; x < width; x += 1) {
-      push(x);
-      push((height - 1) * width + x);
-    }
-    for (let y = 0; y < height; y += 1) {
-      push(y * width);
-      push(y * width + width - 1);
-    }
-    let punched = 0;
-    while (stack.length > 0) {
-      const pixel = stack.pop() ?? 0;
-      out[pixel * 4 + 3] = 0;
-      punched += 1;
-      const x = pixel % width;
-      if (x > 0) push(pixel - 1);
-      if (x < width - 1) push(pixel + 1);
-      if (pixel >= width) push(pixel - width);
-      if (pixel < (height - 1) * width) push(pixel + width);
-    }
+    for (let pixel = 0; pixel < seen.length; pixel += 1) if (seen[pixel] === 1) out[pixel * 4 + 3] = 0;
     if (punched === width * height) return { rgba, borderIsSubject: false };
-    if (!leavesVisibleSubject(rgba, seen)) return { rgba, borderIsSubject: true };
+    if (borderIsSubject(rgba, width, height, [tr, tg, tb], seen, punched)) return { rgba, borderIsSubject: true };
     if (halo.size > 0) {
       let frontier = [];
       for (let pixel = 0; pixel < width * height; pixel += 1) if (seen[pixel] === 1) frontier.push(pixel);
@@ -7187,13 +7290,6 @@
       }
     }
     return { rgba: out, borderIsSubject: false };
-  }
-  function leavesVisibleSubject(rgba, seen) {
-    for (let pixel = 0; pixel < seen.length; pixel += 1) {
-      if (seen[pixel] === 1 || (rgba[pixel * 4 + 3] ?? 0) < 250) continue;
-      if (255 - (rgba[pixel * 4] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 1] ?? 0) > BACKDROP_TOLERANCE || 255 - (rgba[pixel * 4 + 2] ?? 0) > BACKDROP_TOLERANCE) return true;
-    }
-    return false;
   }
   function haloColors(rgba, backdrop) {
     const counts = /* @__PURE__ */ new Map();
