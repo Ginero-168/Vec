@@ -68,20 +68,21 @@ test("a forced single color still keeps a dark red flat off brown", () => {
   assert.ok(painted.palette.some((color) => channel(color, 0) > 60 && channel(color, 1) > 40));
 });
 
-test("preprocess runs before the palette is read", () => {
+test("preprocess runs before the palette and labels are read", () => {
+  // A 3x3 red block on blue that the preprocess paints over: it must not become a region. The fills themselves come
+  // from the input's own pixels (see the median fill test), so the block is checked through the labels.
   const image = fill(16, 16, 20, 40, 220, 255);
-  const painted = labelImage(image.rgba, 16, 16, 2, (rgba) => {
-    const next = new Uint8Array(rgba.length);
-    for (let index = 0; index < rgba.length; index += 4) {
-      next[index] = 220;
-      next[index + 1] = 30;
-      next[index + 2] = 40;
-      next[index + 3] = 255;
-    }
+  for (let y = 7; y < 10; y += 1) for (let x = 7; x < 10; x += 1) setPixel(image, 16, x, y, 220, 30, 40, 255);
+  const cleaned = labelImage(image.rgba, 16, 16, 2, (rgba) => {
+    const next = rgba.slice();
+    for (let index = 0; index < next.length; index += 4) next.set([20, 40, 220, 255], index);
     return next;
   });
-  const center = pixel(painted.rgba, painted.width, 8 * 8, 8 * 8);
-  assert.ok(center.r > center.b);
+  const center = pixel(cleaned.rgba, cleaned.width, 8 * 8 + 4, 8 * 8 + 4);
+  assert.ok(center.b > center.r, "the painted-over block is not a region");
+  const raw = labelImage(image.rgba, 16, 16, 2);
+  const block = pixel(raw.rgba, raw.width, 8 * 8 + 4, 8 * 8 + 4);
+  assert.ok(block.r > block.b, "without the preprocess the block stays");
 });
 
 test("a small red flat stays in the palette and gray is not painted green", () => {
@@ -600,6 +601,36 @@ test("a pale anti-aliasing ring folds into its two ends; a real colour that is a
     foldThinMixes(kept, width, height, palette, sampled, split);
     assert.deepEqual(kept, labels);
   }
+});
+
+test("a lossy fill takes the median of its own pixels, so gamut-edge noise clipped by the decoder does not tint it", () => {
+  // Black and white halves with symmetric noise of up to 6 levels, clamped to 0..255 as a JPEG decoder clamps it: the
+  // clipped side pulls a mean to about 1.5 (black) and 253.5 (white). The cleanup preprocess (here a 3x3 box blur, as
+  // a denoiser smooths) mixes the two inks near the seam, which must not tint the fills either.
+  const size = 32;
+  const image = fill(size, size, 255, 255, 255, 255);
+  let seed = 7;
+  const noise = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return (seed % 13) - 6; };
+  for (let y = 0; y < size; y += 1) for (let x = 0; x < size; x += 1) {
+    const base = x < 16 ? 0 : 255;
+    const v = () => Math.min(255, Math.max(0, base + noise()));
+    setPixel(image, size, x, y, v(), v(), v(), 255);
+  }
+  const blur = (rgba: Uint8Array) => {
+    const out = rgba.slice();
+    for (let y = 0; y < size; y += 1) for (let x = 0; x < size; x += 1) for (let c = 0; c < 3; c += 1) {
+      let sum = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+        const yy = y + dy, xx = x + dx;
+        if (yy < 0 || yy >= size || xx < 0 || xx >= size) continue;
+        sum += rgba[(yy * size + xx) * 4 + c] ?? 0; n += 1;
+      }
+      out[(y * size + x) * 4 + c] = Math.round(sum / n);
+    }
+    return out;
+  };
+  const painted = labelImage(image.rgba, size, size, 2, blur);
+  assert.deepEqual([...painted.palette].sort(), ["#000000", "#ffffff"]);
 });
 
 test("a clean anti-aliased disc keeps its area on the plate", () => {

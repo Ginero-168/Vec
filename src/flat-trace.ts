@@ -310,7 +310,7 @@ export function labelImage(
   const centers = source !== rgba ? mergeNearCenters(found, lab, core) : found;
   const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = assignLabels(linear, lab, core, alpha, opacity, width, height, centers, (fraction) => onProgress?.(0.32 + fraction * 0.54), edges);
-  const colors = fillColors(source, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
+  const colors = fillColors(rgba, alpha, core, labels, width, height, centers, (fraction) => onProgress?.(0.86 + fraction * 0.02));
   const painted = paintLabels(labels, colors, width * UP, height * UP, (fraction) => onProgress?.(0.88 + fraction * 0.12));
   onProgress?.(1);
   return painted;
@@ -363,7 +363,7 @@ async function labelImageAsync(
   onProgress(0.26);
   const edges = edgeRule(rgba, source, width, height, centers, sampled.length);
   const labels = await assignLabelsAsync(linear, lab, core, alpha, opacity, width, height, centers, context, (fraction) => onProgress(0.26 + fraction * 0.64), edges);
-  const colors = fillColors(source, alpha, core, labels, width, height, centers);
+  const colors = fillColors(rgba, alpha, core, labels, width, height, centers);
   onProgress(0.94);
   const painted = await paintLabelsAsync(labels, colors, width * UP, height * UP, context, (fraction) => onProgress(0.94 + fraction * 0.06));
   onProgress(1);
@@ -1412,8 +1412,17 @@ function explain(sample: Lab, bits: readonly number[], centers: readonly Lab[], 
   return best;
 }
 
+/**
+ * Each label's fill, per channel, from its core pixels in the input itself. A JPEG decoder clamps its noise to 0..255,
+ * so a channel whose pixels reach the clamp (black, white, any saturated channel) has that noise clipped on one side
+ * and its mean is pulled inward (q60 black outlines filled #040404, si-airbnb's #FF5A5F as #FA5A60): such a channel
+ * takes the median, which one-sided clipping does not move while more than half of the pixels sit on the true side.
+ * A channel that never reaches the clamp has unclipped noise, where the mean is the unbiased, lower-variance estimate.
+ * The cleaned raster is not used: its filter mixes neighbouring inks into the fill. On a clean raster the core pixels
+ * are one flat colour, where both give that colour.
+ */
 function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, labels: Uint8Array, width: number, height: number, centers: readonly Lab[], onProgress?: (fraction: number) => void): RGB[] {
-  const sums = centers.map(() => ({ r: 0, g: 0, b: 0, n: 0 }));
+  const histograms = centers.map(() => ({ counts: new Uint32Array(3 * 256), n: 0 }));
   const upW = width * UP;
   const mid = UP >> 1;
   for (let y = 0; y < height; y += 1) {
@@ -1421,21 +1430,42 @@ function fillColors(rgba: Uint8Array, alpha: Uint8Array, core: Uint8Array, label
       const index = y * width + x;
       if (alpha[index] === 0 || core[index] !== 1) continue;
       const label = labels[(y * UP + mid) * upW + x * UP + mid] ?? 255;
-      const bin = sums[label];
+      const bin = histograms[label];
       if (bin === undefined) continue;
       const offset = index * 4;
-      bin.r += rgba[offset] ?? 0;
-      bin.g += rgba[offset + 1] ?? 0;
-      bin.b += rgba[offset + 2] ?? 0;
+      const counts = bin.counts;
+      const r = rgba[offset] ?? 0, g = 256 + (rgba[offset + 1] ?? 0), b = 512 + (rgba[offset + 2] ?? 0);
+      counts[r] = (counts[r] ?? 0) + 1;
+      counts[g] = (counts[g] ?? 0) + 1;
+      counts[b] = (counts[b] ?? 0) + 1;
       bin.n += 1;
     }
     onProgress?.((y + 1) / height);
   }
   return centers.map((center, index) => {
-    const bin = sums[index];
-    if (bin !== undefined && bin.n > 4) return { r: Math.round(bin.r / bin.n), g: Math.round(bin.g / bin.n), b: Math.round(bin.b / bin.n) };
-    return oklabToRgb(center);
+    const bin = histograms[index];
+    if (bin === undefined || bin.n <= 4) return oklabToRgb(center);
+    return { r: channelFill(bin.counts, 0, bin.n), g: channelFill(bin.counts, 256, bin.n), b: channelFill(bin.counts, 512, bin.n) };
   });
+}
+
+function channelFill(counts: Uint32Array, base: number, n: number): number {
+  if ((counts[base] ?? 0) > 0 || (counts[base + 255] ?? 0) > 0) return channelMedian(counts, base, n);
+  let sum = 0;
+  for (let value = 1; value < 255; value += 1) sum += value * (counts[base + value] ?? 0);
+  return Math.round(sum / n);
+}
+
+/** Median of one channel's 256-bin histogram; for an even count, the mean of the two middle values, rounded. */
+function channelMedian(counts: Uint32Array, base: number, n: number): number {
+  const lowRank = Math.floor((n - 1) / 2), highRank = Math.floor(n / 2);
+  let seen = 0, low = -1;
+  for (let value = 0; value < 256; value += 1) {
+    seen += counts[base + value] ?? 0;
+    if (low < 0 && seen > lowRank) low = value;
+    if (seen > highRank) return Math.round((low + value) / 2);
+  }
+  return 255;
 }
 
 function paintLabels(labels: Uint8Array, colors: readonly RGB[], width: number, height: number, onProgress?: (fraction: number) => void): Painted {
