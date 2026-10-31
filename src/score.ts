@@ -341,7 +341,7 @@ export function unifyNearFills(svg: string): string {
   return result + svg.slice(cursor);
 }
 
-const NEAR_FILL = 2;
+export const NEAR_FILL = 2;
 
 export function sealGaps(svg: string, strokeWidth = 0.8): string {
   const width = Math.round(Math.min(4, Math.max(0.8, strokeWidth)) * 10) / 10;
