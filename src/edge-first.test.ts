@@ -170,3 +170,45 @@ test("a boundary between two bands of a gradient is fitted to its points' own un
   const band = pathsOf(svg).find((p) => p.fill === hex(b(32)).toUpperCase())!;
   assert.ok((band.d.match(/[CL]/g) ?? []).length < 40, band.d);
 });
+
+test("a 1 px line at a half-pixel offset keeps its 1 px width and centre though only one of its two columns has its label", () => {
+  // 32x16 white page; a grey line covers x 14.5-15.5, so columns 14 and 15 are each half grey; only
+  // column 15 has the line's label.
+  // Each edge alone would put its half of the run's coverage at its own side; the line's cross-section puts both at
+  // centroid -/+ width / 2. Whichever shape is drawn on top, the edges inside the page are those two.
+  const grey = [128, 128, 128] as const, white = [255, 255, 255] as const;
+  const half = grey.map((v, c) => Math.round((v + white[c]!) / 2)) as unknown as readonly [number, number, number];
+  const source = image(32, 16, (x) => (x === 14 || x === 15 ? half : white));
+  const labels = new Int32Array(32 * 16).map((_, at) => (at % 32 === 15 ? 0 : 1));
+  const svg = edgeFirstSvg({ width: 32, height: 16, labels, inks: ["#808080", "#ffffff"] }, source, false);
+  const xs = [...svg.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])] as const)
+    .filter(([x, y]) => y > 2 && y < 14 && x > 8 && x < 24).map(([x]) => x);
+  assert.ok(xs.length > 0 && xs.every((x) => Math.abs(x - 14.5) < 0.05 || Math.abs(x - 15.5) < 0.05), svg);
+  assert.ok(xs.some((x) => x < 15) && xs.some((x) => x > 15), svg);
+});
+
+test("a 2 px bar's square end keeps both corners: its sides are parallel, so the end is two corners, not a bevel", () => {
+  // 24x40 white page; a grey bar on columns 10-11, rows 6-33. Its outline turns back within 2 px at each end.
+  const grey = [128, 128, 128] as const, white = [255, 255, 255] as const;
+  const inBar = (x: number, y: number) => (x === 10 || x === 11) && y >= 6 && y < 34;
+  const source = image(24, 40, (x, y) => (inBar(x, y) ? grey : white));
+  const labels = new Int32Array(24 * 40).map((_, at) => (inBar(at % 24, Math.floor(at / 24)) ? 0 : 1));
+  const svg = edgeFirstSvg({ width: 24, height: 40, labels, inks: ["#808080", "#ffffff"] }, source, false);
+  const points = [...svg.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
+  const at = (x: number, y: number) => points.some(([px, py]) => Math.abs(px - x) < 0.05 && Math.abs(py - y) < 0.05);
+  assert.ok((at(10, 6) && at(12, 6)) || (at(10, 34) && at(12, 34)), svg);
+});
+
+test("on a clean source a 1 px line of a near ink that the labels smoothed into its surround is drawn again", () => {
+  // 48x24 blue page; row 12 is a near blue (36 apart) in the source but carries the page's label, as the plates'
+  // label smoothing leaves a thin near-ink line. Its pixels are nearer their own ink, and together they are a line.
+  const a = [40, 96, 200] as const, b = [54, 87, 213] as const;
+  const source = image(48, 24, (_, y) => (y === 12 ? b : a));
+  const labels = new Int32Array(48 * 24).fill(0);
+  const svg = edgeFirstSvg({ width: 48, height: 24, labels, inks: ["#2860c8", "#3657d5"] }, source, false);
+  assert.ok(svg.includes('fill="#3657D5"'), svg);
+  const ys = [...svg.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])] as const)
+    .filter(([x, y]) => x > 4 && x < 44 && y > 2 && y < 22).map(([, y]) => y);
+  assert.ok(ys.some((y) => Math.abs(y - 12) < 0.05) && ys.some((y) => Math.abs(y - 13) < 0.05), svg);
+  assert.ok(ys.every((y) => Math.abs(y - 12) < 0.05 || Math.abs(y - 13) < 0.05), svg);
+});
