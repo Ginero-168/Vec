@@ -157,13 +157,44 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
     moved.set(v, vx === 0 || vx === W ? [vx, Math.min(H, Math.max(0, mean[1]))] : [Math.min(W, Math.max(0, mean[0])), vy]);
   }
   const edgeTolerance = lossy ? LOSSY_TOLERANCE : EDGE_TOLERANCE;
+  // Square strip ends (capCorners) read the samples as exact, which they are on a clean render: there each pixel
+  // that mixes the boundary's two colours lies between them, to within the half-step rounding of each 8-bit
+  // channel. Ringing beside a JPEG-coded edge overshoots one of them (at 256 px a q60 source can pass the noise
+  // test, its flat areas coding almost exactly), and inside a region the coding error leaves a pixel off its colour:
+  // a mix pixel past either colour, an inner pixel off its own, or a pixel off the two colours' line with no third
+  // region beside it, within the window round the end, keeps the bevel.
+  // Lossy sources never take the square ends.
+  const square = (chain: Chain): ((p: Point) => boolean) | null => {
+    if (lossy) return null;
+    const A = chain.pair[0]! < 0 ? backdrop : colours[chain.pair[0]!]!, B = chain.pair[1]! < 0 ? backdrop : colours[chain.pair[1]!]!;
+    const dv = B.map((v, c) => v - A[c]!), dd = rgbaDot(dv, dv), rounding = dv.reduce((sum, v) => sum + 0.5 * Math.abs(v), 0) / dd;
+    if (dd < 1e-3) return () => true;
+    return ([px, py]) => {
+      for (let y = Math.max(0, Math.floor(py) - WINDOW_CLEAN); y <= Math.min(H - 1, Math.floor(py) + WINDOW_CLEAN); y += 1)
+        for (let x = Math.max(0, Math.floor(px) - WINDOW_CLEAN); x <= Math.min(W - 1, Math.floor(px) + WINDOW_CLEAN); x += 1) {
+          const d = [0, 1, 2, 3].map((c) => X[(y * W + x) * 4 + c]! - A[c]!), t = rgbaDot(d, dv) / dd;
+          const off = d.map((v, c) => v - t * dv[c]!);
+          if (rgbaDot(off, off) <= 1 && (t < -rounding || t > 1 + rounding)) return false;
+          // A pixel inside one of the two regions (its four neighbours in it too) is that colour, to the same rounding;
+          // one of either region with only the two round it is a mix of those two alone, on the line between them.
+          const at = y * W + x, here = regions[at]!;
+          if ((here === chain.pair[0] || here === chain.pair[1]) && rgbaDot(off, off) > 1 && x > 0 && y > 0 && x < W - 1 && y < H - 1
+            && [-W - 1, -W, -W + 1, -1, 1, W - 1, W, W + 1].every((k) => regions[at + k] === chain.pair[0] || regions[at + k] === chain.pair[1])) return false;
+          if ((here === chain.pair[0] || here === chain.pair[1]) && [at - 1, at + 1, at - W, at + W].every((n) => n >= 0 && n < W * H && regions[n] === here)) {
+            const C = here === chain.pair[0] ? A : B, e = [0, 1, 2, 3].map((c) => X[at * 4 + c]! - C[c]!);
+            if (rgbaDot(e, e) > 1) return false;
+          }
+        }
+      return true;
+    };
+  };
   const end = (v: number): Point => moved.get(v) ?? corner(v);
   const curves = chains.map((chain, index) => {
     const tolerance = Math.max(edgeTolerance, uncertainty[index]! / KMAX);
     let points = allPoints[index]!;
     if (chain.closed) {
       const loop = points.length >= 3 ? points : chain.vs.slice(0, -1).map(corner);
-      return fitChain(loop, true, tolerance);
+      return fitChain(loop, true, tolerance, square(chain));
     }
     if (chain.pair[0] < 0 || chain.pair[1] < 0) {
       const first = tangent.has(chain.vs[0]!) ? 1 : 0, last = tangent.has(chain.vs[chain.vs.length - 1]!) ? 1 : 0;
@@ -172,7 +203,7 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
     const v0 = end(chain.vs[0]!), v1 = end(chain.vs[chain.vs.length - 1]!);
     let inner = points.filter((p) => Math.hypot(p[0] - v0[0], p[1] - v0[1]) > 0.5 && Math.hypot(p[0] - v1[0], p[1] - v1[1]) > 0.5);
     if (inner.length === 0 && chain.vs.length > 2) inner = chain.vs.slice(1, -1).map(corner);
-    return fitChain([v0, ...inner, v1], false, tolerance);
+    return fitChain([v0, ...inner, v1], false, tolerance, square(chain));
   });
   const area = new Array<number>(count).fill(0);
   for (const region of regions) area[region]! += 1;
@@ -363,6 +394,10 @@ function smoothedLines(labels: Int32Array, inks: readonly string[], source: Uint
       }
     }
     if (!clear || Math.max(x1 - x0, y1 - y0) + 1 <= 2 * WINDOW_CLEAN || patch.length >= THIN_RATIO * edge) continue;
+    // A clean render shows the line's ink in some pixel: to within the half-step rounding of the pixel and of the
+    // palette's ink, one level per channel. Block noise at 256 px q60 (which can pass the noise test) leaves none.
+    const rgb = inkRgb[ink]!;
+    if (!taken.some((at) => rgb.every((v, c) => Math.abs(v - source[at * 4 + c]!) <= 1))) continue;
     for (const at of taken) labels[at] = ink;
   }
 }
@@ -736,6 +771,11 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
         let n = 0, i = start;
         while (i >= 0 && i < size && regionAt(i) === T && n < 2) { n += 1; i += step; }
         if (n !== 1 || i < 0 || i >= size || !same(regionAt(i), O)) continue;
+        // A pixel wholly the region's colour (to within the half-step rounding of each 8-bit channel) holds neither edge:
+        // each lies in its own outer pixel, whose share places it exactly. The centroid would instead put an outer
+        // pixel's share at its centre, not against the line, and shift a line of 1-2 px towards its wider side.
+        const own = (j: number) => T === e.la ? 1 - share(j) : share(j), rounding = dv.reduce((sum, v) => sum + 0.5 * Math.abs(v), 0) / dd;
+        if (own(start) >= 1 - rounding) continue;
         // A line runs along the edge: beside its pixel the region goes on one pixel across again (not a lone pixel on an
         // edge's anti-aliased row, nor the tip of a region that widens past it).
         if (!beside(start).some(([cell, prev, next]) => regions[cell] === T && (prev < 0 || regions[prev] !== T) && (next < 0 || regions[next] !== T))) continue;
@@ -753,8 +793,16 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
         // The outer pixels hold this line's anti-aliasing only: beside none of them (along the edge) is the line's
         // region again, as where the line meets another part of itself, whose anti-aliasing they would also hold.
         if (cells.some((j) => j !== start && beside(j).some(([cell]) => regions[cell] === T))) return null;
+        // The integral holds the line's whole area only where its coverage stops in the pixels next to its own: a line
+        // that only partly covers its pixel is under 2 px wide, so the cells past those are the outer colour (to within
+        // the half-step rounding of each 8-bit channel), and so are their neighbours along the line, not inside a
+        // spread such as a JPEG's ringing or block noise.
+        // Each window then reaches past the neighbouring pixel, or the integral cannot see where the coverage stops.
+        const pureAt = (q: number) => { let gap = 0; for (let c = 0; c < 4; c += 1) gap += (X[q * 4 + c]! - O[c]!) ** 2; return gap <= 1; };
+        const pure = (j: number) => pureAt(along(j)) && beside(j).every(([cell]) => pureAt(cell));
+        if (far < 2 || near < 2 || cells.some((j) => j !== start && j !== i && j !== start - step && !pure(j))) return null;
         let width = 0, moment = 0;
-        for (const j of cells) { const own = T === e.la ? 1 - share(j) : share(j); width += own; moment += (j + 0.5) * own; }
+        for (const j of cells) { width += own(j); moment += (j + 0.5) * own(j); }
         if (width <= 0) return null;
         return T === e.la ? moment / width + width / 2 : moment / width - width / 2;
       }
@@ -935,7 +983,7 @@ function findCorners(P: readonly Point[], closed: boolean): number[] {
 }
 
 /** The corner's bevelled anti-aliasing points replaced by the intersection of the lines fitted on both sides. */
-function sharpenCorner(P: readonly Point[], c: number): [Point[], number, boolean] {
+function sharpenCorner(P: readonly Point[], c: number, square: ((p: Point) => boolean) | null): [Point[], number, boolean] {
   const n = P.length;
   const fitLine = (ix: number[]): [Point, Point] => {
     const m: Point = [ix.reduce((a, i) => a + P[i]![0], 0) / ix.length, ix.reduce((a, i) => a + P[i]![1], 0) / ix.length];
@@ -957,7 +1005,7 @@ function sharpenCorner(P: readonly Point[], c: number): [Point[], number, boolea
     return norm(sub(X, P[c]!)) > 1.5 ? null : X;
   };
   const first = intersect(P[c]!);
-  if (first === null) { const cap = capCorners(P, c, fitLine); return cap === null ? [P.slice(), c, false] : [...cap, true]; }
+  if (first === null) { const cap = square === null ? null : capCorners(P, c, fitLine); return cap === null || !square!(P[c]!) ? [P.slice(), c, false] : [...cap, true]; }
   const X = intersect(first) ?? first;
   // The bevel's points (within 1 px of the corner, and of the sample it replaces) go.
   const s = P.map((p) => Math.min(norm(sub(p, P[c]!)), norm(sub(p, X))));
@@ -971,6 +1019,7 @@ function sharpenCorner(P: readonly Point[], c: number): [Point[], number, boolea
  * have no intersection. It is two corners (each a turn of more than CORNER_DEGREES within 2 px): the end runs through
  * the turn's sample across the sides, and meets each side's line within 1.5 px of that sample, as a corner may move.
  * Returns the points with both corners in place of the bevel, and the first corner's index (the second follows it).
+ * Clean sources only (sharpenCorner): on a lossy one the sides wander by the block noise, past what the end tests read.
  */
 function capCorners(P: readonly Point[], c: number, fitLine: (ix: number[]) => [Point, Point]): [Point[], number] | null {
   const n = P.length, s = P.map((p) => norm(sub(p, P[c]!)));
@@ -1002,14 +1051,14 @@ function capCorners(P: readonly Point[], c: number, fitLine: (ix: number[]) => [
   return [out, keep.indexOf(c)];
 }
 
-function fitChain(input: readonly Point[], closed: boolean, tol: number): Cubic[] {
+function fitChain(input: readonly Point[], closed: boolean, tol: number, square: ((p: Point) => boolean) | null): Cubic[] {
   let P = input.filter((p, i) => i === 0 || norm(sub(p, input[i - 1]!)) > 1e-4);
   if (closed && P.length > 1 && norm(sub(P[0]!, P[P.length - 1]!)) < 1e-4) P = P.slice(0, -1);
   if (P.length < 2) return [];
   if (!closed && P.length <= 3) return P.slice(0, -1).map((p, i) => line(p, P[i + 1]!));
   let cs = findCorners(P, closed);
   for (let k = 0; k < cs.length; k += 1) {
-    const [next, nc, cap] = sharpenCorner(P, cs[k]!);
+    const [next, nc, cap] = sharpenCorner(P, cs[k]!, square);
     if (cap) {
       // A strip's end became two corners (capCorners): later corners move by the change in length.
       const shift = next.length - P.length; P = next;
