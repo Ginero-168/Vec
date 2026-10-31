@@ -9,6 +9,9 @@ import { segmentRaster } from "./segment.ts";
 import { scaleSvg } from "./svg-scale.ts";
 import { assembleTrace, mergePlates, type PlacedPlate } from "./trace-finish.ts";
 import { type Stacking, type TracePreset, type TraceRequest } from "./trace.ts";
+import { edgeFirstSvg, type EdgeLabels } from "./edge-first.ts";
+import { MIN_SIDE, wouldDenoise } from "./denoise.ts";
+import { NEAR_FILL } from "./score.ts";
 
 export type PipelineSettings = {
   readonly preset: TracePreset;
@@ -30,6 +33,8 @@ export type TracePlan = {
   readonly plates: readonly PlannedPlate[];
   readonly droppedColor: string | null;
   readonly rasterStages?: LabRasterStages;
+  /** The flat plates as one source-resolution label map, for the edge-first finish (edge-first.ts). */
+  readonly edgeFirst?: { readonly labels: EdgeLabels; readonly lossy: boolean };
 };
 
 export function planTrace(
@@ -132,7 +137,17 @@ export function traceRasterWithControls(
 }
 
 export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, controls: LabControls, onProgress?: PipelineProgress) {
-  return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+  const stages = vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+  const source = plan.plates.find((plate) => plate.source !== undefined)?.source;
+  const defaults = controlsFor(controls.mode);
+  // The edge-first finish replaces the flat finish where that runs at its defaults (fairLabVector's relax branch).
+  // Below denoise's MIN_SIDE the edge-first finish has no basis for its lossy/clean choice (the integration window and
+  // fit tolerance): wouldDenoise refuses to judge rasters that small, since their anti-aliased edges alone read as noise.
+  // Those keep the flat finish.
+  if (plan.edgeFirst === undefined || source === undefined || plan.droppedColor !== null || (controls.mode !== "logo" && controls.mode !== "icon")
+    || Math.min(plan.width, plan.height) < MIN_SIDE
+    || controls.smoothness !== defaults.smoothness || controls.corner !== defaults.corner) return stages;
+  return { ...stages, sealed: edgeFirstSvg(plan.edgeFirst.labels, source.rgba, plan.edgeFirst.lossy) };
 }
 
 export function settingsFromControls(controls: LabControls): PipelineSettings {
@@ -194,8 +209,10 @@ function planFlat(
   onProgress?: (fraction: number) => void
 ): TracePlan {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
+  const punchedPlates: Uint8Array[] = [];
   const plates = flat.map((plate) => {
     const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
+    punchedPlates.push(punched.rgba);
     return {
       png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
       scale: plate.scale,
@@ -211,13 +228,59 @@ function planFlat(
     };
   });
   const rasterStages = controls === undefined ? undefined : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
+  const labels = plateLabels(flat, punchedPlates, width, height);
   return {
     width,
     height,
     droppedColor: null,
     plates,
-    ...(rasterStages === undefined ? {} : { rasterStages })
+    ...(rasterStages === undefined ? {} : { rasterStages }),
+    edgeFirst: { labels, lossy: wouldDenoise(rgba, width, height) }
   };
+}
+
+/**
+ * The flat plates as one label map at source resolution: each source pixel takes the ink at its centre in the plate
+ * (as flatPreviewFromPlates reads them), a later plate on top of an earlier one, as they are drawn. A pixel no plate
+ * covers (clear after the backdrop punch) is the backdrop, -1.
+ */
+function plateLabels(flat: readonly FlatPlate[], punched: readonly Uint8Array[], width: number, height: number): EdgeLabels {
+  const labels = new Int32Array(width * height).fill(-1);
+  const inks: string[] = [];
+  const index = new Map<number, number>();
+  flat.forEach((plate, which) => {
+    const rgba = punched[which]!, half = plate.scale >> 1;
+    for (let y = 0; y < plate.sourceHeight; y += 1) {
+      const sy = plate.originY + y;
+      if (sy < 0 || sy >= height) continue;
+      for (let x = 0; x < plate.sourceWidth; x += 1) {
+        const sx = plate.originX + x;
+        if (sx < 0 || sx >= width) continue;
+        const at = ((y * plate.scale + half) * plate.width + x * plate.scale + half) * 4;
+        if ((rgba[at + 3] ?? 0) === 0) continue;
+        const key = ((rgba[at] ?? 0) << 16) | ((rgba[at + 1] ?? 0) << 8) | (rgba[at + 2] ?? 0);
+        let ink = index.get(key);
+        if (ink === undefined) { ink = inks.length; index.set(key, ink); inks.push("#" + key.toString(16).padStart(6, "0")); }
+        labels[sy * width + sx] = ink;
+      }
+    }
+  });
+  // As the flat finish does for cut-outs (unifyNearFills): a fringe can win its own palette slot one step from the fill
+  // it rims; on a cut-out such a near-identical ink is folded into the larger one.
+  if (flat.length > 0 && flat.every((plate) => plate.cutOut)) {
+    const area = new Array<number>(inks.length).fill(0);
+    for (const ink of labels) if (ink >= 0) area[ink]! += 1;
+    const ranked = [...inks.keys()].sort((a, b) => area[b]! - area[a]! || a - b);
+    const into = new Map<number, number>();
+    const rgb = (ink: number) => [1, 3, 5].map((at) => parseInt(inks[ink]!.slice(at, at + 2), 16));
+    for (const [rank, ink] of ranked.entries()) {
+      const own = rgb(ink);
+      const target = ranked.slice(0, rank).find((other) => !into.has(other) && rgb(other).every((value, channel) => Math.abs(value - own[channel]!) <= NEAR_FILL));
+      if (target !== undefined) into.set(ink, target);
+    }
+    for (let at = 0; at < labels.length; at += 1) labels[at] = into.get(labels[at]!) ?? labels[at]!;
+  }
+  return { width, height, labels, inks };
 }
 
 const HALO_MIX = 0.35;
