@@ -1,6 +1,7 @@
 import { fairPaths, relaxPaths } from "./edit.ts";
-import { BACKDROP_TOLERANCE, borderIsSubject, cornerColor, flatPlates, floodBorder, hasClearPixel, flatPlatesAsync, type FlatPlate } from "./flat-trace.ts";
+import { BACKDROP_TOLERANCE, borderIsSubject, cornerColor, flatPlates, floodBorder, hasClearPixel, flatPlatesAsync, TRACER_LAYER_DIFFERENCE, type FlatPlate } from "./flat-trace.ts";
 import { lossyCleanup } from "./jpeg-clean.ts";
+import { wouldDenoise } from "./denoise.ts";
 import { controlsFor, paletteFromRaster, traceRequest, type LabControls } from "./lab-model.ts";
 import { buildLabRasterStages, buildLabRasterStagesAsync, flatPreviewFromPlates, flatRasterStages, vectorStagesFromPlan, type LabRasterStages, type LabStepId, type PipelineProgress } from "./lab-pipeline.ts";
 import { encodeRgbaPng, punchTransparency, readRgbaPng } from "./png-alpha.ts";
@@ -194,10 +195,19 @@ function planFlat(
   onProgress?: (fraction: number) => void
 ): TracePlan {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
-  const plates = flat.map((plate) => {
+  // Near inks are separated only on a clean source. On a lossy one (judged on the whole image, at any size: the JPEG
+  // cleanup skips small sources but their noise is there all the same) two near plate colours are mostly one ink that
+  // the noise split, and tracing them apart brings the noise back as islands.
+  const clean = !wouldDenoise(rgba, width, height);
+  // A plate traced with stand-in inks also goes out as it was (a backup plate after the others), so the finish can
+  // fall back to that trace where the stand-ins paint the plate worse (chooseTraces).
+  const plates: PlannedPlate[] = [];
+  const backups: PlannedPlate[] = [];
+  for (const plate of flat) {
     const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
-    return {
-      png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
+    const separated = clean ? separateNearInks(punched.rgba, plate.palette, { rgba, width, height, originX: plate.originX, originY: plate.originY, scale: plate.scale, plateWidth: plate.width }) : null;
+    const planned = (pixels: Uint8Array, palette: readonly string[]): PlannedPlate => ({
+      png: encodeRgbaPng(plate.width, plate.height, pixels),
       scale: plate.scale,
       originX: plate.originX,
       originY: plate.originY,
@@ -206,10 +216,14 @@ function planFlat(
       cutOut: plate.cutOut,
       source: { rgba, width, height },
       request: controls === undefined
-        ? flatRequest(settings, plate.palette, plate.scale)
-        : flatRequestForControls(settings, plate.palette, plate.scale, controls)
-    };
-  });
+        ? flatRequest(settings, palette, plate.scale)
+        : flatRequestForControls(settings, palette, plate.scale, controls)
+    });
+    if (separated === null) { plates.push(planned(punched.rgba, plate.palette)); continue; }
+    plates.push({ ...planned(separated.rgba, separated.palette), fills: separated.fills, plain: flat.length + backups.length });
+    backups.push({ ...planned(punched.rgba, plate.palette), backup: true });
+  }
+  plates.push(...backups);
   const rasterStages = controls === undefined ? undefined : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
   return {
     width,
@@ -218,6 +232,139 @@ function planFlat(
     plates,
     ...(rasterStages === undefined ? {} : { rasterStages })
   };
+}
+
+/**
+ * How far apart two inks must be for VTracer to keep them apart whatever it has folded into them. Its clustering
+ * (visioncortex) merges regions smallest first, each into its nearest-colour neighbour, and keeps a region as its own
+ * layer only when its colour is more than the layer difference (16) from that neighbour's. The colour it compares is
+ * the region's whole pixel mean, including the smaller regions already layered on it: a ring of ink B that has taken in
+ * the disc of ink A inside it, or a stripe of B that has taken in the strip of A beyond it, compares as a mix of the
+ * two. A region is never smaller than one it takes in, so the other ink is at most half of a merge and leaves the mix
+ * at least half the inks' difference from it. The mix has to stay one more than the layer difference away after the
+ * tracer floors each channel's mean (up to 1 per channel, 3 in all), so the inks need twice (16 + 1 + 3) = 40 between
+ * them. Two inks closer than that and further apart than the layer difference (which merges by design) can fold into
+ * one layer and the one fill the palette snaps it to.
+ */
+const INK_FOLD_REACH = 2 * (TRACER_LAYER_DIFFERENCE + 1 + 3);
+
+type SeparatedInks = { readonly rgba: Uint8Array; readonly palette: readonly string[]; readonly fills: Readonly<Record<string, string>> };
+
+/** The source raster a plate was cut from, where the plate sits on it (plate pixel = (source - origin) * scale), and the plate's width. */
+type InkSource = { readonly rgba: Uint8Array; readonly width: number; readonly height: number; readonly originX: number; readonly originY: number; readonly scale: number; readonly plateWidth: number };
+
+/**
+ * Trace a plate whose inks sit closer than INK_FOLD_REACH to each other (and further apart than the layer difference,
+ * which VTracer merges by design) with stand-in colours that are not: the ink with fewer pixels moves away from the
+ * other along their own difference until they are INK_FOLD_REACH apart. A stand-in that would come within reach of a
+ * third ink it was out of reach of is not used (the other ink moves instead, or the pair stays). Both inks of a pair
+ * must be inks of the source: the colour its own pixels most often have exactly. A flat ink is (its edge pixels each
+ * differ); a colour a JPEG's noise split off an ink is a median that few decoded pixels hit. The returned fills map
+ * each stand-in back to the plate colour (restoreFills). Null when no pair needs it.
+ */
+export function separateNearInks(rgba: Uint8Array, palette: readonly string[], source: InkSource): SeparatedInks | null {
+  const inks = palette.map((hex) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16)) as [number, number, number]);
+  if (inks.length < 2 || inks.some((ink) => ink.some((value) => !Number.isFinite(value)))) return null;
+  const apart = (left: readonly number[], right: readonly number[]) => Math.abs(left[0]! - right[0]!) + Math.abs(left[1]! - right[1]!) + Math.abs(left[2]! - right[2]!);
+  const pairs: [number, number][] = [];
+  for (let left = 0; left < inks.length; left += 1) {
+    for (let right = left + 1; right < inks.length; right += 1) {
+      const distance = apart(inks[left]!, inks[right]!);
+      if (distance > TRACER_LAYER_DIFFERENCE && distance < INK_FOLD_REACH) pairs.push([left, right]);
+    }
+  }
+  if (pairs.length === 0) return null;
+  const real = sourceInks(rgba, inks, new Set(pairs.flat()), source);
+  pairs.splice(0, pairs.length, ...pairs.filter(([left, right]) => real.has(left) && real.has(right)));
+  if (pairs.length === 0) return null;
+  const counts = new Map<number, number>();
+  for (let at = 0; at < rgba.length; at += 4) {
+    if ((rgba[at + 3] ?? 0) === 0) continue;
+    const key = ((rgba[at] ?? 0) << 16) | ((rgba[at + 1] ?? 0) << 8) | (rgba[at + 2] ?? 0);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const count = (ink: readonly number[]) => counts.get((ink[0]! << 16) | (ink[1]! << 8) | ink[2]!) ?? 0;
+  const traced = inks.map((ink) => [...ink] as [number, number, number]);
+  pairs.sort((a, b) => apart(inks[a[0]]!, inks[a[1]]!) - apart(inks[b[0]]!, inks[b[1]]!) || a[0] - b[0] || a[1] - b[1]);
+  for (const [left, right] of pairs) {
+    if (apart(traced[left]!, traced[right]!) >= INK_FOLD_REACH) continue;
+    const minor = count(inks[left]!) <= count(inks[right]!) ? left : right;
+    const major = minor === left ? right : left;
+    for (const [moved, kept] of [[minor, major], [major, minor]] as const) {
+      const stand = pushApart(traced[moved]!, traced[kept]!, INK_FOLD_REACH);
+      if (stand === null) continue;
+      const clear = traced.every((other, index) => index === moved || index === kept
+        || apart(stand, other) >= INK_FOLD_REACH || apart(stand, other) >= apart(traced[moved]!, other));
+      if (!clear) continue;
+      traced[moved] = stand;
+      break;
+    }
+  }
+  const fills: Record<string, string> = {};
+  const repaint = new Map<number, [number, number, number]>();
+  const hex = (ink: readonly number[]) => "#" + ink.map((value) => value.toString(16).padStart(2, "0")).join("");
+  for (const [index, ink] of inks.entries()) {
+    const stand = traced[index]!;
+    if (apart(stand, ink) === 0) continue;
+    if (inks.some((other) => apart(other, stand) === 0)) return null;
+    fills[hex(stand).toUpperCase()] = palette[index]!;
+    repaint.set((ink[0] << 16) | (ink[1] << 8) | ink[2], stand);
+  }
+  if (repaint.size === 0) return null;
+  const out = new Uint8Array(rgba);
+  for (let at = 0; at < out.length; at += 4) {
+    if ((out[at + 3] ?? 0) === 0) continue;
+    const stand = repaint.get(((out[at] ?? 0) << 16) | ((out[at + 1] ?? 0) << 8) | (out[at + 2] ?? 0));
+    if (stand === undefined) continue;
+    out[at] = stand[0]; out[at + 1] = stand[1]; out[at + 2] = stand[2];
+  }
+  return { rgba: out, palette: traced.map((ink, index) => apart(ink, inks[index]!) === 0 ? palette[index]! : hex(ink)), fills };
+}
+
+/** The inks (of `wanted`) that are the most frequent exact source colour among the source pixels the plate gives them. */
+function sourceInks(plate: Uint8Array, inks: readonly (readonly number[])[], wanted: ReadonlySet<number>, source: InkSource): Set<number> {
+  const key = (at: number, from: Uint8Array) => ((from[at] ?? 0) << 16) | ((from[at + 1] ?? 0) << 8) | (from[at + 2] ?? 0);
+  const ink = new Map<number, number>();
+  for (const index of wanted) ink.set((inks[index]![0]! << 16) | (inks[index]![1]! << 8) | inks[index]![2]!, index);
+  const tallies = new Map<number, Map<number, number>>();
+  const { scale, plateWidth } = source, half = scale >> 1;
+  const columns = Math.floor(plateWidth / scale), rows = Math.floor(plate.length / 4 / plateWidth / scale);
+  for (let y = 0; y < rows; y += 1) {
+    const sy = y + source.originY;
+    if (sy < 0 || sy >= source.height) continue;
+    for (let x = 0; x < columns; x += 1) {
+      const sx = x + source.originX;
+      if (sx < 0 || sx >= source.width) continue;
+      const at = ((y * scale + half) * plateWidth + x * scale + half) * 4;
+      if ((plate[at + 3] ?? 0) === 0) continue;
+      const label = ink.get(key(at, plate));
+      if (label === undefined) continue;
+      const tally = tallies.get(label) ?? new Map<number, number>();
+      const colour = key((sy * source.width + sx) * 4, source.rgba);
+      tally.set(colour, (tally.get(colour) ?? 0) + 1);
+      tallies.set(label, tally);
+    }
+  }
+  const real = new Set<number>();
+  for (const [label, tally] of tallies) {
+    const own = tally.get((inks[label]![0]! << 16) | (inks[label]![1]! << 8) | inks[label]![2]!) ?? 0;
+    if (own > 0 && [...tally.values()].every((count) => count <= own)) real.add(label);
+  }
+  return real;
+}
+
+/** `ink` moved away from `from` along their difference until they are at least `distance` apart, or null (clamped). */
+function pushApart(ink: readonly number[], from: readonly number[], distance: number): [number, number, number] | null {
+  const delta = [ink[0]! - from[0]!, ink[1]! - from[1]!, ink[2]! - from[2]!];
+  const length = Math.abs(delta[0]!) + Math.abs(delta[1]!) + Math.abs(delta[2]!);
+  if (length === 0) return null;
+  for (let scale = distance / length; scale <= 255; scale += 1 / length) {
+    const moved = delta.map((value, channel) => Math.min(255, Math.max(0, Math.round(from[channel]! + value * scale)))) as [number, number, number];
+    const reached = Math.abs(moved[0] - from[0]!) + Math.abs(moved[1] - from[1]!) + Math.abs(moved[2] - from[2]!);
+    if (reached >= distance) return moved;
+    if (moved.every((value) => value === 0 || value === 255)) return null;
+  }
+  return null;
 }
 
 const HALO_MIX = 0.35;
