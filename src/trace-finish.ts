@@ -1,6 +1,7 @@
 import { fairPaths, fitRasterCorners, relaxPaths, sharpenConfirmed, sharpenCorners, type ColourAt, type CornerCheck } from "./edit.ts";
 import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps, unifyNearFills } from "./score.ts";
 import { scaleSvg, translateSvg } from "./svg-scale.ts";
+import { chooseTraces } from "./trace-coverage.ts";
 import type { Stacking, TracePreset } from "./trace.ts";
 
 export type PlacedPlate = {
@@ -12,6 +13,14 @@ export type PlacedPlate = {
   readonly cutOut?: boolean;
   /** The source raster the plate was cut from, when the caller still has it; lets sharpening check corners. */
   readonly source?: SourceRaster;
+  /** Fills the plate was traced with in place of its own (upper-case hex -> the plate colour); see separateNearInks. */
+  readonly fills?: Readonly<Record<string, string>>;
+  /** The traced raster, when the plate has stand-in fills to check against it (chooseTraces). */
+  readonly png?: Uint8Array;
+  /** Index of this plate's plain trace to fall back on (chooseTraces). */
+  readonly plain?: number;
+  /** This plate is another plate's fallback trace only. */
+  readonly backup?: boolean;
 };
 
 export type SourceRaster = { readonly rgba: Uint8Array; readonly width: number; readonly height: number };
@@ -27,12 +36,13 @@ export function mergePlates(
   removeBackground: boolean,
   fitGeometry = true
 ): string {
+  ({ svgs, plates } = chooseTraces(svgs, plates));
   const drawings: string[] = [];
   for (let index = 0; index < svgs.length; index += 1) {
     const plate = plates[index];
     const svg = svgs[index];
     if (plate === undefined || svg === undefined) continue;
-    let next = scaleSvg(svg, 1 / plate.scale);
+    let next = scaleSvg(plate.fills === undefined ? svg : restoreFills(svg, plate.fills), 1 / plate.scale);
     if (droppedColor !== null) next = dropFill(next, droppedColor);
     if (removeBackground) next = dropCanvasBackground(next, plate.borderColor);
     next = translateSvg(next, plate.originX, plate.originY);
@@ -75,6 +85,14 @@ export function mergePlates(
   const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, sourceCheck(plates, true) ?? check);
   const colour = sourceColour(plates);
   return colour === null ? sharpened : fitRasterCorners(sharpened, colour, check);
+}
+
+/** Give the paths traced with a stand-in fill (PlacedPlate.fills) the plate colour it stands for. */
+export function restoreFills(svg: string, fills: Readonly<Record<string, string>>): string {
+  return svg.replace(/fill="(#[0-9a-f]{6})"/gi, (whole, hex: string) => {
+    const own = fills[hex.toUpperCase()];
+    return own === undefined ? whole : 'fill="' + own.toUpperCase() + '"';
+  });
 }
 
 function sourceColour(plates: readonly PlacedPlate[]): ColourAt | null {

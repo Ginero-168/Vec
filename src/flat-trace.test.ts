@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { cornerColor, foldThinMixes, hasClearPixel, labelImage, shareTracerLayers, subjectBoxes } from "./flat-trace.ts";
-import { mergePlates } from "./trace-finish.ts";
+import { mergePlates, restoreFills } from "./trace-finish.ts";
+import { chooseTraces } from "./trace-coverage.ts";
 import { lossyCleanup, mergeNearCenters } from "./jpeg-clean.ts";
 import { rgbToOklab } from "./color.ts";
 import { encodeRgbaPng, readRgbaPng } from "./png-alpha.ts";
-import { cappedPalette, planTrace, punchBorderBackdrop } from "./trace-pipeline.ts";
+import { cappedPalette, planTrace, punchBorderBackdrop, separateNearInks } from "./trace-pipeline.ts";
 
 test("a full palette keeps the sentinel in the last slot", () => {
   const colors = ["#ff00ff"];
@@ -691,4 +692,79 @@ test("on a cleaned lossy raster, a label the tracer would have grouped by its cl
   const shared = shareTracerLayers(fills, rows, alphaT, coreT, labelsT, width, tall);
   assert.deepEqual(shared[1], fills[0]);
   assert.deepEqual(shared[2], fills[2]);
+});
+
+test("two inks the tracer could fold into one layer are traced with a stand-in pushed out of its reach", () => {
+  // 18 apart (8 + 5 + 5): far enough for two layers on their own, close enough for one to fold into the other once it
+  // has taken in a region of the other ink. The ink with fewer pixels moves along their difference to 40 apart.
+  const rgba = new Uint8Array(4 * 4 * 4);
+  for (let index = 0; index < 16; index += 1) rgba.set(index < 10 ? [60, 121, 202, 255] : index < 15 ? [68, 116, 207, 255] : [9, 9, 9, 0], index * 4);
+  const own = { rgba, width: 4, height: 4, originX: 0, originY: 0, scale: 1, plateWidth: 4 };
+  const separated = separateNearInks(rgba, ["#ffffff", "#3c79ca", "#4474cf"], own);
+  assert.ok(separated !== null);
+  assert.equal(separated.palette[0], "#ffffff");
+  assert.equal(separated.palette[1], "#3c79ca");
+  const stand = separated.palette[2]!;
+  const ink = [1, 3, 5].map((at) => parseInt(stand.slice(at, at + 2), 16));
+  assert.ok(Math.abs(ink[0]! - 60) + Math.abs(ink[1]! - 121) + Math.abs(ink[2]! - 202) >= 40, stand);
+  assert.ok(ink[0]! > 68 && ink[1]! < 116 && ink[2]! > 207, stand);
+  assert.deepEqual(separated.fills, { [stand.toUpperCase()]: "#4474cf" });
+  assert.deepEqual([...separated.rgba.slice(10 * 4, 10 * 4 + 4)], [...ink, 255]);
+  assert.deepEqual([...separated.rgba.slice(0, 4)], [60, 121, 202, 255]);
+  assert.deepEqual([...separated.rgba.slice(15 * 4)], [9, 9, 9, 0]);
+  assert.equal(separateNearInks(rgba, ["#ffffff", "#3c79ca", "#3e78cf"], own), null, "8 apart is one layer by design");
+  assert.equal(separateNearInks(rgba, ["#ffffff", "#3c79ca", "#5470d2"], own), null, "41 apart already stays apart");
+  // A JPEG splits one ink into near colours that are medians of noisy pixels: the source seldom has them exactly.
+  const noisy = new Uint8Array(rgba);
+  for (let index = 10; index < 15; index += 1) noisy.set([68 + (index % 3) - 1, 116 + (index % 2), 207 - (index % 3), 255], index * 4);
+  assert.equal(separateNearInks(rgba, ["#ffffff", "#3c79ca", "#4474cf"], { ...own, rgba: noisy }), null, "an ink the source does not have is not separated");
+});
+
+test("a stand-in that would come within reach of a third ink is not used", () => {
+  const rgba = new Uint8Array([60, 121, 202, 255, 60, 121, 202, 255, 68, 116, 207, 255]);
+  // #4474cf has fewer pixels, but pushed away from #3c79ca it would land 25 from #5a6ce0 (47 before): #3c79ca moves instead.
+  const separated = separateNearInks(rgba, ["#3c79ca", "#4474cf", "#5a6ce0"], { rgba, width: 3, height: 1, originX: 0, originY: 0, scale: 1, plateWidth: 3 });
+  assert.ok(separated !== null);
+  assert.equal(separated.palette[1], "#4474cf");
+  assert.notEqual(separated.palette[0], "#3c79ca");
+});
+
+test("paths traced with a stand-in fill get the plate colour back", () => {
+  const svg = '<svg><path d="M0 0" fill="#4B70D3"/><path d="M1 1" fill="#3C79CA"/></svg>';
+  assert.equal(restoreFills(svg, { "#4B70D3": "#4474cf" }), '<svg><path d="M0 0" fill="#4474CF"/><path d="M1 1" fill="#3C79CA"/></svg>');
+  const plate = { scale: 1, originX: 0, originY: 0, borderColor: null, cutOut: false, fills: { "#4B70D3": "#4474cf" } };
+  const merged = mergePlates(['<svg viewBox="0 0 4 4"><path d="M0,0L4,0L4,4Z" fill="#4b70d3"/></svg>'], [plate], 4, 4, null, false);
+  assert.ok(merged.includes('fill="#4474CF"') && !/4b70d3/i.test(merged), merged);
+});
+
+test("a clean plate with two near inks is traced with the stand-in and keeps the fills to restore", () => {
+  const image = fill(32, 32, 255, 255, 255, 255);
+  for (let y = 4; y < 28; y += 1) {
+    for (let x = 4; x < 28; x += 1) setPixel(image, 32, x, y, ...(y < 20 ? [60, 121, 202] as const : [68, 116, 207] as const), 255);
+  }
+  const plan = planTrace(encodeRgbaPng(32, 32, image.rgba), { preset: "icon", maxColors: 8, smoothness: 2.4, corner: 35, removeBackground: true, stacking: "stacked" });
+  const plate = plan?.plates[0];
+  assert.ok(plate?.fills !== undefined, "near inks are separated");
+  assert.deepEqual(Object.values(plate.fills), ["#4474cf"]);
+  const stand = Object.keys(plate.fills)[0]!.toLowerCase();
+  assert.ok(plate.request.palette?.includes(stand), String(plate.request.palette));
+  assert.ok(!plate.request.palette?.includes("#4474cf"));
+});
+
+test("a stand-in trace is kept only where it paints the plate's own inks better than the plain trace", () => {
+  // 4x2 source pixels at scale 2: left half ink A, right half ink B (traced with stand-in #5070D2).
+  const width = 8, height = 4, rgba = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) rgba.set(x < 4 ? [60, 121, 202, 255] : [80, 112, 210, 255], (y * width + x) * 4);
+  const png = encodeRgbaPng(width, height, rgba);
+  const fills = { "#5070D2": "#4474cf" };
+  const path = (x: number, w: number, fill: string) => `<path d="M${x},0L${x + w},0L${x + w},4L${x},4Z" fill="${fill}"/>`;
+  const both = `<svg>${path(0, 4, "#3C79CA")}${path(4, 4, "#5070D2")}</svg>`;
+  const folded = `<svg>${path(0, 8, "#3C79CA")}</svg>`;
+  const plates = [{ scale: 2, png, fills, plain: 1 }, { scale: 2, png, backup: true }];
+  const kept = chooseTraces([both, folded], plates);
+  assert.deepEqual(kept.svgs, [both], "the stand-in keeps B: fewer wrong pixels");
+  assert.equal(kept.plates.length, 1, "the backup is never drawn");
+  const smeared = `<svg>${path(0, 8, "#5070D2")}</svg>`;
+  assert.deepEqual(chooseTraces([smeared, folded], plates).svgs, [folded], "the stand-in paints A in B: plain trace");
+  assert.deepEqual(chooseTraces([folded, folded], plates).svgs, [folded], "a tie keeps the plain trace");
 });

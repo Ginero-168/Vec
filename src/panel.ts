@@ -238,6 +238,9 @@ function parsePlannedPlate(value: unknown): PlannedPlate | null {
     borderColor: value.borderColor,
     ...(value.cutOut === true ? { cutOut: true } : {}),
     ...(isSourceRaster(value.source) ? { source: value.source } : {}),
+    ...(isRecord(value.fills) && Object.values(value.fills).every((fill) => typeof fill === "string") ? { fills: value.fills as Record<string, string> } : {}),
+    ...(Number.isInteger(value.plain) ? { plain: value.plain as number } : {}),
+    ...(value.backup === true ? { backup: true } : {}),
     request
   };
 }
