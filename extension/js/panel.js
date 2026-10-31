@@ -1086,8 +1086,8 @@
     const span = { x: aim.x - anchor.x, y: aim.y - anchor.y };
     const size = lengthOf(span);
     if (size < 0.5) return null;
-    const unit2 = { x: span.x / size, y: span.y / size };
-    const off = (point2) => Math.abs((point2.x - anchor.x) * unit2.y - (point2.y - anchor.y) * unit2.x);
+    const unit3 = { x: span.x / size, y: span.y / size };
+    const off = (point2) => Math.abs((point2.x - anchor.x) * unit3.y - (point2.y - anchor.y) * unit3.x);
     for (let step = 16; step >= 8; step -= 1) if (off(bezier(cubic, step / 20)) > STRAIGHT_TOLERANCE) return null;
     let t = 0.4;
     for (let step = 39; step >= 0; step -= 1) {
@@ -1095,7 +1095,7 @@
       if (off(bezier(cubic, at)) > STRAIGHT_TOLERANCE) break;
       t = at;
     }
-    return { t, direction: { x: -unit2.x, y: -unit2.y }, length: distance(bezier(cubic, t), end) };
+    return { t, direction: { x: -unit3.x, y: -unit3.y }, length: distance(bezier(cubic, t), end) };
   }
   function reverseCubic(cubic) {
     return { p0: cubic.p3, p1: cubic.p2, p2: cubic.p1, p3: cubic.p0 };
@@ -1244,10 +1244,10 @@
       const end = nearest2(corner.end);
       if (start2 === null || end === null) continue;
       const forward = ((end.at - start2.at) % total + total) % total;
-      const reversed = forward > total / 2;
-      const from = reversed ? end : start2;
-      const to = reversed ? start2 : end;
-      const vertices = reversed ? [...corner.vertices].reverse() : corner.vertices;
+      const reversed2 = forward > total / 2;
+      const from = reversed2 ? end : start2;
+      const to = reversed2 ? start2 : end;
+      const vertices = reversed2 ? [...corner.vertices].reverse() : corner.vertices;
       const next = spliceCorner(subpath, from, to, vertices[0] ?? corner.start, (a, b) => {
         const points = [a, ...vertices, b];
         return points.slice(1).map((point2, at) => line(points[at], point2));
@@ -1399,13 +1399,13 @@
         const inPoint = onLine(pointAt(centre.at - spanBefore + lead).point, before);
         const outPoint = onLine(pointAt(centre.at + spanAfter - trail).point, after);
         const startTangent = unit({ x: pointAt(centre.at - spanBefore + 0.2).point.x - start2.point.x, y: pointAt(centre.at - spanBefore + 0.2).point.y - start2.point.y });
-        const endTangent = unit({ x: end.point.x - pointAt(centre.at + spanAfter - 0.2).point.x, y: end.point.y - pointAt(centre.at + spanAfter - 0.2).point.y });
-        if (startTangent !== null && endTangent !== null) {
+        const endTangent2 = unit({ x: end.point.x - pointAt(centre.at + spanAfter - 0.2).point.x, y: end.point.y - pointAt(centre.at + spanAfter - 0.2).point.y });
+        if (startTangent !== null && endTangent2 !== null) {
           const ease = (from, fromTangent, to, toTangent) => {
             const k = distance(from, to) / 3;
             return { p0: from, p1: { x: from.x + fromTangent.x * k, y: from.y + fromTangent.y * k }, p2: { x: to.x - toTangent.x * k, y: to.y - toTangent.y * k }, p3: to };
           };
-          middle = (from, to) => [ease(from, startTangent, inPoint, before.direction), line(inPoint, meet), line(meet, outPoint), ease(outPoint, after.direction, to, endTangent)];
+          middle = (from, to) => [ease(from, startTangent, inPoint, before.direction), line(inPoint, meet), line(meet, outPoint), ease(outPoint, after.direction, to, endTangent2)];
           vertices = [inPoint, meet, outPoint];
         }
         const next = spliceCorner(subpath, start2, end, meet, middle);
@@ -2686,7 +2686,7 @@
       }
     }
     finish();
-    const area = subs.reduce((sum, sub) => sum + Math.abs(sub.area), 0);
+    const area = subs.reduce((sum, sub2) => sum + Math.abs(sub2.area), 0);
     return {
       anchors,
       holes: countHoles(subs),
@@ -2696,7 +2696,7 @@
       maxX,
       maxY,
       loops: subs.length,
-      samples: subs.flatMap((sub) => sub.points)
+      samples: subs.flatMap((sub2) => sub2.points)
     };
   }
   function curveControls(op, relative, args, start2, prevControl) {
@@ -2743,15 +2743,15 @@
   }
   function countHoles(subs) {
     let outer = null;
-    for (const sub of subs) {
-      if (outer === null || Math.abs(sub.area) > Math.abs(outer.area)) outer = sub;
+    for (const sub2 of subs) {
+      if (outer === null || Math.abs(sub2.area) > Math.abs(outer.area)) outer = sub2;
     }
     if (outer === null || Math.abs(outer.area) < 0.5) return 0;
     const sign = Math.sign(outer.area);
     let holes = 0;
-    for (const sub of subs) {
-      if (sub === outer || Math.abs(sub.area) < 0.5 || Math.sign(sub.area) === sign) continue;
-      const center = centroid(sub.points);
+    for (const sub2 of subs) {
+      if (sub2 === outer || Math.abs(sub2.area) < 0.5 || Math.sign(sub2.area) === sign) continue;
+      const center = centroid(sub2.points);
       if (pointInPoly(center, outer.points)) holes += 1;
     }
     return holes;
@@ -5155,12 +5155,12 @@
     for (let pass = 0; pass < 2; pass += 1) {
       for (let label = 0; label < kCount; label += 1) {
         if (pass === 1 && retry[label] !== 1) continue;
-        const components2 = await smallLabelComponentsAsync(labels, label, width, height, minArea, context);
-        const small = components2.mask;
-        if (components2.any) {
-          const replacement = await nearestOutsideAsync(labels, small, components2.pixels, width, height, context);
-          for (let cursor = 0; cursor < components2.pixels.length; cursor += 1) {
-            const index = components2.pixels[cursor];
+        const components3 = await smallLabelComponentsAsync(labels, label, width, height, minArea, context);
+        const small = components3.mask;
+        if (components3.any) {
+          const replacement = await nearestOutsideAsync(labels, small, components3.pixels, width, height, context);
+          for (let cursor = 0; cursor < components3.pixels.length; cursor += 1) {
+            const index = components3.pixels[cursor];
             const next = replacement[index] ?? label;
             if (next !== label) retry[next] = 1;
             labels[index] = next;
@@ -5578,7 +5578,7 @@
               consider(left.mask.map((value, cell) => value | (right.mask[cell] ?? 0)));
             }
           }
-          if (bestError === Number.POSITIVE_INFINITY) for (const line2 of neighbours) consider(line2.mask);
+          if (bestError === Number.POSITIVE_INFINITY) for (const line3 of neighbours) consider(line3.mask);
         }
         shapes.set(index, best);
         if (reliable[index] !== 1) corners.push(index);
@@ -6224,11 +6224,11 @@
     for (let pass = 0; pass < 2; pass += 1) {
       for (let label = 0; label < kCount; label += 1) {
         if (pass === 1 && retry[label] !== 1) continue;
-        const components2 = smallLabelComponents(labels, label, width, height, minArea, (fraction) => onProgress?.((pass * kCount + label) / (2 * Math.max(1, kCount)) + fraction * 0.5 / Math.max(1, kCount)));
-        const small = components2.mask;
-        if (!components2.any) continue;
-        const replacement = nearestOutside(labels, small, components2.pixels, width, height, (fraction) => onProgress?.((pass * kCount + label) / (2 * Math.max(1, kCount)) + 0.5 / Math.max(1, kCount) + fraction * 0.5 / Math.max(1, kCount)));
-        for (const index of components2.pixels) {
+        const components3 = smallLabelComponents(labels, label, width, height, minArea, (fraction) => onProgress?.((pass * kCount + label) / (2 * Math.max(1, kCount)) + fraction * 0.5 / Math.max(1, kCount)));
+        const small = components3.mask;
+        if (!components3.any) continue;
+        const replacement = nearestOutside(labels, small, components3.pixels, width, height, (fraction) => onProgress?.((pass * kCount + label) / (2 * Math.max(1, kCount)) + 0.5 / Math.max(1, kCount) + fraction * 0.5 / Math.max(1, kCount)));
+        for (const index of components3.pixels) {
           const next = replacement[index] ?? label;
           if (next !== label) retry[next] = 1;
           labels[index] = next;
@@ -7250,13 +7250,13 @@
       const row = y * width;
       for (let x = 0; x < width; x += 1) output[row + x] = counts[x] > 0 ? 1 : 0;
       const remove = y - radius;
-      const add = y + radius + 1;
-      if (remove >= 0 || add < height) {
+      const add2 = y + radius + 1;
+      if (remove >= 0 || add2 < height) {
         const removeRow = remove * width;
-        const addRow = add * width;
+        const addRow = add2 * width;
         for (let x = 0; x < width; x += 1) {
           if (remove >= 0) counts[x] = counts[x] - source[removeRow + x];
-          if (add < height) counts[x] = counts[x] + source[addRow + x];
+          if (add2 < height) counts[x] = counts[x] + source[addRow + x];
         }
       }
     }
@@ -7275,13 +7275,13 @@
       const row = y * width;
       for (let x = 0; x < width; x += 1) output[row + x] = counts[x] > 0 ? 1 : 0;
       const remove = y - radius;
-      const add = y + radius + 1;
-      if (remove >= 0 || add < height) {
+      const add2 = y + radius + 1;
+      if (remove >= 0 || add2 < height) {
         const removeRow = remove * width;
-        const addRow = add * width;
+        const addRow = add2 * width;
         for (let x = 0; x < width; x += 1) {
           if (remove >= 0) counts[x] = counts[x] - source[removeRow + x];
-          if (add < height) counts[x] = counts[x] + source[addRow + x];
+          if (add2 < height) counts[x] = counts[x] + source[addRow + x];
         }
       }
       await cooperate(context);
@@ -7413,9 +7413,9 @@
       for (let x = 0; x < width; x += 1) {
         horizontal[row + x] = count > 0 ? 1 : 0;
         const remove = x - radius;
-        const add = x + radius + 1;
+        const add2 = x + radius + 1;
         if (remove >= 0) count -= edges[row + remove];
-        if (add < width) count += edges[row + add];
+        if (add2 < width) count += edges[row + add2];
       }
     }
     const candidates = dilateVertically(horizontal, width, height, radius);
@@ -7467,9 +7467,9 @@
       for (let x = 0; x < width; x += 1) {
         horizontal[row + x] = count > 0 ? 1 : 0;
         const remove = x - radius;
-        const add = x + radius + 1;
+        const add2 = x + radius + 1;
         if (remove >= 0) count -= edges[row + remove];
-        if (add < width) count += edges[row + add];
+        if (add2 < width) count += edges[row + add2];
       }
       await cooperate(context);
     }
@@ -7597,6 +7597,828 @@
     return "#" + [red, green, blue].map((value) => Math.min(255, Math.max(0, value)).toString(16).padStart(2, "0")).join("");
   }
 
+  // src/edge-first.ts
+  var KMAX = 2.5;
+  var KRMS = 0.5;
+  var EDGE_TOLERANCE = 0.5 / KMAX;
+  var CORNER_DEGREES = 50;
+  var WINDOW_CLEAN = 3;
+  var WINDOW_LOSSY = 2;
+  var LOSSY_TOLERANCE = EDGE_TOLERANCE * Math.sqrt(WINDOW_CLEAN / WINDOW_LOSSY);
+  function edgeFirstSvg(labelMap, source, lossy) {
+    const { width: W, height: H } = labelMap;
+    const { regions, count, inkOf } = connectedRegions(labelMap, source, lossy);
+    const X = new Float32Array(W * H * 4);
+    let clearPixels = 0;
+    for (let at = 0; at < W * H; at += 1) {
+      const alpha = (source[at * 4 + 3] ?? 0) / 255;
+      if (alpha < 250 / 255) clearPixels += 1;
+      for (let channel = 0; channel < 3; channel += 1) X[at * 4 + channel] = (source[at * 4 + channel] ?? 0) * alpha;
+      X[at * 4 + 3] = alpha * 255;
+    }
+    const hasAlpha = clearPixels > 2e-3 * W * H;
+    const backdrop = hasAlpha ? [0, 0, 0, 0] : borderColour(X, W, H);
+    let underlay = -1;
+    const underRegions = /* @__PURE__ */ new Set();
+    if (!hasAlpha) {
+      const size = /* @__PURE__ */ new Map(), contact = /* @__PURE__ */ new Map();
+      for (let at = 0; at < W * H; at += 1) {
+        const here = regions[at];
+        size.set(here, (size.get(here) ?? 0) + 1);
+        if (at % W + 1 < W && regions[at + 1] !== here) for (const r of [here, regions[at + 1]]) contact.set(r, (contact.get(r) ?? 0) + 1);
+        if (at + W < W * H && regions[at + W] !== here) for (const r of [here, regions[at + W]]) contact.set(r, (contact.get(r) ?? 0) + 1);
+      }
+      const onBorder2 = /* @__PURE__ */ new Set();
+      for (let at = 0; at < W * H; at += 1) {
+        const x = at % W, y = Math.floor(at / W);
+        if (x === 0 || y === 0 || x === W - 1 || y === H - 1) onBorder2.add(regions[at]);
+      }
+      const punched = [...onBorder2].some((region) => inkOf[region] < 0);
+      const nearBy = lossy ? RANGE_SIGMA : NEAR_FILL;
+      const near = (ink) => hexRgb(labelMap.inks[ink]).every((v, c) => Math.abs(v - backdrop[c]) <= nearBy);
+      if (punched) {
+        for (const region of onBorder2) if (inkOf[region] >= 0 && near(inkOf[region])) inkOf[region] = -1;
+      } else {
+        let best = -1;
+        for (const region of onBorder2) {
+          const score = (contact.get(region) ?? 0) * (W * H + 1) + size.get(region);
+          if (inkOf[region] >= 0 && score > best) {
+            best = score;
+            underlay = inkOf[region];
+          }
+        }
+        for (const region of onBorder2) if (inkOf[region] === underlay) underRegions.add(region);
+      }
+      for (const region of underRegions) inkOf[region] = -1;
+    }
+    const colours = [];
+    for (let region = 0; region < count; region += 1) {
+      const ink = inkOf[region];
+      colours.push(underRegions.has(region) ? [...hexRgb(labelMap.inks[underlay]), 255] : ink < 0 ? backdrop : [...hexRgb(labelMap.inks[ink]), 255]);
+    }
+    const { edges, chains } = crackGraph(regions, W, H);
+    const window2 = lossy ? WINDOW_LOSSY : WINDOW_CLEAN;
+    const corner = (v) => [v % (W + 1), Math.floor(v / (W + 1))];
+    const allPoints = chains.map((chain) => subpixelPoints(chain, edges, regions, W, H, X, colours, window2, backdrop, lossy));
+    const moved = /* @__PURE__ */ new Map();
+    const reach = /* @__PURE__ */ new Map();
+    const tangent = /* @__PURE__ */ new Set();
+    const onBorder = (v) => {
+      const [vx, vy] = corner(v);
+      return vx === 0 || vx === W || vy === 0 || vy === H;
+    };
+    const canvasCorner = (v) => {
+      const [vx, vy] = corner(v);
+      return (vx === 0 || vx === W) && (vy === 0 || vy === H);
+    };
+    chains.forEach((chain, index) => {
+      if (chain.closed || chain.pair[0] < 0 || allPoints[index].length === 0) return;
+      const pts = allPoints[index];
+      for (const [v, p, far] of [[chain.vs[0], pts[0], pts[Math.min(3, pts.length - 1)]], [chain.vs[chain.vs.length - 1], pts[pts.length - 1], pts[Math.max(0, pts.length - 4)]]]) {
+        if (!onBorder(v) || canvasCorner(v)) continue;
+        const [vx, vy] = corner(v);
+        if (Math.hypot(p[0] - vx, p[1] - vy) > 1.5) continue;
+        (reach.get(v) ?? reach.set(v, []).get(v)).push(p);
+        const along = vx === 0 || vx === W ? Math.abs(far[1] - p[1]) : Math.abs(far[0] - p[0]);
+        const across = vx === 0 || vx === W ? Math.abs(far[0] - p[0]) : Math.abs(far[1] - p[1]);
+        if (along > across) tangent.add(v);
+      }
+    });
+    for (const [v, ps] of reach) {
+      const [vx, vy] = corner(v);
+      const mean = [ps.reduce((a, p) => a + p[0], 0) / ps.length, ps.reduce((a, p) => a + p[1], 0) / ps.length];
+      if (tangent.has(v) && ps.length === 1) {
+        moved.set(v, mean);
+        continue;
+      }
+      tangent.delete(v);
+      moved.set(v, vx === 0 || vx === W ? [vx, Math.min(H, Math.max(0, mean[1]))] : [Math.min(W, Math.max(0, mean[0])), vy]);
+    }
+    const tolerance = lossy ? LOSSY_TOLERANCE : EDGE_TOLERANCE;
+    const end = (v) => moved.get(v) ?? corner(v);
+    const curves = chains.map((chain, index) => {
+      let points = allPoints[index];
+      if (chain.closed) {
+        const loop = points.length >= 3 ? points : chain.vs.slice(0, -1).map(corner);
+        return fitChain2(loop, true, tolerance);
+      }
+      if (chain.pair[0] < 0 || chain.pair[1] < 0) {
+        const first = tangent.has(chain.vs[0]) ? 1 : 0, last = tangent.has(chain.vs[chain.vs.length - 1]) ? 1 : 0;
+        if (points.length > first + last) points = points.slice(first, points.length - last);
+      }
+      const v0 = end(chain.vs[0]), v1 = end(chain.vs[chain.vs.length - 1]);
+      let inner = points.filter((p) => Math.hypot(p[0] - v0[0], p[1] - v0[1]) > 0.5 && Math.hypot(p[0] - v1[0], p[1] - v1[1]) > 0.5);
+      if (inner.length === 0 && chain.vs.length > 2) inner = chain.vs.slice(1, -1).map(corner);
+      return fitChain2([v0, ...inner, v1], false, tolerance);
+    });
+    const area = new Array(count).fill(0);
+    for (const region of regions) area[region] += 1;
+    const drawn = [...Array(count).keys()].filter((region) => inkOf[region] >= 0);
+    const order = drawn.sort((left, right) => area[right] - area[left] || left - right);
+    const rank = new Map(order.map((region, index) => [region, index]));
+    const neighbours = /* @__PURE__ */ new Map();
+    const byRegion = /* @__PURE__ */ new Map();
+    chains.forEach((chain, index) => {
+      const [a, b] = chain.pair;
+      for (const [p, q] of [[a, b], [b, a]]) {
+        if (p < 0) continue;
+        (byRegion.get(p) ?? byRegion.set(p, []).get(p)).push(index);
+        if (q >= 0) (neighbours.get(p) ?? neighbours.set(p, /* @__PURE__ */ new Set()).get(p)).add(q);
+      }
+    });
+    const parts = underlay < 0 ? [] : [`<path d="M0,0L${W},0L${W},${H}L0,${H}Z" fill="${labelMap.inks[underlay].toUpperCase()}"/>`];
+    for (const region of order) {
+      const union = /* @__PURE__ */ new Set([region]);
+      for (const other of neighbours.get(region) ?? []) if ((rank.get(other) ?? -1) > rank.get(region)) union.add(other);
+      const boundary = /* @__PURE__ */ new Set();
+      for (const member of union) {
+        for (const index of byRegion.get(member) ?? []) {
+          const [a, b] = chains[index].pair;
+          if (union.has(a) !== union.has(b)) boundary.add(index);
+        }
+      }
+      const d = loops([...boundary].sort((l, r) => l - r), chains, curves, W);
+      if (d !== "") parts.push(`<path d="${d}" fill="${labelMap.inks[inkOf[region]].toUpperCase()}" fill-rule="evenodd"/>`);
+    }
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${parts.join("")}</svg>`;
+  }
+  function hexRgb(hex3) {
+    return [1, 3, 5].map((at) => parseInt(hex3.slice(at, at + 2), 16));
+  }
+  function connectedRegions(labelMap, source, lossy) {
+    const { width: W, height: H } = labelMap;
+    const labels = Int32Array.from(labelMap.labels);
+    const speck = lossy ? LOSSY_SPECK : SPECK_SOURCE;
+    foldThinMixes2(labels, labelMap.inks, source, W, H, lossy);
+    for (let pass = 0; pass < 4; pass += 1) {
+      const found = components2(labels, W, H);
+      let changed = false;
+      const size = new Array(found.count).fill(0);
+      for (const region of found.regions) size[region] += 1;
+      const shared = /* @__PURE__ */ new Map();
+      for (let at = 0; at < W * H; at += 1) {
+        const here = found.regions[at];
+        if (size[here] >= speck) continue;
+        const x = at % W;
+        for (const next of [x > 0 ? at - 1 : -1, x < W - 1 ? at + 1 : -1, at - W, at + W]) {
+          if (next < 0 || next >= W * H) continue;
+          const other = found.regions[next];
+          if (other === here) continue;
+          const tally = shared.get(here) ?? shared.set(here, /* @__PURE__ */ new Map()).get(here);
+          tally.set(other, (tally.get(other) ?? 0) + 1);
+        }
+      }
+      const inkOfRegion = found.inkOf;
+      const target = /* @__PURE__ */ new Map();
+      for (const [region, tally] of shared) {
+        let best = -1, most = 0;
+        for (const [other, count] of tally) if (count > most || count === most && size[other] > size[best]) {
+          best = other;
+          most = count;
+        }
+        if (best >= 0 && inkOfRegion[best] !== inkOfRegion[region]) target.set(region, inkOfRegion[best]);
+      }
+      for (let at = 0; at < W * H; at += 1) {
+        const ink = target.get(found.regions[at]);
+        if (ink !== void 0) {
+          labels[at] = ink;
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    return components2(labels, W, H);
+  }
+  var LOSSY_SPECK = 4;
+  var THIN_RATIO = 0.7;
+  function foldThinMixes2(labels, inks, source, W, H, lossy) {
+    const inkRgb = inks.map((hex3) => [1, 3, 5].map((at) => parseInt(hex3.slice(at, at + 2), 16)));
+    let clear = 0;
+    const premultiplied = new Float32Array(W * H * 4);
+    for (let at = 0; at < W * H; at += 1) {
+      const alpha = source[at * 4 + 3] / 255;
+      if (alpha < 250 / 255) clear += 1;
+      for (let c = 0; c < 3; c += 1) premultiplied[at * 4 + c] = source[at * 4 + c] * alpha;
+      premultiplied[at * 4 + 3] = alpha * 255;
+    }
+    const page = clear > 2e-3 * W * H ? null : borderColour(premultiplied, W, H).slice(0, 3);
+    const PAGE = -2;
+    for (let pass = 0; pass < 3; pass += 1) {
+      const found = components2(labels, W, H);
+      const area = new Array(found.count).fill(0), perimeter = new Array(found.count).fill(0);
+      const interior = new Array(found.count).fill(0), edge = new Uint8Array(found.count);
+      const sum = Array.from({ length: found.count }, () => [0, 0, 0, 0]);
+      for (let at = 0; at < W * H; at += 1) {
+        const total = sum[found.regions[at]], alpha = source[at * 4 + 3] / 255;
+        for (let c = 0; c < 3; c += 1) total[c] += source[at * 4 + c] * alpha;
+        total[3] += alpha;
+      }
+      const rgb = sum.map((total) => total[3] > 0 ? [0, 1, 2].map((c) => total[c] / total[3]) : [0, 0, 0]);
+      const touching = /* @__PURE__ */ new Map();
+      for (let at = 0; at < W * H; at += 1) {
+        const here = found.regions[at], x = at % W, y = Math.floor(at / W);
+        area[here] += 1;
+        let inside = true;
+        for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) {
+            perimeter[here] += 1;
+            edge[here] = 1;
+            continue;
+          }
+          const other = found.regions[ny * W + nx];
+          if (other === here) continue;
+          perimeter[here] += 1;
+          inside = false;
+          (touching.get(here) ?? touching.set(here, /* @__PURE__ */ new Set()).get(here)).add(other);
+        }
+        if (inside) interior[here] += 1;
+      }
+      const into = /* @__PURE__ */ new Map();
+      if (lossy) {
+        for (let region = 0; region < found.count; region += 1) {
+          const ink = found.inkOf[region];
+          if (ink < 0) continue;
+          let best = -1;
+          for (const other of touching.get(region) ?? []) {
+            const otherInk = found.inkOf[other];
+            if (otherInk < 0 || otherInk === ink || area[other] <= area[region]) continue;
+            if (!inkRgb[ink].every((v, c) => Math.abs(v - inkRgb[otherInk][c]) < RANGE_SIGMA)) continue;
+            if (best < 0 || area[other] > area[best]) best = other;
+          }
+          if (best >= 0) into.set(region, found.inkOf[best]);
+        }
+      }
+      for (let region = 0; region < found.count; region += 1) {
+        if (into.has(region)) continue;
+        const ink = found.inkOf[region];
+        if (ink < 0 || area[region] >= THIN_RATIO * perimeter[region]) continue;
+        const own = rgb[region];
+        const inkRegion = /* @__PURE__ */ new Map();
+        for (const other of touching.get(region) ?? []) {
+          const otherInk = found.inkOf[other];
+          if (otherInk === ink || otherInk < 0 && sum[other][3] < 0.5 * area[other]) continue;
+          if (!inkRegion.has(otherInk) || area[other] > area[inkRegion.get(otherInk)]) inkRegion.set(otherInk, other);
+        }
+        const neighbours = [...inkRegion.keys()];
+        if (page !== null && edge[region] === 1) neighbours.push(PAGE);
+        const colourOf = (key) => key === PAGE ? page : rgb[inkRegion.get(key)];
+        let best = null;
+        for (let a = 0; a < neighbours.length; a += 1) {
+          for (let b = a + 1; b < neighbours.length; b += 1) {
+            const A = colourOf(neighbours[a]), B = colourOf(neighbours[b]), d = B.map((v, c) => v - A[c]), dd = d.reduce((sum2, v) => sum2 + v * v, 0);
+            if (dd < 1e-6) continue;
+            const t = Math.min(1, Math.max(0, own.reduce((sum2, v, c) => sum2 + (v - A[c]) * d[c], 0) / dd));
+            const residual = own.reduce((sum2, v, c) => sum2 + Math.abs(A[c] + t * d[c] - v), 0);
+            const off = Math.hypot(...own.map((v, c) => A[c] + t * d[c] - v)), edgeOnly = interior[region] === 0;
+            if (t <= 0 || t >= 1 || residual > TRACER_LAYER_DIFFERENCE + 1 && !(edgeOnly && off < 0.5 * Math.sqrt(dd))) continue;
+            const side = neighbours[a] === PAGE ? neighbours[b] : neighbours[b] === PAGE ? neighbours[a] : t < 0.5 ? neighbours[a] : neighbours[b];
+            if (best === null || residual < best.residual) best = { residual, ink: side };
+          }
+        }
+        if (best !== null) into.set(region, best.ink);
+      }
+      if (into.size === 0) return;
+      for (let at = 0; at < W * H; at += 1) {
+        const ink = into.get(found.regions[at]);
+        if (ink !== void 0) labels[at] = ink;
+      }
+    }
+  }
+  function components2(labels, W, H) {
+    const regions = new Int32Array(W * H).fill(-1);
+    const inkOf = [];
+    const stack = [];
+    for (let start2 = 0; start2 < W * H; start2 += 1) {
+      if (regions[start2] !== -1) continue;
+      const id = inkOf.length, ink = labels[start2];
+      inkOf.push(ink);
+      regions[start2] = id;
+      stack.push(start2);
+      while (stack.length > 0) {
+        const at = stack.pop(), x = at % W;
+        for (const next of [x > 0 ? at - 1 : -1, x < W - 1 ? at + 1 : -1, at - W, at + W]) {
+          if (next < 0 || next >= W * H || regions[next] !== -1 || labels[next] !== ink) continue;
+          regions[next] = id;
+          stack.push(next);
+        }
+      }
+    }
+    return { regions, count: inkOf.length, inkOf };
+  }
+  function borderColour(X, W, H) {
+    const at = [];
+    for (let x = 0; x < W; x += 1) at.push(x, (H - 1) * W + x);
+    for (let y = 0; y < H; y += 1) at.push(y * W, y * W + W - 1);
+    const bins = /* @__PURE__ */ new Map();
+    for (const pixel of at) {
+      const key = [0, 1, 2, 3].map((c) => Math.round(X[pixel * 4 + c] / 8)).join(",");
+      (bins.get(key) ?? bins.set(key, []).get(key)).push(pixel);
+    }
+    let best = [];
+    for (const pixels of bins.values()) if (pixels.length > best.length) best = pixels;
+    return [0, 1, 2, 3].map((c) => {
+      const v = best.map((p) => X[p * 4 + c]).sort((l, r) => l - r);
+      return v.length % 2 === 1 ? v[(v.length - 1) / 2] : (v[v.length / 2 - 1] + v[v.length / 2]) / 2;
+    });
+  }
+  function crackGraph(regions, W, H) {
+    const label = (y, x) => y < 0 || x < 0 || y >= H || x >= W ? -1 : regions[y * W + x];
+    const vertex = (y, x) => y * (W + 1) + x;
+    const edges = [];
+    for (let y = 0; y <= H; y += 1) for (let x = 0; x < W; x += 1) {
+      const la = label(y - 1, x), lb = label(y, x);
+      if (la !== lb) edges.push({ a: vertex(y, x), b: vertex(y, x + 1), kind: "h", y, x, la, lb });
+    }
+    for (let y = 0; y < H; y += 1) for (let x = 0; x <= W; x += 1) {
+      const la = label(y, x - 1), lb = label(y, x);
+      if (la !== lb) edges.push({ a: vertex(y, x), b: vertex(y + 1, x), kind: "v", y, x, la, lb });
+    }
+    const incident = /* @__PURE__ */ new Map();
+    edges.forEach((edge, index) => {
+      (incident.get(edge.a) ?? incident.set(edge.a, []).get(edge.a)).push(index);
+      (incident.get(edge.b) ?? incident.set(edge.b, []).get(edge.b)).push(index);
+    });
+    const junction = /* @__PURE__ */ new Set();
+    for (const [v, list] of incident) if (list.length !== 2) junction.add(v);
+    const used = new Uint8Array(edges.length);
+    const chains = [];
+    const walk = (start2, first, loopOnly) => {
+      const vs = [start2], es = [];
+      let v = start2, index = first, closed = loopOnly;
+      for (; ; ) {
+        used[index] = 1;
+        es.push(index);
+        const edge2 = edges[index];
+        v = edge2.a === v ? edge2.b : edge2.a;
+        vs.push(v);
+        if (junction.has(v)) break;
+        const next = incident.get(v).find((k) => used[k] === 0);
+        if (next === void 0) {
+          closed = closed || vs[0] === v;
+          break;
+        }
+        index = next;
+      }
+      const edge = edges[es[0]];
+      chains.push({ vs, es, closed: closed || vs[0] === vs[vs.length - 1], pair: [Math.min(edge.la, edge.lb), Math.max(edge.la, edge.lb)] });
+    };
+    for (const v of [...junction].sort((l, r) => l - r)) for (const index of incident.get(v)) if (used[index] === 0) walk(v, index, false);
+    for (let index = 0; index < edges.length; index += 1) if (used[index] === 0) walk(edges[index].a, index, true);
+    return { edges, chains };
+  }
+  var rgbaDot = (p, q) => p[0] * q[0] + p[1] * q[1] + p[2] * q[2] + p[3] * q[3];
+  var lossyDot = (p, q) => {
+    const y = (v) => 0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2];
+    const cb = (v) => -0.168736 * v[0] - 0.331264 * v[1] + 0.5 * v[2];
+    const cr = (v) => 0.5 * v[0] - 0.418688 * v[1] - 0.081312 * v[2];
+    return y(p) * y(q) + (cb(p) * cb(q) + cr(p) * cr(q)) / 4 + p[3] * q[3];
+  };
+  var MIX_RESIDUAL2 = 30;
+  function subpixelPoints(chain, edges, regions, W, H, X, colours, window2, backdrop, lossy) {
+    const [la, lb] = chain.pair;
+    const pixel = (y, x) => [0, 1, 2, 3].map((c) => X[(y * W + x) * 4 + c]);
+    const dot = rgbaDot, mixDot = lossy ? lossyDot : rgbaDot;
+    const out = [];
+    const reach = (from, step, size, at, region) => {
+      let run = 0, i = from;
+      while (i >= 0 && i < size && at(i) === region && run < 2 * window2) {
+        run += 1;
+        i += step;
+      }
+      return i < 0 || i >= size ? Math.min(window2, run) : Math.max(1, Math.min(window2, Math.floor(run / 2)));
+    };
+    if (la < 0 || lb < 0) {
+      const C = colours[lb < 0 ? la : lb], d = C.map((v, c) => v - backdrop[c]), dd = dot(d, d);
+      chain.es.forEach((index, k) => {
+        const e = edges[index];
+        const atEnd = !chain.closed && (k === 0 || k === chain.es.length - 1);
+        const ax = e.a % (W + 1), ay = Math.floor(e.a / (W + 1)), bx = e.b % (W + 1), by = Math.floor(e.b / (W + 1));
+        let mx = (ax + bx) / 2, my = (ay + by) / 2;
+        if (dd > 400 && !atEnd) {
+          const outsideFirst = e.la < 0, inward = outsideFirst ? 1 : -1;
+          const [py, px] = e.kind === "h" ? outsideFirst ? [e.y, e.x] : [e.y - 1, e.x] : outsideFirst ? [e.y, e.x] : [e.y, e.x - 1];
+          const pv = pixel(py, px);
+          const cover = (v) => Math.min(1, Math.max(0, dot(v.map((value, c) => value - backdrop[c]), d) / dd));
+          const t = cover(pv);
+          const off = pv.map((v, c) => backdrop[c] + t * d[c] - v), residual = Math.sqrt(mixDot(off, off));
+          let shift2 = 1 - t;
+          if (lossy) {
+            const region = la < 0 ? lb : la;
+            let n2 = 0, sum = 0;
+            for (let k2 = 0; k2 < window2; k2 += 1) {
+              const y = e.kind === "h" ? py + k2 * inward : py, x = e.kind === "h" ? px : px + k2 * inward;
+              if (y < 0 || y >= H || x < 0 || x >= W || regions[y * W + x] !== region) break;
+              n2 += 1;
+              sum += cover(pixel(y, x));
+            }
+            shift2 = Math.min(1, Math.max(0, n2 - sum));
+          }
+          if (residual < MIX_RESIDUAL2 && (!lossy || shift2 * Math.sqrt(dd) >= RANGE_SIGMA)) {
+            if (e.kind === "h") my += shift2 * inward;
+            else mx += shift2 * inward;
+          }
+        }
+        out.push([mx, my]);
+      });
+      return out;
+    }
+    const vs = chain.vs, n = chain.es.length, Vx = (k) => vs[k] % (W + 1), Vy = (k) => Math.floor(vs[k] / (W + 1));
+    chain.es.forEach((index, k) => {
+      const e = edges[index];
+      let dx, dy;
+      if (chain.closed) {
+        const p = (k + 4) % n, q = ((k - 3) % n + n) % n;
+        dx = Vx(p) - Vx(q);
+        dy = Vy(p) - Vy(q);
+      } else {
+        const i0 = Math.max(0, k - 3), i1 = Math.min(vs.length - 1, k + 4);
+        dx = Vx(i1) - Vx(i0);
+        dy = Vy(i1) - Vy(i0);
+      }
+      const ax = Math.abs(dx), ay = Math.abs(dy);
+      if (e.kind === "h" && ax < 0.75 * ay) return;
+      if (e.kind === "v" && ay < 0.75 * ax) return;
+      const Ca = colours[e.la], Cb = colours[e.lb], dv = Cb.map((v, c) => v - Ca[c]), dd = mixDot(dv, dv);
+      if (dd < 1e-3) return;
+      const t = (y, x) => Math.min(1, Math.max(0, mixDot(pixel(y, x).map((v, c) => v - Ca[c]), dv) / dd));
+      if (e.kind === "v") {
+        const y = e.y, x = e.x;
+        let l = x - 1, r = x;
+        const wl = reach(x - 1, -1, W, (i) => regions[y * W + i], e.la), wr = reach(x, 1, W, (i) => regions[y * W + i], e.lb);
+        while (l - 1 >= 0 && x - 1 - (l - 1) < wl && regions[y * W + l - 1] === e.la) l -= 1;
+        while (r + 1 < W && r + 1 - x < wr && regions[y * W + r + 1] === e.lb) r += 1;
+        let sum = 0;
+        for (let i = l; i <= r; i += 1) sum += t(y, i);
+        out.push([Math.min(Math.max(r + 1 - sum, x - 1), x + 1), y + 0.5]);
+      } else {
+        const y = e.y, x = e.x;
+        let l = y - 1, r = y;
+        const wl = reach(y - 1, -1, H, (i) => regions[i * W + x], e.la), wr = reach(y, 1, H, (i) => regions[i * W + x], e.lb);
+        while (l - 1 >= 0 && y - 1 - (l - 1) < wl && regions[(l - 1) * W + x] === e.la) l -= 1;
+        while (r + 1 < H && r + 1 - y < wr && regions[(r + 1) * W + x] === e.lb) r += 1;
+        let sum = 0;
+        for (let i = l; i <= r; i += 1) sum += t(i, x);
+        out.push([x + 0.5, Math.min(Math.max(r + 1 - sum, y - 1), y + 1)]);
+      }
+    });
+    return out;
+  }
+  var sub = (p, q) => [p[0] - q[0], p[1] - q[1]];
+  var add = (p, q) => [p[0] + q[0], p[1] + q[1]];
+  var mul = (p, k) => [p[0] * k, p[1] * k];
+  var norm = (p) => Math.hypot(p[0], p[1]);
+  var unit2 = (p) => {
+    const n = norm(p);
+    return n > 1e-9 ? [p[0] / n, p[1] / n] : p;
+  };
+  var bez = (b, t) => {
+    const m = 1 - t;
+    return [0, 1].map((c) => m * m * m * b[0][c] + 3 * m * m * t * b[1][c] + 3 * m * t * t * b[2][c] + t * t * t * b[3][c]);
+  };
+  var bezd = (b, t) => {
+    const m = 1 - t;
+    return [0, 1].map((c) => 3 * m * m * (b[1][c] - b[0][c]) + 6 * m * t * (b[2][c] - b[1][c]) + 3 * t * t * (b[3][c] - b[2][c]));
+  };
+  var bezdd = (b, t) => [0, 1].map((c) => 6 * (1 - t) * (b[2][c] - 2 * b[1][c] + b[0][c]) + 6 * t * (b[3][c] - 2 * b[2][c] + b[1][c]));
+  var line2 = (p, q) => [p, add(p, mul(sub(q, p), 1 / 3)), add(p, mul(sub(q, p), 2 / 3)), q];
+  function chordU(P) {
+    const d = [0];
+    for (let i = 1; i < P.length; i += 1) d.push(d[i - 1] + norm(sub(P[i], P[i - 1])));
+    const total = d[d.length - 1];
+    return total > 0 ? d.map((v) => v / total) : P.map((_, i) => i / Math.max(1, P.length - 1));
+  }
+  function genBez(P, u, t1, t2) {
+    const p0 = P[0], p3 = P[P.length - 1];
+    let c00 = 0, c01 = 0, c11 = 0, x0 = 0, x1 = 0;
+    u.forEach((t, i) => {
+      const a12 = mul(t1, 3 * (1 - t) ** 2 * t), a22 = mul(t2, 3 * (1 - t) * t * t);
+      c00 += a12[0] * a12[0] + a12[1] * a12[1];
+      c01 += a12[0] * a22[0] + a12[1] * a22[1];
+      c11 += a22[0] * a22[0] + a22[1] * a22[1];
+      const tmp = sub(P[i], bez([p0, p0, p3, p3], t));
+      x0 += a12[0] * tmp[0] + a12[1] * tmp[1];
+      x1 += a22[0] * tmp[0] + a22[1] * tmp[1];
+    });
+    const det = c00 * c11 - c01 * c01, seg = norm(sub(p3, p0));
+    let a1 = seg / 3, a2 = seg / 3;
+    if (Math.abs(det) > 1e-12) {
+      a1 = (x0 * c11 - x1 * c01) / det;
+      a2 = (c00 * x1 - c01 * x0) / det;
+    }
+    if (a1 < 1e-6 * seg || a2 < 1e-6 * seg || a1 > 2 * seg || a2 > 2 * seg) {
+      a1 = seg / 3;
+      a2 = seg / 3;
+    }
+    return [p0, add(p0, mul(t1, a1)), add(p3, mul(t2, a2)), p3];
+  }
+  function reparam(b, P, u) {
+    return u.map((t, i) => {
+      const d = sub(bez(b, t), P[i]), d1 = bezd(b, t), d2 = bezdd(b, t);
+      const num = d[0] * d1[0] + d[1] * d1[1], den = d1[0] * d1[0] + d1[1] * d1[1] + d[0] * d2[0] + d[1] * d2[1];
+      return Math.min(1, Math.max(0, t - (Math.abs(den) > 1e-9 ? num / den : 0)));
+    });
+  }
+  function fitError(b, P, u) {
+    let worst = 0, at = 0, squares = 0;
+    u.forEach((t, i) => {
+      const e = norm(sub(bez(b, t), P[i]));
+      squares += e * e;
+      if (e > worst) {
+        worst = e;
+        at = i;
+      }
+    });
+    return [Math.max(worst / KMAX, Math.sqrt(squares / P.length) / KRMS), at];
+  }
+  function endTangent(P, forward, reach = 2) {
+    if (forward) {
+      for (let j = 1; j < P.length; j += 1) if (norm(sub(P[j], P[0])) >= reach || j === P.length - 1) return unit2(sub(P[j], P[0]));
+    } else {
+      for (let j = P.length - 2; j >= 0; j -= 1) if (norm(sub(P[j], P[P.length - 1])) >= reach || j === 0) return unit2(sub(P[j], P[P.length - 1]));
+    }
+    return [0, 0];
+  }
+  function straightWithin(P, limit) {
+    const ch = sub(P[P.length - 1], P[0]), L = norm(ch);
+    if (L < 1e-9) return false;
+    const n = [-ch[1] / L, ch[0] / L];
+    return P.every((p) => Math.abs((p[0] - P[0][0]) * n[0] + (p[1] - P[0][1]) * n[1]) <= limit);
+  }
+  function fitCubic2(P, t1, t2, tol, depth = 0) {
+    if (P.length > 3 && norm(sub(P[P.length - 1], P[0])) < 1e-6) {
+      let m = 0, far = -1;
+      P.forEach((p, i2) => {
+        const d = norm(sub(p, P[0]));
+        if (d > far) {
+          far = d;
+          m = i2;
+        }
+      });
+      m = Math.min(Math.max(m, 1), P.length - 2);
+      const tm = unit2(sub(P[Math.min(m + 1, P.length - 1)], P[m - 1]));
+      return [...fitCubic2(P.slice(0, m + 1), t1, mul(tm, -1), tol, depth + 1), ...fitCubic2(P.slice(m), tm, t2, tol, depth + 1)];
+    }
+    if (P.length === 2 || norm(sub(P[P.length - 1], P[0])) < 1e-6) {
+      const d = norm(sub(P[P.length - 1], P[0])) / 3;
+      return [[P[0], add(P[0], mul(t1, d)), add(P[P.length - 1], mul(t2, d)), P[P.length - 1]]];
+    }
+    if (straightWithin(P, tol)) return [line2(P[0], P[P.length - 1])];
+    let u = chordU(P), b = genBez(P, u, t1, t2), [e, i] = fitError(b, P, u);
+    if (e <= tol) return [b];
+    if (e <= tol * 4) {
+      for (let k = 0; k < 8; k += 1) {
+        u = reparam(b, P, u);
+        b = genBez(P, u, t1, t2);
+        [e, i] = fitError(b, P, u);
+        if (e <= tol) return [b];
+      }
+    }
+    if (P.length < 4 || depth > 40) return [b];
+    i = Math.min(Math.max(i, 1), P.length - 2);
+    const tc = unit2(sub(P[Math.max(0, i - 2)], P[Math.min(P.length - 1, i + 2)]));
+    return [...fitCubic2(P.slice(0, i + 1), t1, tc, tol, depth + 1), ...fitCubic2(P.slice(i), mul(tc, -1), t2, tol, depth + 1)];
+  }
+  function tryFit(S, t1, t2, tol) {
+    if (norm(sub(S[S.length - 1], S[0])) < 1e-9) return null;
+    if (S.length <= 2 || straightWithin(S, tol * KMAX * 0.5)) return line2(S[0], S[S.length - 1]);
+    let u = chordU(S), b = genBez(S, u, t1, t2), [e] = fitError(b, S, u);
+    for (let k = 0; k < 10; k += 1) {
+      if (e <= tol) return b;
+      u = reparam(b, S, u);
+      b = genBez(S, u, t1, t2);
+      [e] = fitError(b, S, u);
+    }
+    return e <= tol ? b : null;
+  }
+  function fitSpan(S, tol) {
+    const cubics = fitCubic2(S, endTangent(S, true), endTangent(S, false), tol);
+    if (cubics.length <= 1) return cubics;
+    const index = [0];
+    for (const b of cubics.slice(0, -1)) {
+      let j = 0, best = Infinity;
+      S.forEach((p, k) => {
+        const d = norm(sub(p, b[3]));
+        if (d < best) {
+          best = d;
+          j = k;
+        }
+      });
+      index.push(Math.max(j, index[index.length - 1] + 1));
+    }
+    index.push(S.length - 1);
+    const segs = cubics.map((b, k) => ({ i0: index[k], i1: index[k + 1], t1: norm(sub(b[1], b[0])) > 1e-9 ? unit2(sub(b[1], b[0])) : endTangent(S, true), t2: norm(sub(b[2], b[3])) > 1e-9 ? unit2(sub(b[2], b[3])) : endTangent(S, false), b }));
+    let changed = true;
+    while (changed && segs.length > 1) {
+      changed = false;
+      for (let k = 0; k < segs.length - 1; k += 1) {
+        const part = S.slice(segs[k].i0, segs[k + 1].i1 + 1);
+        const t1 = k > 0 ? segs[k].t1 : endTangent(part, true), t2 = k + 1 < segs.length - 1 ? segs[k + 1].t2 : endTangent(part, false);
+        const b = tryFit(part, t1, t2, tol);
+        if (b === null) continue;
+        segs.splice(k, 2, { i0: segs[k].i0, i1: segs[k + 1].i1, t1, t2, b });
+        changed = true;
+        break;
+      }
+    }
+    return segs.map((seg) => seg.b);
+  }
+  function findCorners(P, closed) {
+    const n = P.length;
+    if (n < 5) return [];
+    const s = [0];
+    for (let i = 1; i < n; i += 1) s.push(s[i - 1] + norm(sub(P[i], P[i - 1])));
+    const angle = new Array(n).fill(0), R = 2;
+    for (let i = 0; i < n; i += 1) {
+      let j, k;
+      if (closed) {
+        j = i;
+        let acc = 0;
+        while (acc < R) {
+          const j2 = (j - 1 + n) % n;
+          acc += norm(sub(P[j], P[j2]));
+          j = j2;
+          if (j === i) break;
+        }
+        k = i;
+        acc = 0;
+        while (acc < R) {
+          const k2 = (k + 1) % n;
+          acc += norm(sub(P[k2], P[k]));
+          k = k2;
+          if (k === i) break;
+        }
+      } else {
+        if (i === 0 || i === n - 1) continue;
+        j = 0;
+        while (j + 1 < n && s[j + 1] <= s[i] - R) j += 1;
+        k = n - 1;
+        for (let q = i; q < n; q += 1) if (s[q] >= s[i] + R) {
+          k = q;
+          break;
+        }
+        if (j === i || k === i) continue;
+      }
+      const a = sub(P[i], P[j]), b = sub(P[k], P[i]), na = norm(a), nb = norm(b);
+      if (na < 1e-6 || nb < 1e-6) continue;
+      angle[i] = Math.acos(Math.max(-1, Math.min(1, (a[0] * b[0] + a[1] * b[1]) / na / nb))) * 180 / Math.PI;
+    }
+    const out = [];
+    for (let i = 0; i < n; i += 1) {
+      if (angle[i] < CORNER_DEGREES) continue;
+      let peak = true;
+      for (let k = i - 2; k <= i + 2; k += 1) {
+        const v = closed ? angle[(k % n + n) % n] : k >= 0 && k < n ? angle[k] : 0;
+        if (v > angle[i]) peak = false;
+      }
+      if (peak && (out.length === 0 || i - out[out.length - 1] > 2)) out.push(i);
+    }
+    return out;
+  }
+  function sharpenCorner(P, c) {
+    const n = P.length;
+    const fitLine = (ix) => {
+      const m = [ix.reduce((a, i) => a + P[i][0], 0) / ix.length, ix.reduce((a, i) => a + P[i][1], 0) / ix.length];
+      let xx = 0, xy = 0, yy = 0;
+      for (const i of ix) {
+        const d = sub(P[i], m);
+        xx += d[0] * d[0];
+        xy += d[0] * d[1];
+        yy += d[1] * d[1];
+      }
+      const angle = 0.5 * Math.atan2(2 * xy, xx - yy);
+      return [m, [Math.cos(angle), Math.sin(angle)]];
+    };
+    const intersect = (from) => {
+      const s2 = P.map((p) => norm(sub(p, from)));
+      const L = [], R = [];
+      for (let i = Math.max(0, c - 8); i < c; i += 1) if (s2[i] >= 1.2 && s2[i] <= 5) L.push(i);
+      for (let i = c + 1; i < Math.min(n, c + 9); i += 1) if (s2[i] >= 1.2 && s2[i] <= 5) R.push(i);
+      if (L.length < 2 || R.length < 2) return null;
+      const [m1, d1] = fitLine(L), [m2, d2] = fitLine(R);
+      const det = d1[0] * -d2[1] - -d2[0] * d1[1];
+      if (Math.abs(det) < 0.2) return null;
+      const r = sub(m2, m1), t = (r[0] * -d2[1] - -d2[0] * r[1]) / det, X2 = add(m1, mul(d1, t));
+      return norm(sub(X2, P[c])) > 1.5 ? null : X2;
+    };
+    const first = intersect(P[c]);
+    if (first === null) return [P.slice(), c];
+    const X = intersect(first) ?? first;
+    const s = P.map((p) => Math.min(norm(sub(p, P[c])), norm(sub(p, X))));
+    const keep = [...Array(n).keys()].filter((i) => i === c || s[i] >= 1 || i === 0 || i === n - 1);
+    const out = keep.map((i) => i === c ? X : P[i]);
+    return [out, keep.indexOf(c)];
+  }
+  function fitChain2(input, closed, tol) {
+    let P = input.filter((p, i) => i === 0 || norm(sub(p, input[i - 1])) > 1e-4);
+    if (closed && P.length > 1 && norm(sub(P[0], P[P.length - 1])) < 1e-4) P = P.slice(0, -1);
+    if (P.length < 2) return [];
+    if (!closed && P.length <= 3) return P.slice(0, -1).map((p, i) => line2(p, P[i + 1]));
+    let cs = findCorners(P, closed);
+    for (let k = 0; k < cs.length; k += 1) {
+      const [next, nc] = sharpenCorner(P, cs[k]);
+      if (next.length !== P.length || nc !== cs[k]) {
+        const shift2 = nc - cs[k];
+        P = next;
+        cs[k] = nc;
+        cs = [...new Set([...cs.slice(0, k + 1), ...cs.slice(k + 1).map((c) => c + shift2)].map((c) => Math.min(Math.max(c, 0), P.length - 1)))].sort((l, r) => l - r);
+      }
+    }
+    let bounds2;
+    if (closed) {
+      if (cs.length > 0) {
+        const st = cs[0];
+        P = [...P.slice(st), ...P.slice(0, st + 1)];
+        cs = [...cs.map((c) => ((c - st) % (P.length - 1) + (P.length - 1)) % (P.length - 1)), P.length - 1];
+        if (cs.length === 2) {
+          let m = 0, far = -1;
+          P.forEach((p, i) => {
+            const d = norm(sub(p, P[0]));
+            if (d > far) {
+              far = d;
+              m = i;
+            }
+          });
+          cs.push(m);
+        }
+        bounds2 = [.../* @__PURE__ */ new Set([...cs, 0])].sort((l, r) => l - r);
+      } else {
+        let m = 0, far = -1;
+        P.forEach((p, i) => {
+          const d = norm(sub(p, P[0]));
+          if (d > far) {
+            far = d;
+            m = i;
+          }
+        });
+        P = [...P, P[0]];
+        const N = P.length;
+        const t0 = unit2(sub(P[1], P[N - 2])), tm = m > 0 && m < N - 1 ? unit2(sub(P[m + 1], P[m - 1])) : t0;
+        return [...fitCubic2(P.slice(0, m + 1), t0, mul(tm, -1), tol), ...fitCubic2(P.slice(m), tm, mul(t0, -1), tol)];
+      }
+    } else bounds2 = [.../* @__PURE__ */ new Set([...cs, 0, P.length - 1])].sort((l, r) => l - r);
+    const out = [];
+    for (let k = 0; k + 1 < bounds2.length; k += 1) {
+      const S = P.slice(bounds2[k], bounds2[k + 1] + 1);
+      if (S.length >= 2) out.push(...fitSpan(S, tol));
+    }
+    return out;
+  }
+  var fmt3 = (v) => {
+    const s = v.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+    return s === "-0" || s === "" ? "0" : s;
+  };
+  var reversed = (cubics) => cubics.slice().reverse().map((b) => [b[3], b[2], b[1], b[0]]);
+  var pathOf = (input) => {
+    const cubics = joinLines(input);
+    return "M" + fmt3(cubics[0][0][0]) + "," + fmt3(cubics[0][0][1]) + cubics.map((b) => "C" + b.slice(1).map((p) => fmt3(p[0]) + "," + fmt3(p[1])).join(" ")).join("") + "Z";
+  };
+  function joinLines(cubics) {
+    const straight = (b) => straightWithin(b, EDGE_TOLERANCE);
+    const joinable = (a, b) => straight(a) && straight(b) && straightWithin([a[0], a[1], a[2], a[3], b[1], b[2], b[3]], EDGE_TOLERANCE);
+    const out = [];
+    for (const b of cubics) {
+      const last = out[out.length - 1];
+      if (last !== void 0 && joinable(last, b)) out[out.length - 1] = line2(last[0], b[3]);
+      else out.push(b);
+    }
+    while (out.length > 2 && joinable(out[out.length - 1], out[0])) out[0] = line2(out.pop()[0], out[0][3]);
+    return out;
+  }
+  function loops(ids, chains, curves, W) {
+    void W;
+    const d = [], open = [];
+    for (const id of ids) {
+      if (chains[id].closed) {
+        if (curves[id].length > 0) d.push(pathOf(curves[id]));
+      } else open.push(id);
+    }
+    const at = /* @__PURE__ */ new Map();
+    for (const id of open) {
+      const vs = chains[id].vs;
+      (at.get(vs[0]) ?? at.set(vs[0], []).get(vs[0])).push([id, 0]);
+      (at.get(vs[vs.length - 1]) ?? at.set(vs[vs.length - 1], []).get(vs[vs.length - 1])).push([id, 1]);
+    }
+    const used = /* @__PURE__ */ new Set();
+    for (const id of open) {
+      if (used.has(id)) continue;
+      const seq = [];
+      let cur = id, forward = true;
+      const start2 = chains[id].vs[0];
+      for (; ; ) {
+        used.add(cur);
+        seq.push(...forward ? curves[cur] : reversed(curves[cur]));
+        const vs = chains[cur].vs, v = forward ? vs[vs.length - 1] : vs[0];
+        if (v === start2) break;
+        const next = (at.get(v) ?? []).find(([c]) => !used.has(c));
+        if (next === void 0) break;
+        cur = next[0];
+        forward = next[1] === 0;
+      }
+      if (seq.length > 0) d.push(pathOf(seq));
+    }
+    return d.join("");
+  }
+
   // src/trace-pipeline.ts
   function planTrace(source, settings, controls, previousStages = null, from = "colors", onProgress) {
     const decoded = readRgbaPng(source);
@@ -7646,7 +8468,11 @@
     return plan;
   }
   function vectorStagesForPlan(svgs, plan, controls, onProgress) {
-    return vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+    const stages = vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+    const source = plan.plates.find((plate) => plate.source !== void 0)?.source;
+    const defaults = controlsFor(controls.mode);
+    if (plan.edgeFirst === void 0 || source === void 0 || plan.droppedColor !== null || controls.mode !== "logo" && controls.mode !== "icon" || Math.min(plan.width, plan.height) < MIN_SIDE || controls.smoothness !== defaults.smoothness || controls.corner !== defaults.corner) return stages;
+    return { ...stages, sealed: edgeFirstSvg(plan.edgeFirst.labels, source.rgba, plan.edgeFirst.lossy) };
   }
   function settingsFromControls(controls) {
     return {
@@ -7677,8 +8503,10 @@
   }
   function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
     const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
+    const punchedPlates = [];
     const plates = flat.map((plate) => {
       const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
+      punchedPlates.push(punched.rgba);
       return {
         png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
         scale: plate.scale,
@@ -7692,13 +8520,55 @@
       };
     });
     const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
+    const labels = plateLabels(flat, punchedPlates, width, height);
     return {
       width,
       height,
       droppedColor: null,
       plates,
-      ...rasterStages === void 0 ? {} : { rasterStages }
+      ...rasterStages === void 0 ? {} : { rasterStages },
+      edgeFirst: { labels, lossy: wouldDenoise(rgba, width, height) }
     };
+  }
+  function plateLabels(flat, punched, width, height) {
+    const labels = new Int32Array(width * height).fill(-1);
+    const inks = [];
+    const index = /* @__PURE__ */ new Map();
+    flat.forEach((plate, which) => {
+      const rgba = punched[which], half = plate.scale >> 1;
+      for (let y = 0; y < plate.sourceHeight; y += 1) {
+        const sy = plate.originY + y;
+        if (sy < 0 || sy >= height) continue;
+        for (let x = 0; x < plate.sourceWidth; x += 1) {
+          const sx = plate.originX + x;
+          if (sx < 0 || sx >= width) continue;
+          const at = ((y * plate.scale + half) * plate.width + x * plate.scale + half) * 4;
+          if ((rgba[at + 3] ?? 0) === 0) continue;
+          const key = (rgba[at] ?? 0) << 16 | (rgba[at + 1] ?? 0) << 8 | (rgba[at + 2] ?? 0);
+          let ink = index.get(key);
+          if (ink === void 0) {
+            ink = inks.length;
+            index.set(key, ink);
+            inks.push("#" + key.toString(16).padStart(6, "0"));
+          }
+          labels[sy * width + sx] = ink;
+        }
+      }
+    });
+    if (flat.length > 0 && flat.every((plate) => plate.cutOut)) {
+      const area = new Array(inks.length).fill(0);
+      for (const ink of labels) if (ink >= 0) area[ink] += 1;
+      const ranked = [...inks.keys()].sort((a, b) => area[b] - area[a] || a - b);
+      const into = /* @__PURE__ */ new Map();
+      const rgb = (ink) => [1, 3, 5].map((at) => parseInt(inks[ink].slice(at, at + 2), 16));
+      for (const [rank, ink] of ranked.entries()) {
+        const own = rgb(ink);
+        const target = ranked.slice(0, rank).find((other) => !into.has(other) && rgb(other).every((value, channel) => Math.abs(value - own[channel]) <= NEAR_FILL));
+        if (target !== void 0) into.set(ink, target);
+      }
+      for (let at = 0; at < labels.length; at += 1) labels[at] = into.get(labels[at]) ?? labels[at];
+    }
+    return { width, height, labels, inks };
   }
   var HALO_MIX = 0.35;
   var HALO_RESIDUAL = 16;
