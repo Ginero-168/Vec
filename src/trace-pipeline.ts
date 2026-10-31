@@ -9,7 +9,11 @@ import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps }
 import { segmentRaster } from "./segment.ts";
 import { scaleSvg } from "./svg-scale.ts";
 import { assembleTrace, mergePlates, type PlacedPlate } from "./trace-finish.ts";
+import { setCoveragePngDecoder } from "./trace-coverage.ts";
 import { type Stacking, type TracePreset, type TraceRequest } from "./trace.ts";
+
+// The stand-in plates planFlat makes are checked against their traced raster after tracing (chooseTraces).
+setCoveragePngDecoder(readRgbaPng);
 
 export type PipelineSettings = {
   readonly preset: TracePreset;
