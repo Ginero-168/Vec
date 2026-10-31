@@ -86,3 +86,87 @@ test("a square corner whose anti-aliased pixel has the outside's label is sharpe
   const points = [...d.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])] as const);
   assert.ok(points.every(([x, y]) => (Math.abs(x - e) < 0.02 || x < 12.7) && (Math.abs(y - e) < 0.02 || y < 12.7)), svg);
 });
+
+const pathsOf = (svg: string) => [...svg.matchAll(/<path d="([^"]*)" fill="(#[0-9A-F]{6})"/g)].map((m) => ({ d: m[1]!, fill: m[2]! }));
+
+test("a 1 px diagonal hairline survives: its pixels touch only at corners, but together they are a line", () => {
+  // 32x32 white with a grey 1 px diagonal from (4,4) to (27,27); each step is a 1 px region, below the speck size.
+  const W = 32, grey = [90, 90, 90] as const, white = [255, 255, 255] as const;
+  const on = (x: number, y: number) => x === y && x >= 4 && x < 28;
+  const source = image(W, W, (x, y) => (on(x, y) ? grey : white));
+  const labels = new Int32Array(W * W).map((_, at) => (on(at % W, Math.floor(at / W)) ? 0 : 1));
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: ["#5a5a5a", "#ffffff"] }, source, false);
+  assert.ok(pathsOf(svg).some((p) => p.fill === "#5A5A5A"), svg);
+});
+
+test("a 2 px speck cluster stays speckle and joins its surround", () => {
+  const W = 32, grey = [90, 90, 90] as const, white = [255, 255, 255] as const;
+  const on = (x: number, y: number) => (x === 10 && y === 10) || (x === 11 && y === 11);
+  const source = image(W, W, (x, y) => (on(x, y) ? grey : white));
+  const labels = new Int32Array(W * W).map((_, at) => (on(at % W, Math.floor(at / W)) ? 0 : 1));
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: ["#5a5a5a", "#ffffff"] }, source, false);
+  assert.ok(!pathsOf(svg).some((p) => p.fill === "#5A5A5A"), svg);
+});
+
+test("on a lossy source a long 1 px line of a near ink inside one region keeps its ink; edge ringing does not", () => {
+  // 64x64 green L (rows 8-55) on white; a 1 px line of a near green (within the denoiser's range of L) at row 30, and
+  // a strip of the same near ink at row 53, two rows inside L's lower edge (within one DCT block of it).
+  const W = 64, L = [62, 176, 106] as const, B = [52, 166, 96] as const, white = [255, 255, 255] as const;
+  const at = (x: number, y: number) => (y < 8 || y >= 56 || x < 4 || x >= 60 ? white : (y === 30 || y === 53) && x >= 8 && x < 56 ? B : L);
+  const source = image(W, W, at);
+  const labels = new Int32Array(W * W).map((_, i) => { const p = at(i % W, Math.floor(i / W)); return p === white ? 2 : p === B ? 1 : 0; });
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: ["#3eb06a", "#34a660", "#ffffff"] }, source, true);
+  const line = pathsOf(svg).filter((p) => p.fill === "#34A660");
+  assert.equal(line.length, 1, svg);
+  const ys = [...line[0]!.d.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((m) => Number(m[2]));
+  assert.ok(ys.every((y) => y > 28 && y < 33), "only the row-30 line is kept: " + line[0]!.d);
+});
+
+test("an island the plates labelled apart, whose pixels are its surround's ink, joins the surround", () => {
+  // 32x32: blue surround; a 3 px island labelled a paler blue whose source pixels are the surround's colour.
+  const W = 32, blue = [114, 152, 255] as const, white = [255, 255, 255] as const;
+  const island = (x: number, y: number) => y === 15 && x >= 14 && x < 17;
+  const source = image(W, W, (x, y) => (x < 4 || x >= 28 || y < 4 || y >= 28 ? white : blue));
+  const labels = new Int32Array(W * W).map((_, i) => { const x = i % W, y = Math.floor(i / W); return x < 4 || x >= 28 || y < 4 || y >= 28 ? 2 : island(x, y) ? 1 : 0; });
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: ["#7298ff", "#9aa4ff", "#ffffff"] }, source, false);
+  const paths = pathsOf(svg);
+  assert.ok(!paths.some((p) => p.fill === "#9AA4FF"), svg);
+  assert.ok(paths.every((p) => (p.d.match(/M/g) ?? []).length === 1), "no hole is cut for it: " + svg);
+});
+
+test("an island whose own pixels are its own ink is a dot and stays", () => {
+  const W = 32, blue = [114, 152, 255] as const, pale = [154, 164, 255] as const, white = [255, 255, 255] as const;
+  const island = (x: number, y: number) => y === 15 && x >= 14 && x < 17;
+  const source = image(W, W, (x, y) => (x < 4 || x >= 28 || y < 4 || y >= 28 ? white : island(x, y) ? pale : blue));
+  const labels = new Int32Array(W * W).map((_, i) => { const x = i % W, y = Math.floor(i / W); return x < 4 || x >= 28 || y < 4 || y >= 28 ? 2 : island(x, y) ? 1 : 0; });
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: ["#7298ff", "#9aa4ff", "#ffffff"] }, source, false);
+  assert.ok(pathsOf(svg).some((p) => p.fill === "#9AA4FF"), svg);
+});
+
+test("a shape on a framed page integrates its edge against the page inside the frame, not the frame", () => {
+  // 40x40 opaque: a 2 px grey frame (the border colour), a white page inside it (undrawn backdrop), and a red square
+  // to x = 20.25 (column 20 is 25% red over white). The square's edge is placed against white.
+  const W = 40, grey = [128, 128, 128], white = [255, 255, 255], red = [240, 80, 30];
+  const frame = (x: number, y: number) => x < 2 || y < 2 || x >= W - 2 || y >= W - 2;
+  const cover = (x: number, y: number) => (y >= 10 && y < 30 ? (x >= 10 && x < 20 ? 1 : x === 20 ? 0.25 : 0) : 0);
+  const source = image(W, W, (x, y) => (frame(x, y) ? grey : red.map((v, c) => Math.round(v * cover(x, y) + white[c]! * (1 - cover(x, y))))) as unknown as readonly [number, number, number]);
+  const labels = new Int32Array(W * W).map((_, i) => { const x = i % W, y = Math.floor(i / W); return frame(x, y) ? 1 : cover(x, y) >= 0.5 ? 0 : -1; });
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: ["#f0501e", "#808080"] }, source, false);
+  const red_ = pathsOf(svg).find((p) => p.fill === "#F0501E")!;
+  const xs = [...red_.d.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]).filter(([x, y]) => x > 15 && y > 12 && y < 28).map(([x]) => x!);
+  assert.ok(xs.length > 0 && xs.every((x) => Math.abs(x - 20.25) < 0.05), red_.d);
+});
+
+test("a boundary between two bands of a gradient is fitted to its points' own uncertainty", () => {
+  // 64x64: a diagonal gradient (blue 60 -> 160 along x + y) posterised into two bands whose inks are the band centres'
+  // colours, labelled apart along x + y = 63 with up to 2 px of stair noise. The band edge is no edge: its windows'
+  // ends carry a third of the other ink, so every point is that uncertain, and a fit within the clean edge
+  // tolerance (45 segments here) follows the stair noise.
+  const W = 64, b = (s: number) => Math.round(60 + (100 * s) / 126);
+  const source = image(W, W, (x, y) => [40, 120, b(x + y)]);
+  const labels = new Int32Array(W * W).map((_, i) => { const x = i % W, y = Math.floor(i / W); return x + y + ((x * 7 + y * 3) % 5) - 2 < 63 ? 0 : 1; });
+  const hex = (v: number) => "#2878" + v.toString(16).padStart(2, "0");
+  const svg = edgeFirstSvg({ width: W, height: W, labels, inks: [hex(b(32)), hex(b(94))] }, source, false);
+  const band = pathsOf(svg).find((p) => p.fill === hex(b(32)).toUpperCase())!;
+  assert.ok((band.d.match(/[CL]/g) ?? []).length < 40, band.d);
+});
