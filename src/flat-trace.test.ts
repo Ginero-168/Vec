@@ -768,3 +768,41 @@ test("a stand-in trace is kept only where it paints the plate's own inks better 
   assert.deepEqual(chooseTraces([smeared, folded], plates).svgs, [folded], "the stand-in paints A in B: plain trace");
   assert.deepEqual(chooseTraces([folded, folded], plates).svgs, [folded], "a tie keeps the plain trace");
 });
+
+test("the stand-in trace is judged against the source, not labels that give the minor ink more than its pixels", () => {
+  // 4x2 source pixels: columns 0-2 ink A, column 3 ink B. The plate (scale 2) labels columns 1-3 B, as anti-aliased rims do.
+  const source = new Uint8Array(4 * 2 * 4);
+  for (let y = 0; y < 2; y += 1) for (let x = 0; x < 4; x += 1) source.set(x < 3 ? [68, 116, 207, 255] : [60, 121, 202, 255], (y * 4 + x) * 4);
+  const width = 8, height = 4, rgba = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) rgba.set(x < 2 ? [68, 116, 207, 255] : [80, 112, 210, 255], (y * width + x) * 4);
+  const png = encodeRgbaPng(width, height, rgba), fills = { "#5070D2": "#3c79ca" };
+  const path = (x: number, w: number, fill: string) => `<path d="M${x},0L${x + w},0L${x + w},4L${x},4Z" fill="${fill}"/>`;
+  const labelled = `<svg>${path(0, 2, "#4474CF")}${path(2, 6, "#5070D2")}</svg>`;
+  const folded = `<svg>${path(0, 8, "#4474CF")}</svg>`;
+  const plate = { scale: 2, originX: 0, originY: 0, png, fills, plain: 1 };
+  const backup = { scale: 2, png, backup: true };
+  assert.deepEqual(chooseTraces([labelled, folded], [{ scale: 2, png, fills, plain: 1 }, backup]).svgs, [labelled], "the labels alone pick the stand-in");
+  assert.deepEqual(chooseTraces([labelled, folded], [{ ...plate, source: { rgba: source, width: 4, height: 2 } }, backup]).svgs, [folded],
+    "the source has B on one column only: painting A there costs 2 pixels, painting B on two A columns costs 4");
+  // Where the labels match the source, a stand-in that paints B where the source has it is kept by all three measures.
+  const sourceLabels = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) sourceLabels.set(x < 6 ? [68, 116, 207, 255] : [80, 112, 210, 255], (y * width + x) * 4);
+  const exactPng = encodeRgbaPng(width, height, sourceLabels);
+  const exact = `<svg>${path(0, 6, "#4474CF")}${path(6, 2, "#5070D2")}</svg>`;
+  assert.deepEqual(chooseTraces([exact, folded], [{ ...plate, png: exactPng, source: { rgba: source, width: 4, height: 2 } }, { ...backup, png: exactPng }]).svgs, [exact], "B where the source has it");
+});
+
+test("a stand-in trace that costs an ink more than 0.03 of its own source pixels is rejected whatever the other ink gains", () => {
+  // 40x1 source pixels, scale 1: ink A on columns 0-29, ink B on 30-39; the labels match the source.
+  const width = 40, rgba = new Uint8Array(width * 4);
+  for (let x = 0; x < width; x += 1) rgba.set(x < 30 ? [68, 116, 207, 255] : [60, 121, 202, 255], x * 4);
+  const png = encodeRgbaPng(width, 1, rgba), fills = { "#5070D2": "#3c79ca" };
+  const path = (x: number, w: number, fill: string) => `<path d="M${x},0L${x + w},0L${x + w},1L${x},1Z" fill="${fill}"/>`;
+  const plain = `<svg>${path(0, 40, "#4474CF")}</svg>`;
+  const plates = [{ scale: 1, originX: 0, originY: 0, png, fills, plain: 1, source: { rgba, width, height: 1 } }, { scale: 1, png, backup: true }];
+  // B gains all 10 pixels; A loses 1 of 30 (0.033 > 0.03): the plain trace, though labels and counts prefer the stand-in.
+  const costly = `<svg>${path(0, 29, "#4474CF")}${path(29, 11, "#5070D2")}</svg>`;
+  assert.deepEqual(chooseTraces([costly, plain], plates).svgs, [plain]);
+  const exact = `<svg>${path(0, 30, "#4474CF")}${path(30, 10, "#5070D2")}</svg>`;
+  assert.deepEqual(chooseTraces([exact, plain], plates).svgs, [exact], "no ink loses: the stand-in is kept");
+});
