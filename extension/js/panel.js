@@ -3874,15 +3874,236 @@
     return String(rounded);
   }
 
+  // src/trace-coverage.ts
+  var decodePng;
+  function setCoveragePngDecoder(decoder) {
+    decodePng = decoder;
+  }
+  var PATH = /<path\b[^>]*?\bd="([^"]*)"[^>]*>/gi;
+  var STEPS = 16;
+  function paintedInks(svg, columns, rows, scale, fills = {}) {
+    const painted = new Int32Array(columns * rows).fill(-1);
+    for (const match of svg.matchAll(PATH)) {
+      const tag = match[0];
+      const fill = /\bfill="(#[0-9a-f]{6})"/i.exec(tag)?.[1];
+      if (fill === void 0) continue;
+      const ink = parseInt((fills[fill.toUpperCase()] ?? fill).slice(1), 16);
+      const shift2 = /translate\(\s*(-?[\d.]+)[\s,]+(-?[\d.]+)\s*\)/.exec(tag);
+      const rings = pathRings(match[1] ?? "", shift2 === null ? 0 : Number(shift2[1]), shift2 === null ? 0 : Number(shift2[2]));
+      fillRings(rings, painted, columns, rows, scale, ink);
+    }
+    return painted;
+  }
+  function plateInks(rgba, plateWidth, plateHeight, scale, fills = {}) {
+    const columns = Math.floor(plateWidth / scale), rows = Math.floor(plateHeight / scale), half = scale >> 1;
+    const back = new Map(Object.entries(fills).map(([stand, own]) => [parseInt(stand.slice(1), 16), parseInt(own.slice(1), 16)]));
+    const inks = new Int32Array(columns * rows);
+    for (let y = 0; y < rows; y += 1) {
+      for (let x = 0; x < columns; x += 1) {
+        const at = ((y * scale + half) * plateWidth + x * scale + half) * 4;
+        if ((rgba[at + 3] ?? 0) === 0) {
+          inks[y * columns + x] = -1;
+          continue;
+        }
+        const ink = (rgba[at] ?? 0) << 16 | (rgba[at + 1] ?? 0) << 8 | (rgba[at + 2] ?? 0);
+        inks[y * columns + x] = back.get(ink) ?? ink;
+      }
+    }
+    return inks;
+  }
+  function inkMismatches(traced, plate) {
+    let wrong = 0;
+    for (let index = 0; index < plate.length; index += 1) if (traced[index] !== plate[index]) wrong += 1;
+    return wrong;
+  }
+  function pathRings(data, dx, dy) {
+    const tokens = data.match(/[MmLlHhVvCcSsQqTtZz]|-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?/g) ?? [];
+    const rings = [];
+    let ring = [];
+    let x = 0, y = 0, startX = 0, startY = 0, command = "M", at = 0;
+    const number = () => Number(tokens[at++]);
+    const close = () => {
+      if (ring.length > 2) rings.push(ring);
+      ring = [];
+    };
+    while (at < tokens.length) {
+      if (/[A-Za-z]/.test(tokens[at])) command = tokens[at++];
+      const relative = command === command.toLowerCase();
+      const ox = relative ? x : 0, oy = relative ? y : 0;
+      switch (command.toUpperCase()) {
+        case "M":
+          close();
+          x = ox + number();
+          y = oy + number();
+          startX = x;
+          startY = y;
+          ring.push([x + dx, y + dy]);
+          command = relative ? "l" : "L";
+          break;
+        case "L":
+          x = ox + number();
+          y = oy + number();
+          ring.push([x + dx, y + dy]);
+          break;
+        case "H":
+          x = ox + number();
+          ring.push([x + dx, y + dy]);
+          break;
+        case "V":
+          y = oy + number();
+          ring.push([x + dx, y + dy]);
+          break;
+        case "C": {
+          const x1 = ox + number(), y1 = oy + number(), x2 = ox + number(), y2 = oy + number(), x3 = ox + number(), y3 = oy + number();
+          for (let step = 1; step <= STEPS; step += 1) {
+            const t = step / STEPS, u = 1 - t;
+            ring.push([u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3 + dx, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3 + dy]);
+          }
+          x = x3;
+          y = y3;
+          break;
+        }
+        case "Z":
+          x = startX;
+          y = startY;
+          close();
+          break;
+        default:
+          return rings;
+      }
+    }
+    close();
+    return rings;
+  }
+  function fillRings(rings, painted, columns, rows, scale, ink) {
+    let minY = Infinity, maxY = -Infinity;
+    for (const ring of rings) for (const [, y] of ring) {
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const first = Math.max(0, Math.ceil(minY / scale - 0.5)), last = Math.min(rows - 1, Math.floor(maxY / scale - 0.5));
+    for (let row = first; row <= last; row += 1) {
+      const cy = (row + 0.5) * scale;
+      const crossings = [];
+      for (const ring of rings) {
+        for (let index = 0; index < ring.length; index += 1) {
+          const a = ring[index], b = ring[(index + 1) % ring.length];
+          if (a[1] <= cy === b[1] <= cy) continue;
+          crossings.push([a[0] + (cy - a[1]) / (b[1] - a[1]) * (b[0] - a[0]), b[1] > a[1] ? 1 : -1]);
+        }
+      }
+      crossings.sort((left, right) => left[0] - right[0]);
+      let winding2 = 0;
+      for (let index = 0; index + 1 < crossings.length; index += 1) {
+        winding2 += crossings[index][1];
+        if (winding2 === 0) continue;
+        const from = Math.max(0, Math.ceil(crossings[index][0] / scale - 0.5)), to = Math.min(columns - 1, Math.floor(crossings[index + 1][0] / scale - 0.5));
+        for (let column = from; column <= to; column += 1) painted[row * columns + column] = ink;
+      }
+    }
+  }
+  function chooseTraces(svgs, plates) {
+    const keptSvgs = [], keptPlates = [];
+    for (const [index, plate] of plates.entries()) {
+      if (plate.backup === true) continue;
+      const svg = svgs[index];
+      if (svg === void 0) continue;
+      const plainSvg = plate.plain === void 0 ? void 0 : svgs[plate.plain];
+      if (plate.fills === void 0 || plainSvg === void 0 || plate.png === void 0) {
+        keptSvgs.push(svg);
+        keptPlates.push(plate);
+        continue;
+      }
+      const decoded = decodePng?.(Buffer.from(plate.png.buffer, plate.png.byteOffset, plate.png.byteLength)) ?? null;
+      if (decoded === null) {
+        keptSvgs.push(plainSvg);
+        keptPlates.push(plate);
+        continue;
+      }
+      const [labelSeparated, labelPlain] = labelMismatches(svg, plainSvg, decoded, plate.scale, plate.fills);
+      let better = labelSeparated < labelPlain;
+      if (better && plate.source !== void 0) {
+        const traced = sourceTraces(svg, plainSvg, decoded, plate.scale, plate.fills, plate.source, plate.originX ?? 0, plate.originY ?? 0);
+        const [sourceSeparated, sourcePlain] = sourceMismatches(traced);
+        better = sourceSeparated < sourcePlain && worstInkLoss(traced) <= RECALL_TOLERANCE;
+      }
+      keptSvgs.push(better ? svg : plainSvg);
+      keptPlates.push(plate);
+    }
+    return { svgs: keptSvgs, plates: keptPlates };
+  }
+  function labelMismatches(svg, plainSvg, decoded, scale, fills) {
+    const step = Math.max(1, scale >> 1);
+    const columns = Math.floor(decoded.width / step), rows = Math.floor(decoded.height / step);
+    const labels = plateInks(decoded.rgba, decoded.width, decoded.height, step, fills);
+    return [inkMismatches(paintedInks(svg, columns, rows, step, fills), labels), inkMismatches(paintedInks(plainSvg, columns, rows, step), labels)];
+  }
+  function sourceTraces(svg, plainSvg, decoded, scale, fills, source, originX, originY) {
+    const columns = Math.floor(decoded.width / scale), rows = Math.floor(decoded.height / scale);
+    const colours = new Int32Array(columns * rows).fill(-2);
+    for (let y = 0; y < rows; y += 1) {
+      const sy = y + originY;
+      if (sy < 0 || sy >= source.height) continue;
+      for (let x = 0; x < columns; x += 1) {
+        const sx = x + originX;
+        if (sx < 0 || sx >= source.width) continue;
+        const at = (sy * source.width + sx) * 4;
+        colours[y * columns + x] = (source.rgba[at + 3] ?? 0) === 0 ? -1 : (source.rgba[at] ?? 0) << 16 | (source.rgba[at + 1] ?? 0) << 8 | (source.rgba[at + 2] ?? 0);
+      }
+    }
+    return {
+      separated: paintedInks(svg, columns, rows, scale, fills),
+      plain: paintedInks(plainSvg, columns, rows, scale),
+      labels: plateInks(decoded.rgba, decoded.width, decoded.height, scale, fills),
+      colours
+    };
+  }
+  var apart = (left, right) => Math.abs((left >> 16 & 255) - (right >> 16 & 255)) + Math.abs((left >> 8 & 255) - (right >> 8 & 255)) + Math.abs((left & 255) - (right & 255));
+  function sourceMismatches({ separated, plain, labels, colours }) {
+    let separatedWrong = 0, plainWrong = 0;
+    for (let cell = 0; cell < colours.length; cell += 1) {
+      const colour = colours[cell], left = separated[cell], right = plain[cell];
+      if (colour === -2 || left === right) continue;
+      if (left === -1 || right === -1) {
+        const clear = labels[cell] === -1;
+        if (left === -1 !== clear) separatedWrong += 1;
+        if (right === -1 !== clear) plainWrong += 1;
+        continue;
+      }
+      if (colour === -1) continue;
+      const near = apart(left, colour), far = apart(right, colour);
+      if (near > far) separatedWrong += 1;
+      else if (far > near) plainWrong += 1;
+    }
+    return [separatedWrong, plainWrong];
+  }
+  var RECALL_TOLERANCE = 0.03;
+  function worstInkLoss({ separated, plain, colours }) {
+    const inks = /* @__PURE__ */ new Set();
+    for (const traced of [separated, plain]) for (const ink of traced) if (ink >= 0) inks.add(ink);
+    const own = new Map([...inks].map((ink) => [ink, [0, 0, 0]]));
+    for (let cell = 0; cell < colours.length; cell += 1) {
+      const tally = own.get(colours[cell]);
+      if (tally === void 0) continue;
+      tally[0] += 1;
+      if (separated[cell] === colours[cell]) tally[1] += 1;
+      if (plain[cell] === colours[cell]) tally[2] += 1;
+    }
+    let worst = 0;
+    for (const [pixels, separatedHits, plainHits] of own.values()) if (pixels > 0) worst = Math.max(worst, (plainHits - separatedHits) / pixels);
+    return worst;
+  }
+
   // src/trace-finish.ts
   var SHAPE = /<path\b[^>]*\/>|<path\b[^>]*>[\s\S]*?<\/path>|<circle\b[^>]*\/>|<ellipse\b[^>]*\/>|<rect\b[^>]*\/>/gi;
   function mergePlates(svgs, plates, width, height, droppedColor, removeBackground, fitGeometry = true) {
+    ({ svgs, plates } = chooseTraces(svgs, plates));
     const drawings = [];
     for (let index = 0; index < svgs.length; index += 1) {
       const plate = plates[index];
       const svg = svgs[index];
       if (plate === void 0 || svg === void 0) continue;
-      let next = scaleSvg(svg, 1 / plate.scale);
+      let next = scaleSvg(plate.fills === void 0 ? svg : restoreFills(svg, plate.fills), 1 / plate.scale);
       if (droppedColor !== null) next = dropFill(next, droppedColor);
       if (removeBackground) next = dropCanvasBackground(next, plate.borderColor);
       next = translateSvg(next, plate.originX, plate.originY);
@@ -3901,6 +4122,12 @@
     const sharpened = sharpenConfirmed(fitted, fillet, 35, curl, sourceCheck(plates, true) ?? check);
     const colour = sourceColour(plates);
     return colour === null ? sharpened : fitRasterCorners(sharpened, colour, check);
+  }
+  function restoreFills(svg, fills) {
+    return svg.replace(/fill="(#[0-9a-f]{6})"/gi, (whole, hex3) => {
+      const own = fills[hex3.toUpperCase()];
+      return own === void 0 ? whole : 'fill="' + own.toUpperCase() + '"';
+    });
   }
   function sourceColour(plates) {
     const source = plates.find((plate) => plate.source !== void 0)?.source;
@@ -6963,8 +7190,8 @@
           const a = open[left];
           const b = open[right];
           if (a === void 0 || b === void 0) continue;
-          const apart = a.x > b.x + b.width + gap || b.x > a.x + a.width + gap || a.y > b.y + b.height + gap || b.y > a.y + a.height + gap;
-          if (apart) continue;
+          const apart2 = a.x > b.x + b.width + gap || b.x > a.x + a.width + gap || a.y > b.y + b.height + gap || b.y > a.y + a.height + gap;
+          if (apart2) continue;
           const x = Math.min(a.x, b.x);
           const y = Math.min(a.y, b.y);
           open[left] = { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
@@ -7598,6 +7825,7 @@
   }
 
   // src/trace-pipeline.ts
+  setCoveragePngDecoder(readRgbaPng);
   function planTrace(source, settings, controls, previousStages = null, from = "colors", onProgress) {
     const decoded = readRgbaPng(source);
     if (decoded === null) return null;
@@ -7677,10 +7905,14 @@
   }
   function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
     const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
-    const plates = flat.map((plate) => {
+    const clean = !wouldDenoise(rgba, width, height);
+    const plates = [];
+    const backups = [];
+    for (const plate of flat) {
       const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
-      return {
-        png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
+      const separated = clean ? separateNearInks(punched.rgba, plate.palette, { rgba, width, height, originX: plate.originX, originY: plate.originY, scale: plate.scale, plateWidth: plate.width }) : null;
+      const planned = (pixels, palette) => ({
+        png: encodeRgbaPng(plate.width, plate.height, pixels),
         scale: plate.scale,
         originX: plate.originX,
         originY: plate.originY,
@@ -7688,9 +7920,16 @@
         borderColor: punched.borderIsSubject ? null : plate.borderColor,
         cutOut: plate.cutOut,
         source: { rgba, width, height },
-        request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
-      };
-    });
+        request: controls === void 0 ? flatRequest(settings, palette, plate.scale) : flatRequestForControls(settings, palette, plate.scale, controls)
+      });
+      if (separated === null) {
+        plates.push(planned(punched.rgba, plate.palette));
+        continue;
+      }
+      plates.push({ ...planned(separated.rgba, separated.palette), fills: separated.fills, plain: flat.length + backups.length });
+      backups.push({ ...planned(punched.rgba, plate.palette), backup: true });
+    }
+    plates.push(...backups);
     const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
     return {
       width,
@@ -7699,6 +7938,108 @@
       plates,
       ...rasterStages === void 0 ? {} : { rasterStages }
     };
+  }
+  var INK_FOLD_REACH = 2 * (TRACER_LAYER_DIFFERENCE + 1 + 3);
+  function separateNearInks(rgba, palette, source) {
+    const inks = palette.map((hex4) => [1, 3, 5].map((at) => parseInt(hex4.slice(at, at + 2), 16)));
+    if (inks.length < 2 || inks.some((ink) => ink.some((value) => !Number.isFinite(value)))) return null;
+    const apart2 = (left, right) => Math.abs(left[0] - right[0]) + Math.abs(left[1] - right[1]) + Math.abs(left[2] - right[2]);
+    const pairs = [];
+    for (let left = 0; left < inks.length; left += 1) {
+      for (let right = left + 1; right < inks.length; right += 1) {
+        const distance3 = apart2(inks[left], inks[right]);
+        if (distance3 > TRACER_LAYER_DIFFERENCE && distance3 < INK_FOLD_REACH) pairs.push([left, right]);
+      }
+    }
+    if (pairs.length === 0) return null;
+    const real = sourceInks(rgba, inks, new Set(pairs.flat()), source);
+    pairs.splice(0, pairs.length, ...pairs.filter(([left, right]) => real.has(left) && real.has(right)));
+    if (pairs.length === 0) return null;
+    const counts = /* @__PURE__ */ new Map();
+    for (let at = 0; at < rgba.length; at += 4) {
+      if ((rgba[at + 3] ?? 0) === 0) continue;
+      const key = (rgba[at] ?? 0) << 16 | (rgba[at + 1] ?? 0) << 8 | (rgba[at + 2] ?? 0);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const count = (ink) => counts.get(ink[0] << 16 | ink[1] << 8 | ink[2]) ?? 0;
+    const traced = inks.map((ink) => [...ink]);
+    pairs.sort((a, b) => apart2(inks[a[0]], inks[a[1]]) - apart2(inks[b[0]], inks[b[1]]) || a[0] - b[0] || a[1] - b[1]);
+    for (const [left, right] of pairs) {
+      if (apart2(traced[left], traced[right]) >= INK_FOLD_REACH) continue;
+      const minor = count(inks[left]) <= count(inks[right]) ? left : right;
+      const major = minor === left ? right : left;
+      for (const [moved, kept] of [[minor, major], [major, minor]]) {
+        const stand = pushApart(traced[moved], traced[kept], INK_FOLD_REACH);
+        if (stand === null) continue;
+        const clear = traced.every((other, index) => index === moved || index === kept || apart2(stand, other) >= INK_FOLD_REACH || apart2(stand, other) >= apart2(traced[moved], other));
+        if (!clear) continue;
+        traced[moved] = stand;
+        break;
+      }
+    }
+    const fills = {};
+    const repaint = /* @__PURE__ */ new Map();
+    const hex3 = (ink) => "#" + ink.map((value) => value.toString(16).padStart(2, "0")).join("");
+    for (const [index, ink] of inks.entries()) {
+      const stand = traced[index];
+      if (apart2(stand, ink) === 0) continue;
+      if (inks.some((other) => apart2(other, stand) === 0)) return null;
+      fills[hex3(stand).toUpperCase()] = palette[index];
+      repaint.set(ink[0] << 16 | ink[1] << 8 | ink[2], stand);
+    }
+    if (repaint.size === 0) return null;
+    const out = new Uint8Array(rgba);
+    for (let at = 0; at < out.length; at += 4) {
+      if ((out[at + 3] ?? 0) === 0) continue;
+      const stand = repaint.get((out[at] ?? 0) << 16 | (out[at + 1] ?? 0) << 8 | (out[at + 2] ?? 0));
+      if (stand === void 0) continue;
+      out[at] = stand[0];
+      out[at + 1] = stand[1];
+      out[at + 2] = stand[2];
+    }
+    return { rgba: out, palette: traced.map((ink, index) => apart2(ink, inks[index]) === 0 ? palette[index] : hex3(ink)), fills };
+  }
+  function sourceInks(plate, inks, wanted, source) {
+    const key = (at, from) => (from[at] ?? 0) << 16 | (from[at + 1] ?? 0) << 8 | (from[at + 2] ?? 0);
+    const ink = /* @__PURE__ */ new Map();
+    for (const index of wanted) ink.set(inks[index][0] << 16 | inks[index][1] << 8 | inks[index][2], index);
+    const tallies = /* @__PURE__ */ new Map();
+    const { scale, plateWidth } = source, half = scale >> 1;
+    const columns = Math.floor(plateWidth / scale), rows = Math.floor(plate.length / 4 / plateWidth / scale);
+    for (let y = 0; y < rows; y += 1) {
+      const sy = y + source.originY;
+      if (sy < 0 || sy >= source.height) continue;
+      for (let x = 0; x < columns; x += 1) {
+        const sx = x + source.originX;
+        if (sx < 0 || sx >= source.width) continue;
+        const at = ((y * scale + half) * plateWidth + x * scale + half) * 4;
+        if ((plate[at + 3] ?? 0) === 0) continue;
+        const label = ink.get(key(at, plate));
+        if (label === void 0) continue;
+        const tally = tallies.get(label) ?? /* @__PURE__ */ new Map();
+        const colour = key((sy * source.width + sx) * 4, source.rgba);
+        tally.set(colour, (tally.get(colour) ?? 0) + 1);
+        tallies.set(label, tally);
+      }
+    }
+    const real = /* @__PURE__ */ new Set();
+    for (const [label, tally] of tallies) {
+      const own = tally.get(inks[label][0] << 16 | inks[label][1] << 8 | inks[label][2]) ?? 0;
+      if (own > 0 && [...tally.values()].every((count) => count <= own)) real.add(label);
+    }
+    return real;
+  }
+  function pushApart(ink, from, distance3) {
+    const delta = [ink[0] - from[0], ink[1] - from[1], ink[2] - from[2]];
+    const length = Math.abs(delta[0]) + Math.abs(delta[1]) + Math.abs(delta[2]);
+    if (length === 0) return null;
+    for (let scale = distance3 / length; scale <= 255; scale += 1 / length) {
+      const moved = delta.map((value, channel) => Math.min(255, Math.max(0, Math.round(from[channel] + value * scale))));
+      const reached = Math.abs(moved[0] - from[0]) + Math.abs(moved[1] - from[1]) + Math.abs(moved[2] - from[2]);
+      if (reached >= distance3) return moved;
+      if (moved.every((value) => value === 0 || value === 255)) return null;
+    }
+    return null;
   }
   var HALO_MIX = 0.35;
   var HALO_RESIDUAL = 16;
@@ -8673,6 +9014,9 @@
       borderColor: value.borderColor,
       ...value.cutOut === true ? { cutOut: true } : {},
       ...isSourceRaster(value.source) ? { source: value.source } : {},
+      ...isRecord(value.fills) && Object.values(value.fills).every((fill) => typeof fill === "string") ? { fills: value.fills } : {},
+      ...Number.isInteger(value.plain) ? { plain: value.plain } : {},
+      ...value.backup === true ? { backup: true } : {},
       request
     };
   }
