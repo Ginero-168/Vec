@@ -226,6 +226,7 @@ function connectedRegions(labelMap: EdgeLabels, source: Uint8Array, lossy: boole
   const unify = labelMap.unify;
   if (unify !== undefined) for (let at = 0; at < labels.length; at += 1) { const ink = labels[at]!; if (ink >= 0 && !keep.has(ink)) labels[at] = unify[ink]!; }
   const speck = lossy ? LOSSY_SPECK : SPECK_SOURCE;
+  if (!lossy) smoothedLines(labels, labelMap.inks, source, W, H);
   foldThinMixes(labels, labelMap.inks, source, W, H, lossy, keep);
   for (let pass = 0; pass < 4; pass += 1) {
     const found = components(labels, W, H);
@@ -301,6 +302,69 @@ function mislabelledIslands(inks: readonly string[], source: Uint8Array, found: 
     if (outer >= 0 && outer !== ink) into.set(region, outer);
   }
   return into;
+}
+
+/**
+ * The thin lines the plates' label smoothing took from a clean source: the opaque pixels of a broad region (no strip)
+ * nearer another ink than their label's take that ink where, with what is left of that ink's line, they make one
+ * 8-connected strip (narrower than THIN_RATIO) longer than the clean integration span (2 WINDOW_CLEAN, as speckLines)
+ * that lies in that one region, clear of its other edges by a whole transform block (BLOCK, as foldThinMixes on a
+ * lossy source: a source judged clean can still be a JPEG, and a strip within a block of an edge can be its ringing).
+ * A 1 px line of a near ink covers at least half of one pixel in every cross-section, and the cross-section integral
+ * places it. A strip's own pixels stay: an anti-aliased hairline's pixels can all be nearer its surround's ink.
+ */
+function smoothedLines(labels: Int32Array, inks: readonly string[], source: Uint8Array, W: number, H: number): void {
+  const inkRgb = inks.map(hexRgb);
+  const found = components(labels, W, H);
+  const area = new Array<number>(found.count).fill(0), perimeter = new Array<number>(found.count).fill(0);
+  for (let at = 0; at < W * H; at += 1) {
+    const here = found.regions[at]!, x = at % W, y = (at - x) / W;
+    area[here]! += 1;
+    for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] as const)
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H || found.regions[ny * W + nx] !== here) perimeter[here]! += 1;
+  }
+  const nearer = new Int32Array(W * H).fill(-1);
+  for (let at = 0; at < W * H; at += 1) {
+    const ink = labels[at]!, region = found.regions[at]!;
+    if (ink < 0 || source[at * 4 + 3]! < 255 || area[region]! < THIN_RATIO * perimeter[region]!) continue;
+    const gap = (rgb: readonly number[]) => rgb.reduce((sum, v, c) => sum + Math.abs(v - source[at * 4 + c]!), 0);
+    let best = ink, least = gap(inkRgb[ink]!);
+    inkRgb.forEach((rgb, other) => { const g = gap(rgb); if (g < least) { least = g; best = other; } });
+    if (best !== ink) nearer[at] = best;
+  }
+  const seen = new Uint8Array(W * H);
+  for (let start = 0; start < W * H; start += 1) {
+    if (nearer[start]! < 0 || seen[start] === 1) continue;
+    const ink = nearer[start]!, within = found.regions[start]!;
+    const line = (at: number) => nearer[at] === ink || labels[at] === ink;
+    const patch = [start], taken: number[] = []; seen[start] = 1;
+    let x0 = W, x1 = -1, y0 = H, y1 = -1, edge = 0, clear = true;
+    for (let k = 0; k < patch.length; k += 1) {
+      const at = patch[k]!, x = at % W, y = (at - x) / W;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+      const candidate = nearer[at] === ink;
+      if (candidate) { taken.push(at); if (found.regions[at] !== within) clear = false; }
+      for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]] as const) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H || !line(ny * W + nx)) edge += 1;
+        // A candidate's surround, a block out along both axes, is the line or its own region.
+        if (!candidate) continue;
+        for (let d = 1; d <= BLOCK && clear; d += 1) {
+          const fx = x + dx * d, fy = y + dy * d;
+          if (fx < 0 || fy < 0 || fx >= W || fy >= H) break;
+          const far = fy * W + fx;
+          if (!line(far) && found.regions[far] !== within) clear = false;
+        }
+      }
+      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+        const nx = x + dx, ny = y + dy, next = ny * W + nx;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H || seen[next] === 1 || !line(next)) continue;
+        seen[next] = 1; patch.push(next);
+      }
+    }
+    if (!clear || Math.max(x1 - x0, y1 - y0) + 1 <= 2 * WINDOW_CLEAN || patch.length >= THIN_RATIO * edge) continue;
+    for (const at of taken) labels[at] = ink;
+  }
 }
 
 /** On a lossy (4:2:0) source a patch smaller than one chroma sample (2 x 2 px) has no colour of its own. */
@@ -658,6 +722,32 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
     const Ca = colours[e.la]!, Cb = colours[e.lb]!, dv = Cb.map((v, c) => v - Ca[c]!), dd = mixDot(dv, dv);
     if (dd < 1e-3) return;
     const t = (y: number, x: number) => Math.min(1, Math.max(0, mixDot(pixel(y, x).map((v, c) => v - Ca[c]!), dv) / dd));
+    // A region one pixel across between two parts of one colour: half of that run cannot be split between its two
+    // edges, so each would read the whole pixel, and its anti-aliasing spills into the outer colour's pixels. The
+    // whole cross-section (the outer colour's window on both sides and the pixel between) holds the region's area and
+    // centroid, which blur keeps: it spans centroid +- width / 2. A longer run gives each edge its own half. The pixel
+    // must go on along the edge (a line), so its cross-section's outer pixels are the outer colour's, not the same edge's.
+    const thin = (size: number, along: (i: number) => number, share: (i: number) => number, at: number, beside: (i: number) => (readonly [number, number, number])[]): number | null => {
+      const regionAt = (i: number) => regions[along(i)]!;
+      const same = (region: number, colour: readonly number[]) => colours[region]!.every((v, c) => v === colour[c]);
+      for (const [T, O, start, step] of [[e.la, Cb, at - 1, -1], [e.lb, Ca, at, 1]] as const) {
+        let n = 0, i = start;
+        while (i >= 0 && i < size && regionAt(i) === T && n < 2) { n += 1; i += step; }
+        if (n !== 1 || i < 0 || i >= size || !same(regionAt(i), O)) continue;
+        // A line runs along the edge: beside its pixel the region goes on one pixel across again (not a lone pixel on an
+        // edge's anti-aliased row, nor the tip of a region that widens past it).
+        if (!beside(start).some(([cell, prev, next]) => regions[cell] === T && (prev < 0 || regions[prev] !== T) && (next < 0 || regions[next] !== T))) continue;
+        const cells: number[] = [];
+        for (let j = i, k = 0; j >= 0 && j < size && k < window && same(regionAt(j), O); j += step, k += 1) cells.push(j);
+        for (let j = start, k = 0; k < n; j += step, k += 1) cells.push(j);
+        for (let j = start - step, k = 0; j >= 0 && j < size && k < window && same(regionAt(j), O); j -= step, k += 1) cells.push(j);
+        let width = 0, moment = 0;
+        for (const j of cells) { const own = T === e.la ? 1 - share(j) : share(j); width += own; moment += (j + 0.5) * own; }
+        if (width <= 0) return null;
+        return T === e.la ? moment / width + width / 2 : moment / width - width / 2;
+      }
+      return null;
+    };
     if (e.kind === "v") {
       const y = e.y, x = e.x; let l = x - 1, r = x;
       const wl = reach(x - 1, -1, W, (i) => regions[y * W + i]!, e.la), wr = reach(x, 1, W, (i) => regions[y * W + i]!, e.lb);
@@ -665,7 +755,8 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
       while (r + 1 < W && r + 1 - x < wr && regions[y * W + r + 1] === e.lb) r += 1;
       let sum = 0; for (let i = l; i <= r; i += 1) sum += t(y, i);
       impurity.push(wl === window && wr === window ? t(y, l) + 1 - t(y, r) : NaN);
-      out.push([Math.min(Math.max(r + 1 - sum, x - 1), x + 1), y + 0.5]);
+      const across = thin(W, (i) => y * W + i, (i) => t(y, i), x, (i) => [y - 1, y + 1].filter((v) => v >= 0 && v < H).map((v) => [v * W + i, i > 0 ? v * W + i - 1 : -1, i < W - 1 ? v * W + i + 1 : -1] as const));
+      out.push([Math.min(Math.max(across ?? r + 1 - sum, x - 1), x + 1), y + 0.5]);
     } else {
       const y = e.y, x = e.x; let l = y - 1, r = y;
       const wl = reach(y - 1, -1, H, (i) => regions[i * W + x]!, e.la), wr = reach(y, 1, H, (i) => regions[i * W + x]!, e.lb);
@@ -673,7 +764,8 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
       while (r + 1 < H && r + 1 - y < wr && regions[(r + 1) * W + x] === e.lb) r += 1;
       let sum = 0; for (let i = l; i <= r; i += 1) sum += t(i, x);
       impurity.push(wl === window && wr === window ? t(l, x) + 1 - t(r, x) : NaN);
-      out.push([x + 0.5, Math.min(Math.max(r + 1 - sum, y - 1), y + 1)]);
+      const across = thin(H, (i) => i * W + x, (i) => t(i, x), y, (i) => [x - 1, x + 1].filter((v) => v >= 0 && v < W).map((v) => [i * W + v, i > 0 ? (i - 1) * W + v : -1, i < H - 1 ? (i + 1) * W + v : -1] as const));
+      out.push([x + 0.5, Math.min(Math.max(across ?? r + 1 - sum, y - 1), y + 1)]);
     }
   });
   return out;
@@ -831,7 +923,7 @@ function findCorners(P: readonly Point[], closed: boolean): number[] {
 }
 
 /** The corner's bevelled anti-aliasing points replaced by the intersection of the lines fitted on both sides. */
-function sharpenCorner(P: readonly Point[], c: number): [Point[], number] {
+function sharpenCorner(P: readonly Point[], c: number): [Point[], number, boolean] {
   const n = P.length;
   const fitLine = (ix: number[]): [Point, Point] => {
     const m: Point = [ix.reduce((a, i) => a + P[i]![0], 0) / ix.length, ix.reduce((a, i) => a + P[i]![1], 0) / ix.length];
@@ -853,12 +945,40 @@ function sharpenCorner(P: readonly Point[], c: number): [Point[], number] {
     return norm(sub(X, P[c]!)) > 1.5 ? null : X;
   };
   const first = intersect(P[c]!);
-  if (first === null) return [P.slice(), c];
+  if (first === null) { const cap = capCorners(P, c, fitLine); return cap === null ? [P.slice(), c, false] : [...cap, true]; }
   const X = intersect(first) ?? first;
   // The bevel's points (within 1 px of the corner, and of the sample it replaces) go.
   const s = P.map((p) => Math.min(norm(sub(p, P[c]!)), norm(sub(p, X))));
   const keep = [...Array(n).keys()].filter((i) => i === c || s[i]! >= 1 || i === 0 || i === n - 1);
   const out = keep.map((i) => (i === c ? X : P[i]!));
+  return [out, keep.indexOf(c), false];
+}
+
+/**
+ * A strip's end narrower than the corner scale: the outline turns back within 2 px, so the two sides are parallel and
+ * have no intersection. It is two corners (each a turn of more than CORNER_DEGREES within 2 px): the end runs through
+ * the turn's sample across the sides, and meets each side's line within 1.5 px of that sample, as a corner may move.
+ * Returns the points with both corners in place of the bevel, and the first corner's index (the second follows it).
+ */
+function capCorners(P: readonly Point[], c: number, fitLine: (ix: number[]) => [Point, Point]): [Point[], number] | null {
+  const n = P.length, s = P.map((p) => norm(sub(p, P[c]!)));
+  const L: number[] = [], R: number[] = [];
+  for (let i = Math.max(0, c - 8); i < c; i += 1) if (s[i]! >= 1.2 && s[i]! <= 5) L.push(i);
+  for (let i = c + 1; i < Math.min(n, c + 9); i += 1) if (s[i]! >= 1.2 && s[i]! <= 5) R.push(i);
+  if (L.length < 2 || R.length < 2) return null;
+  const [m1, d1] = fitLine(L), [m2, d2] = fitLine(R);
+  if (Math.abs(d1[0] * d2[1] - d1[1] * d2[0]) >= 0.2) return null;
+  // The sides run back along each other: towards the turn on one, away from it on the other.
+  const toward = sub(P[c]!, P[L[0]!]!), away = sub(P[R[R.length - 1]!]!, P[c]!);
+  if (toward[0] * away[0] + toward[1] * away[1] >= 0) return null;
+  const along = (m: Point) => { const t = (P[c]![0] - m[0]) * d1[0] + (P[c]![1] - m[1]) * d1[1]; return add(m, mul(d1, t)); };
+  const X1 = along(m1), X2 = add(m2, mul(d2, (P[c]![0] - m2[0]) * d2[0] + (P[c]![1] - m2[1]) * d2[1]));
+  if (norm(sub(X1, P[c]!)) > 1.5 || norm(sub(X2, P[c]!)) > 1.5) return null;
+  // The bevel's points (within 1 px of the sample or either corner) go; the corners take the sample's place.
+  const d = P.map((p) => Math.min(norm(sub(p, P[c]!)), norm(sub(p, X1)), norm(sub(p, X2))));
+  const keep = [...Array(n).keys()].filter((i) => i === c || d[i]! >= 1 || i === 0 || i === n - 1);
+  const out: Point[] = [];
+  for (const i of keep) { if (i === c) out.push(X1, X2); else out.push(P[i]!); }
   return [out, keep.indexOf(c)];
 }
 
@@ -869,7 +989,13 @@ function fitChain(input: readonly Point[], closed: boolean, tol: number): Cubic[
   if (!closed && P.length <= 3) return P.slice(0, -1).map((p, i) => line(p, P[i + 1]!));
   let cs = findCorners(P, closed);
   for (let k = 0; k < cs.length; k += 1) {
-    const [next, nc] = sharpenCorner(P, cs[k]!);
+    const [next, nc, cap] = sharpenCorner(P, cs[k]!);
+    if (cap) {
+      // A strip's end became two corners (capCorners): later corners move by the change in length.
+      const shift = next.length - P.length; P = next;
+      cs = [...new Set([...cs.slice(0, k), nc, nc + 1, ...cs.slice(k + 1).map((c) => c + shift)].map((c) => Math.min(Math.max(c, 0), P.length - 1)))].sort((l, r) => l - r);
+      k = Math.max(k, cs.indexOf(nc + 1)); continue;
+    }
     if (next.length !== P.length || nc !== cs[k]) {
       const shift = nc - cs[k]!; P = next; cs[k] = nc;
       cs = [...new Set([...cs.slice(0, k + 1), ...cs.slice(k + 1).map((c) => c + shift)].map((c) => Math.min(Math.max(c, 0), P.length - 1)))].sort((l, r) => l - r);
