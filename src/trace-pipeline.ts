@@ -9,7 +9,7 @@ import { dropCanvasBackground, dropFill, fitShapes, groupPathsByFill, sealGaps }
 import { segmentRaster } from "./segment.ts";
 import { scaleSvg } from "./svg-scale.ts";
 import { assembleTrace, mergePlates, type PlacedPlate } from "./trace-finish.ts";
-import { setCoveragePngDecoder } from "./trace-coverage.ts";
+import { chooseTraces, setCoveragePngDecoder } from "./trace-coverage.ts";
 import { type Stacking, type TracePreset, type TraceRequest } from "./trace.ts";
 import { edgeFirstSvg, type EdgeLabels } from "./edge-first.ts";
 import { NEAR_FILL } from "./score.ts";
@@ -141,7 +141,11 @@ export function traceRasterWithControls(
 }
 
 export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, controls: LabControls, onProgress?: PipelineProgress) {
-  const stages = vectorStagesFromPlan(svgs, plan.plates, plan.width, plan.height, plan.droppedColor, controls, onProgress);
+  // chooseTraces decides each stand-in plate once, here: the traces it keeps go on without their fallbacks (so the
+  // merges below keep them as they are), and the edge-first finish keeps apart the inks whose stand-ins it kept.
+  const chosen = chooseTraces(svgs, plan.plates);
+  const settled = chosen.plates.map((plate): PlannedPlate => { const { plain, ...rest } = plate; void plain; return rest; });
+  const stages = vectorStagesFromPlan(chosen.svgs, settled, plan.width, plan.height, plan.droppedColor, controls, onProgress);
   const source = plan.plates.find((plate) => plate.source !== undefined)?.source;
   const defaults = controlsFor(controls.mode);
   // The edge-first finish replaces the flat finish where that runs at its defaults (fairLabVector's relax branch).
@@ -151,7 +155,31 @@ export function vectorStagesForPlan(svgs: readonly string[], plan: TracePlan, co
   if (plan.edgeFirst === undefined || source === undefined || plan.droppedColor !== null || (controls.mode !== "logo" && controls.mode !== "icon")
     || Math.min(plan.width, plan.height) < MIN_SIDE
     || controls.smoothness !== defaults.smoothness || controls.corner !== defaults.corner) return stages;
-  return { ...stages, sealed: edgeFirstSvg(plan.edgeFirst.labels, source.rgba, plan.edgeFirst.lossy) };
+  // On a lossy source a kept ink's fringes are still chroma-subsampling mixes that fold, and its lines are kept as
+  // lines (edge-first's enclosed-line rule): the kept inks matter on clean sources only.
+  const keep = plan.edgeFirst.lossy ? new Set<number>() : keptApart(plan.edgeFirst.labels.inks, svgs, chosen);
+  return { ...stages, sealed: edgeFirstSvg(plan.edgeFirst.labels, source.rgba, plan.edgeFirst.lossy, keep) };
+}
+
+/**
+ * The label inks f19 kept apart: on each plate whose stand-in trace chooseTraces kept, the inks that moved to stand-ins
+ * and the near inks they were moved away from (separateNearInks' pairs: further apart than the layer difference and
+ * closer than INK_FOLD_REACH).
+ */
+function keptApart(inks: readonly string[], svgs: readonly string[], chosen: { readonly svgs: readonly string[]; readonly plates: readonly PlannedPlate[] }): Set<number> {
+  const rgb = (hex: string) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16));
+  const apart = (left: readonly number[], right: readonly number[]) => left.reduce((sum, value, channel) => sum + Math.abs(value - right[channel]!), 0);
+  const moved: number[][] = [];
+  chosen.plates.forEach((plate, index) => {
+    if (plate.fills === undefined || plate.plain === undefined || chosen.svgs[index] === svgs[plate.plain]) return;
+    for (const ink of Object.values(plate.fills)) moved.push(rgb(ink));
+  });
+  const kept = new Set<number>();
+  inks.forEach((hex, index) => {
+    const own = rgb(hex);
+    if (moved.some((ink) => apart(ink, own) === 0 || (apart(ink, own) > TRACER_LAYER_DIFFERENCE && apart(ink, own) < INK_FOLD_REACH))) kept.add(index);
+  });
+  return kept;
 }
 
 export function settingsFromControls(controls: LabControls): PipelineSettings {
@@ -417,7 +445,8 @@ function plateLabels(flat: readonly FlatPlate[], punched: readonly Uint8Array[],
     }
   });
   // As the flat finish does for cut-outs (unifyNearFills): a fringe can win its own palette slot one step from the fill
-  // it rims; on a cut-out such a near-identical ink is folded into the larger one.
+  // it rims; on a cut-out such a near-identical ink is folded into the larger one (by the edge-first finish, which
+  // knows which near inks the traces kept apart).
   if (flat.length > 0 && flat.every((plate) => plate.cutOut)) {
     const area = new Array<number>(inks.length).fill(0);
     for (const ink of labels) if (ink >= 0) area[ink]! += 1;
@@ -429,7 +458,7 @@ function plateLabels(flat: readonly FlatPlate[], punched: readonly Uint8Array[],
       const target = ranked.slice(0, rank).find((other) => !into.has(other) && rgb(other).every((value, channel) => Math.abs(value - own[channel]!) <= NEAR_FILL));
       if (target !== undefined) into.set(ink, target);
     }
-    for (let at = 0; at < labels.length; at += 1) labels[at] = into.get(labels[at]!) ?? labels[at]!;
+    return { width, height, labels, inks, unify: inks.map((_, ink) => into.get(ink) ?? ink) };
   }
   return { width, height, labels, inks };
 }
