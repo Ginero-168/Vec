@@ -20,6 +20,8 @@ export type EdgeLabels = {
   readonly labels: Int32Array;
   /** Ink colours (#rrggbb), indexed by label. */
   readonly inks: readonly string[];
+  /** Per ink, the ink a near-identical cut-out fringe folds into (itself when it stays): see plateLabels. */
+  readonly unify?: readonly number[];
 };
 
 /** The prototype's fit: a cubic passes when its largest error is within KMAX tolerances and its rms within KRMS. */
@@ -46,9 +48,9 @@ type Chain = { readonly vs: number[]; readonly es: number[]; readonly closed: bo
  * edge points use the narrower window. Transparent backdrop when the source has transparency, else the backdrop colour
  * is the source's most common border colour.
  */
-export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: boolean): string {
+export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: boolean, keep: ReadonlySet<number> = new Set()): string {
   const { width: W, height: H } = labelMap;
-  const { regions, count, inkOf } = connectedRegions(labelMap, source, lossy);
+  const { regions, count, inkOf } = connectedRegions(labelMap, source, lossy, keep);
   const X = new Float32Array(W * H * 4);
   let clearPixels = 0;
   for (let at = 0; at < W * H; at += 1) {
@@ -62,6 +64,8 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
   // On an opaque image the background is not a shape every neighbour has to be unioned with. Where the plan punched a
   // backdrop, border regions of the backdrop's colour join it; otherwise the border region with the longest boundary
   // to the others (what everything sits on; the larger on a tie) becomes one canvas-sized underlay drawn first.
+  // Near the backdrop: within NEAR_FILL, or on a lossy source within the denoiser's noise range.
+  const nearBy = lossy ? RANGE_SIGMA : NEAR_FILL;
   let underlay = -1;
   const underRegions = new Set<number>();
   if (!hasAlpha) {
@@ -78,8 +82,6 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
       if (x === 0 || y === 0 || x === W - 1 || y === H - 1) onBorder.add(regions[at]!);
     }
     const punched = [...onBorder].some((region) => inkOf[region]! < 0);
-    // Near the backdrop: within NEAR_FILL, or on a lossy source within the denoiser's noise range.
-    const nearBy = lossy ? RANGE_SIGMA : NEAR_FILL;
     const near = (ink: number) => hexRgb(labelMap.inks[ink]!).every((v, c) => Math.abs(v - backdrop[c]!) <= nearBy);
     if (punched) {
       // The plan already punched the backdrop: border regions of its colour are more of it, and stay undrawn.
@@ -94,15 +96,33 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
     }
     for (const region of underRegions) inkOf[region] = -1;
   }
+  // A backdrop region's colour is the border colour unless the region itself shows another beyond the noise range
+  // (a frame round the page: the border colour is the frame's, what the shapes sit on is the region's own, its median).
+  const own = hasAlpha ? new Map<number, number[]>() : regionMedians(regions, X, (region) => inkOf[region]! < 0 && !underRegions.has(region));
   const colours: number[][] = [];
   for (let region = 0; region < count; region += 1) {
-    const ink = inkOf[region]!;
-    colours.push(underRegions.has(region) ? [...hexRgb(labelMap.inks[underlay]!), 255] : ink < 0 ? backdrop : [...hexRgb(labelMap.inks[ink]!), 255]);
+    const ink = inkOf[region]!, seen = own.get(region);
+    const backdropHere = seen !== undefined && seen.some((v, c) => Math.abs(v - backdrop[c]!) > nearBy) ? seen : backdrop;
+    colours.push(underRegions.has(region) ? [...hexRgb(labelMap.inks[underlay]!), 255] : ink < 0 ? backdropHere : [...hexRgb(labelMap.inks[ink]!), 255]);
   }
   const { edges, chains } = crackGraph(regions, W, H);
   const window = lossy ? WINDOW_LOSSY : WINDOW_CLEAN;
   const corner = (v: number): Point => [v % (W + 1), Math.floor(v / (W + 1))];
-  const allPoints = chains.map((chain) => subpixelPoints(chain, edges, regions, W, H, X, colours, window, backdrop, lossy));
+  // The area integral counts the window's far pixels as pure inks; the coverage they still carry (t on the near side's
+  // end, 1 - t on the far side's) is unaccounted, so an edge point is uncertain by that much. Inside a gradient (a
+  // posterised band's edge) every point carries it, and a fit closer than that fits the stair noise of the bands: the
+  // chain's tolerance grows to its median uncertainty (as the largest error, KMAX tolerances). A real edge has pure
+  // window ends and keeps the edge tolerance. A window cut short by its region's run (a thin feature) ends on the
+  // feature's own anti-aliasing, which says nothing of a gradient: it is not counted, and a chain most of whose
+  // windows are cut short is a thin feature's, not a band's.
+  const uncertainty: number[] = [];
+  const allPoints = chains.map((chain) => {
+    const impurity: number[] = [];
+    const points = subpixelPoints(chain, edges, regions, W, H, X, colours, window, backdrop, lossy, impurity);
+    const full = impurity.filter((v) => !Number.isNaN(v)).sort((a, b) => a - b);
+    uncertainty.push(2 * full.length > impurity.length ? full[full.length >> 1]! : 0);
+    return points;
+  });
   // A junction on the canvas border slides along the border to where the boundaries meeting it reach it (the mean of
   // their nearest edge points within the integration's reach), so an edge that crosses the border does not bend back
   // to the crack corner there. Every chain ending at the junction uses the moved point. A boundary that meets the
@@ -136,9 +156,10 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
     tangent.delete(v);
     moved.set(v, vx === 0 || vx === W ? [vx, Math.min(H, Math.max(0, mean[1]))] : [Math.min(W, Math.max(0, mean[0])), vy]);
   }
-  const tolerance = lossy ? LOSSY_TOLERANCE : EDGE_TOLERANCE;
+  const edgeTolerance = lossy ? LOSSY_TOLERANCE : EDGE_TOLERANCE;
   const end = (v: number): Point => moved.get(v) ?? corner(v);
   const curves = chains.map((chain, index) => {
+    const tolerance = Math.max(edgeTolerance, uncertainty[index]! / KMAX);
     let points = allPoints[index]!;
     if (chain.closed) {
       const loop = points.length >= 3 ? points : chain.vs.slice(0, -1).map(corner);
@@ -192,22 +213,30 @@ function hexRgb(hex: string): [number, number, number] {
 /**
  * The 4-connected regions of one ink each (the backdrop, -1, is a region too). A region smaller than the speckle the
  * flat trace already drops (SPECK_SOURCE source px, VTracer's filter-speckle) joins the neighbour it shares the most
- * boundary with, as VTracer folds such a patch into its surroundings.
+ * boundary with, as VTracer folds such a patch into its surroundings. Speck-sized pieces of one ink that touch at
+ * corners are one patch, though: the steps of a 1 px diagonal line are a pixel each, but together they are the line.
+ * A patch longer than the clean integration span (an edge's window on both sides, 2 WINDOW_CLEAN) is a line that has
+ * edge points of its own away from its ends, and its pieces stay; a shorter cluster is speckle.
  */
-function connectedRegions(labelMap: EdgeLabels, source: Uint8Array, lossy: boolean): { regions: Int32Array; count: number; inkOf: number[] } {
+function connectedRegions(labelMap: EdgeLabels, source: Uint8Array, lossy: boolean, keep: ReadonlySet<number> = new Set()): { regions: Int32Array; count: number; inkOf: number[] } {
   const { width: W, height: H } = labelMap;
   const labels = Int32Array.from(labelMap.labels);
+  // An ink the near-ink separation kept apart (keep) is no fringe of its near neighbour: it is neither unified with it
+  // nor folded as a mix.
+  const unify = labelMap.unify;
+  if (unify !== undefined) for (let at = 0; at < labels.length; at += 1) { const ink = labels[at]!; if (ink >= 0 && !keep.has(ink)) labels[at] = unify[ink]!; }
   const speck = lossy ? LOSSY_SPECK : SPECK_SOURCE;
-  foldThinMixes(labels, labelMap.inks, source, W, H, lossy);
+  foldThinMixes(labels, labelMap.inks, source, W, H, lossy, keep);
   for (let pass = 0; pass < 4; pass += 1) {
     const found = components(labels, W, H);
     let changed = false;
     const size = new Array<number>(found.count).fill(0);
     for (const region of found.regions) size[region]! += 1;
+    const line = speckLines(labels, found.regions, size, speck, W, H);
     const shared = new Map<number, Map<number, number>>();
     for (let at = 0; at < W * H; at += 1) {
       const here = found.regions[at]!;
-      if (size[here]! >= speck) continue;
+      if (size[here]! >= speck || line.has(here)) continue;
       const x = at % W;
       for (const next of [x > 0 ? at - 1 : -1, x < W - 1 ? at + 1 : -1, at - W, at + W]) {
         if (next < 0 || next >= W * H) continue;
@@ -224,6 +253,7 @@ function connectedRegions(labelMap: EdgeLabels, source: Uint8Array, lossy: boole
       for (const [other, count] of tally) if (count > most || (count === most && size[other]! > size[best]!)) { best = other; most = count; }
       if (best >= 0 && inkOfRegion[best]! !== inkOfRegion[region]!) target.set(region, inkOfRegion[best]!);
     }
+    for (const [region, ink] of mislabelledIslands(labelMap.inks, source, found, keep, W, H)) if (!target.has(region)) target.set(region, ink);
     for (let at = 0; at < W * H; at += 1) {
       const ink = target.get(found.regions[at]!);
       if (ink !== undefined) { labels[at] = ink; changed = true; }
@@ -231,6 +261,46 @@ function connectedRegions(labelMap: EdgeLabels, source: Uint8Array, lossy: boole
     if (!changed) break;
   }
   return components(labels, W, H);
+}
+
+/**
+ * The islands the plates mislabelled: a region inside one other region (touching nothing else, nor the canvas edge)
+ * whose every source pixel is opaque and nearer that region's ink than its own is that region's ink, labelled apart
+ * (a posterised gradient band's stair steps leave such pixels). The surround's ink is its nearest ink, so it joins it.
+ * A real dot or hairline keeps its core pixels nearer its own ink.
+ */
+function mislabelledIslands(inks: readonly string[], source: Uint8Array, found: { regions: Int32Array; count: number; inkOf: number[] }, keep: ReadonlySet<number>, W: number, H: number): Map<number, number> {
+  const { regions, count, inkOf } = found;
+  const inkRgb = inks.map(hexRgb);
+  const around = new Int32Array(count).fill(-1), open = new Uint8Array(count);
+  for (let at = 0; at < W * H; at += 1) {
+    const here = regions[at]!, x = at % W, y = (at - x) / W;
+    if (open[here] === 1) continue;
+    if (x === 0 || y === 0 || x === W - 1 || y === H - 1 || source[at * 4 + 3]! < 255) { open[here] = 1; continue; }
+    for (const next of [at - 1, at + 1, at - W, at + W]) {
+      const other = regions[next]!;
+      if (other === here) continue;
+      if (around[here] === -1) around[here] = other;
+      else if (around[here] !== other) { open[here] = 1; break; }
+    }
+  }
+  const nearer = new Uint8Array(count).fill(1);
+  for (let at = 0; at < W * H; at += 1) {
+    const here = regions[at]!, ink = inkOf[here]!;
+    if (open[here] === 1 || around[here] === -1 || nearer[here] === 0 || ink < 0) continue;
+    const outer = inkOf[around[here]!]!;
+    if (outer < 0) { nearer[here] = 0; continue; }
+    const gap = (rgb: readonly number[]) => rgb.reduce((sum, v, c) => sum + Math.abs(v - source[at * 4 + c]!), 0);
+    if (gap(inkRgb[outer]!) >= gap(inkRgb[ink]!)) nearer[here] = 0;
+  }
+  const into = new Map<number, number>();
+  for (let region = 0; region < count; region += 1) {
+    const ink = inkOf[region]!;
+    if (open[region] === 1 || around[region] === -1 || nearer[region] === 0 || ink < 0 || keep.has(ink)) continue;
+    const outer = inkOf[around[region]!]!;
+    if (outer >= 0 && outer !== ink) into.set(region, outer);
+  }
+  return into;
 }
 
 /** On a lossy (4:2:0) source a patch smaller than one chroma sample (2 x 2 px) has no colour of its own. */
@@ -242,8 +312,12 @@ const THIN_RATIO = 0.7;
  * A thin region (narrower than about 1.4 px, THIN_RATIO) whose ink is a mix of two neighbouring inks, within the
  * tracer's own layer difference of the line between them, is an anti-aliasing ramp: its pixels join the neighbour
  * the mix is nearer to. A region between two parts of one ink (a hairline) is kept: its ink is no mix of two inks.
+ * That holds pixel by pixel too (enclosedLine): where a folded or merged region runs as a line between two parts of
+ * one ink, those pixels keep their ink, and only the rest of the region joins its neighbour. On a lossy source that
+ * ink must run on for a whole DCT block (BLOCK) on both sides: a strip within one block of another edge can be that
+ * edge's ringing, which the block's basis spreads along the edge.
  */
-function foldThinMixes(labels: Int32Array, inks: readonly string[], source: Uint8Array, W: number, H: number, lossy: boolean): void {
+function foldThinMixes(labels: Int32Array, inks: readonly string[], source: Uint8Array, W: number, H: number, lossy: boolean, keep: ReadonlySet<number>): void {
   const inkRgb = inks.map((hex) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16)));
   // On an opaque image the page goes on past the canvas edge in the backdrop colour (edgeFirstSvg's test), so the
   // canvas outside is one more side a border fringe can be the mix with.
@@ -303,7 +377,7 @@ function foldThinMixes(labels: Int32Array, inks: readonly string[], source: Uint
     for (let region = 0; region < found.count; region += 1) {
       if (into.has(region)) continue;
       const ink = found.inkOf[region]!;
-      if (ink < 0 || area[region]! >= THIN_RATIO * perimeter[region]!) continue;
+      if (ink < 0 || keep.has(ink) || area[region]! >= THIN_RATIO * perimeter[region]!) continue;
       const own = rgb[region]!;
       const inkRegion = new Map<number, number>();
       for (const other of touching.get(region) ?? []) {
@@ -335,8 +409,75 @@ function foldThinMixes(labels: Int32Array, inks: readonly string[], source: Uint
       if (best !== null) into.set(region, best.ink);
     }
     if (into.size === 0) return;
-    for (let at = 0; at < W * H; at += 1) { const ink = into.get(found.regions[at]!); if (ink !== undefined) labels[at] = ink; }
+    const members = new Map<number, number[]>();
+    for (let at = 0; at < W * H; at += 1) { const region = found.regions[at]!; if (into.has(region)) (members.get(region) ?? members.set(region, []).get(region)!).push(at); }
+    const stays = new Set<number>();
+    for (const pixels of members.values()) for (const at of enclosedLine(found.regions, found.inkOf, pixels, W, H, lossy ? BLOCK : 1)) stays.add(at);
+    let changed = false;
+    for (let at = 0; at < W * H; at += 1) {
+      const ink = into.get(found.regions[at]!);
+      if (ink !== undefined && !stays.has(at)) { labels[at] = ink; changed = true; }
+    }
+    if (!changed) return;
   }
+}
+
+/** A JPEG codes chroma per 16 px MCU and the transform per 8 px block. */
+const MCU = 16, BLOCK = 8;
+
+/**
+ * The pixels of one region (`pixels`) that run as a line between two parts of one ink: across the region (along the shorter of
+ * its row and column runs through the pixel) both sides are the same other ink. They are a line, not a fringe or a
+ * noise split, when they reach further than two MCUs (a JPEG's noise is coded per MCU, so a split it makes is no
+ * longer than the two MCUs it may straddle; a clean source can be judged clean and still be a JPEG) and are narrower
+ * on average than one transform block. Empty otherwise.
+ */
+function enclosedLine(regions: Int32Array, inkOf: readonly number[], pixels: readonly number[], W: number, H: number, flank: number): number[] {
+  const ink = (x: number, y: number) => (x < 0 || y < 0 || x >= W || y >= H ? null : inkOf[regions[y * W + x]!]!);
+  const region = regions[pixels[0]!]!;
+  const line: number[] = [];
+  let x0 = W, x1 = -1, y0 = H, y1 = -1;
+  for (const at of pixels) {
+    const x = at % W, y = (at - x) / W;
+    let l = x, r = x, u = y, d = y;
+    while (l > 0 && regions[at - (x - l) - 1] === region) l -= 1;
+    while (r < W - 1 && regions[at + (r - x) + 1] === region) r += 1;
+    while (u > 0 && regions[(u - 1) * W + x] === region) u -= 1;
+    while (d < H - 1 && regions[(d + 1) * W + x] === region) d += 1;
+    const across = r - l <= d - u;
+    const side = (k: number) => (across ? [ink(l - k, y), ink(r + k, y)] : [ink(x, u - k), ink(x, d + k)]);
+    const [one, other] = side(1);
+    if (one === null || one !== other) continue;
+    let flanked = true;
+    for (let k = 2; k <= flank && flanked; k += 1) flanked = side(k).every((v) => v === one);
+    if (!flanked) continue;
+    line.push(at); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+  }
+  const reach = Math.max(x1 - x0, y1 - y0) + 1;
+  return reach > 2 * MCU && line.length < BLOCK * reach ? line : [];
+}
+
+/** The speck-sized regions whose 8-connected patch of speck-sized pieces of their ink spans more than 2 WINDOW_CLEAN. */
+function speckLines(labels: Int32Array, regions: Int32Array, size: readonly number[], speck: number, W: number, H: number): Set<number> {
+  const small = (at: number) => size[regions[at]!]! < speck;
+  const seen = new Uint8Array(W * H), stack: number[] = [], line = new Set<number>();
+  for (let start = 0; start < W * H; start += 1) {
+    if (seen[start] === 1 || !small(start)) continue;
+    const ink = labels[start]!, members: number[] = [];
+    let x0 = W, x1 = -1, y0 = H, y1 = -1;
+    seen[start] = 1; stack.push(start);
+    while (stack.length > 0) {
+      const at = stack.pop()!, x = at % W, y = (at - x) / W;
+      members.push(at); x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+      for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+        const nx = x + dx, ny = y + dy, next = ny * W + nx;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H || seen[next] === 1 || labels[next] !== ink || !small(next)) continue;
+        seen[next] = 1; stack.push(next);
+      }
+    }
+    if (Math.max(x1 - x0, y1 - y0) + 1 > 2 * WINDOW_CLEAN) for (const at of members) line.add(regions[at]!);
+  }
+  return line;
 }
 
 function components(labels: Int32Array, W: number, H: number): { regions: Int32Array; count: number; inkOf: number[] } {
@@ -357,6 +498,24 @@ function components(labels: Int32Array, W: number, H: number): { regions: Int32A
     }
   }
   return { regions, count: inkOf.length, inkOf };
+}
+
+/** Per region that `wanted` picks, the median of its pixels (premultiplied RGBA, per channel). */
+function regionMedians(regions: Int32Array, X: Float32Array, wanted: (region: number) => boolean): Map<number, number[]> {
+  const histograms = new Map<number, Uint32Array>();
+  for (let at = 0; at < regions.length; at += 1) {
+    const region = regions[at]!;
+    if (!wanted(region)) continue;
+    const histogram = histograms.get(region) ?? histograms.set(region, new Uint32Array(4 * 256)).get(region)!;
+    for (let c = 0; c < 4; c += 1) histogram[c * 256 + Math.min(255, Math.max(0, Math.round(X[at * 4 + c]!)))]! += 1;
+  }
+  const medians = new Map<number, number[]>();
+  for (const [region, histogram] of histograms) {
+    let total = 0;
+    for (let v = 0; v < 256; v += 1) total += histogram[v]!;
+    medians.set(region, [0, 1, 2, 3].map((c) => { let seen = 0, v = 0; for (; v < 255; v += 1) { seen += histogram[c * 256 + v]!; if (2 * seen > total) break; } return v; }));
+  }
+  return medians;
 }
 
 /** The most common border colour (premultiplied, binned by 8), as the median of its pixels. */
@@ -438,7 +597,7 @@ const lossyDot = (p: readonly number[], q: readonly number[]) => {
 /** A border pixel further than this (RGBA) from the line between region and backdrop colours is not their mix. */
 const MIX_RESIDUAL = 30;
 
-function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Array, W: number, H: number, X: Float32Array, colours: readonly number[][], window: number, backdrop: readonly number[], lossy: boolean): Point[] {
+function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Array, W: number, H: number, X: Float32Array, colours: readonly number[][], window: number, backdrop: readonly number[], lossy: boolean, impurity: number[]): Point[] {
   const [la, lb] = chain.pair;
   const pixel = (y: number, x: number) => [0, 1, 2, 3].map((c) => X[(y * W + x) * 4 + c]!);
   // Fractions use the weighted product; the distance tests below compare RGB distances with RGB thresholds.
@@ -505,6 +664,7 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
       while (l - 1 >= 0 && x - 1 - (l - 1) < wl && regions[y * W + l - 1] === e.la) l -= 1;
       while (r + 1 < W && r + 1 - x < wr && regions[y * W + r + 1] === e.lb) r += 1;
       let sum = 0; for (let i = l; i <= r; i += 1) sum += t(y, i);
+      impurity.push(wl === window && wr === window ? t(y, l) + 1 - t(y, r) : NaN);
       out.push([Math.min(Math.max(r + 1 - sum, x - 1), x + 1), y + 0.5]);
     } else {
       const y = e.y, x = e.x; let l = y - 1, r = y;
@@ -512,6 +672,7 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
       while (l - 1 >= 0 && y - 1 - (l - 1) < wl && regions[(l - 1) * W + x] === e.la) l -= 1;
       while (r + 1 < H && r + 1 - y < wr && regions[(r + 1) * W + x] === e.lb) r += 1;
       let sum = 0; for (let i = l; i <= r; i += 1) sum += t(i, x);
+      impurity.push(wl === window && wr === window ? t(l, x) + 1 - t(r, x) : NaN);
       out.push([x + 0.5, Math.min(Math.max(r + 1 - sum, y - 1), y + 1)]);
     }
   });
