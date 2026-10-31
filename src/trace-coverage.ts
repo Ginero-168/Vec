@@ -3,7 +3,19 @@
  * against the labels it was traced from. VTracer's SVG is a stack of filled paths (later on top), each one
  * `<path d=".." fill="#RRGGBB" transform="translate(x,y)"/>` in plate pixels, filled by the nonzero rule.
  */
-import { readRgbaPng } from "./png-alpha.ts";
+
+type Decoded = { readonly rgba: Uint8Array; readonly width: number; readonly height: number };
+
+/**
+ * The PNG decoder the check reads a plate's traced raster with. It needs node's zlib, which a browser bundle (the lab)
+ * cannot import, so trace-pipeline.ts (the node module that makes stand-in plates) registers it. Without one, a plate
+ * with stand-in fills keeps its plain trace, as when its raster does not decode.
+ */
+let decodePng: ((png: Buffer) => Decoded | null) | undefined;
+
+export function setCoveragePngDecoder(decoder: (png: Buffer) => Decoded | null): void {
+  decodePng = decoder;
+}
 
 type Ring = readonly (readonly [number, number])[];
 
@@ -143,7 +155,7 @@ export function chooseTraces<Plate extends CoveragePlate>(svgs: readonly string[
     if (plate.fills === undefined || plainSvg === undefined || plate.png === undefined) {
       keptSvgs.push(svg); keptPlates.push(plate); continue;
     }
-    const decoded = readRgbaPng(Buffer.from(plate.png.buffer, plate.png.byteOffset, plate.png.byteLength));
+    const decoded = decodePng?.(Buffer.from(plate.png.buffer, plate.png.byteOffset, plate.png.byteLength)) ?? null;
     if (decoded === null) { keptSvgs.push(plainSvg); keptPlates.push(plate); continue; }
     const [labelSeparated, labelPlain] = labelMismatches(svg, plainSvg, decoded, plate.scale, plate.fills);
     let better = labelSeparated < labelPlain;
@@ -157,8 +169,6 @@ export function chooseTraces<Plate extends CoveragePlate>(svgs: readonly string[
   }
   return { svgs: keptSvgs, plates: keptPlates };
 }
-
-type Decoded = { readonly rgba: Uint8Array; readonly width: number; readonly height: number };
 
 /** Mismatches of the stand-in and plain traces against the plate's labels, on a half-source-pixel grid (fix18). */
 function labelMismatches(svg: string, plainSvg: string, decoded: Decoded, scale: number, fills: Readonly<Record<string, string>>): [number, number] {
