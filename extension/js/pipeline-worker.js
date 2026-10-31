@@ -2718,6 +2718,9 @@ function hex2(color) {
   return "#" + color.toString(16).padStart(6, "0");
 }
 
+// src/score.ts
+var NEAR_FILL = 2;
+
 // src/segment.ts
 var MODE_CAP = { logo: 8, icon: 8, photo: 32, poster: 10 };
 var SPECK_AREA = { logo: 18, icon: 12, photo: 6, poster: 28 };
@@ -3176,6 +3179,12 @@ function distance2(a, b) {
   return dr * dr + dg * dg + db * db;
 }
 
+// src/trace-coverage.ts
+var decodePng;
+function setCoveragePngDecoder(decoder) {
+  decodePng = decoder;
+}
+
 // src/lab-pipeline.ts
 var LAB_STEPS = ["capture", "colors", "backdrop", "punch", "trace", "fit", "fair", "seal"];
 function buildLabRasterStages(source, width, height, controls, previous = null, from = "colors", onProgress) {
@@ -3439,7 +3448,15 @@ function chunk(type, data) {
   return Buffer.concat([length, name, data, checksum]);
 }
 
+// src/edge-first.ts
+var KMAX = 2.5;
+var EDGE_TOLERANCE = 0.5 / KMAX;
+var WINDOW_CLEAN = 3;
+var WINDOW_LOSSY = 2;
+var LOSSY_TOLERANCE = EDGE_TOLERANCE * Math.sqrt(WINDOW_CLEAN / WINDOW_LOSSY);
+
 // src/trace-pipeline.ts
+setCoveragePngDecoder(readRgbaPng);
 function planTrace(source, settings, controls, previousStages = null, from = "colors", onProgress) {
   const decoded = readRgbaPng(source);
   if (decoded === null) return null;
@@ -3460,10 +3477,16 @@ function planTrace(source, settings, controls, previousStages = null, from = "co
 }
 function planFlat(rgba, width, height, settings, controls, preparedPlates, onProgress) {
   const flat = preparedPlates ?? flatPlates(rgba, width, height, settings.maxColors, lossyCleanup(rgba, width, height), onProgress);
-  const plates = flat.map((plate) => {
+  const clean = !wouldDenoise(rgba, width, height);
+  const plates = [];
+  const punchedPlates = [];
+  const backups = [];
+  for (const plate of flat) {
     const punched = settings.removeBackground ? punchBackdrop(plate.rgba, plate.width, plate.height, plate.borderColor, plate.scale) : { rgba: plate.rgba, borderIsSubject: false };
-    return {
-      png: encodeRgbaPng(plate.width, plate.height, punched.rgba),
+    punchedPlates.push(punched.rgba);
+    const separated = clean ? separateNearInks(punched.rgba, plate.palette, { rgba, width, height, originX: plate.originX, originY: plate.originY, scale: plate.scale, plateWidth: plate.width }) : null;
+    const planned = (pixels, palette) => ({
+      png: encodeRgbaPng(plate.width, plate.height, pixels),
       scale: plate.scale,
       originX: plate.originX,
       originY: plate.originY,
@@ -3471,17 +3494,168 @@ function planFlat(rgba, width, height, settings, controls, preparedPlates, onPro
       borderColor: punched.borderIsSubject ? null : plate.borderColor,
       cutOut: plate.cutOut,
       source: { rgba, width, height },
-      request: controls === void 0 ? flatRequest(settings, plate.palette, plate.scale) : flatRequestForControls(settings, plate.palette, plate.scale, controls)
-    };
-  });
+      request: controls === void 0 ? flatRequest(settings, palette, plate.scale) : flatRequestForControls(settings, palette, plate.scale, controls)
+    });
+    if (separated === null) {
+      plates.push(planned(punched.rgba, plate.palette));
+      continue;
+    }
+    plates.push({ ...planned(separated.rgba, separated.palette), fills: separated.fills, plain: flat.length + backups.length });
+    backups.push({ ...planned(punched.rgba, plate.palette), backup: true });
+  }
+  plates.push(...backups);
   const rasterStages = controls === void 0 ? void 0 : flatRasterStages(controls.mode, rgba, flatPreviewFromPlates([...flat], width, height));
+  const labels = plateLabels(flat, punchedPlates, width, height);
   return {
     width,
     height,
     droppedColor: null,
     plates,
-    ...rasterStages === void 0 ? {} : { rasterStages }
+    ...rasterStages === void 0 ? {} : { rasterStages },
+    edgeFirst: { labels, lossy: !clean }
   };
+}
+var INK_FOLD_REACH = 2 * (TRACER_LAYER_DIFFERENCE + 1 + 3);
+function separateNearInks(rgba, palette, source) {
+  const inks = palette.map((hex4) => [1, 3, 5].map((at) => parseInt(hex4.slice(at, at + 2), 16)));
+  if (inks.length < 2 || inks.some((ink) => ink.some((value) => !Number.isFinite(value)))) return null;
+  const apart = (left, right) => Math.abs(left[0] - right[0]) + Math.abs(left[1] - right[1]) + Math.abs(left[2] - right[2]);
+  const pairs = [];
+  for (let left = 0; left < inks.length; left += 1) {
+    for (let right = left + 1; right < inks.length; right += 1) {
+      const distance = apart(inks[left], inks[right]);
+      if (distance > TRACER_LAYER_DIFFERENCE && distance < INK_FOLD_REACH) pairs.push([left, right]);
+    }
+  }
+  if (pairs.length === 0) return null;
+  const real = sourceInks(rgba, inks, new Set(pairs.flat()), source);
+  pairs.splice(0, pairs.length, ...pairs.filter(([left, right]) => real.has(left) && real.has(right)));
+  if (pairs.length === 0) return null;
+  const counts = /* @__PURE__ */ new Map();
+  for (let at = 0; at < rgba.length; at += 4) {
+    if ((rgba[at + 3] ?? 0) === 0) continue;
+    const key = (rgba[at] ?? 0) << 16 | (rgba[at + 1] ?? 0) << 8 | (rgba[at + 2] ?? 0);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const count = (ink) => counts.get(ink[0] << 16 | ink[1] << 8 | ink[2]) ?? 0;
+  const traced = inks.map((ink) => [...ink]);
+  pairs.sort((a, b) => apart(inks[a[0]], inks[a[1]]) - apart(inks[b[0]], inks[b[1]]) || a[0] - b[0] || a[1] - b[1]);
+  for (const [left, right] of pairs) {
+    if (apart(traced[left], traced[right]) >= INK_FOLD_REACH) continue;
+    const minor = count(inks[left]) <= count(inks[right]) ? left : right;
+    const major = minor === left ? right : left;
+    for (const [moved, kept] of [[minor, major], [major, minor]]) {
+      const stand = pushApart(traced[moved], traced[kept], INK_FOLD_REACH);
+      if (stand === null) continue;
+      const clear = traced.every((other, index) => index === moved || index === kept || apart(stand, other) >= INK_FOLD_REACH || apart(stand, other) >= apart(traced[moved], other));
+      if (!clear) continue;
+      traced[moved] = stand;
+      break;
+    }
+  }
+  const fills = {};
+  const repaint = /* @__PURE__ */ new Map();
+  const hex3 = (ink) => "#" + ink.map((value) => value.toString(16).padStart(2, "0")).join("");
+  for (const [index, ink] of inks.entries()) {
+    const stand = traced[index];
+    if (apart(stand, ink) === 0) continue;
+    if (inks.some((other) => apart(other, stand) === 0)) return null;
+    fills[hex3(stand).toUpperCase()] = palette[index];
+    repaint.set(ink[0] << 16 | ink[1] << 8 | ink[2], stand);
+  }
+  if (repaint.size === 0) return null;
+  const out = new Uint8Array(rgba);
+  for (let at = 0; at < out.length; at += 4) {
+    if ((out[at + 3] ?? 0) === 0) continue;
+    const stand = repaint.get((out[at] ?? 0) << 16 | (out[at + 1] ?? 0) << 8 | (out[at + 2] ?? 0));
+    if (stand === void 0) continue;
+    out[at] = stand[0];
+    out[at + 1] = stand[1];
+    out[at + 2] = stand[2];
+  }
+  return { rgba: out, palette: traced.map((ink, index) => apart(ink, inks[index]) === 0 ? palette[index] : hex3(ink)), fills };
+}
+function sourceInks(plate, inks, wanted, source) {
+  const key = (at, from) => (from[at] ?? 0) << 16 | (from[at + 1] ?? 0) << 8 | (from[at + 2] ?? 0);
+  const ink = /* @__PURE__ */ new Map();
+  for (const index of wanted) ink.set(inks[index][0] << 16 | inks[index][1] << 8 | inks[index][2], index);
+  const tallies = /* @__PURE__ */ new Map();
+  const { scale, plateWidth } = source, half = scale >> 1;
+  const columns = Math.floor(plateWidth / scale), rows = Math.floor(plate.length / 4 / plateWidth / scale);
+  for (let y = 0; y < rows; y += 1) {
+    const sy = y + source.originY;
+    if (sy < 0 || sy >= source.height) continue;
+    for (let x = 0; x < columns; x += 1) {
+      const sx = x + source.originX;
+      if (sx < 0 || sx >= source.width) continue;
+      const at = ((y * scale + half) * plateWidth + x * scale + half) * 4;
+      if ((plate[at + 3] ?? 0) === 0) continue;
+      const label = ink.get(key(at, plate));
+      if (label === void 0) continue;
+      const tally = tallies.get(label) ?? /* @__PURE__ */ new Map();
+      const colour = key((sy * source.width + sx) * 4, source.rgba);
+      tally.set(colour, (tally.get(colour) ?? 0) + 1);
+      tallies.set(label, tally);
+    }
+  }
+  const real = /* @__PURE__ */ new Set();
+  for (const [label, tally] of tallies) {
+    const own = tally.get(inks[label][0] << 16 | inks[label][1] << 8 | inks[label][2]) ?? 0;
+    if (own > 0 && [...tally.values()].every((count) => count <= own)) real.add(label);
+  }
+  return real;
+}
+function pushApart(ink, from, distance) {
+  const delta = [ink[0] - from[0], ink[1] - from[1], ink[2] - from[2]];
+  const length = Math.abs(delta[0]) + Math.abs(delta[1]) + Math.abs(delta[2]);
+  if (length === 0) return null;
+  for (let scale = distance / length; scale <= 255; scale += 1 / length) {
+    const moved = delta.map((value, channel) => Math.min(255, Math.max(0, Math.round(from[channel] + value * scale))));
+    const reached = Math.abs(moved[0] - from[0]) + Math.abs(moved[1] - from[1]) + Math.abs(moved[2] - from[2]);
+    if (reached >= distance) return moved;
+    if (moved.every((value) => value === 0 || value === 255)) return null;
+  }
+  return null;
+}
+function plateLabels(flat, punched, width, height) {
+  const labels = new Int32Array(width * height).fill(-1);
+  const inks = [];
+  const index = /* @__PURE__ */ new Map();
+  flat.forEach((plate, which) => {
+    const rgba = punched[which], half = plate.scale >> 1;
+    for (let y = 0; y < plate.sourceHeight; y += 1) {
+      const sy = plate.originY + y;
+      if (sy < 0 || sy >= height) continue;
+      for (let x = 0; x < plate.sourceWidth; x += 1) {
+        const sx = plate.originX + x;
+        if (sx < 0 || sx >= width) continue;
+        const at = ((y * plate.scale + half) * plate.width + x * plate.scale + half) * 4;
+        if ((rgba[at + 3] ?? 0) === 0) continue;
+        const key = (rgba[at] ?? 0) << 16 | (rgba[at + 1] ?? 0) << 8 | (rgba[at + 2] ?? 0);
+        let ink = index.get(key);
+        if (ink === void 0) {
+          ink = inks.length;
+          index.set(key, ink);
+          inks.push("#" + key.toString(16).padStart(6, "0"));
+        }
+        labels[sy * width + sx] = ink;
+      }
+    }
+  });
+  if (flat.length > 0 && flat.every((plate) => plate.cutOut)) {
+    const area = new Array(inks.length).fill(0);
+    for (const ink of labels) if (ink >= 0) area[ink] += 1;
+    const ranked = [...inks.keys()].sort((a, b) => area[b] - area[a] || a - b);
+    const into = /* @__PURE__ */ new Map();
+    const rgb = (ink) => [1, 3, 5].map((at) => parseInt(inks[ink].slice(at, at + 2), 16));
+    for (const [rank, ink] of ranked.entries()) {
+      const own = rgb(ink);
+      const target = ranked.slice(0, rank).find((other) => !into.has(other) && rgb(other).every((value, channel) => Math.abs(value - own[channel]) <= NEAR_FILL));
+      if (target !== void 0) into.set(ink, target);
+    }
+    return { width, height, labels, inks, unify: inks.map((_, ink) => into.get(ink) ?? ink) };
+  }
+  return { width, height, labels, inks };
 }
 var HALO_MIX = 0.35;
 var HALO_RESIDUAL = 16;
