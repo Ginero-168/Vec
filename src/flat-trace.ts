@@ -25,7 +25,7 @@ const REGION_TOLERANCE = 0.06;
 const COLOR_FLOOR = 0.035;
 const OWN_COLOR = 0.05;
 const DILATE_RADIUS = 3;
-const SPECK_SOURCE = 1.44;
+export const SPECK_SOURCE = 1.44;
 const SMOOTH_SOURCE = 0.6;
 const K_MAX = 16;
 
