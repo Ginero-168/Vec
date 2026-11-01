@@ -345,24 +345,41 @@ function mislabelledIslands(inks: readonly string[], source: Uint8Array, found: 
  * places it. A strip's own pixels stay: an anti-aliased hairline's pixels can all be nearer its surround's ink.
  */
 function smoothedLines(labels: Int32Array, inks: readonly string[], source: Uint8Array, W: number, H: number): void {
-  const inkRgb = inks.map(hexRgb);
+  const inkRgb = inks.map(hexRgb), count = inks.length;
+  // Each opaque pixel's nearest ink (the first of the least RGB distance, its own ink on a tie), once per colour and
+  // label: a pixel of its own ink exactly has none nearer.
+  const nearer = new Int32Array(W * H).fill(-1), memo = new Map<number, number>();
+  let any = false;
+  for (let at = 0; at < W * H; at += 1) {
+    const ink = labels[at]!;
+    if (ink < 0 || source[at * 4 + 3]! < 255) continue;
+    const r = source[at * 4]!, g = source[at * 4 + 1]!, b = source[at * 4 + 2]!, own = inkRgb[ink]!;
+    if (own[0] === r && own[1] === g && own[2] === b) continue;
+    const key = ((r << 16) | (g << 8) | b) * count + ink;
+    let best = memo.get(key);
+    if (best === undefined) {
+      best = ink; let least = Math.abs(own[0] - r) + Math.abs(own[1] - g) + Math.abs(own[2] - b);
+      for (let other = 0; other < count; other += 1) {
+        const rgb = inkRgb[other]!, d = Math.abs(rgb[0] - r) + Math.abs(rgb[1] - g) + Math.abs(rgb[2] - b);
+        if (d < least) { least = d; best = other; }
+      }
+      memo.set(key, best);
+    }
+    if (best !== ink) { nearer[at] = best; any = true; }
+  }
+  if (!any) return;
+  // Only pixels of a broad region (not a strip) count.
   const found = components(labels, W, H);
-  const area = new Array<number>(found.count).fill(0), perimeter = new Array<number>(found.count).fill(0);
+  const area = new Int32Array(found.count), perimeter = new Int32Array(found.count), regionsOf = found.regions;
   for (let at = 0; at < W * H; at += 1) {
-    const here = found.regions[at]!, x = at % W, y = (at - x) / W;
+    const here = regionsOf[at]!, x = at % W;
     area[here]! += 1;
-    for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] as const)
-      if (nx < 0 || ny < 0 || nx >= W || ny >= H || found.regions[ny * W + nx] !== here) perimeter[here]! += 1;
+    if (x === 0 || regionsOf[at - 1] !== here) perimeter[here]! += 1;
+    if (x === W - 1 || regionsOf[at + 1] !== here) perimeter[here]! += 1;
+    if (at < W || regionsOf[at - W] !== here) perimeter[here]! += 1;
+    if (at >= W * (H - 1) || regionsOf[at + W] !== here) perimeter[here]! += 1;
   }
-  const nearer = new Int32Array(W * H).fill(-1);
-  for (let at = 0; at < W * H; at += 1) {
-    const ink = labels[at]!, region = found.regions[at]!;
-    if (ink < 0 || source[at * 4 + 3]! < 255 || area[region]! < THIN_RATIO * perimeter[region]!) continue;
-    const gap = (rgb: readonly number[]) => rgb.reduce((sum, v, c) => sum + Math.abs(v - source[at * 4 + c]!), 0);
-    let best = ink, least = gap(inkRgb[ink]!);
-    inkRgb.forEach((rgb, other) => { const g = gap(rgb); if (g < least) { least = g; best = other; } });
-    if (best !== ink) nearer[at] = best;
-  }
+  for (let at = 0; at < W * H; at += 1) if (nearer[at]! >= 0 && area[regionsOf[at]!]! < THIN_RATIO * perimeter[regionsOf[at]!]!) nearer[at] = -1;
   const seen = new Uint8Array(W * H);
   for (let start = 0; start < W * H; start += 1) {
     if (nearer[start]! < 0 || seen[start] === 1) continue;
@@ -590,10 +607,10 @@ function components(labels: Int32Array, W: number, H: number): { regions: Int32A
     regions[start] = id; stack.push(start);
     while (stack.length > 0) {
       const at = stack.pop()!, x = at % W;
-      for (const next of [x > 0 ? at - 1 : -1, x < W - 1 ? at + 1 : -1, at - W, at + W]) {
-        if (next < 0 || next >= W * H || regions[next] !== -1 || labels[next] !== ink) continue;
-        regions[next] = id; stack.push(next);
-      }
+      if (x > 0 && regions[at - 1] === -1 && labels[at - 1] === ink) { regions[at - 1] = id; stack.push(at - 1); }
+      if (x < W - 1 && regions[at + 1] === -1 && labels[at + 1] === ink) { regions[at + 1] = id; stack.push(at + 1); }
+      if (at >= W && regions[at - W] === -1 && labels[at - W] === ink) { regions[at - W] = id; stack.push(at - W); }
+      if (at + W < W * H && regions[at + W] === -1 && labels[at + W] === ink) { regions[at + W] = id; stack.push(at + W); }
     }
   }
   return { regions, count: inkOf.length, inkOf };
@@ -756,7 +773,15 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
     if (e.kind === "v" && ay < 0.75 * ax) return;
     const Ca = colours[e.la]!, Cb = colours[e.lb]!, dv = Cb.map((v, c) => v - Ca[c]!), dd = mixDot(dv, dv);
     if (dd < 1e-3) return;
-    const t = (y: number, x: number) => Math.min(1, Math.max(0, mixDot(pixel(y, x).map((v, c) => v - Ca[c]!), dv) / dd));
+    const t = lossy
+      ? (y: number, x: number) => Math.min(1, Math.max(0, mixDot(pixel(y, x).map((v, c) => v - Ca[c]!), dv) / dd))
+      : (y: number, x: number) => { // rgbaDot of the same differences, in the same order, without the arrays
+        const at = (y * W + x) * 4;
+        return Math.min(1, Math.max(0, ((X[at]! - Ca[0]!) * dv[0]! + (X[at + 1]! - Ca[1]!) * dv[1]! + (X[at + 2]! - Ca[2]!) * dv[2]! + (X[at + 3]! - Ca[3]!) * dv[3]!) / dd));
+      };
+    // thin() needs a 1 px run of one side's region with the other side's colour past it: test that first.
+    const sameColour = (region: number, colour: readonly number[]) => { const C = colours[region]!; for (let c = 0; c < C.length; c += 1) if (C[c] !== colour[c]) return false; return true; };
+    const oneRun = (before: number, after: number) => (before >= 0 && regions[before] !== e.la && sameColour(regions[before]!, Cb)) || (after >= 0 && regions[after] !== e.lb && sameColour(regions[after]!, Ca));
     // (Clean sources only: on a lossy source the block transform spreads a 1 px line's pixels over the outer windows,
     // whose area the integral would read as the line's.)
     // A region one pixel across between two parts of one colour: half of that run cannot be split between its two
@@ -815,7 +840,7 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
       while (r + 1 < W && r + 1 - x < wr && regions[y * W + r + 1] === e.lb) r += 1;
       let sum = 0; for (let i = l; i <= r; i += 1) sum += t(y, i);
       impurity.push(wl === window && wr === window ? t(y, l) + 1 - t(y, r) : NaN);
-      const across = lossy ? null : thin(W, (i) => y * W + i, (i) => t(y, i), x, (i) => [y - 1, y + 1].filter((v) => v >= 0 && v < H).map((v) => [v * W + i, i > 0 ? v * W + i - 1 : -1, i < W - 1 ? v * W + i + 1 : -1] as const));
+      const across = lossy || !oneRun(x >= 2 ? y * W + x - 2 : -1, x + 1 < W ? y * W + x + 1 : -1) ? null : thin(W, (i) => y * W + i, (i) => t(y, i), x, (i) => [y - 1, y + 1].filter((v) => v >= 0 && v < H).map((v) => [v * W + i, i > 0 ? v * W + i - 1 : -1, i < W - 1 ? v * W + i + 1 : -1] as const));
       out.push([Math.min(Math.max(across ?? r + 1 - sum, x - 1), x + 1), y + 0.5]);
     } else {
       const y = e.y, x = e.x; let l = y - 1, r = y;
@@ -824,7 +849,7 @@ function subpixelPoints(chain: Chain, edges: readonly Edge[], regions: Int32Arra
       while (r + 1 < H && r + 1 - y < wr && regions[(r + 1) * W + x] === e.lb) r += 1;
       let sum = 0; for (let i = l; i <= r; i += 1) sum += t(i, x);
       impurity.push(wl === window && wr === window ? t(l, x) + 1 - t(r, x) : NaN);
-      const across = lossy ? null : thin(H, (i) => i * W + x, (i) => t(i, x), y, (i) => [x - 1, x + 1].filter((v) => v >= 0 && v < W).map((v) => [i * W + v, i > 0 ? (i - 1) * W + v : -1, i < H - 1 ? (i + 1) * W + v : -1] as const));
+      const across = lossy || !oneRun(y >= 2 ? (y - 2) * W + x : -1, y + 1 < H ? (y + 1) * W + x : -1) ? null : thin(H, (i) => i * W + x, (i) => t(i, x), y, (i) => [x - 1, x + 1].filter((v) => v >= 0 && v < W).map((v) => [i * W + v, i > 0 ? (i - 1) * W + v : -1, i < H - 1 ? (i + 1) * W + v : -1] as const));
       out.push([x + 0.5, Math.min(Math.max(across ?? r + 1 - sum, y - 1), y + 1)]);
     }
   });
@@ -837,9 +862,10 @@ const add = (p: Point, q: Point): Point => [p[0] + q[0], p[1] + q[1]];
 const mul = (p: Point, k: number): Point => [p[0] * k, p[1] * k];
 const norm = (p: Point) => Math.hypot(p[0], p[1]);
 const unit = (p: Point): Point => { const n = norm(p); return n > 1e-9 ? [p[0] / n, p[1] / n] : p; };
-const bez = (b: Cubic, t: number): Point => { const m = 1 - t; return [0, 1].map((c) => m * m * m * b[0][c]! + 3 * m * m * t * b[1][c]! + 3 * m * t * t * b[2][c]! + t * t * t * b[3][c]!) as Point; };
-const bezd = (b: Cubic, t: number): Point => { const m = 1 - t; return [0, 1].map((c) => 3 * m * m * (b[1][c]! - b[0][c]!) + 6 * m * t * (b[2][c]! - b[1][c]!) + 3 * t * t * (b[3][c]! - b[2][c]!)) as Point; };
-const bezdd = (b: Cubic, t: number): Point => [0, 1].map((c) => 6 * (1 - t) * (b[2][c]! - 2 * b[1][c]! + b[0][c]!) + 6 * t * (b[3][c]! - 2 * b[2][c]! + b[1][c]!)) as Point;
+// Per coordinate, written out (the same arithmetic in the same order as a map over [0, 1], without its arrays).
+const bezAt = (b: Cubic, t: number, c: number) => { const m = 1 - t; return m * m * m * b[0][c]! + 3 * m * m * t * b[1][c]! + 3 * m * t * t * b[2][c]! + t * t * t * b[3][c]!; };
+const bezdAt = (b: Cubic, t: number, c: number) => { const m = 1 - t; return 3 * m * m * (b[1][c]! - b[0][c]!) + 6 * m * t * (b[2][c]! - b[1][c]!) + 3 * t * t * (b[3][c]! - b[2][c]!); };
+const bezddAt = (b: Cubic, t: number, c: number) => 6 * (1 - t) * (b[2][c]! - 2 * b[1][c]! + b[0][c]!) + 6 * t * (b[3][c]! - 2 * b[2][c]! + b[1][c]!);
 const line = (p: Point, q: Point): Cubic => [p, add(p, mul(sub(q, p), 1 / 3)), add(p, mul(sub(q, p), 2 / 3)), q];
 
 function chordU(P: readonly Point[]): number[] {
@@ -852,12 +878,14 @@ function chordU(P: readonly Point[]): number[] {
 function genBez(P: readonly Point[], u: readonly number[], t1: Point, t2: Point): Cubic {
   const p0 = P[0]!, p3 = P[P.length - 1]!;
   let c00 = 0, c01 = 0, c11 = 0, x0 = 0, x1 = 0;
-  u.forEach((t, i) => {
-    const a1 = mul(t1, 3 * (1 - t) ** 2 * t), a2 = mul(t2, 3 * (1 - t) * t * t);
-    c00 += a1[0] * a1[0] + a1[1] * a1[1]; c01 += a1[0] * a2[0] + a1[1] * a2[1]; c11 += a2[0] * a2[0] + a2[1] * a2[1];
-    const tmp = sub(P[i]!, bez([p0, p0, p3, p3], t));
-    x0 += a1[0] * tmp[0] + a1[1] * tmp[1]; x1 += a2[0] * tmp[0] + a2[1] * tmp[1];
-  });
+  const ends: Cubic = [p0, p0, p3, p3];
+  for (let i = 0; i < u.length; i += 1) {
+    const t = u[i]!, k1 = 3 * (1 - t) ** 2 * t, k2 = 3 * (1 - t) * t * t;
+    const a10 = t1[0] * k1, a11 = t1[1] * k1, a20 = t2[0] * k2, a21 = t2[1] * k2;
+    c00 += a10 * a10 + a11 * a11; c01 += a10 * a20 + a11 * a21; c11 += a20 * a20 + a21 * a21;
+    const tmp0 = P[i]![0] - bezAt(ends, t, 0), tmp1 = P[i]![1] - bezAt(ends, t, 1);
+    x0 += a10 * tmp0 + a11 * tmp1; x1 += a20 * tmp0 + a21 * tmp1;
+  }
   const det = c00 * c11 - c01 * c01, seg = norm(sub(p3, p0));
   let a1 = seg / 3, a2 = seg / 3;
   if (Math.abs(det) > 1e-12) { a1 = (x0 * c11 - x1 * c01) / det; a2 = (c00 * x1 - c01 * x0) / det; }
@@ -866,17 +894,20 @@ function genBez(P: readonly Point[], u: readonly number[], t1: Point, t2: Point)
 }
 
 function reparam(b: Cubic, P: readonly Point[], u: readonly number[]): number[] {
-  return u.map((t, i) => {
-    const d = sub(bez(b, t), P[i]!), d1 = bezd(b, t), d2 = bezdd(b, t);
-    const num = d[0] * d1[0] + d[1] * d1[1], den = d1[0] * d1[0] + d1[1] * d1[1] + d[0] * d2[0] + d[1] * d2[1];
-    return Math.min(1, Math.max(0, t - (Math.abs(den) > 1e-9 ? num / den : 0)));
-  });
+  const out = new Array<number>(u.length);
+  for (let i = 0; i < u.length; i += 1) {
+    const t = u[i]!, d0 = bezAt(b, t, 0) - P[i]![0], d1 = bezAt(b, t, 1) - P[i]![1];
+    const e0 = bezdAt(b, t, 0), e1 = bezdAt(b, t, 1), f0 = bezddAt(b, t, 0), f1 = bezddAt(b, t, 1);
+    const num = d0 * e0 + d1 * e1, den = e0 * e0 + e1 * e1 + d0 * f0 + d1 * f1;
+    out[i] = Math.min(1, Math.max(0, t - (Math.abs(den) > 1e-9 ? num / den : 0)));
+  }
+  return out;
 }
 
 /** The fit error in tolerance terms: the larger of max error / KMAX and rms / KRMS, and the worst sample. */
 function fitError(b: Cubic, P: readonly Point[], u: readonly number[]): [number, number] {
   let worst = 0, at = 0, squares = 0;
-  u.forEach((t, i) => { const e = norm(sub(bez(b, t), P[i]!)); squares += e * e; if (e > worst) { worst = e; at = i; } });
+  for (let i = 0; i < u.length; i += 1) { const t = u[i]!, e = Math.hypot(bezAt(b, t, 0) - P[i]![0], bezAt(b, t, 1) - P[i]![1]); squares += e * e; if (e > worst) { worst = e; at = i; } }
   return [Math.max(worst / KMAX, Math.sqrt(squares / P.length) / KRMS), at];
 }
 
