@@ -220,6 +220,111 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
       if (q >= 0) (neighbours.get(p) ?? neighbours.set(p, new Set()).get(p)!).add(q);
     }
   });
+  // A region is drawn as the union of itself and its later (smaller) neighbours, so it runs on under each of them to
+  // their far edges. Where such a member's edge is the background's (the backdrop, the underlay, or clear), both paths
+  // cross that edge's pixels with the same coverage a, and a renderer composites them one after the other: the lower
+  // colour shows through by a(1 - a), a tinted, too opaque fringe round the member against the page. The lower path
+  // there runs instead inside the member, clear of the edge's pixels: every point of a pixel an edge crosses lies within
+  // SQRT2 (its diagonal) of the edge, so moved by SQRT2 it no longer reaches them. It must stay as clear of the
+  // member's other edge, the one it covers (or the page shows through there instead): the move is the member's width
+  // there less SQRT2, at most SQRT2, nothing where the member is narrower than that. The edge's own pixels are read as
+  // mixes of the member's and the background's colours, as they are on a clean render: each pixel either side of the
+  // chain lies on the line between the two colours, to the half-step rounding of each channel (as capCorners reads its
+  // window), unless a third region is beside it. A source whose edge pixels are otherwise keeps the shared edge.
+  const mixOk = new Map<number, boolean>();
+  const exactMixes = (index: number): boolean => {
+    const known = mixOk.get(index);
+    if (known !== undefined) return known;
+    const chain = chains[index]!, [p, q] = chain.pair, A = colours[p]!, B = colours[q]!;
+    const dv = [B[0]! - A[0]!, B[1]! - A[1]!, B[2]! - A[2]!, B[3]! - A[3]!], dd = rgbaDot(dv, dv);
+    const rounding = (Math.abs(dv[0]!) + Math.abs(dv[1]!) + Math.abs(dv[2]!) + Math.abs(dv[3]!)) * 0.5 / dd;
+    let ok = dd >= 1e-3, read = 0;
+    for (let k = 0; ok && k < chain.es.length; k += 1) {
+      const edge = edges[chain.es[k]!]!;
+      for (const at of edge.kind === "h" ? [(edge.y - 1) * W + edge.x, edge.y * W + edge.x] : [edge.y * W + edge.x - 1, edge.y * W + edge.x]) {
+        const x = at % W, y = (at - x) / W;
+        let third = false;
+        for (let ny = Math.max(0, y - 1); !third && ny <= Math.min(H - 1, y + 1); ny += 1)
+          for (let nx = Math.max(0, x - 1); nx <= Math.min(W - 1, x + 1); nx += 1) { const r = regions[ny * W + nx]!; if (r !== p && r !== q) { third = true; break; } }
+        if (third) continue;
+        read += 1;
+        const d0 = X[at * 4]! - A[0]!, d1 = X[at * 4 + 1]! - A[1]!, d2 = X[at * 4 + 2]! - A[2]!, d3 = X[at * 4 + 3]! - A[3]!;
+        const t = (d0 * dv[0]! + d1 * dv[1]! + d2 * dv[2]! + d3 * dv[3]!) / dd;
+        const o0 = d0 - t * dv[0]!, o1 = d1 - t * dv[1]!, o2 = d2 - t * dv[2]!, o3 = d3 - t * dv[3]!;
+        if (o0 * o0 + o1 * o1 + o2 * o2 + o3 * o3 > 1 || t < -rounding || t > 1 + rounding) { ok = false; break; }
+      }
+    }
+    // A premise is read off at least two pixels (as S1's windows), not taken for granted where every pixel has a third region.
+    ok = ok && read >= 2;
+    mixOk.set(index, ok);
+    return ok;
+  };
+  const span = (p: Point, q: Point) => Math.sqrt((q[0] - p[0]) * (q[0] - p[0]) + (q[1] - p[1]) * (q[1] - p[1]));
+  const steps = (cb: Cubic) => Math.max(2, Math.ceil((span(cb[0], cb[1]) + span(cb[1], cb[2]) + span(cb[2], cb[3])) / 0.5));
+  // The chain's cubics with each vertex (and its two handles) moved into the member along the vertex's mean normal, by
+  // the least clearance over the samples (every half pixel) of the cubics either side; a chain's open ends stay on their
+  // junctions. Null when nothing moves. The member's side is the one whose pixels lie a pixel off the curve.
+  // The same chain under the same member edges (another lower region whose union holds the same neighbours) moves alike.
+  // The chains that can move: on a clean source, between a drawn region and one drawn as nothing (the canvas border's
+  // outside, -1, is clipped and has no anti-aliasing to leak).
+  const pageEdge = new Uint8Array(chains.length);
+  let pageEdges = 0;
+  if (!lossy) chains.forEach((chain, index) => {
+    const [a, b] = chain.pair;
+    if (a >= 0 && b >= 0 && (inkOf[a]! < 0) !== (inkOf[b]! < 0)) { pageEdge[index] = 1; pageEdges += 1; }
+  });
+  const hiddenMemo = new Map<number, [number[], Cubic[] | null][]>();
+  const grids = new Map<string, Map<number, Point[]>>();
+  const hidden = (index: number, member: number, union: ReadonlySet<number>): Cubic[] | null => {
+    const covered: number[] = [];
+    for (const k of byRegion.get(member) ?? []) { const [p, q] = chains[k]!.pair, other = p === member ? q : p; if (other !== member && union.has(other)) covered.push(k); }
+    const seen = hiddenMemo.get(index) ?? hiddenMemo.set(index, []).get(index)!;
+    for (const [list, result] of seen) if (list.length === covered.length && list.every((k, i) => k === covered[i])) return result;
+    const result = hiddenOf(index, member, covered);
+    seen.push([covered, result]);
+    return result;
+  };
+  const hiddenOf = (index: number, member: number, covered: readonly number[]): Cubic[] | null => {
+    const reach = 2 * Math.SQRT2, gridKey = member + ":" + covered.join(",");
+    let grid = grids.get(gridKey);
+    if (grid === undefined) {
+      grid = new Map<number, Point[]>(); grids.set(gridKey, grid);
+      for (const k of covered) for (const cb of curves[k]!) {
+        const n = steps(cb);
+        for (let j = 0; j <= n; j += 1) { const pt: Point = [bezAt(cb, j / n, 0), bezAt(cb, j / n, 1)], key = Math.floor(pt[1] / reach) * 4096 + Math.floor(pt[0] / reach); (grid.get(key) ?? grid.set(key, []).get(key)!).push(pt); }
+      }
+    }
+    if (grid.size === 0) return null;
+    const cs = curves[index]!, closed = chains[index]!.closed, clear: number[] = [];
+    let vote = 0, any = false;
+    for (const cb of cs) {
+      const n = steps(cb);
+      let least2 = reach * reach;
+      for (let k = 0; k <= n && least2 > 2; k += 1) {
+        const t = k / n, px = bezAt(cb, t, 0), py = bezAt(cb, t, 1), cx = Math.floor(px / reach), cy = Math.floor(py / reach);
+        for (let gy = cy - 1; gy <= cy + 1; gy += 1) for (let gx = cx - 1; gx <= cx + 1; gx += 1)
+          for (const r of grid.get(gy * 4096 + gx) ?? []) { const dx = r[0] - px, dy = r[1] - py, d2 = dx * dx + dy * dy; if (d2 < least2) least2 = d2; }
+        const tx = bezdAt(cb, t, 0), ty = bezdAt(cb, t, 1), tl = Math.hypot(tx, ty);
+        if (tl < 1e-9) continue;
+        for (const sg of [1, -1]) {
+          const x = Math.floor(px - sg * ty / tl), y = Math.floor(py + sg * tx / tl);
+          if (x >= 0 && y >= 0 && x < W && y < H && regions[y * W + x] === member) vote += sg;
+        }
+      }
+      const e = Math.min(Math.SQRT2, Math.max(0, Math.sqrt(least2) - Math.SQRT2));
+      clear.push(e); if (e > 0) any = true;
+    }
+    if (!any || vote === 0) return null;
+    const side = Math.sign(vote), N = cs.length, move: Point[] = [];
+    const tangentAt = (cb: Cubic, end: 0 | 1): Point => unit(end === 0 ? sub(norm(sub(cb[1], cb[0])) > 1e-9 ? cb[1] : cb[2], cb[0]) : sub(cb[3], norm(sub(cb[3], cb[2])) > 1e-9 ? cb[2] : cb[1]));
+    for (let k = 0; k <= N; k += 1) {
+      const before = k > 0 ? k - 1 : closed ? N - 1 : -1, after = k < N ? k : closed ? 0 : -1;
+      if (before < 0 || after < 0) { move.push([0, 0]); continue; }
+      const tg = unit(add(tangentAt(cs[before]!, 1), tangentAt(cs[after]!, 0))), e = Math.min(clear[before]!, clear[after]!) * side;
+      move.push([-tg[1] * e, tg[0] * e]);
+    }
+    return cs.map((cb, k): Cubic => [add(cb[0], move[k]!), add(cb[1], move[k]!), add(cb[2], move[k + 1]!), add(cb[3], move[k + 1]!)]);
+  };
   const parts: string[] = underlay < 0 ? [] : [`<path d="M0,0L${W},0L${W},${H}L0,${H}Z" fill="${labelMap.inks[underlay]!.toUpperCase()}"/>`];
   for (const region of order) {
     const union = new Set([region]);
@@ -231,7 +336,18 @@ export function edgeFirstSvg(labelMap: EdgeLabels, source: Uint8Array, lossy: bo
         if (union.has(a) !== union.has(b)) boundary.add(index);
       }
     }
+    let saved: [number, Cubic[]][] | null = null;
+    if (pageEdges > 0) {
+      for (const index of boundary) {
+        if (pageEdge[index] === 0) continue;
+        const [a, b] = chains[index]!.pair, member = union.has(a) ? a : b;
+        if (member === region || inkOf[member]! < 0) continue;
+        const cs = hidden(index, member, union);
+        if (cs !== null && exactMixes(index)) { (saved ??= []).push([index, curves[index]!]); curves[index] = cs; }
+      }
+    }
     const d = loops([...boundary].sort((l, r) => l - r), chains, curves, W);
+    if (saved !== null) for (const [index, cs] of saved) curves[index] = cs;
     if (d !== "") parts.push(`<path d="${d}" fill="${labelMap.inks[inkOf[region]!]!.toUpperCase()}" fill-rule="evenodd"/>`);
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${parts.join("")}</svg>`;
